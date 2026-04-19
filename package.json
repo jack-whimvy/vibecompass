@@ -1,0 +1,30 @@
+{
+  "name": "vibecompass",
+  "version": "0.1.0",
+  "description": "Local-first project-memory core for VibeCompass",
+  "type": "module",
+  "bin": {
+    "vibecompass": "./src/cli.js"
+  },
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "test": "node --test src/tests/*.test.js"
+  },
+  "keywords": [
+    "vibecompass",
+    "project-memory",
+    "documentation",
+    "local-first"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
