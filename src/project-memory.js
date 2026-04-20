@@ -5,8 +5,8 @@ import { sha256Text } from './hash.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 const PROJECT_FILE = 'project.yaml';
-const NON_CANONICAL_DECISION_FILES = new Set(['INDEX.md']);
-const NON_CANONICAL_SESSION_FILES = new Set(['wip.md', 'handoff.md']);
+const NON_CANONICAL_DECISION_FILES = new Set(['INDEX.md', 'README.md']);
+const NON_CANONICAL_SESSION_FILES = new Set(['wip.md', 'handoff.md', 'README.md']);
 const NON_CANONICAL_ARCHITECTURE_FILES = new Set(['README.md']);
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 const RECOMMENDED_ARCHITECTURE_SECTIONS = [

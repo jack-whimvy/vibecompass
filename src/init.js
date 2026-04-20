@@ -2,6 +2,8 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { serializeProjectConfig } from './project-yaml.js';
 import { writeStateManifest } from './manifest.js';
+import { scaffoldInitFiles } from './scaffold.js';
+import { applyPlacementDefaults } from './setup.js';
 
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 
@@ -21,6 +23,7 @@ export async function initializeProjectMemory(options) {
   const manifestResult = await writeStateManifest(normalized.rootDir, {
     generatedAt: normalized.generatedAt,
   });
+  const scaffoldResult = await scaffoldInitFiles(normalized.bootstrap);
 
   return {
     rootDir: normalized.rootDir,
@@ -31,6 +34,9 @@ export async function initializeProjectMemory(options) {
     manifest: manifestResult.manifest,
     scanResult: manifestResult.scanResult,
     syncEnvVar: normalized.projectConfig.sync?.credential_env_var ?? null,
+    contextFilePath: scaffoldResult.contextFilePath,
+    scaffoldCreatedFiles: scaffoldResult.createdFiles,
+    scaffoldSkippedFiles: scaffoldResult.skippedFiles,
   };
 }
 
@@ -40,22 +46,26 @@ function normalizeInitOptions(options) {
   }
 
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
-  const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  const preparedOptions = applyPlacementDefaults(options, { cwd });
+  const rootDir = path.resolve(cwd, preparedOptions.rootDir ?? '.compass');
+  const toolingRootDir = preparedOptions.toolingRootDir
+    ? path.resolve(cwd, preparedOptions.toolingRootDir)
+    : cwd;
 
-  if (typeof options.name !== 'string' || options.name.trim() === '') {
+  if (typeof preparedOptions.name !== 'string' || preparedOptions.name.trim() === '') {
     throw new Error('init requires a non-empty project name.');
   }
 
-  if (typeof options.mode !== 'string' || !VALID_MODES.has(options.mode)) {
+  if (typeof preparedOptions.mode !== 'string' || !VALID_MODES.has(preparedOptions.mode)) {
     throw new Error('init requires mode to be local-only, local-primary, or hosted-only.');
   }
 
-  if (!Array.isArray(options.repos) || options.repos.length === 0) {
+  if (!Array.isArray(preparedOptions.repos) || preparedOptions.repos.length === 0) {
     throw new Error('init requires at least one repo descriptor.');
   }
 
   const seenRepoIds = new Set();
-  const repos = options.repos.map((repo, index) => {
+  const repos = preparedOptions.repos.map((repo, index) => {
     if (!repo || typeof repo !== 'object') {
       throw new Error(`repo ${index + 1} must be an object.`);
     }
@@ -80,9 +90,13 @@ function normalizeInitOptions(options) {
     };
   });
 
-  const syncOptions = options.sync ?? null;
+  const syncOptions = preparedOptions.sync ?? null;
   let sync = undefined;
   if (syncOptions) {
+    if (preparedOptions.mode !== 'local-primary') {
+      throw new Error('sync configuration is only supported when mode is local-primary.');
+    }
+
     const requiredFields = ['apiUrl', 'projectId', 'credentialEnvVar'];
     const missing = requiredFields.filter((field) => typeof syncOptions[field] !== 'string' || syncOptions[field].trim() === '');
 
@@ -103,19 +117,46 @@ function normalizeInitOptions(options) {
 
   const projectConfig = {
     format_version: 1,
-    name: options.name.trim(),
-    ...(options.slug ? { slug: options.slug } : {}),
-    ...(options.description ? { description: options.description } : {}),
-    mode: options.mode,
+    name: preparedOptions.name.trim(),
+    ...(preparedOptions.slug ? { slug: preparedOptions.slug } : {}),
+    ...(preparedOptions.description ? { description: preparedOptions.description } : {}),
+    mode: preparedOptions.mode,
     repos,
     ...(sync ? { sync } : {}),
+    ...(preparedOptions.metadata ? { metadata: preparedOptions.metadata } : {}),
   };
+
+  const bootstrapOptions = normalizeBootstrapOptions(preparedOptions.bootstrap, {
+    rootDir,
+    toolingRootDir,
+    projectConfig,
+  });
 
   return {
     rootDir,
-    force: Boolean(options.force),
-    generatedAt: options.generatedAt,
+    force: Boolean(preparedOptions.force),
+    generatedAt: preparedOptions.generatedAt,
     projectConfig,
+    bootstrap: bootstrapOptions,
+  };
+}
+
+function normalizeBootstrapOptions(bootstrap, context) {
+  const requested = bootstrap && typeof bootstrap === 'object' ? bootstrap : {};
+  const workflow = Boolean(requested.workflow || requested.claude || requested.agents);
+  const contextFilePath = path.join(context.rootDir, 'context.md');
+
+  return {
+    workflow,
+    claude: Boolean(requested.claude),
+    agents: Boolean(requested.agents),
+    rootDir: context.rootDir,
+    toolingRootDir: context.toolingRootDir,
+    projectConfig: context.projectConfig,
+    rootRelativePath: toPosix(path.relative(context.toolingRootDir, context.rootDir) || '.'),
+    contextRelativeToToolingRoot: toPosix(
+      path.relative(context.toolingRootDir, contextFilePath) || 'context.md',
+    ),
   };
 }
 
@@ -154,4 +195,8 @@ async function fileExists(filePath) {
   } catch {
     return false;
   }
+}
+
+function toPosix(value) {
+  return value.split(path.sep).join('/');
 }
