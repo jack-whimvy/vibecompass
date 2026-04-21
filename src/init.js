@@ -4,6 +4,7 @@ import { serializeProjectConfig } from './project-yaml.js';
 import { writeStateManifest } from './manifest.js';
 import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
+import { buildWorkflowMetadata } from './workflow.js';
 
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 
@@ -123,7 +124,13 @@ function normalizeInitOptions(options) {
     mode: preparedOptions.mode,
     repos,
     ...(sync ? { sync } : {}),
-    ...(preparedOptions.metadata ? { metadata: preparedOptions.metadata } : {}),
+    metadata: buildWorkflowMetadata(preparedOptions.metadata, {
+      gitPublish:
+        typeof preparedOptions.closeSessionGitPublish === 'boolean'
+          ? preparedOptions.closeSessionGitPublish
+          : undefined,
+      gitRemote: preparedOptions.closeSessionGitRemote,
+    }),
   };
 
   const bootstrapOptions = normalizeBootstrapOptions(preparedOptions.bootstrap, {

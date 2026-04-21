@@ -1,5 +1,7 @@
 import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { parseSimpleYaml } from './simple-yaml.js';
+import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
 
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
@@ -83,8 +85,9 @@ export async function closeProjectSession(options) {
     throw new Error('close-session requires at least one next-step entry.');
   }
 
-  await ensureInitializedProjectMemory(normalized.rootDir);
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const claude = await readClaudeFile(normalized.claudePath);
+  const workflowSettings = await readWorkflowSettings(normalized.projectFilePath);
 
   if (!(await fileExists(normalized.wipFilePath))) {
     throw new Error(
@@ -157,10 +160,12 @@ export async function closeProjectSession(options) {
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
     claudePath: normalized.claudePath,
+    projectFilePath: normalized.projectFilePath,
     sessionFilePath,
     sessionRelativePath,
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
+    workflowGuidance: buildCloseSessionGuidance(workflowSettings),
     removedScratchFiles: [
       normalized.wipFilePath,
       ...(hadHandoff ? [normalized.handoffFilePath] : []),
@@ -176,6 +181,7 @@ function normalizeSessionPaths(options) {
     toolingRootDir: options?.toolingRootDir
       ? path.resolve(cwd, options.toolingRootDir)
       : cwd,
+    projectFilePath: path.resolve(path.resolve(cwd, options?.rootDir ?? '.compass'), 'project.yaml'),
     claudePath: path.resolve(
       options?.toolingRootDir ? path.resolve(cwd, options.toolingRootDir) : cwd,
       'CLAUDE.md',
@@ -186,12 +192,28 @@ function normalizeSessionPaths(options) {
   };
 }
 
-async function ensureInitializedProjectMemory(rootDir) {
+async function ensureInitializedProjectMemory(rootDir, options = {}) {
+  if (!(await fileExists(rootDir))) {
+    throw new Error(
+      `No project memory root was found at ${rootDir}. Run "vibecompass init" before using session commands.`,
+    );
+  }
+
   const projectFilePath = path.join(rootDir, 'project.yaml');
-  if (!(await fileExists(projectFilePath))) {
+  if (!options.allowMissingProjectFile && !(await fileExists(projectFilePath))) {
     throw new Error(
       `No project.yaml was found at ${projectFilePath}. Run "vibecompass init" before using session commands.`,
     );
+  }
+}
+
+async function readWorkflowSettings(projectFilePath) {
+  try {
+    const source = await readFile(projectFilePath, 'utf8');
+    const data = parseSimpleYaml(source, { sourceName: projectFilePath });
+    return resolveWorkflowSettings(data);
+  } catch {
+    return resolveWorkflowSettings(null);
   }
 }
 

@@ -73,6 +73,8 @@ npx -y vibecompass init \
   --with-workflow \
   --with-claude \
   --with-agents \
+  --close-session-git-publish \
+  --close-session-git-remote origin \
   --start-session \
   --session-working-on "Validate the local-first MCP workflow"
 ```
@@ -120,6 +122,10 @@ address review     # builder reads reviewer feedback, responds inline, and conti
 Those prompt commands are documented in the generated `context.md`,
 `CLAUDE.md`, and `AGENTS.md` templates. They are not additional
 `vibecompass` CLI subcommands.
+Reviewer handback is explicit in the package-managed workflow: the reviewer
+ends the pass by updating `wip.md` + `handoff.md`, and the builder closes
+the session with `vibecompass close-session` using the defaults stored in
+`project.yaml.metadata.workflow.close_session`.
 
 Create a `local-primary` root when you also want the hosted sync binding written into `project.yaml`:
 
@@ -182,10 +188,15 @@ Options:
 - `--with-agents`: create a starter `AGENTS.md` if it does not already exist
 - `--start-session`: open the first builder session after init
 - `--session-working-on <text>`: required with `--start-session` outside guided mode
+- `--close-session-git-publish`: store that the close-session workflow includes a Git publish step
+- `--close-session-git-remote <name>`: optional default Git remote name for that stored publish step
 - `--force`: overwrite an existing `project.yaml`
 
 When `--start-session` is used, `init` automatically enables the minimum
 workflow bootstrap required for that session: `context.md` plus `CLAUDE.md`.
+Guided init can also record workflow defaults in
+`project.yaml.metadata.workflow`, including whether close-session should
+include a Git publish step and which remote name to use for that step.
 
 ### `vibecompass start-session`
 
@@ -225,6 +236,10 @@ This command finalizes the active scratchpad into
 `sessions/YYYY-MM-DD-N-display-title.md`, deletes `wip.md` / `handoff.md`, and
 updates the `Current session` block in `CLAUDE.md`. If no `--model` flags are
 provided, the session note records `Not recorded.` under `Models used`.
+This is the final builder lifecycle step after the last `address review`
+pass, not a reviewer action. It also prints the workflow guidance derived
+from `project.yaml.metadata.workflow.close_session`, including any
+configured Git publish step.
 
 ### Prompt commands
 
@@ -236,6 +251,11 @@ These are the default prompt commands used by the scaffolded workflow files:
 - `address review`: builder reads the latest reviewer feedback in `wip.md` / `handoff.md`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 They are prompt commands for AI-tool behavior, not package CLI commands.
+Reviewer handback ends when the reviewer has updated `wip.md` and
+`handoff.md`; there is no extra reviewer-exit step. The builder remains
+in builder role, uses `address review` until findings are resolved or
+explicitly deferred, and then runs `vibecompass close-session` using the
+workflow defaults recorded in `project.yaml`.
 
 ## JavaScript API
 

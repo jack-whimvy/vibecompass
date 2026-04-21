@@ -32,6 +32,10 @@ export async function resolveInitCliOptions(options, environment = {}) {
   resolved = applyPlacementDefaults(resolved, { cwd });
   ensureSessionBootstrap(resolved);
 
+  if (resolved.closeSessionGitRemote && resolved.closeSessionGitPublish === undefined) {
+    resolved.closeSessionGitPublish = true;
+  }
+
   if (resolved.startSession && !resolved.sessionWorkingOn) {
     throw new Error('init requires --session-working-on when --start-session is used without guided setup.');
   }
@@ -50,6 +54,8 @@ export async function resolveInitCliOptions(options, environment = {}) {
       bootstrap: resolved.bootstrap,
       generatedAt: resolved.generatedAt,
       metadata: resolved.metadata,
+      closeSessionGitPublish: resolved.closeSessionGitPublish,
+      closeSessionGitRemote: resolved.closeSessionGitRemote,
       placementPattern: resolved.placementPattern,
     },
     placementPattern: resolved.placementPattern ?? null,
@@ -272,6 +278,24 @@ async function completeGuidedInitOptions(options, environment) {
     if (!resolved.sessionWorkingOn) {
       resolved.sessionWorkingOn = await askInput(prompter, 'What are you working on?');
     }
+  }
+
+  if (resolved.closeSessionGitPublish === undefined && (resolved.bootstrap.workflow || resolved.startSession)) {
+    resolved.closeSessionGitPublish = await askConfirm(
+      prompter,
+      'Should close-session include a Git publish step?',
+      false,
+    );
+  }
+
+  if (resolved.closeSessionGitPublish && !resolved.closeSessionGitRemote) {
+    resolved.closeSessionGitRemote = await askInput(
+      prompter,
+      'Git remote for the close-session publish step',
+      {
+        defaultValue: 'origin',
+      },
+    );
   }
 
   return {

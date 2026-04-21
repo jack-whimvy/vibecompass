@@ -1,5 +1,6 @@
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { resolveWorkflowSettings } from './workflow.js';
 
 export async function scaffoldInitFiles(options) {
   const createdFiles = [];
@@ -99,6 +100,7 @@ async function fileExists(filePath) {
 function generateContextMarkdown(options) {
   const projectName = options.projectConfig.name;
   const rootRelativePath = options.rootRelativePath;
+  const workflow = resolveWorkflowSettings(options.projectConfig);
   const repos = options.projectConfig.repos
     .map((repo) => `- \`${repo.id}\` → ${repo.remote}`)
     .join('\n');
@@ -135,6 +137,10 @@ ${repos}
 - \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
+Reviewer handback is explicit: the reviewer ends the pass by updating \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+
+## Workflow defaults
+${renderWorkflowDefaults(workflow)}
 
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
@@ -183,10 +189,12 @@ During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the latest \`wip.md\` / \`handoff.md\`
+- stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session\`
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them
 
 At session close:
 - prefer running \`vibecompass close-session --title "..." --completed "..." --model "..." --next-step "..."\`
+- follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - finalize \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`
 - delete \`wip.md\` and \`handoff.md\`
 - refresh any affected architecture/decision docs
@@ -197,6 +205,7 @@ At session close:
 - inspect the relevant code/docs diffs
 - append findings under \`## Review log\` in \`wip.md\`
 - write a concise baton-pass summary into \`handoff.md\`
+- end the review pass after those file updates; there is no separate reviewer-exit step
 
 ## Tooling note
 \`CLAUDE.md\` and \`AGENTS.md\` are developer-owned starter files. If they exist,
@@ -283,6 +292,8 @@ Those scratch files are session-scoped working artifacts, not finalized history.
 }
 
 function generateClaudeTemplate(options) {
+  const workflow = resolveWorkflowSettings(options.projectConfig);
+
   return `# ${options.projectConfig.name} Workspace
 
 Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
@@ -302,6 +313,7 @@ Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
 - \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
+Reviewer handback is explicit: the reviewer ends the pass by updating \`${options.rootRelativePath}/sessions/wip.md\` + \`${options.rootRelativePath}/sessions/handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
 
 ## Current session
 
@@ -320,10 +332,14 @@ Next session should: Read \`${options.contextRelativeToToolingRoot}\`, then open
 - Follow the builder/reviewer protocol defined there
 - Use \`vibecompass start-session\` and \`vibecompass close-session\` to manage the active-session files when possible
 - Keep \`${options.rootRelativePath}/sessions/wip.md\` and \`${options.rootRelativePath}/sessions/handoff.md\` current during an active session
+- Workflow defaults:
+${renderWorkflowDefaults(workflow)}
 `;
 }
 
 function generateAgentsTemplate(options) {
+  const workflow = resolveWorkflowSettings(options.projectConfig);
+
   return `# ${options.projectConfig.name} Workspace
 
 This workspace uses VibeCompass project memory rooted at \`${options.rootRelativePath}\`.
@@ -343,6 +359,7 @@ This workspace uses VibeCompass project memory rooted at \`${options.rootRelativ
 - \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
+Reviewer handback is explicit: the reviewer ends the pass by updating \`${options.rootRelativePath}/sessions/wip.md\` + \`${options.rootRelativePath}/sessions/handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
 
 ## Startup
 Before doing substantive work:
@@ -354,5 +371,33 @@ Before doing substantive work:
 
 ## Working rule
 Treat \`${options.contextRelativeToToolingRoot}\` as the local workflow source of truth for the builder/reviewer protocol and session scratch-file structure. When the package provides \`start-session\` / \`close-session\`, prefer those commands over hand-editing boilerplate.
+- Workflow defaults:
+${renderWorkflowDefaults(workflow)}
 `;
+}
+
+function renderWorkflowDefaults(workflow) {
+  const lines = [
+    `- reviewer handback: ${describeReviewerHandback(workflow)}`,
+    '- close-session: refresh any relevant architecture docs before finalizing the session',
+    '- close-session: refresh any relevant decision files before finalizing the session',
+  ];
+
+  if (workflow.closeSession.gitPublish) {
+    lines.push(
+      `- close-session: include a Git publish step after finalization using remote \`${workflow.closeSession.gitRemote}\``,
+    );
+  } else {
+    lines.push('- close-session: no Git publish step is included by default');
+  }
+
+  return lines.join('\n');
+}
+
+function describeReviewerHandback(workflow) {
+  if (workflow.reviewerHandback === 'handoff-file') {
+    return 'update sessions/wip.md and sessions/handoff.md, then stop the review pass';
+  }
+
+  return workflow.reviewerHandback;
 }

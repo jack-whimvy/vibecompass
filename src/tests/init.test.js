@@ -36,6 +36,9 @@ test('initializeProjectMemory scaffolds a new root and writes a manifest', async
     assert.match(projectYaml, /name: Example Project/);
     assert.match(projectYaml, /slug: example-project/);
     assert.match(projectYaml, /default_branch: main/);
+    assert.match(projectYaml, /reviewer_handback: handoff-file/);
+    assert.match(projectYaml, /refresh_architecture_docs: true/);
+    assert.match(projectYaml, /refresh_decision_files: true/);
     assert.equal(gitignore, 'state/\n');
     assert.equal(manifest.generated_at, '2026-04-19T10:00:00.000Z');
     assert.equal(manifest.canonical.document_count, 1);
@@ -57,6 +60,8 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
       name: 'Workflow Project',
       mode: 'local-only',
       repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      closeSessionGitPublish: true,
+      closeSessionGitRemote: 'origin',
       bootstrap: {
         workflow: true,
         claude: true,
@@ -73,6 +78,7 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
 
     assert.match(context, /\.compass\/project\.yaml/);
     assert.match(context, /sessions\/wip\.md/);
+    assert.match(context, /include a Git publish step after finalization using remote `origin`/);
     assert.match(architectureGuide, /Recommended layout/);
     assert.match(decisionsGuide, /Append-only decision log/);
     assert.match(sessionsGuide, /Finalized session notes/);
@@ -282,12 +288,17 @@ test('runCli parses init arguments and creates the root', async () => {
       'docs=main',
       '--with-workflow',
       '--with-claude',
+      '--close-session-git-publish',
+      '--close-session-git-remote',
+      'upstream',
     ]);
 
     assert.equal(parsed.command, 'init');
     assert.equal(parsed.options.repos[0].defaultBranch, 'main');
     assert.equal(parsed.options.bootstrap.workflow, true);
     assert.equal(parsed.options.bootstrap.claude, true);
+    assert.equal(parsed.options.closeSessionGitPublish, true);
+    assert.equal(parsed.options.closeSessionGitRemote, 'upstream');
 
     const exitCode = await runCli(
       [
@@ -304,6 +315,9 @@ test('runCli parses init arguments and creates the root', async () => {
         'docs=main',
         '--with-workflow',
         '--with-claude',
+        '--close-session-git-publish',
+        '--close-session-git-remote',
+        'upstream',
       ],
       {
         stdout: {
@@ -404,6 +418,8 @@ test('runCli supports guided init with placement recommendation and first-sessio
     ['Create a starter AGENTS.md if missing?', 'no'],
     ['Open the first builder session immediately after init?', 'yes'],
     ['What are you working on?', 'Bootstrap the guided init flow.'],
+    ['Should close-session include a Git publish step?', 'yes'],
+    ['Git remote for the close-session publish step', ''],
   ]);
 
   try {
@@ -456,11 +472,15 @@ test('runCli supports guided init with placement recommendation and first-sessio
       'Create a starter AGENTS.md if missing?',
       'Open the first builder session immediately after init?',
       'What are you working on?',
+      'Should close-session include a Git publish step?',
+      'Git remote for the close-session publish step',
     ]);
     assert.ok(stdout.join('').includes('Placement: primary-repo'));
     assert.ok(stdout.join('').includes('Started session'));
     assert.match(projectYaml, /placement_pattern: primary-repo/);
     assert.match(projectYaml, /default_branch: main/);
+    assert.match(projectYaml, /git_publish: true/);
+    assert.match(projectYaml, /git_remote: origin/);
     assert.match(claude, /Working on: Bootstrap the guided init flow\./);
     assert.match(wip, /Bootstrap the guided init flow\./);
   } finally {

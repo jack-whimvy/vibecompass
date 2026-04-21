@@ -18,6 +18,8 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
       name: 'Session Project',
       mode: 'local-only',
       repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      closeSessionGitPublish: true,
+      closeSessionGitRemote: 'origin',
       bootstrap: {
         workflow: true,
         claude: true,
@@ -69,6 +71,8 @@ test('startProjectSession finds the current-session fence even if another code b
       name: 'Session Project',
       mode: 'local-only',
       repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      closeSessionGitPublish: true,
+      closeSessionGitRemote: 'origin',
       bootstrap: {
         workflow: true,
         claude: true,
@@ -119,6 +123,8 @@ test('closeProjectSession finalizes the session note and removes scratch files',
       name: 'Session Project',
       mode: 'local-only',
       repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      closeSessionGitPublish: true,
+      closeSessionGitRemote: 'origin',
       bootstrap: {
         workflow: true,
         claude: true,
@@ -160,11 +166,72 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.match(sessionNote, /1\. Verify the updated package docs and public docs copy\./);
     assert.match(claude, /Working on: Session closed\. Ready for the next builder session\./);
     assert.match(claude, /Last thing completed: Closed session 1 and wrote `sessions\/2026-04-20-1-workflow-parity-commands\.md`\./);
+    assert.ok(result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'));
+    assert.ok(result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'));
+    assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
 
     await assert.rejects(() => access(path.join(rootDir, 'sessions/wip.md')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/handoff.md')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('closeProjectSession falls back to default workflow guidance when project.yaml is unavailable', async () => {
+  for (const scenario of ['missing', 'malformed']) {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), `vibecompass-session-workflow-${scenario}-`));
+    const rootDir = path.join(tempDir, '.compass');
+
+    try {
+      await initializeProjectMemory({
+        cwd: tempDir,
+        rootDir,
+        name: 'Session Project',
+        mode: 'local-only',
+        repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+        closeSessionGitPublish: true,
+        closeSessionGitRemote: 'origin',
+        bootstrap: {
+          workflow: true,
+          claude: true,
+        },
+      });
+
+      await startProjectSession({
+        cwd: tempDir,
+        rootDir,
+        workingOn: `Close a session after the workflow file becomes ${scenario}.`,
+        date: '2026-04-20',
+      });
+
+      const projectFilePath = path.join(rootDir, 'project.yaml');
+      if (scenario === 'missing') {
+        await rm(projectFilePath, { force: true });
+      } else {
+        await writeFile(projectFilePath, 'metadata:\n  workflow:\n    close_session: [\n', 'utf8');
+      }
+
+      const result = await closeProjectSession({
+        cwd: tempDir,
+        rootDir,
+        title: `Workflow Fallback ${scenario}`,
+        completed: ['Closed the session even though the workflow file was unavailable.'],
+        nextSteps: ['Restore or regenerate project.yaml before the next session.'],
+      });
+
+      assert.ok(
+        result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'),
+      );
+      assert.ok(
+        result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'),
+      );
+      assert.equal(
+        result.workflowGuidance.some((line) => line.includes('Git publish step')),
+        false,
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -272,6 +339,8 @@ test('runCli supports start-session and close-session', async () => {
     assert.ok(stdout.join('').includes('Started session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('Closed session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('2026-04-20-1-cli-session-flow.md'));
+    assert.ok(stdout.join('').includes('Workflow guidance:'));
+    assert.ok(stdout.join('').includes('Refresh any relevant architecture docs before finalizing the session.'));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

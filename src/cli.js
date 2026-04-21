@@ -93,6 +93,12 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
+    if (result.workflowGuidance.length > 0) {
+      io.stdout.write('Workflow guidance:\n');
+      for (const item of result.workflowGuidance) {
+        io.stdout.write(`- ${item}\n`);
+      }
+    }
     return 0;
   }
 
@@ -156,6 +162,11 @@ export function parseCliArgs(argv) {
       continue;
     }
 
+    if (token === '--close-session-git-publish') {
+      parsed.closeSessionGitPublish = true;
+      continue;
+    }
+
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
     }
@@ -210,6 +221,9 @@ export function parseCliArgs(argv) {
       case '--session-working-on':
         parsed.sessionWorkingOn = value;
         break;
+      case '--close-session-git-remote':
+        parsed.closeSessionGitRemote = value;
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -243,6 +257,8 @@ export function parseCliArgs(argv) {
       force: parsed.force,
       startSession: parsed.startSession,
       sessionWorkingOn: parsed.sessionWorkingOn,
+      closeSessionGitPublish: parsed.closeSessionGitPublish,
+      closeSessionGitRemote: parsed.closeSessionGitRemote,
       ...(parsed.withWorkflow || parsed.withClaude || parsed.withAgents
         ? {
             bootstrap: {
@@ -416,6 +432,8 @@ function usageText() {
     '  --with-agents                        Create a starter AGENTS.md if missing',
     '  --start-session                      Open the first builder session after init',
     '  --session-working-on <text>          Required with --start-session outside guided mode',
+    '  --close-session-git-publish          Include a Git publish step in the stored close-session workflow',
+    '  --close-session-git-remote <name>    Default Git remote name for that close-session publish step',
     '  --force                              Overwrite an existing project.yaml',
     '',
     'Start-session options:',
