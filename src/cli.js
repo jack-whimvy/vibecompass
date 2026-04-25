@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { initializeProjectMemory } from './init.js';
 import { resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, startProjectSession } from './session.js';
+import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 
 export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   const parsed = parseCliArgs(argv);
@@ -99,6 +100,16 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         io.stdout.write(`- ${item}\n`);
       }
     }
+    writeAgentFileSyncResult(io, result.agentFileSync);
+    return 0;
+  }
+
+  if (parsed.command === 'sync-agents') {
+    const result = await syncAgentInstructionFiles({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    writeAgentFileSyncResult(io, result);
     return 0;
   }
 
@@ -119,6 +130,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'close-session') {
       return parseCloseSessionArgs(rest);
+    }
+
+    if (command === 'sync-agents') {
+      return parseSyncAgentsArgs(rest);
     }
 
     return { command };
@@ -398,6 +413,61 @@ function parseCloseSessionArgs(argv) {
   };
 }
 
+function parseSyncAgentsArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--dry-run') {
+      parsed.dryRun = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--tooling-root':
+        parsed.toolingRootDir = value;
+        break;
+      case '--format':
+        parsed.format = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'sync-agents',
+    options: parsed,
+  };
+}
+
+function writeAgentFileSyncResult(io, result) {
+  if (!result) {
+    return;
+  }
+
+  io.stdout.write('Agent instruction files:\n');
+  for (const item of result.results) {
+    const suffix = item.warning ? ` — ${item.warning}` : '';
+    const stream = item.warning ? io.stderr : io.stdout;
+    stream.write(`- ${item.relativePath}: ${item.status}${suffix}\n`);
+  }
+}
+
 function splitAssignment(value, flagName) {
   const separatorIndex = value.indexOf('=');
   if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
@@ -413,6 +483,7 @@ function usageText() {
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
     '  vibecompass start-session --working-on <text> [options]',
     '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
+    '  vibecompass sync-agents [options]',
     '',
     'Init options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -457,6 +528,12 @@ function usageText() {
     '  --next-step <text>                   Repeatable next-session step',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md completed summary',
     '  --next-session-should <text>         Optional override for the CLAUDE.md next-session summary',
+    '',
+    'Sync-agents options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --tooling-root <path>                Directory where agent files are written. Defaults to cwd',
+    '  --format <name>                      Optional format: claude_md, agents_md, cursor_rules, copilot_instructions',
+    '  --dry-run                            Show planned writes without changing files',
   ].join('\n');
 }
 

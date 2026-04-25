@@ -1,4 +1,4 @@
-# vibecompass
+# @vibecompass/vibecompass
 
 Local-first project-memory core for [VibeCompass](https://vibecompass.dev).
 
@@ -15,6 +15,7 @@ Shipped today:
 - generated `context.md` plus opt-in workflow guide files
 - opt-in starter `CLAUDE.md` / `AGENTS.md` templates that are created once and never overwritten
 - `vibecompass start-session` / `vibecompass close-session` for the local builder workflow
+- `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
 - canonical file scanning and validation
 - `state/manifest.json` generation
 - JavaScript read-model helpers for project, feature, decision, and file context
@@ -35,13 +36,16 @@ broader local-primary sync workflow is still being built on top of it.
 ### CLI
 
 ```bash
-npx -y vibecompass --help
+npx -y @vibecompass/vibecompass --help
 ```
+
+The npm package is scoped under the VibeCompass org, but the installed CLI
+command is intentionally unscoped: `vibecompass`.
 
 ### Library
 
 ```bash
-npm install vibecompass
+npm install @vibecompass/vibecompass
 ```
 
 ## Quickstart
@@ -49,7 +53,7 @@ npm install vibecompass
 Run the guided bootstrap:
 
 ```bash
-npx -y vibecompass init --guided
+npx -y @vibecompass/vibecompass init --guided
 ```
 
 Guided init asks about repo topology, recommends a placement pattern
@@ -64,7 +68,7 @@ the canonical root defaults to the repo root itself.
 Skip the prompts and drive the setup explicitly:
 
 ```bash
-npx -y vibecompass init \
+npx -y @vibecompass/vibecompass init \
   --placement primary-repo \
   --tooling-root . \
   --name "Acme Platform" \
@@ -96,14 +100,14 @@ regenerates it; do not treat it as a hand-edited source document.
 If you do not chain straight into a first session from `init`, open one later:
 
 ```bash
-npx -y vibecompass start-session \
+npx -y @vibecompass/vibecompass start-session \
   --working-on "Validate the MCP dogfood workflow against the docs repo"
 ```
 
 Close the active builder session:
 
 ```bash
-npx -y vibecompass close-session \
+npx -y @vibecompass/vibecompass close-session \
   --title "Workflow Parity Commands" \
   --completed "Added package-owned start-session and close-session commands" \
   --next-step "Run the package publish dry-run"
@@ -127,10 +131,27 @@ ends the pass by updating `wip.md` + `handoff.md`, and the builder closes
 the session with `vibecompass close-session` using the defaults stored in
 `project.yaml.metadata.workflow.close_session`.
 
+Generate agent-instruction files from project memory:
+
+```bash
+npx -y @vibecompass/vibecompass sync-agents --root .compass
+```
+
+`sync-agents` writes only VibeCompass managed regions:
+
+```md
+<!-- vibecompass:start - managed by VibeCompass, do not edit -->
+... generated content ...
+<!-- vibecompass:end -->
+```
+
+Content outside those markers is preserved. Existing files without markers are
+reported as warnings and left untouched.
+
 Create a `local-primary` root when you also want the hosted sync binding written into `project.yaml`:
 
 ```bash
-npx -y vibecompass init \
+npx -y @vibecompass/vibecompass init \
   --placement primary-repo \
   --tooling-root . \
   --name "Acme Platform" \
@@ -241,6 +262,24 @@ pass, not a reviewer action. It also prints the workflow guidance derived
 from `project.yaml.metadata.workflow.close_session`, including any
 configured Git publish step.
 
+### `vibecompass sync-agents`
+
+```text
+vibecompass sync-agents [options]
+```
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--tooling-root <path>`: directory where agent files are written; defaults to cwd
+- `--format <name>`: optional format filter: `claude_md`, `agents_md`, `cursor_rules`, or `copilot_instructions`
+- `--dry-run`: show planned writes without changing files
+
+This command generates enabled agent-instruction files from canonical project
+memory. It creates missing files with managed markers, replaces existing
+managed regions, preserves content outside markers, and warns instead of
+overwriting existing unmarked files.
+
 ### Prompt commands
 
 These are the default prompt commands used by the scaffolded workflow files:
@@ -264,6 +303,7 @@ import {
   initializeProjectMemory,
   startProjectSession,
   closeProjectSession,
+  syncAgentInstructionFiles,
   scanProjectMemory,
   writeStateManifest,
   loadProjectReadModel,

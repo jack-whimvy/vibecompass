@@ -386,6 +386,7 @@ function renderWorkflowDefaults(workflow) {
   if (workflow.closeSession.gitPublish) {
     lines.push(
       `- close-session: include a Git publish step after finalization using remote \`${workflow.closeSession.gitRemote}\``,
+      `- close-session: use commit message format \`${workflow.closeSession.commitTemplate}\` for VibeCompass-templated commits`,
     );
   } else {
     lines.push('- close-session: no Git publish step is included by default');

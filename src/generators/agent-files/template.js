@@ -1,0 +1,75 @@
+export function buildAgentContext(readModel) {
+  return {
+    projectName: readModel.project.name ?? 'Unnamed project',
+    description: readModel.project.description ?? null,
+    mode: readModel.project.mode ?? null,
+    rootDir: readModel.project.root_dir,
+    repos: readModel.project.repos ?? [],
+    domains: readModel.domains ?? [],
+    recentDecisions: readModel.decisions.slice(0, 8),
+    recentSessions: readModel.sessions.slice(0, 3),
+  };
+}
+
+export function renderSharedInstructionBody(context, options = {}) {
+  const heading = options.heading ?? `${context.projectName} Project Instructions`;
+  const intro =
+    options.intro ??
+    'Use VibeCompass project memory as the source of truth before making code changes.';
+
+  return [
+    `# ${heading}`,
+    '',
+    intro,
+    '',
+    '## Read First',
+    `- Project memory root: \`${context.rootDir}\``,
+    '- Read `project.yaml` for project identity, repos, mode, and workflow defaults.',
+    '- Read the latest finalized session note under `sessions/` before resuming work.',
+    '- Read `sessions/wip.md` and `sessions/handoff.md` when they exist; they are the active builder/reviewer scratch files.',
+    '- Read relevant `architecture/` and `decisions/` files before changing implementation.',
+    '',
+    '## Project Shape',
+    ...renderProjectShape(context),
+    '',
+    '## Workflow Rules',
+    '- Use `start session` for builder work and `join as reviewer` for review work.',
+    '- Use `review handoff` to ask a reviewer to inspect the active handoff.',
+    '- Use `address review` to process reviewer feedback from `sessions/wip.md` and `sessions/handoff.md`.',
+    '- Treat generated agent files as views. Update canonical VibeCompass project memory instead of editing managed regions.',
+    '',
+    '## Recent Decisions',
+    ...renderDecisionLines(context.recentDecisions),
+  ].join('\n');
+}
+
+function renderProjectShape(context) {
+  const lines = [];
+
+  if (context.description) {
+    lines.push(`- Description: ${context.description}`);
+  }
+
+  if (context.mode) {
+    lines.push(`- Mode: ${context.mode}`);
+  }
+
+  for (const repo of context.repos) {
+    lines.push(`- Repo \`${repo.id}\`: ${repo.remote}`);
+  }
+
+  for (const domain of context.domains.slice(0, 8)) {
+    const features = domain.features.map((feature) => feature.feature).join(', ');
+    lines.push(`- ${domain.domain}: ${features || 'No features recorded yet.'}`);
+  }
+
+  return lines.length > 0 ? lines : ['- No architecture domains recorded yet.'];
+}
+
+function renderDecisionLines(decisions) {
+  if (!decisions || decisions.length === 0) {
+    return ['- No decisions recorded yet.'];
+  }
+
+  return decisions.map((decision) => `- D-${String(decision.decision_id).padStart(3, '0')} — ${decision.title}`);
+}

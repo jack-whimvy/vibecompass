@@ -1,5 +1,6 @@
 export const DEFAULT_REVIEWER_HANDBACK = 'handoff-file';
 export const DEFAULT_GIT_REMOTE = 'origin';
+export const DEFAULT_COMMIT_TEMPLATE = 'docs(session): YYYY-MM-DD-N — <summary>';
 
 /**
  * Normalize workflow defaults from either a full project config object or a
@@ -19,6 +20,7 @@ export function resolveWorkflowSettings(projectConfigOrMetadata) {
       refreshDecisionFiles: closeSession.refresh_decision_files !== false,
       gitPublish: closeSession.git_publish === true,
       gitRemote: normalizeOptionalString(closeSession.git_remote) ?? DEFAULT_GIT_REMOTE,
+      commitTemplate: normalizeOptionalString(closeSession.commit_template) ?? DEFAULT_COMMIT_TEMPLATE,
     },
   };
 }
@@ -39,6 +41,10 @@ export function buildWorkflowMetadata(existingMetadata, overrides = {}) {
     normalizeOptionalString(overrides.gitRemote) ??
     normalizeOptionalString(existingCloseSession.git_remote) ??
     resolved.closeSession.gitRemote;
+  const commitTemplate =
+    normalizeOptionalString(overrides.commitTemplate) ??
+    normalizeOptionalString(existingCloseSession.commit_template) ??
+    resolved.closeSession.commitTemplate;
 
   return {
     ...metadata,
@@ -62,6 +68,7 @@ export function buildWorkflowMetadata(existingMetadata, overrides = {}) {
         ...(gitPublish || normalizeOptionalString(existingCloseSession.git_remote) || normalizeOptionalString(overrides.gitRemote)
           ? { git_remote: gitRemote }
           : {}),
+        commit_template: commitTemplate,
       },
     },
   };
@@ -84,6 +91,7 @@ export function buildCloseSessionGuidance(workflowSettings) {
     guidance.push(
       `This workflow includes a Git publish step after close-session; review, commit, and push to ${workflowSettings.closeSession.gitRemote}.`,
     );
+    guidance.push(`Use commit message format: ${workflowSettings.closeSession.commitTemplate}`);
   }
 
   return guidance;

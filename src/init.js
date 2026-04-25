@@ -124,13 +124,13 @@ function normalizeInitOptions(options) {
     mode: preparedOptions.mode,
     repos,
     ...(sync ? { sync } : {}),
-    metadata: buildWorkflowMetadata(preparedOptions.metadata, {
+    metadata: buildAgentFilesMetadata(buildWorkflowMetadata(preparedOptions.metadata, {
       gitPublish:
         typeof preparedOptions.closeSessionGitPublish === 'boolean'
           ? preparedOptions.closeSessionGitPublish
           : undefined,
       gitRemote: preparedOptions.closeSessionGitRemote,
-    }),
+    })),
   };
 
   const bootstrapOptions = normalizeBootstrapOptions(preparedOptions.bootstrap, {
@@ -145,6 +145,24 @@ function normalizeInitOptions(options) {
     generatedAt: preparedOptions.generatedAt,
     projectConfig,
     bootstrap: bootstrapOptions,
+  };
+}
+
+function buildAgentFilesMetadata(metadata) {
+  const existingAgentFiles = metadata?.agent_files && typeof metadata.agent_files === 'object'
+    ? metadata.agent_files
+    : {};
+
+  return {
+    ...metadata,
+    agent_files: {
+      claude_md: existingAgentFiles.claude_md !== false,
+      agents_md: existingAgentFiles.agents_md !== false,
+      cursor_rules: existingAgentFiles.cursor_rules !== false,
+      copilot_instructions: existingAgentFiles.copilot_instructions !== false,
+      windsurf_rules: existingAgentFiles.windsurf_rules === true,
+      gemini_md: existingAgentFiles.gemini_md === true,
+    },
   };
 }
 

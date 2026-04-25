@@ -169,6 +169,10 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.ok(result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'));
     assert.ok(result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'));
     assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
+    assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
+    assert.equal(result.agentFileSync.results.find((item) => item.format === 'claude_md')?.status, 'warning');
+    assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'create');
+    assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Session Project Agent Instructions/);
 
     await assert.rejects(() => access(path.join(rootDir, 'sessions/wip.md')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/handoff.md')));
@@ -227,6 +231,10 @@ test('closeProjectSession falls back to default workflow guidance when project.y
       );
       assert.equal(
         result.workflowGuidance.some((line) => line.includes('Git publish step')),
+        false,
+      );
+      assert.equal(
+        result.workflowGuidance.some((line) => line.includes('commit message format')),
         false,
       );
     } finally {
@@ -335,7 +343,7 @@ test('runCli supports start-session and close-session', async () => {
 
     assert.equal(startExitCode, 0);
     assert.equal(closeExitCode, 0);
-    assert.equal(stderr.length, 0);
+    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
     assert.ok(stdout.join('').includes('Started session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('Closed session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('2026-04-20-1-cli-session-flow.md'));

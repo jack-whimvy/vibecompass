@@ -39,6 +39,7 @@ test('initializeProjectMemory scaffolds a new root and writes a manifest', async
     assert.match(projectYaml, /reviewer_handback: handoff-file/);
     assert.match(projectYaml, /refresh_architecture_docs: true/);
     assert.match(projectYaml, /refresh_decision_files: true/);
+    assert.match(projectYaml, /commit_template: "docs\(session\): YYYY-MM-DD-N — <summary>"/);
     assert.equal(gitignore, 'state/\n');
     assert.equal(manifest.generated_at, '2026-04-19T10:00:00.000Z');
     assert.equal(manifest.canonical.document_count, 1);
@@ -79,6 +80,7 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /\.compass\/project\.yaml/);
     assert.match(context, /sessions\/wip\.md/);
     assert.match(context, /include a Git publish step after finalization using remote `origin`/);
+    assert.match(context, /use commit message format `docs\(session\): YYYY-MM-DD-N — <summary>`/);
     assert.match(architectureGuide, /Recommended layout/);
     assert.match(decisionsGuide, /Append-only decision log/);
     assert.match(sessionsGuide, /Finalized session notes/);
@@ -155,6 +157,198 @@ test('initializeProjectMemory supports workspace-root placement defaults', async
     assert.match(projectYaml, /placement_pattern: workspace-root/);
     assert.match(context, /\.compass\/project\.yaml/);
     assert.match(claude, /Read `\.compass\/context\.md` before doing substantive work/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli sync-agents creates and updates managed agent instruction files', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-agents-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Agent File Project',
+      description: 'Keeps agent files generated from project memory.',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const dryRunExitCode = await runCli(
+      ['sync-agents', '--root', '.compass', '--dry-run'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    await assert.rejects(() => access(path.join(tempDir, 'CLAUDE.md')));
+    assert.equal(dryRunExitCode, 0);
+    assert.match(stdout.join(''), /CLAUDE\.md: dry-run-create/);
+
+    stdout.length = 0;
+    const exitCode = await runCli(
+      ['sync-agents', '--root', '.compass'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    const cursorRules = await readFile(path.join(tempDir, '.cursorrules'), 'utf8');
+    const copilot = await readFile(path.join(tempDir, '.github/copilot-instructions.md'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.match(claude, /vibecompass:start - managed by VibeCompass/);
+    assert.match(claude, /Agent File Project Claude Instructions/);
+    assert.match(cursorRules, /Agent File Project Cursor Rules/);
+    assert.match(copilot, /Agent File Project Copilot Instructions/);
+
+    await writeFile(
+      path.join(tempDir, 'CLAUDE.md'),
+      `User header\n\n${claude}\nUser footer\n`,
+      'utf8',
+    );
+
+    await runCli(
+      ['sync-agents', '--root', '.compass', '--format', 'claude_md'],
+      {
+        stdout: {
+          write() {},
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    const updatedClaude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    assert.match(updatedClaude, /^User header/);
+    assert.match(updatedClaude, /User footer\s*$/);
+
+    await writeFile(path.join(tempDir, 'AGENTS.md'), 'Hand-written agents file\n', 'utf8');
+    stdout.length = 0;
+    await runCli(
+      ['sync-agents', '--root', '.compass', '--format', 'agents_md'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    assert.match(stderr.join(''), /AGENTS\.md: warning/);
+    assert.equal(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), 'Hand-written agents file\n');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli sync-agents reports disabled requested formats explicitly', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-disabled-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Disabled Agent File Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      metadata: {
+        agent_files: {
+          agents_md: false,
+        },
+      },
+    });
+
+    const exitCode = await runCli(
+      ['sync-agents', '--root', '.compass', '--format', 'agents_md'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.match(stdout.join(''), /Agent instruction files:/);
+    assert.match(stderr.join(''), /AGENTS\.md: disabled/);
+    assert.match(stderr.join(''), /Format "agents_md" is disabled/);
+    await assert.rejects(() => access(path.join(tempDir, 'AGENTS.md')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli sync-agents validates format arguments', async () => {
+  assert.throws(
+    () => parseCliArgs(['sync-agents', '--format']),
+    /requires a value/,
+  );
+
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-validation-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Validation Agent File Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    await assert.rejects(
+      () =>
+        runCli(
+          ['sync-agents', '--root', '.compass', '--format', 'unknown'],
+          {
+            stdout: { write() {} },
+            stderr: { write() {} },
+          },
+          { cwd: tempDir },
+        ),
+      /Unknown agent file format "unknown"/,
+    );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

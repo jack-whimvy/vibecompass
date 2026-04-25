@@ -2,6 +2,7 @@ import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
+import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
@@ -155,6 +156,10 @@ export async function closeProjectSession(options) {
   });
 
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
+  const agentFileSync = await syncAgentInstructionFilesSafely({
+    rootDir: normalized.rootDir,
+    toolingRootDir: normalized.toolingRootDir,
+  });
 
   return {
     rootDir: normalized.rootDir,
@@ -166,11 +171,34 @@ export async function closeProjectSession(options) {
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
     workflowGuidance: buildCloseSessionGuidance(workflowSettings),
+    agentFileSync,
     removedScratchFiles: [
       normalized.wipFilePath,
       ...(hadHandoff ? [normalized.handoffFilePath] : []),
     ],
   };
+}
+
+async function syncAgentInstructionFilesSafely(options) {
+  try {
+    return await syncAgentInstructionFiles(options);
+  } catch (error) {
+    return {
+      rootDir: options.rootDir,
+      toolingRootDir: options.toolingRootDir,
+      dryRun: false,
+      results: [
+        {
+          format: 'all',
+          path: options.toolingRootDir,
+          relativePath: '.',
+          status: 'warning',
+          warning: `Agent instruction file sync skipped: ${error instanceof Error ? error.message : String(error)}`,
+          changed: false,
+        },
+      ],
+    };
+  }
 }
 
 function normalizeSessionPaths(options) {
