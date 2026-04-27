@@ -14,7 +14,9 @@ Shipped today:
 - interactive guided init for placement, workflow bootstrap, and first-session setup
 - generated `context.md` plus opt-in workflow guide files
 - opt-in starter `CLAUDE.md` / `AGENTS.md` templates that are created once and never overwritten
-- `vibecompass start-session` / `vibecompass close-session` for the local builder workflow
+- `vibecompass start-session` / `vibecompass close-session` for lane-aware local builder workflow
+- `vibecompass list-sessions` / `vibecompass switch-session` for multiple active session lanes
+- `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
 - canonical file scanning and validation
 - `state/manifest.json` generation
@@ -26,6 +28,8 @@ Not shipped yet:
 
 The package is publishable now as the file-contract and read-model core. The
 broader local-primary sync workflow is still being built on top of it.
+The lane-aware session workflow is intended to publish as `0.2.0`; the local
+package may remain at `0.1.0` until the publish pass.
 
 ## Requirements
 
@@ -101,6 +105,7 @@ If you do not chain straight into a first session from `init`, open one later:
 
 ```bash
 npx -y @vibecompass/vibecompass start-session \
+  --id mcp-dogfood \
   --working-on "Validate the MCP dogfood workflow against the docs repo"
 ```
 
@@ -108,10 +113,14 @@ Close the active builder session:
 
 ```bash
 npx -y @vibecompass/vibecompass close-session \
+  --session mcp-dogfood \
   --title "Workflow Parity Commands" \
   --completed "Added package-owned start-session and close-session commands" \
   --next-step "Run the package publish dry-run"
 ```
+
+`end-session` is accepted as an alias for the same lifecycle step and flags:
+`npx -y @vibecompass/vibecompass end-session ...`.
 
 The package CLI owns filesystem lifecycle only. The default scaffolded
 workflow also uses prompt commands inside your coding tool:
@@ -119,17 +128,33 @@ workflow also uses prompt commands inside your coding tool:
 ```text
 start session      # builder role trigger
 join as reviewer   # reviewer role trigger
-review handoff     # reviewer reads the latest note, wip.md, handoff.md, and diffs
-address review     # builder reads reviewer feedback, responds inline, and continues
+review handoff     # reviewer reads selected-lane wip.md, handoff.md, and diffs
+address review     # builder reads selected-lane feedback, responds inline, and continues
 ```
 
 Those prompt commands are documented in the generated `context.md`,
 `CLAUDE.md`, and `AGENTS.md` templates. They are not additional
 `vibecompass` CLI subcommands.
 Reviewer handback is explicit in the package-managed workflow: the reviewer
-ends the pass by updating `wip.md` + `handoff.md`, and the builder closes
-the session with `vibecompass close-session` using the defaults stored in
+ends the pass by updating the selected lane's `wip.md` + `handoff.md`, and
+the builder closes the session with `vibecompass close-session --session
+<lane-id>` using the defaults stored in
 `project.yaml.metadata.workflow.close_session`.
+
+Active builder sessions are named lanes under
+`sessions/active/<lane-id>/`. Use one lane per active feature or workstream.
+`start-session` without `--id` opens the compatibility `default` lane only
+when no other lanes are active; concurrent work should pass `--id`.
+Finalized sessions are append-only notes named
+`sessions/YYYY-MM-DD-N-title.md`, so multiple sessions on the same day
+increment `N`. Decisions remain append-only in `decisions/`; a session note
+can reference a decision, but the decision file is the durable source of truth.
+
+For higher-risk work, use planning mode as a prompt-level step inside the
+active session. Planning mode should read the same context, propose scope and
+tradeoffs, and record the agreed plan in the selected lane's `wip.md`; it
+should not create a separate lifecycle artifact or finalize decisions until
+you approve implementation.
 
 Generate agent-instruction files from project memory:
 
@@ -230,10 +255,31 @@ Options:
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--tooling-root <path>`: workspace root that contains `CLAUDE.md`; defaults to cwd
 - `--working-on <text>`: required active-session summary
+- `--id <lane-id>`: optional lane ID; defaults to `default` only when no lanes are active
+- `--feature <slug>`: repeatable feature slug for the lane
+- `--repo <id>`: repeatable repo ID for the lane
+- `--claim <path>`: repeatable path claim for overlap warnings
 - `--date <YYYY-MM-DD>`: optional explicit session date
 
 This command updates the `Current session` block in `CLAUDE.md` and creates
-`sessions/wip.md` plus `sessions/handoff.md` for the next session number.
+`sessions/active/<lane-id>/session.yaml`, `wip.md`, and `handoff.md` for the
+next session number. It also updates `sessions/active/index.yaml`.
+
+### `vibecompass list-sessions`
+
+```text
+vibecompass list-sessions [options]
+```
+
+Lists active session lanes and marks the current lane.
+
+### `vibecompass switch-session`
+
+```text
+vibecompass switch-session <lane-id> [options]
+```
+
+Changes the current lane in `sessions/active/index.yaml`.
 
 ### `vibecompass close-session`
 
@@ -241,12 +287,17 @@ This command updates the `Current session` block in `CLAUDE.md` and creates
 vibecompass close-session --title <text> --completed <text> --next-step <text> [options]
 ```
 
+`vibecompass end-session` accepts the same options and runs the same close
+path. `close-session` remains the canonical command name in generated workflow
+metadata and docs.
+
 Options:
 
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--tooling-root <path>`: workspace root that contains `CLAUDE.md`; defaults to cwd
 - `--title <text>`: required finalized session-note title
 - `--worked-on <text>`: optional override for the "What we worked on" section
+- `--session <lane-id>`: active lane to close; required when multiple lanes are active
 - `--completed <text>`: repeatable completed item
 - `--decision <text>`: repeatable decision reference or summary
 - `--model <text>`: optional repeatable model contribution entry
@@ -254,7 +305,8 @@ Options:
 - `--next-step <text>`: repeatable next-session instruction
 
 This command finalizes the active scratchpad into
-`sessions/YYYY-MM-DD-N-display-title.md`, deletes `wip.md` / `handoff.md`, and
+`sessions/YYYY-MM-DD-N-display-title.md`, deletes the closed lane directory
+under `sessions/active/<lane-id>/`, updates `sessions/active/index.yaml`, and
 updates the `Current session` block in `CLAUDE.md`. If no `--model` flags are
 provided, the session note records `Not recorded.` under `Models used`.
 This is the final builder lifecycle step after the last `address review`
@@ -286,15 +338,15 @@ These are the default prompt commands used by the scaffolded workflow files:
 
 - `start session`: builder role trigger
 - `join as reviewer`: reviewer role trigger
-- `review handoff`: reviewer reads the latest finalized note, `wip.md`, `handoff.md`, and relevant diffs before appending findings
-- `address review`: builder reads the latest reviewer feedback in `wip.md` / `handoff.md`, responds inline, applies accepted changes, and refreshes the builder handoff
+- `review handoff`: reviewer reads the selected lane's latest `wip.md`, `handoff.md`, latest finalized note, and relevant diffs before appending findings
+- `address review`: builder reads the latest reviewer feedback in the selected lane's `wip.md` / `handoff.md`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 They are prompt commands for AI-tool behavior, not package CLI commands.
-Reviewer handback ends when the reviewer has updated `wip.md` and
-`handoff.md`; there is no extra reviewer-exit step. The builder remains
-in builder role, uses `address review` until findings are resolved or
-explicitly deferred, and then runs `vibecompass close-session` using the
-workflow defaults recorded in `project.yaml`.
+Reviewer handback ends when the reviewer has updated the selected lane's
+`wip.md` and `handoff.md`; there is no extra reviewer-exit step. The builder
+remains in builder role, uses `address review` until findings are resolved or
+explicitly deferred, and then runs `vibecompass close-session --session
+<lane-id>` using the workflow defaults recorded in `project.yaml`.
 
 ## JavaScript API
 

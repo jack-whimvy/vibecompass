@@ -118,8 +118,18 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 ## Derived and scratch files
 - \`${rootRelativePath}/context.md\` — generated AI-facing workflow context
 - \`${rootRelativePath}/state/manifest.json\` — machine-owned local state; do not hand-edit
-- \`${rootRelativePath}/sessions/wip.md\` — active builder scratchpad during a session
-- \`${rootRelativePath}/sessions/handoff.md\` — builder/reviewer relay during a session
+- \`${rootRelativePath}/sessions/active/index.yaml\` — active session lane index and current lane pointer
+- \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` — lane metadata
+- \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` — lane-local builder scratchpad
+- \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` — lane-local builder/reviewer relay
+
+## Session model
+- VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
+- \`vibecompass start-session\` without \`--id\` opens the compatibility \`default\` lane only when no other lanes are active; use \`--id <lane-id>\` for concurrent work.
+- The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
+- \`${rootRelativePath}/sessions/active/index.yaml\` is the authoritative current lane pointer; the tool-specific Current session block is a human-readable continuity summary, not the lane-selection source of truth.
+- Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
+- Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable source of truth.
 
 ## Repos in scope
 ${repos}
@@ -133,11 +143,13 @@ ${repos}
 ## Session prompt commands
 - \`start session\` — builder role trigger
 - \`join as reviewer\` — reviewer role trigger
-- \`review handoff\` — reviewer reads the latest finalized note, \`wip.md\`, \`handoff.md\`, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`planning mode\` — optional prompt-level mode for scoping work before implementation
+- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
+- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+\`vibecompass end-session\` is also accepted as an alias for \`vibecompass close-session\`; the canonical command name remains \`close-session\`.
 
 ## Workflow defaults
 ${renderWorkflowDefaults(workflow)}
@@ -145,16 +157,19 @@ ${renderWorkflowDefaults(workflow)}
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
 2. Read the latest finalized session note in \`${rootRelativePath}/sessions/\`.
-3. If present, read \`${rootRelativePath}/sessions/wip.md\`.
-4. If present, read \`${rootRelativePath}/sessions/handoff.md\`.
-5. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
+3. If present, read \`${rootRelativePath}/sessions/active/index.yaml\` and choose the selected or current lane.
+4. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
+5. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
+6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
 
 ## Builder workflow
-At session start, prefer running \`vibecompass start-session --working-on "..." \`.
-If you manage files manually, create \`${rootRelativePath}/sessions/wip.md\` if it does not exist:
+At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`. Omit \`--id\` only for the first/default lane in a project with no other active lanes.
+If you manage files manually, create \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` and \`${rootRelativePath}/sessions/active/index.yaml\`, then create \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` if it does not exist:
 
 \`\`\`md
 # WIP — YYYY-MM-DD (session N)
+
+Session lane: <lane-id>
 
 ## Working on
 
@@ -165,10 +180,12 @@ If you manage files manually, create \`${rootRelativePath}/sessions/wip.md\` if 
 ## Review log
 \`\`\`
 
-Also create \`${rootRelativePath}/sessions/handoff.md\` if it does not exist:
+Also create \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` if it does not exist:
 
 \`\`\`md
 # Handoff — YYYY-MM-DD (session N)
+
+Session lane: <lane-id>
 
 ## Builder → Reviewer
 
@@ -188,20 +205,29 @@ Also create \`${rootRelativePath}/sessions/handoff.md\` if it does not exist:
 During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
-- use \`address review\` when reviewer feedback lands so the builder resolves it from the latest \`wip.md\` / \`handoff.md\`
-- stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session\`
+- use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
+- use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
+- stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\`
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them
 
+If \`vibecompass start-session\` reports stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
+
+## Optional planning mode
+- Use planning mode for risky, ambiguous, cross-file, or architectural work before implementation.
+- Planning mode reads the same startup context as builder mode and may update the selected lane's \`wip.md\` with agreed scope, constraints, and open questions.
+- Planning mode should not finalize session notes, mutate decisions, or make broad code changes until the user approves the plan.
+- If planning produces a real architectural decision, append it to \`${rootRelativePath}/decisions/\` before implementing.
+
 At session close:
-- prefer running \`vibecompass close-session --title "..." --completed "..." --model "..." --next-step "..."\`
+- prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --model "..." --next-step "..."\`; \`vibecompass end-session\` is a supported alias
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
-- finalize \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`
-- delete \`wip.md\` and \`handoff.md\`
+- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`
+- delete the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\`
 - refresh any affected architecture/decision docs
 
 ## Reviewer workflow
 - use \`review handoff\` when you want the reviewer to run the next review pass
-- read the latest finalized session note, then \`wip.md\`, then \`handoff.md\`
+- read the latest finalized session note, then the selected lane's \`wip.md\`, then \`handoff.md\`
 - inspect the relevant code/docs diffs
 - append findings under \`## Review log\` in \`wip.md\`
 - write a concise baton-pass summary into \`handoff.md\`
@@ -284,8 +310,10 @@ Finalized session notes for ${projectConfig.name} live here.
 - \`## Next session should start with\`
 
 ## Active-session scratch files
-- \`wip.md\` — builder scratchpad during an active session
-- \`handoff.md\` — reviewer/builder baton-pass during an active session
+- \`active/index.yaml\` — active lane index and current lane pointer
+- \`active/<lane-id>/session.yaml\` — lane metadata
+- \`active/<lane-id>/wip.md\` — builder scratchpad during an active lane
+- \`active/<lane-id>/handoff.md\` — reviewer/builder baton-pass during an active lane
 
 Those scratch files are session-scoped working artifacts, not finalized history.
 `;
@@ -304,16 +332,19 @@ Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
 |---|---|---|
 | "start session" | Builder | Yes |
 | "join as reviewer" | Reviewer | No |
+| "planning mode" | Planner | No — scopes work inside the selected active lane before implementation |
 
 ## Prompt commands
 
 - \`start session\` — builder role trigger
 - \`join as reviewer\` — reviewer role trigger
-- \`review handoff\` — reviewer reads the latest finalized note, \`wip.md\`, \`handoff.md\`, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
+- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
+- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating \`${options.rootRelativePath}/sessions/wip.md\` + \`${options.rootRelativePath}/sessions/handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+\`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
 
 ## Current session
 
@@ -330,8 +361,11 @@ Next session should: Read \`${options.contextRelativeToToolingRoot}\`, then open
 ## Startup
 - Read \`${options.contextRelativeToToolingRoot}\`
 - Follow the builder/reviewer protocol defined there
-- Use \`vibecompass start-session\` and \`vibecompass close-session\` to manage the active-session files when possible
-- Keep \`${options.rootRelativePath}/sessions/wip.md\` and \`${options.rootRelativePath}/sessions/handoff.md\` current during an active session
+- Use \`vibecompass start-session --id <lane-id>\`, \`vibecompass list-sessions\`, \`vibecompass switch-session <lane-id>\`, and \`vibecompass close-session --session <lane-id>\` to manage active lanes when possible
+- Treat \`${options.rootRelativePath}/sessions/active/index.yaml\` as the current lane source of truth; this Current session block is only a continuity summary
+- Keep the selected lane's \`${options.rootRelativePath}/sessions/active/<lane-id>/wip.md\` and \`${options.rootRelativePath}/sessions/active/<lane-id>/handoff.md\` current during an active session
+- Use planning mode when scope is unclear; record the agreed plan in the selected lane's \`wip.md\` before implementing
+- If stale scratch files block \`start-session\`, read them first, then close, recover, move, or delete them intentionally before retrying
 - Workflow defaults:
 ${renderWorkflowDefaults(workflow)}
 `;
@@ -350,27 +384,33 @@ This workspace uses VibeCompass project memory rooted at \`${options.rootRelativ
 |---|---|---|
 | "start session" | Builder | Yes — opens and closes the session lifecycle |
 | "join as reviewer" | Reviewer | No — reviews the builder's work and updates the handoff |
+| "planning mode" | Planner | No — scopes work inside the selected active lane before implementation |
 
 ## Prompt commands
 
 - \`start session\` — builder role trigger
 - \`join as reviewer\` — reviewer role trigger
-- \`review handoff\` — reviewer reads the latest finalized note, \`wip.md\`, \`handoff.md\`, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
+- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
+- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating \`${options.rootRelativePath}/sessions/wip.md\` + \`${options.rootRelativePath}/sessions/handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+\`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
 
 ## Startup
 Before doing substantive work:
 1. Read \`${options.contextRelativeToToolingRoot}\`.
 2. Read the latest finalized session note under \`${options.rootRelativePath}/sessions/\`.
-3. If present, read \`${options.rootRelativePath}/sessions/wip.md\`.
-4. If present, read \`${options.rootRelativePath}/sessions/handoff.md\`.
-5. Read the relevant docs under \`${options.rootRelativePath}/architecture/\` and \`${options.rootRelativePath}/decisions/\`.
+3. If present, read \`${options.rootRelativePath}/sessions/active/index.yaml\` and choose the selected or current lane.
+4. If present, read \`${options.rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
+5. If present, read \`${options.rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
+6. Read the relevant docs under \`${options.rootRelativePath}/architecture/\` and \`${options.rootRelativePath}/decisions/\`.
 
 ## Working rule
 Treat \`${options.contextRelativeToToolingRoot}\` as the local workflow source of truth for the builder/reviewer protocol and session scratch-file structure. When the package provides \`start-session\` / \`close-session\`, prefer those commands over hand-editing boilerplate.
+Use planning mode when scope is unclear; record the agreed plan in the selected lane's \`wip.md\` before implementing.
+If stale scratch files block \`start-session\`, read them first, then close, recover, move, or delete them intentionally before retrying.
 - Workflow defaults:
 ${renderWorkflowDefaults(workflow)}
 `;
@@ -397,7 +437,7 @@ function renderWorkflowDefaults(workflow) {
 
 function describeReviewerHandback(workflow) {
   if (workflow.reviewerHandback === 'handoff-file') {
-    return 'update sessions/wip.md and sessions/handoff.md, then stop the review pass';
+    return 'update sessions/active/<lane-id>/wip.md and sessions/active/<lane-id>/handoff.md, then stop the review pass';
   }
 
   return workflow.reviewerHandback;

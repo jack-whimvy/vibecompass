@@ -4,7 +4,7 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { initializeProjectMemory } from './init.js';
 import { resolveInitCliOptions } from './setup.js';
-import { closeProjectSession, startProjectSession } from './session.js';
+import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 
 export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
@@ -86,7 +86,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
-  if (parsed.command === 'close-session') {
+  if (parsed.command === 'close-session' || parsed.command === 'end-session') {
     const result = await closeProjectSession({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -101,6 +101,32 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       }
     }
     writeAgentFileSyncResult(io, result.agentFileSync);
+    return 0;
+  }
+
+  if (parsed.command === 'list-sessions') {
+    const result = await listProjectSessions({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    io.stdout.write(`Active session lanes${result.current ? ` (current: ${result.current})` : ''}:\n`);
+    if (result.lanes.length === 0) {
+      io.stdout.write('- None\n');
+    } else {
+      for (const lane of result.lanes) {
+        const marker = lane.id === result.current ? '*' : '-';
+        io.stdout.write(`${marker} ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}\n`);
+      }
+    }
+    return 0;
+  }
+
+  if (parsed.command === 'switch-session') {
+    const result = await switchProjectSession({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    io.stdout.write(`Current session lane: ${result.current}\n`);
     return 0;
   }
 
@@ -128,8 +154,16 @@ export function parseCliArgs(argv) {
       return parseStartSessionArgs(rest);
     }
 
-    if (command === 'close-session') {
+    if (command === 'close-session' || command === 'end-session') {
       return parseCloseSessionArgs(rest);
+    }
+
+    if (command === 'list-sessions') {
+      return parseListSessionsArgs(rest);
+    }
+
+    if (command === 'switch-session') {
+      return parseSwitchSessionArgs(rest);
     }
 
     if (command === 'sync-agents') {
@@ -322,6 +356,18 @@ function parseStartSessionArgs(argv) {
       case '--working-on':
         parsed.workingOn = value;
         break;
+      case '--id':
+        parsed.sessionId = value;
+        break;
+      case '--feature':
+        parsed.features = [...(parsed.features ?? []), value];
+        break;
+      case '--repo':
+        parsed.repos = [...(parsed.repos ?? []), value];
+        break;
+      case '--claim':
+        parsed.claims = [...(parsed.claims ?? []), value];
+        break;
       case '--date':
         parsed.date = value;
         break;
@@ -381,6 +427,9 @@ function parseCloseSessionArgs(argv) {
       case '--worked-on':
         parsed.workedOn = value;
         break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
       case '--completed':
         parsed.completed.push(value);
         break;
@@ -409,6 +458,80 @@ function parseCloseSessionArgs(argv) {
 
   return {
     command: 'close-session',
+    options: parsed,
+  };
+}
+
+function parseListSessionsArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'list-sessions',
+    options: parsed,
+  };
+}
+
+function parseSwitchSessionArgs(argv) {
+  const parsed = {};
+  const positional = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      positional.push(token);
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  if (positional.length > 1) {
+    throw new Error(`Unexpected argument "${positional[1]}".`);
+  }
+
+  if (!parsed.sessionId && positional[0]) {
+    parsed.sessionId = positional[0];
+  }
+
+  return {
+    command: 'switch-session',
     options: parsed,
   };
 }
@@ -483,6 +606,9 @@ function usageText() {
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
     '  vibecompass start-session --working-on <text> [options]',
     '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
+    '  vibecompass end-session --title <text> --completed <text> --next-step <text> [options]  # alias',
+    '  vibecompass list-sessions [options]',
+    '  vibecompass switch-session <id> [options]',
     '  vibecompass sync-agents [options]',
     '',
     'Init options:',
@@ -511,16 +637,21 @@ function usageText() {
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
     '  --working-on <text>                  Required active-session summary',
+    '  --id <lane-id>                       Optional active session lane ID. Defaults to default when no lanes exist',
+    '  --feature <slug>                     Repeatable feature slug for the lane',
+    '  --repo <id>                          Repeatable repo ID for the lane',
+    '  --claim <path>                       Repeatable path claim for overlap warnings',
     '  --date <YYYY-MM-DD>                  Optional explicit session date',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
     '',
-    'Close-session options:',
+    'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
     '  --title <text>                       Required display title for the finalized session note',
     '  --worked-on <text>                   Optional override for "What we worked on"',
+    '  --session <lane-id>                  Active session lane to close',
     '  --completed <text>                   Repeatable completed item',
     '  --decision <text>                    Repeatable decision reference or summary',
     '  --model <text>                       Optional repeatable model contribution entry',
@@ -528,6 +659,10 @@ function usageText() {
     '  --next-step <text>                   Repeatable next-session step',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md completed summary',
     '  --next-session-should <text>         Optional override for the CLAUDE.md next-session summary',
+    '',
+    'List/switch-session options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
     '',
     'Sync-agents options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
-import { closeProjectSession, startProjectSession } from '../session.js';
+import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from '../session.js';
 
 test('startProjectSession creates scratch files and updates CLAUDE.md', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-start-'));
@@ -34,16 +34,23 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
     });
 
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(rootDir, 'sessions/wip.md'), 'utf8');
-    const handoff = await readFile(path.join(rootDir, 'sessions/handoff.md'), 'utf8');
+    const wip = await readFile(path.join(rootDir, 'sessions/active/default/wip.md'), 'utf8');
+    const handoff = await readFile(path.join(rootDir, 'sessions/active/default/handoff.md'), 'utf8');
+    const laneMetadata = await readFile(path.join(rootDir, 'sessions/active/default/session.yaml'), 'utf8');
+    const activeIndex = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
 
     assert.equal(result.sessionNumber, 1);
-    assert.match(claude, /Date: 2026-04-20 \(session 1\)/);
-    assert.match(claude, /Working on: Close the workflow parity gap\./);
+    assert.equal(result.sessionId, 'default');
+    assert.match(claude, /Date: 2026-04-20 \(session 1, lane default\)/);
+    assert.match(claude, /Working on: Close the workflow parity gap\. \[default\]/);
     assert.match(wip, /# WIP — 2026-04-20 \(session 1\)/);
+    assert.match(wip, /Session lane: default/);
     assert.match(wip, /## Working on\nClose the workflow parity gap\./);
     assert.match(handoff, /# Handoff — 2026-04-20 \(session 1\)/);
     assert.match(handoff, /Close the workflow parity gap\./);
+    assert.match(laneMetadata, /id: default/);
+    assert.match(laneMetadata, /session_number: 1/);
+    assert.match(activeIndex, /current: default/);
 
     await assert.rejects(
       () =>
@@ -53,7 +60,7 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
           workingOn: 'Try to reopen the same session.',
           date: '2026-04-20',
         }),
-      /active session scratch file already exists/i,
+      /Active session lanes already exist/i,
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -104,8 +111,8 @@ test('startProjectSession finds the current-session fence even if another code b
     });
 
     const updatedClaude = await readFile(claudePath, 'utf8');
-    assert.match(updatedClaude, /Date: 2026-04-20 \(session 1\)/);
-    assert.match(updatedClaude, /Working on: Exercise the session fence parser\./);
+    assert.match(updatedClaude, /Date: 2026-04-20 \(session 1, lane default\)/);
+    assert.match(updatedClaude, /Working on: Exercise the session fence parser\. \[default\]/);
     assert.match(updatedClaude, /Example note: this extra code fence should be ignored\./);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -174,8 +181,10 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'create');
     assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Session Project Agent Instructions/);
 
-    await assert.rejects(() => access(path.join(rootDir, 'sessions/wip.md')));
-    await assert.rejects(() => access(path.join(rootDir, 'sessions/handoff.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/wip.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/handoff.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/session.yaml')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/index.yaml')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -282,6 +291,218 @@ test('closeProjectSession allows sessions without recorded models', async () => 
   }
 });
 
+test('session lanes can run concurrently and switch current lane', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-lanes-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-plans',
+      workingOn: 'Build the billing plans lane.',
+      features: ['billing'],
+      repos: ['app'],
+      claims: ['vibecompass-app/src/app/billing'],
+      date: '2026-04-20',
+    });
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'marketing-copy',
+      workingOn: 'Build the marketing copy lane.',
+      features: ['marketing'],
+      repos: ['docs'],
+      claims: ['vibecompass-docs/product'],
+      date: '2026-04-20',
+    });
+
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.equal(listed.current, 'marketing-copy');
+    assert.deepEqual(listed.lanes.map((lane) => lane.id), ['billing-plans', 'marketing-copy']);
+    assert.deepEqual(listed.lanes.map((lane) => lane.sessionNumber), [1, 2]);
+
+    const switched = await switchProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-plans' });
+    assert.equal(switched.current, 'billing-plans');
+
+    const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    const billingMetadata = await readFile(path.join(rootDir, 'sessions/active/billing-plans/session.yaml'), 'utf8');
+    assert.match(index, /current: billing-plans/);
+    assert.match(billingMetadata, /id: billing-plans/);
+    assert.match(billingMetadata, /session_date: 2026-04-20/);
+    assert.match(billingMetadata, /session_number: 1/);
+    assert.match(billingMetadata, /working_on: "Build the billing plans lane\."/);
+    assert.match(billingMetadata, /feature_slugs:\n  - "billing"/);
+    assert.match(billingMetadata, /repos:\n  - "app"/);
+    assert.match(billingMetadata, /claimed_paths:\n  - "vibecompass-app\/src\/app\/billing"/);
+
+    await assert.rejects(
+      () =>
+        startProjectSession({
+          cwd: tempDir,
+          rootDir,
+          sessionId: 'billing-plans',
+          workingOn: 'Duplicate the billing lane.',
+          date: '2026-04-20',
+        }),
+      /already exists/i,
+    );
+    await assert.rejects(
+      () =>
+        startProjectSession({
+          cwd: tempDir,
+          rootDir,
+          sessionId: 'active',
+          workingOn: 'Use a reserved lane.',
+          date: '2026-04-20',
+        }),
+      /reserved/i,
+    );
+    await assert.rejects(
+      () =>
+        startProjectSession({
+          cwd: tempDir,
+          rootDir,
+          sessionId: 'default',
+          workingOn: 'Use the compatibility lane name explicitly.',
+          date: '2026-04-20',
+        }),
+      /reserved/i,
+    );
+    await assert.rejects(
+      () =>
+        startProjectSession({
+          cwd: tempDir,
+          rootDir,
+          sessionId: 'null',
+          workingOn: 'Use a YAML keyword lane.',
+          date: '2026-04-20',
+        }),
+      /reserved/i,
+    );
+    await assert.rejects(
+      () =>
+        startProjectSession({
+          cwd: tempDir,
+          rootDir,
+          sessionId: 'Billing',
+          workingOn: 'Use an invalid lane.',
+          date: '2026-04-20',
+        }),
+      /lowercase slug/i,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('closeProjectSession requires --session when multiple lanes are active', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-close-multiple-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Multiple Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-plans',
+      workingOn: 'Build billing plans.',
+      date: '2026-04-20',
+    });
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'marketing-copy',
+      workingOn: 'Build marketing copy.',
+      date: '2026-04-20',
+    });
+
+    await assert.rejects(
+      () =>
+        closeProjectSession({
+          cwd: tempDir,
+          rootDir,
+          title: 'Ambiguous Lane Close',
+          completed: ['Tried to close without selecting a lane.'],
+          nextSteps: ['Pass --session before closing.'],
+        }),
+      /Multiple active session lanes exist/i,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('closeProjectSession still supports legacy root scratch files during migration', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-close-legacy-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Legacy Session Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+    await mkdir(path.join(rootDir, 'sessions'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'sessions/wip.md'),
+      [
+        '# WIP — 2026-04-20 (session 1)',
+        '',
+        '## Working on',
+        'Close the legacy scratch files.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(path.join(rootDir, 'sessions/handoff.md'), '# Handoff — 2026-04-20 (session 1)\n', 'utf8');
+
+    const result = await closeProjectSession({
+      cwd: tempDir,
+      rootDir,
+      title: 'Legacy Scratch Close',
+      completed: ['Closed a legacy root-level scratch session.'],
+      nextSteps: ['Start a lane-aware session next.'],
+    });
+
+    assert.equal(result.sessionId, null);
+    assert.match(result.sessionFilePath, /2026-04-20-1-legacy-scratch-close\.md$/);
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/wip.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/handoff.md')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli supports start-session and close-session', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-cli-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -349,6 +570,163 @@ test('runCli supports start-session and close-session', async () => {
     assert.ok(stdout.join('').includes('2026-04-20-1-cli-session-flow.md'));
     assert.ok(stdout.join('').includes('Workflow guidance:'));
     assert.ok(stdout.join('').includes('Refresh any relevant architecture docs before finalizing the session.'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli supports list-sessions, switch-session, and close-session --session', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-cli-lanes-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'CLI Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    const io = {
+      stdout: { write(chunk) { stdout.push(chunk); } },
+      stderr: { write(chunk) { stderr.push(chunk); } },
+    };
+
+    assert.equal(
+      await runCli(
+        [
+          'start-session',
+          '--root',
+          rootDir,
+          '--id',
+          'billing-plans',
+          '--working-on',
+          'Build billing plans.',
+          '--date',
+          '2026-04-20',
+        ],
+        io,
+        { cwd: tempDir },
+      ),
+      0,
+    );
+    assert.equal(
+      await runCli(
+        [
+          'start-session',
+          '--root',
+          rootDir,
+          '--id',
+          'marketing-copy',
+          '--working-on',
+          'Build marketing copy.',
+          '--date',
+          '2026-04-20',
+        ],
+        io,
+        { cwd: tempDir },
+      ),
+      0,
+    );
+    assert.equal(await runCli(['list-sessions', '--root', rootDir], io, { cwd: tempDir }), 0);
+    assert.equal(await runCli(['switch-session', '--root', rootDir, 'billing-plans'], io, { cwd: tempDir }), 0);
+    assert.equal(
+      await runCli(
+        [
+          'close-session',
+          '--root',
+          rootDir,
+          '--session',
+          'billing-plans',
+          '--title',
+          'Billing Lane',
+          '--completed',
+          'Closed the billing lane.',
+          '--next-step',
+          'Continue the marketing lane.',
+        ],
+        io,
+        { cwd: tempDir },
+      ),
+      0,
+    );
+
+    const output = stdout.join('');
+    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
+    assert.match(output, /Active session lanes \(current: marketing-copy\):/);
+    assert.match(output, /\* marketing-copy: Build marketing copy\./);
+    assert.match(output, /- billing-plans: Build billing plans\./);
+    assert.match(output, /Current session lane: billing-plans/);
+    assert.match(output, /Closed session 2026-04-20-1/);
+
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/wip.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/session.yaml')));
+    await access(path.join(rootDir, 'sessions/active/marketing-copy/wip.md'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli supports end-session as a close-session alias', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-end-alias-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const stdout = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'End Alias Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      workingOn: 'Verify the end-session alias.',
+      date: '2026-04-27',
+    });
+
+    const exitCode = await runCli(
+      [
+        'end-session',
+        '--root',
+        rootDir,
+        '--title',
+        'End Alias Flow',
+        '--completed',
+        'Closed the session through the end-session alias.',
+        '--next-step',
+        'Continue with normal start-session flow.',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.join('').includes('Closed session 2026-04-27-1'));
+    assert.ok(stdout.join('').includes('2026-04-27-1-end-alias-flow.md'));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

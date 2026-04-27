@@ -78,14 +78,23 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     const agents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
 
     assert.match(context, /\.compass\/project\.yaml/);
-    assert.match(context, /sessions\/wip\.md/);
+    assert.match(context, /active builder sessions are named lanes/);
+    assert.match(context, /Optional planning mode/);
+    assert.match(context, /end-session` is also accepted as an alias/);
+    assert.match(context, /reports stale scratch files/);
+    assert.match(context, /sessions\/active\/<lane-id>\/wip\.md/);
     assert.match(context, /include a Git publish step after finalization using remote `origin`/);
     assert.match(context, /use commit message format `docs\(session\): YYYY-MM-DD-N — <summary>`/);
     assert.match(architectureGuide, /Recommended layout/);
     assert.match(decisionsGuide, /Append-only decision log/);
     assert.match(sessionsGuide, /Finalized session notes/);
     assert.match(claude, /Read `\.compass\/context\.md` before doing substantive work/);
+    assert.match(claude, /planning mode/);
+    assert.match(claude, /end-session` is accepted as an alias/);
+    assert.match(claude, /stale scratch files block `start-session`/);
     assert.match(agents, /Before doing substantive work/);
+    assert.match(agents, /planning mode/);
+    assert.match(agents, /end-session` is accepted as an alias/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'CLAUDE.md')));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'AGENTS.md')));
@@ -220,6 +229,10 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.equal(exitCode, 0);
     assert.match(claude, /vibecompass:start - managed by VibeCompass/);
     assert.match(claude, /Agent File Project Claude Instructions/);
+    assert.match(claude, /active builder sessions are named lanes/);
+    assert.match(claude, /optional planning mode/);
+    assert.match(claude, /vibecompass end-session/);
+    assert.match(claude, /stale scratch files block `start-session`/);
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
     assert.match(copilot, /Agent File Project Copilot Instructions/);
 
@@ -578,8 +591,9 @@ test('runCli can chain init directly into the first builder session', async () =
     );
 
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(tempDir, '.compass/sessions/wip.md'), 'utf8');
-    const handoff = await readFile(path.join(tempDir, '.compass/sessions/handoff.md'), 'utf8');
+    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/default/wip.md'), 'utf8');
+    const handoff = await readFile(path.join(tempDir, '.compass/sessions/active/default/handoff.md'), 'utf8');
+    const activeIndex = await readFile(path.join(tempDir, '.compass/sessions/active/index.yaml'), 'utf8');
 
     assert.equal(exitCode, 0);
     assert.equal(stderr.length, 0);
@@ -588,6 +602,7 @@ test('runCli can chain init directly into the first builder session', async () =
     assert.match(claude, /Working on: Kick off the first builder session from init\./);
     assert.match(wip, /Kick off the first builder session from init\./);
     assert.match(handoff, /Kick off the first builder session from init\./);
+    assert.match(activeIndex, /current: default/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -646,7 +661,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
 
     const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(tempDir, '.compass/sessions/wip.md'), 'utf8');
+    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/default/wip.md'), 'utf8');
 
     await assert.rejects(() => access(path.join(tempDir, 'AGENTS.md')));
 

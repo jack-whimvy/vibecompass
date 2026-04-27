@@ -77,7 +77,7 @@ export function buildWorkflowMetadata(existingMetadata, overrides = {}) {
 export function buildCloseSessionGuidance(workflowSettings) {
   const guidance = [];
 
-  guidance.push('Reviewer handback stays in sessions/wip.md and sessions/handoff.md before close-session runs.');
+  guidance.push('Reviewer handback stays in the selected sessions/active/<lane-id>/wip.md and handoff.md before close-session runs.');
 
   if (workflowSettings.closeSession.refreshArchitectureDocs) {
     guidance.push('Refresh any relevant architecture docs before finalizing the session.');

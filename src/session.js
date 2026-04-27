@@ -7,6 +7,25 @@ import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
 const SESSION_FILENAME_PATTERN = /^(\d{4}-\d{2}-\d{2})-(\d+)-([a-z0-9-]+)\.md$/i;
+const LANE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+const RESERVED_LANE_IDS = new Set([
+  'active',
+  'current',
+  'default',
+  'false',
+  'handoff',
+  'index',
+  'new',
+  'no',
+  'null',
+  'off',
+  'on',
+  'sessions',
+  'state',
+  'true',
+  'wip',
+  'yes',
+]);
 
 export async function startProjectSession(options) {
   const normalized = normalizeSessionPaths(options);
@@ -15,18 +34,14 @@ export async function startProjectSession(options) {
 
   await ensureInitializedProjectMemory(normalized.rootDir);
   const claude = await readClaudeFile(normalized.claudePath);
-
-  if ((await fileExists(normalized.wipFilePath)) || (await fileExists(normalized.handoffFilePath))) {
-    throw new Error(
-      `An active session scratch file already exists under ${normalized.sessionsDir}. Close or recover the existing session before starting a new one.`,
-    );
-  }
+  const sessionId = await resolveStartSessionId(normalized, options);
+  const lanePaths = getLanePaths(normalized, sessionId);
 
   const nextSessionNumber = await getNextSessionNumber(normalized.sessionsDir, sessionDate);
   const currentSession = parseCurrentSessionBlock(claude.content);
   const updatedClaude = replaceCurrentSessionBlock(claude.content, {
-    date: `${sessionDate} (session ${nextSessionNumber})`,
-    workingOn,
+    date: `${sessionDate} (session ${nextSessionNumber}, lane ${sessionId})`,
+    workingOn: `${workingOn} [${sessionId}]`,
     lastThingCompleted:
       normalizeOptionalString(options?.lastThingCompleted) ??
       currentSession.lastThingCompleted ??
@@ -37,33 +52,62 @@ export async function startProjectSession(options) {
       'Finish the active session and close it with a finalized session note.',
   });
 
-  await mkdir(normalized.sessionsDir, { recursive: true });
+  await mkdir(normalized.activeSessionsDir, { recursive: true });
+  await mkdir(lanePaths.laneDir, { recursive: false }).catch((error) => {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
+      throw new Error(`Active session lane "${sessionId}" already exists. Choose a different --id or close that lane first.`);
+    }
+
+    throw error;
+  });
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
   await writeFile(
-    normalized.wipFilePath,
+    lanePaths.sessionFilePath,
+    renderLaneMetadata({
+      sessionId,
+      sessionDate,
+      sessionNumber: nextSessionNumber,
+      workingOn,
+      features: normalizeStringArray(options?.features),
+      repos: normalizeStringArray(options?.repos),
+      claims: normalizeStringArray(options?.claims),
+    }),
+    'utf8',
+  );
+  await writeFile(
+    lanePaths.wipFilePath,
     renderWipTemplate({
       sessionDate,
       sessionNumber: nextSessionNumber,
       workingOn,
+      sessionId,
     }),
     'utf8',
   );
   await writeFile(
-    normalized.handoffFilePath,
+    lanePaths.handoffFilePath,
     renderHandoffTemplate({
       sessionDate,
       sessionNumber: nextSessionNumber,
       workingOn,
+      sessionId,
     }),
     'utf8',
   );
+  await upsertActiveSessionIndex(normalized, {
+    id: sessionId,
+    status: 'active',
+    workingOn,
+  }, { current: sessionId });
 
   return {
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
     claudePath: normalized.claudePath,
-    wipFilePath: normalized.wipFilePath,
-    handoffFilePath: normalized.handoffFilePath,
+    sessionId,
+    sessionFilePath: lanePaths.sessionFilePath,
+    wipFilePath: lanePaths.wipFilePath,
+    handoffFilePath: lanePaths.handoffFilePath,
     sessionDate,
     sessionNumber: nextSessionNumber,
   };
@@ -71,7 +115,7 @@ export async function startProjectSession(options) {
 
 export async function closeProjectSession(options) {
   const normalized = normalizeSessionPaths(options);
-  const title = requireNonEmptyString(options?.title, 'close-session requires a non-empty title.');
+  const title = requireNonEmptyString(options?.title, 'session close requires a non-empty title.');
   const completed = normalizeStringArray(options?.completed);
   const models = normalizeStringArray(options?.models);
   const nextSteps = normalizeStringArray(options?.nextSteps);
@@ -79,25 +123,27 @@ export async function closeProjectSession(options) {
   const blockers = normalizeStringArray(options?.blockers);
 
   if (completed.length === 0) {
-    throw new Error('close-session requires at least one completed item.');
+    throw new Error('session close requires at least one completed item.');
   }
 
   if (nextSteps.length === 0) {
-    throw new Error('close-session requires at least one next-step entry.');
+    throw new Error('session close requires at least one next-step entry.');
   }
 
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const claude = await readClaudeFile(normalized.claudePath);
   const workflowSettings = await readWorkflowSettings(normalized.projectFilePath);
+  const sessionId = await resolveExistingSessionId(normalized, options);
+  const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
 
-  if (!(await fileExists(normalized.wipFilePath))) {
+  if (!(await fileExists(lanePaths.wipFilePath))) {
     throw new Error(
-      `No active session scratchpad exists at ${normalized.wipFilePath}. Start a session before trying to close it.`,
+      `No active session scratchpad exists at ${lanePaths.wipFilePath}. Start a session before trying to close it.`,
     );
   }
 
-  const wipContent = await readFile(normalized.wipFilePath, 'utf8');
-  const activeSession = parseActiveSession(wipContent);
+  const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
+  const activeSession = parseActiveSession(wipContent, lanePaths.wipFilePath);
   const currentSession = parseCurrentSessionBlock(claude.content);
   const workedOn =
     normalizeOptionalString(options?.workedOn) ??
@@ -105,12 +151,12 @@ export async function closeProjectSession(options) {
     currentSession.workingOn;
 
   if (!workedOn) {
-    throw new Error('close-session could not determine what the session worked on. Pass workedOn explicitly.');
+    throw new Error('session close could not determine what the session worked on. Pass workedOn explicitly.');
   }
 
   const sessionSlug = slugifyTitle(title);
   if (!sessionSlug) {
-    throw new Error('close-session title must contain at least one letter or number.');
+    throw new Error('session close title must contain at least one letter or number.');
   }
 
   const sessionRelativePath = toPosix(
@@ -138,10 +184,15 @@ export async function closeProjectSession(options) {
     'utf8',
   );
 
-  const hadHandoff = await fileExists(normalized.handoffFilePath);
-  await rm(normalized.wipFilePath, { force: true });
-  if (hadHandoff) {
-    await rm(normalized.handoffFilePath, { force: true });
+  const hadHandoff = await fileExists(lanePaths.handoffFilePath);
+  if (sessionId) {
+    await rm(lanePaths.laneDir, { recursive: true, force: true });
+    await removeActiveSessionFromIndex(normalized, sessionId);
+  } else {
+    await rm(lanePaths.wipFilePath, { force: true });
+    if (hadHandoff) {
+      await rm(lanePaths.handoffFilePath, { force: true });
+    }
   }
 
   const updatedClaude = replaceCurrentSessionBlock(claude.content, {
@@ -166,6 +217,7 @@ export async function closeProjectSession(options) {
     toolingRootDir: normalized.toolingRootDir,
     claudePath: normalized.claudePath,
     projectFilePath: normalized.projectFilePath,
+    sessionId,
     sessionFilePath,
     sessionRelativePath,
     sessionDate: activeSession.sessionDate,
@@ -173,9 +225,40 @@ export async function closeProjectSession(options) {
     workflowGuidance: buildCloseSessionGuidance(workflowSettings),
     agentFileSync,
     removedScratchFiles: [
-      normalized.wipFilePath,
-      ...(hadHandoff ? [normalized.handoffFilePath] : []),
+      lanePaths.wipFilePath,
+      ...(hadHandoff ? [lanePaths.handoffFilePath] : []),
     ],
+  };
+}
+
+export async function listProjectSessions(options = {}) {
+  const normalized = normalizeSessionPaths(options);
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const index = await readActiveSessionIndex(normalized);
+  const lanes = await listActiveSessionLanes(normalized);
+
+  return {
+    rootDir: normalized.rootDir,
+    current: index.current ?? lanes[0]?.id ?? null,
+    lanes,
+  };
+}
+
+export async function switchProjectSession(options = {}) {
+  const normalized = normalizeSessionPaths(options);
+  const sessionId = validateLaneId(requireNonEmptyString(options?.sessionId, 'switch-session requires a session ID.'));
+  const lanes = await listActiveSessionLanes(normalized);
+
+  if (!lanes.some((lane) => lane.id === sessionId)) {
+    throw new Error(`Active session lane "${sessionId}" does not exist.`);
+  }
+
+  await upsertActiveSessionIndex(normalized, null, { current: sessionId });
+
+  return {
+    rootDir: normalized.rootDir,
+    current: sessionId,
+    lanes,
   };
 }
 
@@ -203,20 +286,32 @@ async function syncAgentInstructionFilesSafely(options) {
 
 function normalizeSessionPaths(options) {
   const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
+  const rootDir = path.resolve(cwd, options?.rootDir ?? '.compass');
+  const toolingRootDir = options?.toolingRootDir
+    ? path.resolve(cwd, options.toolingRootDir)
+    : cwd;
 
   return {
-    rootDir: path.resolve(cwd, options?.rootDir ?? '.compass'),
-    toolingRootDir: options?.toolingRootDir
-      ? path.resolve(cwd, options.toolingRootDir)
-      : cwd,
-    projectFilePath: path.resolve(path.resolve(cwd, options?.rootDir ?? '.compass'), 'project.yaml'),
-    claudePath: path.resolve(
-      options?.toolingRootDir ? path.resolve(cwd, options.toolingRootDir) : cwd,
-      'CLAUDE.md',
-    ),
-    sessionsDir: path.resolve(path.resolve(cwd, options?.rootDir ?? '.compass'), 'sessions'),
-    wipFilePath: path.resolve(path.resolve(cwd, options?.rootDir ?? '.compass'), 'sessions/wip.md'),
-    handoffFilePath: path.resolve(path.resolve(cwd, options?.rootDir ?? '.compass'), 'sessions/handoff.md'),
+    rootDir,
+    toolingRootDir,
+    projectFilePath: path.resolve(rootDir, 'project.yaml'),
+    claudePath: path.resolve(toolingRootDir, 'CLAUDE.md'),
+    sessionsDir: path.resolve(rootDir, 'sessions'),
+    activeSessionsDir: path.resolve(rootDir, 'sessions/active'),
+    activeSessionsIndexPath: path.resolve(rootDir, 'sessions/active/index.yaml'),
+    wipFilePath: path.resolve(rootDir, 'sessions/wip.md'),
+    handoffFilePath: path.resolve(rootDir, 'sessions/handoff.md'),
+  };
+}
+
+function getLanePaths(normalized, sessionId) {
+  const laneDir = path.resolve(normalized.activeSessionsDir, sessionId);
+
+  return {
+    laneDir,
+    sessionFilePath: path.resolve(laneDir, 'session.yaml'),
+    wipFilePath: path.resolve(laneDir, 'wip.md'),
+    handoffFilePath: path.resolve(laneDir, 'handoff.md'),
   };
 }
 
@@ -304,9 +399,164 @@ function replaceCurrentSessionBlock(content, fields) {
 
 async function getNextSessionNumber(sessionsDir, sessionDate) {
   const sessions = await listFinalizedSessions(sessionsDir);
-  const todaysSessions = sessions.filter((session) => session.sessionDate === sessionDate);
+  const activeSessions = await listActiveSessionLanes({ sessionsDir, activeSessionsDir: path.join(sessionsDir, 'active') });
+  const todaysSessions = [
+    ...sessions,
+    ...activeSessions,
+  ].filter((session) => session.sessionDate === sessionDate);
   const highestNumber = todaysSessions.reduce((max, session) => Math.max(max, session.sessionNumber), 0);
   return highestNumber + 1;
+}
+
+async function resolveStartSessionId(normalized, options) {
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  if (explicitId) {
+    return validateLaneId(explicitId);
+  }
+
+  const lanes = await listActiveSessionLanes(normalized);
+  if (lanes.length > 0) {
+    throw new Error('Active session lanes already exist. Pass --id to start another lane explicitly.');
+  }
+
+  if ((await fileExists(normalized.wipFilePath)) || (await fileExists(normalized.handoffFilePath))) {
+    throw new Error(
+      `Legacy active session scratch files already exist under ${normalized.sessionsDir}. Close or recover that session before starting a lane.`,
+    );
+  }
+
+  return 'default';
+}
+
+async function resolveExistingSessionId(normalized, options) {
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  if (explicitId) {
+    return validateLaneId(explicitId);
+  }
+
+  const lanes = await listActiveSessionLanes(normalized);
+  if (lanes.length === 1) {
+    return lanes[0].id;
+  }
+
+  if (lanes.length > 1) {
+    throw new Error('Multiple active session lanes exist. Pass --session to choose which lane to close.');
+  }
+
+  return null;
+}
+
+async function listActiveSessionLanes(normalized) {
+  try {
+    const entries = await readdir(normalized.activeSessionsDir, { withFileTypes: true });
+    const lanes = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const sessionId = entry.name;
+      const lanePaths = getLanePaths(normalized, sessionId);
+      const metadata = await readLaneMetadata(lanePaths.sessionFilePath);
+      const wipSession = await readLaneWipSession(lanePaths.wipFilePath);
+      lanes.push({
+        id: sessionId,
+        status: metadata.status ?? 'active',
+        workingOn: metadata.workingOn ?? null,
+        features: metadata.features,
+        repos: metadata.repos,
+        claims: metadata.claims,
+        sessionDate: metadata.sessionDate ?? wipSession?.sessionDate ?? null,
+        sessionNumber: metadata.sessionNumber ?? wipSession?.sessionNumber ?? 0,
+      });
+    }
+
+    return lanes.sort((left, right) => left.id.localeCompare(right.id));
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+async function readLaneWipSession(wipFilePath) {
+  try {
+    return parseActiveSession(await readFile(wipFilePath, 'utf8'), wipFilePath);
+  } catch {
+    return null;
+  }
+}
+
+async function readLaneMetadata(sessionFilePath) {
+  try {
+    const content = await readFile(sessionFilePath, 'utf8');
+    const data = parseSimpleYaml(content, { sourceName: sessionFilePath });
+    return {
+      status: normalizeOptionalString(data.status),
+      workingOn: normalizeOptionalString(data.working_on),
+      features: normalizeStringArray(data.feature_slugs),
+      repos: normalizeStringArray(data.repos),
+      claims: normalizeStringArray(data.claimed_paths),
+      sessionDate: normalizeOptionalString(data.session_date),
+      sessionNumber: typeof data.session_number === 'number' ? data.session_number : Number(data.session_number) || null,
+    };
+  } catch {
+    return {
+      status: null,
+      workingOn: null,
+      features: [],
+      repos: [],
+      claims: [],
+      sessionDate: null,
+      sessionNumber: null,
+    };
+  }
+}
+
+async function readActiveSessionIndex(normalized) {
+  try {
+    const data = parseSimpleYaml(await readFile(normalized.activeSessionsIndexPath, 'utf8'), {
+      sourceName: normalized.activeSessionsIndexPath,
+    });
+    return {
+      current: normalizeOptionalString(data.current),
+    };
+  } catch {
+    return {
+      current: null,
+    };
+  }
+}
+
+async function upsertActiveSessionIndex(normalized, lane, options = {}) {
+  const currentIndex = await readActiveSessionIndex(normalized);
+  const lanes = await listActiveSessionLanes(normalized);
+  const laneMap = new Map(lanes.map((item) => [item.id, item]));
+  if (lane) {
+    laneMap.set(lane.id, {
+      id: lane.id,
+      status: lane.status,
+      workingOn: lane.workingOn,
+    });
+  }
+
+  const current = options.current ?? currentIndex.current ?? lane?.id ?? null;
+  await mkdir(normalized.activeSessionsDir, { recursive: true });
+  await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, [...laneMap.values()]), 'utf8');
+}
+
+async function removeActiveSessionFromIndex(normalized, sessionId) {
+  const index = await readActiveSessionIndex(normalized);
+  const lanes = (await listActiveSessionLanes(normalized)).filter((lane) => lane.id !== sessionId);
+  const current = index.current === sessionId ? lanes[0]?.id ?? null : index.current;
+  if (lanes.length === 0) {
+    await rm(normalized.activeSessionsIndexPath, { force: true });
+    return;
+  }
+
+  await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, lanes), 'utf8');
 }
 
 async function listFinalizedSessions(sessionsDir) {
@@ -337,16 +587,29 @@ async function listFinalizedSessions(sessionsDir) {
   }
 }
 
-function parseActiveSession(wipContent) {
+function parseActiveSession(wipContent, wipFilePath = 'sessions/active/<lane-id>/wip.md') {
   const match = wipContent.match(WIP_HEADER_PATTERN);
   if (!match) {
-    throw new Error('sessions/wip.md is missing the expected "# WIP — YYYY-MM-DD (session N)" header.');
+    throw new Error(`${wipFilePath} is missing the expected "# WIP — YYYY-MM-DD (session N)" header.`);
   }
 
   return {
     sessionDate: match[1],
     sessionNumber: Number(match[2]),
   };
+}
+
+function validateLaneId(value) {
+  const normalized = value.trim();
+  if (!LANE_ID_PATTERN.test(normalized)) {
+    throw new Error('Session lane ID must be a lowercase slug 3-64 characters long using letters, numbers, and hyphens.');
+  }
+
+  if (RESERVED_LANE_IDS.has(normalized)) {
+    throw new Error(`Session lane ID "${normalized}" is reserved.`);
+  }
+
+  return normalized;
 }
 
 function extractSectionBody(content, sectionTitle) {
@@ -407,6 +670,8 @@ function findCurrentSessionFence(content) {
 function renderWipTemplate(options) {
   return `# WIP — ${options.sessionDate} (session ${options.sessionNumber})
 
+Session lane: ${options.sessionId}
+
 ## Working on
 ${options.workingOn}
 
@@ -422,6 +687,8 @@ ${options.workingOn}
 
 function renderHandoffTemplate(options) {
   return `# Handoff — ${options.sessionDate} (session ${options.sessionNumber})
+
+Session lane: ${options.sessionId}
 
 ## Builder → Reviewer
 
@@ -442,6 +709,53 @@ function renderHandoffTemplate(options) {
 ### Recommended next step
 - Continue the builder work and request review after the first substantive change block.
 `;
+}
+
+function renderLaneMetadata(options) {
+  return [
+    `id: ${options.sessionId}`,
+    'status: active',
+    `session_date: ${options.sessionDate}`,
+    `session_number: ${options.sessionNumber}`,
+    `working_on: ${quoteYamlString(options.workingOn)}`,
+    renderYamlArray('feature_slugs', options.features),
+    renderYamlArray('repos', options.repos),
+    renderYamlArray('claimed_paths', options.claims),
+    `started_at: ${new Date().toISOString()}`,
+    'decision_snapshot:',
+    '  highest_decision_id: null',
+    '',
+  ].join('\n');
+}
+
+function renderActiveSessionIndex(current, lanes) {
+  const lines = [
+    `current: ${current ?? 'null'}`,
+    'lanes:',
+  ];
+
+  for (const lane of lanes.sort((left, right) => left.id.localeCompare(right.id))) {
+    lines.push(`  - id: ${lane.id}`);
+    lines.push(`    status: ${lane.status ?? 'active'}`);
+    lines.push(`    working_on: ${quoteYamlString(lane.workingOn ?? '')}`);
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function renderYamlArray(key, values) {
+  if (!values || values.length === 0) {
+    return `${key}: []`;
+  }
+
+  return [
+    `${key}:`,
+    ...values.map((value) => `  - ${quoteYamlString(value)}`),
+  ].join('\n');
+}
+
+function quoteYamlString(value) {
+  return JSON.stringify(value);
 }
 
 function renderSessionNote(options) {
