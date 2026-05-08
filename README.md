@@ -28,8 +28,6 @@ Not shipped yet:
 
 The package is publishable now as the file-contract and read-model core. The
 broader local-primary sync workflow is still being built on top of it.
-The lane-aware session workflow is intended to publish as `0.2.0`; the local
-package may remain at `0.1.0` until the publish pass.
 
 ## Requirements
 
@@ -84,6 +82,7 @@ npx -y @vibecompass/vibecompass init \
   --close-session-git-publish \
   --close-session-git-remote origin \
   --start-session \
+  --session-id mcp-dogfood \
   --session-working-on "Validate the local-first MCP workflow"
 ```
 
@@ -143,8 +142,8 @@ the builder closes the session with `vibecompass close-session --session
 
 Active builder sessions are named lanes under
 `sessions/active/<lane-id>/`. Use one lane per active feature or workstream.
-`start-session` without `--id` opens the compatibility `default` lane only
-when no other lanes are active; concurrent work should pass `--id`.
+`start-session` requires `--id <lane-id>` for every lane, including the first
+one in a project.
 Finalized sessions are append-only notes named
 `sessions/YYYY-MM-DD-N-title.md`, so multiple sessions on the same day
 increment `N`. Decisions remain append-only in `decisions/`; a session note
@@ -234,6 +233,7 @@ Options:
 - `--with-agents`: create a starter `AGENTS.md` if it does not already exist
 - `--start-session`: open the first builder session after init
 - `--session-working-on <text>`: required with `--start-session` outside guided mode
+- `--session-id <lane-id>`: required with `--start-session`; names the first builder lane
 - `--close-session-git-publish`: store that the close-session workflow includes a Git publish step
 - `--close-session-git-remote <name>`: optional default Git remote name for that stored publish step
 - `--force`: overwrite an existing `project.yaml`
@@ -247,7 +247,7 @@ include a Git publish step and which remote name to use for that step.
 ### `vibecompass start-session`
 
 ```text
-vibecompass start-session --working-on <text> [options]
+vibecompass start-session --id <lane-id> --working-on <text> [options]
 ```
 
 Options:
@@ -255,7 +255,7 @@ Options:
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--tooling-root <path>`: workspace root that contains `CLAUDE.md`; defaults to cwd
 - `--working-on <text>`: required active-session summary
-- `--id <lane-id>`: optional lane ID; defaults to `default` only when no lanes are active
+- `--id <lane-id>`: required lane ID
 - `--feature <slug>`: repeatable feature slug for the lane
 - `--repo <id>`: repeatable repo ID for the lane
 - `--claim <path>`: repeatable path claim for overlap warnings

@@ -40,6 +40,10 @@ export async function resolveInitCliOptions(options, environment = {}) {
     throw new Error('init requires --session-working-on when --start-session is used without guided setup.');
   }
 
+  if (resolved.startSession && !resolved.sessionId) {
+    throw new Error('init requires --session-id when --start-session is used.');
+  }
+
   return {
     initOptions: {
       rootDir: resolved.rootDir,
@@ -62,6 +66,7 @@ export async function resolveInitCliOptions(options, environment = {}) {
     guidedSummary,
     sessionPlan: resolved.startSession
       ? {
+          sessionId: resolved.sessionId,
           workingOn: resolved.sessionWorkingOn,
         }
       : null,
@@ -277,6 +282,15 @@ async function completeGuidedInitOptions(options, environment) {
 
     if (!resolved.sessionWorkingOn) {
       resolved.sessionWorkingOn = await askInput(prompter, 'What are you working on?');
+    }
+
+    if (!resolved.sessionId) {
+      resolved.sessionId = await askInput(prompter, 'Session lane id', {
+        defaultValue: suggestLaneId(resolved.sessionWorkingOn),
+        validate(value) {
+          return validateLaneIdForPrompt(value);
+        },
+      });
     }
   }
 
@@ -667,6 +681,46 @@ function suggestRepoId(value) {
     .replace(/^-+|-+$/g, '');
 
   return slug || 'repo';
+}
+
+function suggestLaneId(value) {
+  const slug = String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/g, '');
+
+  return slug.length >= 3 ? slug : 'builder-session';
+}
+
+function validateLaneIdForPrompt(value) {
+  if (!/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/.test(value)) {
+    return 'Lane id must be 3-64 lowercase letters, numbers, or hyphens, and must start and end with a letter or number.';
+  }
+
+  if ([
+    'active',
+    'current',
+    'default',
+    'false',
+    'handoff',
+    'index',
+    'new',
+    'no',
+    'null',
+    'off',
+    'on',
+    'sessions',
+    'state',
+    'true',
+    'wip',
+    'yes',
+  ].includes(value)) {
+    return `Lane id "${value}" is reserved.`;
+  }
+
+  return null;
 }
 
 function getRepoDirectoryHints(repo) {

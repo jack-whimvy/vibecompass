@@ -62,6 +62,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       const sessionResult = await startProjectSession({
         rootDir: initPlan.initOptions.rootDir,
         toolingRootDir: initPlan.initOptions.toolingRootDir,
+        sessionId: initPlan.sessionPlan.sessionId,
         workingOn: initPlan.sessionPlan.workingOn,
         ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
       });
@@ -69,6 +70,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Updated ${sessionResult.claudePath}\n`);
       io.stdout.write(`Created ${sessionResult.wipFilePath}\n`);
       io.stdout.write(`Created ${sessionResult.handoffFilePath}\n`);
+      writeAgentFileSyncResult(io, sessionResult.agentFileSync);
     }
 
     return 0;
@@ -83,6 +85,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Created ${result.wipFilePath}\n`);
     io.stdout.write(`Created ${result.handoffFilePath}\n`);
+    writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
   }
 
@@ -127,6 +130,8 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
     });
     io.stdout.write(`Current session lane: ${result.current}\n`);
+    io.stdout.write(`Updated ${result.claudePath}\n`);
+    writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
   }
 
@@ -270,6 +275,9 @@ export function parseCliArgs(argv) {
       case '--session-working-on':
         parsed.sessionWorkingOn = value;
         break;
+      case '--session-id':
+        parsed.sessionId = value;
+        break;
       case '--close-session-git-remote':
         parsed.closeSessionGitRemote = value;
         break;
@@ -306,6 +314,7 @@ export function parseCliArgs(argv) {
       force: parsed.force,
       startSession: parsed.startSession,
       sessionWorkingOn: parsed.sessionWorkingOn,
+      sessionId: parsed.sessionId,
       closeSessionGitPublish: parsed.closeSessionGitPublish,
       closeSessionGitRemote: parsed.closeSessionGitRemote,
       ...(parsed.withWorkflow || parsed.withClaude || parsed.withAgents
@@ -604,7 +613,7 @@ function usageText() {
   return [
     'Usage:',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
-    '  vibecompass start-session --working-on <text> [options]',
+    '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
     '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
     '  vibecompass end-session --title <text> --completed <text> --next-step <text> [options]  # alias',
     '  vibecompass list-sessions [options]',
@@ -629,6 +638,7 @@ function usageText() {
     '  --with-agents                        Create a starter AGENTS.md if missing',
     '  --start-session                      Open the first builder session after init',
     '  --session-working-on <text>          Required with --start-session outside guided mode',
+    '  --session-id <lane-id>                Required with --start-session; names the first builder lane',
     '  --close-session-git-publish          Include a Git publish step in the stored close-session workflow',
     '  --close-session-git-remote <name>    Default Git remote name for that close-session publish step',
     '  --force                              Overwrite an existing project.yaml',
@@ -637,7 +647,7 @@ function usageText() {
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
     '  --working-on <text>                  Required active-session summary',
-    '  --id <lane-id>                       Optional active session lane ID. Defaults to default when no lanes exist',
+    '  --id <lane-id>                       Required active session lane ID',
     '  --feature <slug>                     Repeatable feature slug for the lane',
     '  --repo <id>                          Repeatable repo ID for the lane',
     '  --claim <path>                       Repeatable path claim for overlap warnings',

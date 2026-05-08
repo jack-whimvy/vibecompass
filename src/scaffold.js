@@ -125,7 +125,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 
 ## Session model
 - VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
-- \`vibecompass start-session\` without \`--id\` opens the compatibility \`default\` lane only when no other lanes are active; use \`--id <lane-id>\` for concurrent work.
+- \`vibecompass start-session\` requires \`--id <lane-id>\` so each active lane has a meaningful feature or workstream name.
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the authoritative current lane pointer; the tool-specific Current session block is a human-readable continuity summary, not the lane-selection source of truth.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
@@ -163,7 +163,7 @@ ${renderWorkflowDefaults(workflow)}
 6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
 
 ## Builder workflow
-At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`. Omit \`--id\` only for the first/default lane in a project with no other active lanes.
+At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`.
 If you manage files manually, create \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` and \`${rootRelativePath}/sessions/active/index.yaml\`, then create \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` if it does not exist:
 
 \`\`\`md

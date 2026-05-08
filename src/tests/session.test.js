@@ -29,28 +29,29 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
     const result = await startProjectSession({
       cwd: tempDir,
       rootDir,
+      sessionId: 'workflow-parity',
       workingOn: 'Close the workflow parity gap.',
       date: '2026-04-20',
     });
 
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(rootDir, 'sessions/active/default/wip.md'), 'utf8');
-    const handoff = await readFile(path.join(rootDir, 'sessions/active/default/handoff.md'), 'utf8');
-    const laneMetadata = await readFile(path.join(rootDir, 'sessions/active/default/session.yaml'), 'utf8');
+    const wip = await readFile(path.join(rootDir, 'sessions/active/workflow-parity/wip.md'), 'utf8');
+    const handoff = await readFile(path.join(rootDir, 'sessions/active/workflow-parity/handoff.md'), 'utf8');
+    const laneMetadata = await readFile(path.join(rootDir, 'sessions/active/workflow-parity/session.yaml'), 'utf8');
     const activeIndex = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
 
     assert.equal(result.sessionNumber, 1);
-    assert.equal(result.sessionId, 'default');
-    assert.match(claude, /Date: 2026-04-20 \(session 1, lane default\)/);
-    assert.match(claude, /Working on: Close the workflow parity gap\. \[default\]/);
+    assert.equal(result.sessionId, 'workflow-parity');
+    assert.match(claude, /Date: 2026-04-20 \(session 1, lane workflow-parity\)/);
+    assert.match(claude, /Working on: Close the workflow parity gap\. \[workflow-parity\]/);
     assert.match(wip, /# WIP — 2026-04-20 \(session 1\)/);
-    assert.match(wip, /Session lane: default/);
+    assert.match(wip, /Session lane: workflow-parity/);
     assert.match(wip, /## Working on\nClose the workflow parity gap\./);
     assert.match(handoff, /# Handoff — 2026-04-20 \(session 1\)/);
     assert.match(handoff, /Close the workflow parity gap\./);
-    assert.match(laneMetadata, /id: default/);
+    assert.match(laneMetadata, /id: workflow-parity/);
     assert.match(laneMetadata, /session_number: 1/);
-    assert.match(activeIndex, /current: default/);
+    assert.match(activeIndex, /current: workflow-parity/);
 
     await assert.rejects(
       () =>
@@ -60,7 +61,7 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
           workingOn: 'Try to reopen the same session.',
           date: '2026-04-20',
         }),
-      /Active session lanes already exist/i,
+      /requires --id/i,
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -106,13 +107,14 @@ test('startProjectSession finds the current-session fence even if another code b
     await startProjectSession({
       cwd: tempDir,
       rootDir,
+      sessionId: 'fence-parser',
       workingOn: 'Exercise the session fence parser.',
       date: '2026-04-20',
     });
 
     const updatedClaude = await readFile(claudePath, 'utf8');
-    assert.match(updatedClaude, /Date: 2026-04-20 \(session 1, lane default\)/);
-    assert.match(updatedClaude, /Working on: Exercise the session fence parser\. \[default\]/);
+    assert.match(updatedClaude, /Date: 2026-04-20 \(session 1, lane fence-parser\)/);
+    assert.match(updatedClaude, /Working on: Exercise the session fence parser\. \[fence-parser\]/);
     assert.match(updatedClaude, /Example note: this extra code fence should be ignored\./);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -141,6 +143,7 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     await startProjectSession({
       cwd: tempDir,
       rootDir,
+      sessionId: 'workflow-parity',
       workingOn: 'Bring session lifecycle into the package.',
       date: '2026-04-20',
     });
@@ -178,12 +181,12 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
     assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
     assert.equal(result.agentFileSync.results.find((item) => item.format === 'claude_md')?.status, 'warning');
-    assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'create');
+    assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'update');
     assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Session Project Agent Instructions/);
 
-    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/wip.md')));
-    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/handoff.md')));
-    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/default/session.yaml')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/workflow-parity/wip.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/workflow-parity/handoff.md')));
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/workflow-parity/session.yaml')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/index.yaml')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -213,6 +216,7 @@ test('closeProjectSession falls back to default workflow guidance when project.y
       await startProjectSession({
         cwd: tempDir,
         rootDir,
+        sessionId: `workflow-${scenario}`,
         workingOn: `Close a session after the workflow file becomes ${scenario}.`,
         date: '2026-04-20',
       });
@@ -272,6 +276,7 @@ test('closeProjectSession allows sessions without recorded models', async () => 
     await startProjectSession({
       cwd: tempDir,
       rootDir,
+      sessionId: 'human-session',
       workingOn: 'Close a human-led session without model metadata.',
       date: '2026-04-20',
     });
@@ -338,8 +343,12 @@ test('session lanes can run concurrently and switch current lane', async () => {
     assert.equal(switched.current, 'billing-plans');
 
     const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
     const billingMetadata = await readFile(path.join(rootDir, 'sessions/active/billing-plans/session.yaml'), 'utf8');
     assert.match(index, /current: billing-plans/);
+    assert.match(claude, /Date: 2026-04-20 \(session 1, lane billing-plans\)/);
+    assert.match(claude, /Working on: Build the billing plans lane\. \[billing-plans\]/);
+    assert.match(claude, /Last thing completed: Switched current lane to billing-plans\./);
     assert.match(billingMetadata, /id: billing-plans/);
     assert.match(billingMetadata, /session_date: 2026-04-20/);
     assert.match(billingMetadata, /session_number: 1/);
@@ -376,7 +385,7 @@ test('session lanes can run concurrently and switch current lane', async () => {
           cwd: tempDir,
           rootDir,
           sessionId: 'default',
-          workingOn: 'Use the compatibility lane name explicitly.',
+          workingOn: 'Use a reserved lane name explicitly.',
           date: '2026-04-20',
         }),
       /reserved/i,
@@ -527,6 +536,8 @@ test('runCli supports start-session and close-session', async () => {
         'start-session',
         '--root',
         rootDir,
+        '--id',
+        'cli-session',
         '--working-on',
         'Exercise the CLI session commands.',
         '--date',
@@ -649,6 +660,10 @@ test('runCli supports list-sessions, switch-session, and close-session --session
           'Billing Lane',
           '--completed',
           'Closed the billing lane.',
+          '--blocker',
+          'Stripe API rate limit belongs to billing only.',
+          '--next-session-should',
+          'Resolve billing provider retries before reopening billing.',
           '--next-step',
           'Continue the marketing lane.',
         ],
@@ -665,6 +680,18 @@ test('runCli supports list-sessions, switch-session, and close-session --session
     assert.match(output, /- billing-plans: Build billing plans\./);
     assert.match(output, /Current session lane: billing-plans/);
     assert.match(output, /Closed session 2026-04-20-1/);
+
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    const indexAfterClose = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    assert.match(indexAfterClose, /current: marketing-copy/);
+    assert.match(claude, /Date: 2026-04-20 \(session 2, lane marketing-copy\)/);
+    assert.match(claude, /Working on: Build marketing copy\. \[marketing-copy\]/);
+    assert.match(claude, /Last thing completed: Closed session 1 and wrote `sessions\/2026-04-20-1-billing-lane\.md`\./);
+    assert.match(claude, /Blockers: No blocker recorded for the selected lane\./);
+    assert.match(claude, /Next session should: Continue the selected active lane from `sessions\/active\/index\.yaml`\./);
+    assert.doesNotMatch(claude, /Session closed\. Ready for the next builder session\./);
+    assert.doesNotMatch(claude, /Stripe API rate limit belongs to billing only\./);
+    assert.doesNotMatch(claude, /Resolve billing provider retries before reopening billing\./);
 
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/wip.md')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/session.yaml')));
@@ -695,6 +722,7 @@ test('runCli supports end-session as a close-session alias', async () => {
     await startProjectSession({
       cwd: tempDir,
       rootDir,
+      sessionId: 'end-alias',
       workingOn: 'Verify the end-session alias.',
       date: '2026-04-27',
     });

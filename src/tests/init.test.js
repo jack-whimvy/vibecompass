@@ -570,6 +570,8 @@ test('runCli can chain init directly into the first builder session', async () =
         '--repo',
         'docs=https://github.com/example/docs.git',
         '--start-session',
+        '--session-id',
+        'bootstrap-session',
         '--session-working-on',
         'Kick off the first builder session from init.',
       ],
@@ -591,18 +593,18 @@ test('runCli can chain init directly into the first builder session', async () =
     );
 
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/default/wip.md'), 'utf8');
-    const handoff = await readFile(path.join(tempDir, '.compass/sessions/active/default/handoff.md'), 'utf8');
+    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/bootstrap-session/wip.md'), 'utf8');
+    const handoff = await readFile(path.join(tempDir, '.compass/sessions/active/bootstrap-session/handoff.md'), 'utf8');
     const activeIndex = await readFile(path.join(tempDir, '.compass/sessions/active/index.yaml'), 'utf8');
 
     assert.equal(exitCode, 0);
-    assert.equal(stderr.length, 0);
+    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
     assert.ok(stdout.join('').includes('Generated'));
     assert.ok(stdout.join('').includes('Started session'));
     assert.match(claude, /Working on: Kick off the first builder session from init\./);
     assert.match(wip, /Kick off the first builder session from init\./);
     assert.match(handoff, /Kick off the first builder session from init\./);
-    assert.match(activeIndex, /current: default/);
+    assert.match(activeIndex, /current: bootstrap-session/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -627,6 +629,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
     ['Create a starter AGENTS.md if missing?', 'no'],
     ['Open the first builder session immediately after init?', 'yes'],
     ['What are you working on?', 'Bootstrap the guided init flow.'],
+    ['Session lane id', 'guided-bootstrap'],
     ['Should close-session include a Git publish step?', 'yes'],
     ['Git remote for the close-session publish step', ''],
   ]);
@@ -661,12 +664,11 @@ test('runCli supports guided init with placement recommendation and first-sessio
 
     const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
-    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/default/wip.md'), 'utf8');
-
-    await assert.rejects(() => access(path.join(tempDir, 'AGENTS.md')));
+    const wip = await readFile(path.join(tempDir, '.compass/sessions/active/guided-bootstrap/wip.md'), 'utf8');
 
     assert.equal(exitCode, 0);
-    assert.equal(stderr.length, 0);
+    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
+    await access(path.join(tempDir, 'AGENTS.md'));
     assert.deepEqual(prompts, [
       'Project name',
       'Project mode',
@@ -681,6 +683,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
       'Create a starter AGENTS.md if missing?',
       'Open the first builder session immediately after init?',
       'What are you working on?',
+      'Session lane id',
       'Should close-session include a Git publish step?',
       'Git remote for the close-session publish step',
     ]);

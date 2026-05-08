@@ -99,6 +99,10 @@ export async function startProjectSession(options) {
     status: 'active',
     workingOn,
   }, { current: sessionId });
+  const agentFileSync = await syncAgentInstructionFilesSafely({
+    rootDir: normalized.rootDir,
+    toolingRootDir: normalized.toolingRootDir,
+  });
 
   return {
     rootDir: normalized.rootDir,
@@ -110,6 +114,7 @@ export async function startProjectSession(options) {
     handoffFilePath: lanePaths.handoffFilePath,
     sessionDate,
     sessionNumber: nextSessionNumber,
+    agentFileSync,
   };
 }
 
@@ -185,9 +190,10 @@ export async function closeProjectSession(options) {
   );
 
   const hadHandoff = await fileExists(lanePaths.handoffFilePath);
+  let activeSessionIndex = null;
   if (sessionId) {
     await rm(lanePaths.laneDir, { recursive: true, force: true });
-    await removeActiveSessionFromIndex(normalized, sessionId);
+    activeSessionIndex = await removeActiveSessionFromIndex(normalized, sessionId);
   } else {
     await rm(lanePaths.wipFilePath, { force: true });
     if (hadHandoff) {
@@ -195,16 +201,22 @@ export async function closeProjectSession(options) {
     }
   }
 
-  const updatedClaude = replaceCurrentSessionBlock(claude.content, {
-    date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
-    workingOn: 'Session closed. Ready for the next builder session.',
-    lastThingCompleted:
-      normalizeOptionalString(options?.lastThingCompleted) ??
-      `Closed session ${activeSession.sessionNumber} and wrote \`${sessionRelativePath}\`.`,
-    blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
-    nextSessionShould:
-      normalizeOptionalString(options?.nextSessionShould) ?? summarizeOrderedList(nextSteps),
-  });
+  const closedSummary = `Closed session ${activeSession.sessionNumber} and wrote \`${sessionRelativePath}\`.`;
+  const updatedClaude = replaceCurrentSessionBlock(
+    claude.content,
+    activeSessionIndex?.current
+      ? buildCurrentSessionFieldsForLane(activeSessionIndex.lanes.find((lane) => lane.id === activeSessionIndex.current), {
+          lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
+        })
+      : {
+          date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
+          workingOn: 'Session closed. Ready for the next builder session.',
+          lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
+          blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
+          nextSessionShould:
+            normalizeOptionalString(options?.nextSessionShould) ?? summarizeOrderedList(nextSteps),
+        },
+  );
 
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
   const agentFileSync = await syncAgentInstructionFilesSafely({
@@ -248,17 +260,35 @@ export async function switchProjectSession(options = {}) {
   const normalized = normalizeSessionPaths(options);
   const sessionId = validateLaneId(requireNonEmptyString(options?.sessionId, 'switch-session requires a session ID.'));
   const lanes = await listActiveSessionLanes(normalized);
+  const lane = lanes.find((item) => item.id === sessionId);
 
-  if (!lanes.some((lane) => lane.id === sessionId)) {
+  if (!lane) {
     throw new Error(`Active session lane "${sessionId}" does not exist.`);
   }
 
   await upsertActiveSessionIndex(normalized, null, { current: sessionId });
+  const claude = await readClaudeFile(normalized.claudePath);
+  await writeFile(
+    normalized.claudePath,
+    replaceCurrentSessionBlock(
+      claude.content,
+      buildCurrentSessionFieldsForLane(lane, {
+        lastThingCompleted: `Switched current lane to ${sessionId}.`,
+      }),
+    ),
+    'utf8',
+  );
+  const agentFileSync = await syncAgentInstructionFilesSafely({
+    rootDir: normalized.rootDir,
+    toolingRootDir: normalized.toolingRootDir,
+  });
 
   return {
     rootDir: normalized.rootDir,
+    claudePath: normalized.claudePath,
     current: sessionId,
     lanes,
+    agentFileSync,
   };
 }
 
@@ -397,6 +427,26 @@ function replaceCurrentSessionBlock(content, fields) {
   return `${content.slice(0, sessionFence.bodyStart)}${blockBody}${content.slice(sessionFence.bodyEnd)}`;
 }
 
+function buildCurrentSessionFieldsForLane(lane, overrides = {}) {
+  if (!lane) {
+    throw new Error('Cannot update the Current session block without active lane metadata.');
+  }
+
+  const sessionDate = lane.sessionDate ?? normalizeSessionDate();
+  const sessionNumber = lane.sessionNumber || 0;
+  const workingOn = lane.workingOn ?? 'No summary recorded.';
+
+  return {
+    date: `${sessionDate} (session ${sessionNumber}, lane ${lane.id})`,
+    workingOn: `${workingOn} [${lane.id}]`,
+    lastThingCompleted:
+      overrides.lastThingCompleted ?? 'Current lane selected from `sessions/active/index.yaml`.',
+    blockers: overrides.blockers ?? 'No blocker recorded for the selected lane.',
+    nextSessionShould:
+      overrides.nextSessionShould ?? 'Continue the selected active lane from `sessions/active/index.yaml`.',
+  };
+}
+
 async function getNextSessionNumber(sessionsDir, sessionDate) {
   const sessions = await listFinalizedSessions(sessionsDir);
   const activeSessions = await listActiveSessionLanes({ sessionsDir, activeSessionsDir: path.join(sessionsDir, 'active') });
@@ -414,18 +464,13 @@ async function resolveStartSessionId(normalized, options) {
     return validateLaneId(explicitId);
   }
 
-  const lanes = await listActiveSessionLanes(normalized);
-  if (lanes.length > 0) {
-    throw new Error('Active session lanes already exist. Pass --id to start another lane explicitly.');
-  }
-
   if ((await fileExists(normalized.wipFilePath)) || (await fileExists(normalized.handoffFilePath))) {
     throw new Error(
       `Legacy active session scratch files already exist under ${normalized.sessionsDir}. Close or recover that session before starting a lane.`,
     );
   }
 
-  return 'default';
+  throw new Error('start-session requires --id <lane-id> so each active lane has a meaningful name.');
 }
 
 async function resolveExistingSessionId(normalized, options) {
@@ -547,16 +592,28 @@ async function upsertActiveSessionIndex(normalized, lane, options = {}) {
   await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, [...laneMap.values()]), 'utf8');
 }
 
+/**
+ * Removes a closed lane from the active index and returns the surviving lane
+ * state used to refresh the Current session block. `lanes` contains the full
+ * lane metadata read from each sibling lane's `session.yaml` / `wip.md`.
+ */
 async function removeActiveSessionFromIndex(normalized, sessionId) {
   const index = await readActiveSessionIndex(normalized);
   const lanes = (await listActiveSessionLanes(normalized)).filter((lane) => lane.id !== sessionId);
   const current = index.current === sessionId ? lanes[0]?.id ?? null : index.current;
   if (lanes.length === 0) {
     await rm(normalized.activeSessionsIndexPath, { force: true });
-    return;
+    return {
+      current: null,
+      lanes,
+    };
   }
 
   await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, lanes), 'utf8');
+  return {
+    current,
+    lanes,
+  };
 }
 
 async function listFinalizedSessions(sessionsDir) {

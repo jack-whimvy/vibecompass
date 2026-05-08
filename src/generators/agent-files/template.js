@@ -36,7 +36,7 @@ export function renderSharedInstructionBody(context, options = {}) {
     '## Workflow Rules',
     '- VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream; finalized session notes are append-only history under `sessions/YYYY-MM-DD-N-title.md`.',
     '- Use `start session` for builder work and `join as reviewer` for review work.',
-    '- Use `vibecompass start-session --id <lane-id>` for concurrent lanes. Omitting `--id` opens the compatibility `default` lane only when no other lanes are active.',
+    '- Use `vibecompass start-session --id <lane-id>` to open a named lane for every active feature or workstream.',
     '- Use `vibecompass list-sessions` and `vibecompass switch-session <lane-id>` to inspect or change the current lane.',
     '- Treat `sessions/active/index.yaml` as the current lane source of truth; tool-specific Current session blocks are continuity summaries.',
     '- Use optional planning mode for risky or ambiguous work: read the same context, propose scope, and record the agreed plan in the selected lane `wip.md` before implementation.',
