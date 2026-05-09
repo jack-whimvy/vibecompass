@@ -20,6 +20,9 @@ Shipped today:
 - `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
 - `vibecompass docs-review --guided` runtime preflight for the explicit comprehensive documentation review workflow
+- `vibecompass docs-review --submit-hosted` for explicit hosted docs-review handoff
+- `vibecompass docs-review --run-local-anthropic` for local Anthropic review output under `state/`
+- `vibecompass docs-review --complete` for marking accepted review work complete locally
 - canonical file scanning and validation
 - `state/manifest.json` generation
 - JavaScript read-model helpers for project, feature, decision, and file context
@@ -27,7 +30,7 @@ Shipped today:
 Not shipped yet:
 
 - hosted sync commands such as push, pull-preview, and pull-export
-- full docs-review execution adapters for local Anthropic or hosted scan pipelines
+- hosted docs-review execution workers that produce applied canonical docs automatically
 
 The package is publishable now as the file-contract and read-model core. The
 broader local-primary sync workflow is still being built on top of it.
