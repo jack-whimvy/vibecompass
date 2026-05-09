@@ -157,13 +157,28 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       runtime,
     });
     io.stdout.write(`Docs-review: ${result.status}\n`);
-    io.stdout.write(`LLM: ${result.llm}\n`);
-    io.stdout.write(`Model: ${result.model}\n`);
-    io.stdout.write(`Runtime: ${result.runtime.provider}\n`);
+    if (result.llm) {
+      io.stdout.write(`LLM: ${result.llm}\n`);
+    }
+    if (result.model) {
+      io.stdout.write(`Model: ${result.model}\n`);
+    }
+    if (result.runtime) {
+      io.stdout.write(`Runtime: ${result.runtime.provider}\n`);
+    }
+    if (result.hosted) {
+      io.stdout.write(`Hosted run: ${result.hosted.run_id}\n`);
+    }
+    if (result.localReview) {
+      io.stdout.write(`Local review output: ${result.localReview.output_path}\n`);
+    }
+    writeWarnings(io, result.warnings);
     io.stdout.write(`Recorded ${result.statePath}\n`);
     io.stdout.write(`${result.message}\n`);
-    io.stdout.write('Architecture review prompt:\n');
-    io.stdout.write(`${result.reviewPrompt}\n`);
+    if (result.reviewPrompt) {
+      io.stdout.write('Architecture review prompt:\n');
+      io.stdout.write(`${result.reviewPrompt}\n`);
+    }
     return 0;
   }
 
@@ -625,6 +640,21 @@ function parseDocsReviewArgs(argv) {
       continue;
     }
 
+    if (token === '--submit-hosted') {
+      parsed.submitHosted = true;
+      continue;
+    }
+
+    if (token === '--complete') {
+      parsed.complete = true;
+      continue;
+    }
+
+    if (token === '--run-local-anthropic') {
+      parsed.runLocalAnthropic = true;
+      continue;
+    }
+
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
     }
@@ -647,6 +677,9 @@ function parseDocsReviewArgs(argv) {
         break;
       case '--anthropic-env-var':
         parsed.anthropicEnvVar = value;
+        break;
+      case '--max-tokens':
+        parsed.maxTokens = value;
         break;
       default:
         throw new Error(`Unknown flag "${token}".`);
@@ -762,9 +795,13 @@ function usageText() {
     'Docs-review options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --guided                             Accepted for the explicit comprehensive-review workflow',
+    '  --submit-hosted                      Submit the generated review request to hosted sync',
+    '  --complete                           Mark accepted docs-review changes as completed locally',
+    '  --run-local-anthropic                Run the generated review request with local Anthropic',
     '  --llm <name>                         Preferred LLM/provider to run the external architecture review',
     '  --model <name>                       Model name to record for the review',
     '  --anthropic-env-var <name>           Env var to use for local Anthropic docs-review runtime',
+    '  --max-tokens <number>                Local Anthropic max_tokens, 1024-32000. Defaults to 16000',
   ].join('\n');
 }
 

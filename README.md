@@ -379,9 +379,13 @@ Options:
 
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--guided`: accepted for the explicit comprehensive-review workflow
+- `--submit-hosted`: submit the generated review request to the configured hosted sync binding
+- `--complete`: mark accepted docs-review changes as completed in local state
+- `--run-local-anthropic`: run the generated review request with local Anthropic and save the review output under `state/`
 - `--llm <name>`: preferred LLM/provider to run the external architecture review; common choices are `claude`, `codex`, and `gemini`
 - `--model <name>`: model name/version to record for the review
 - `--anthropic-env-var <name>`: env var to use for local Anthropic runtime; defaults to `ANTHROPIC_API_KEY`
+- `--max-tokens <number>`: local Anthropic output budget from 1024 to 32000; defaults to 16000
 
 This command currently performs external-review handoff and runtime preflight.
 It records the preferred LLM/provider and model in `state/docs-review.json`,
@@ -396,10 +400,24 @@ comprehensive review:
 - `local-primary`: prefers hosted sync binding, otherwise accepts a local Anthropic key
 - `hosted-only`: requires hosted sync binding
 
-The marker stays `external-review-requested` until the actual review runs and
-accepted docs changes are applied. A completed review should update the marker
-to `status: "completed"` and preserve the `llm` / `model` fields so future
-sessions know what reviewed the architecture.
+Use `--submit-hosted` when you want the package to submit the same generated
+review request to the hosted sync binding. The request uses
+`sync.credential_env_var`, sends project metadata and the generated prompt,
+records the hosted run ID in `state/docs-review.json`, and leaves local
+canonical files untouched until accepted docs changes are applied locally.
+
+Use `--run-local-anthropic` when you want the package to execute the generated
+review request through Anthropic with the configured local key. It saves the raw
+review output to `state/docs-review-output.md`; apply accepted docs changes
+manually so canonical project memory stays under user control. If Anthropic
+stops at the configured `max_tokens` budget, the CLI warns that the saved output
+may be partial.
+
+The marker stays `external-review-requested`, `hosted-review-requested`, or
+`local-review-generated` until the actual review runs and accepted docs changes are applied. Run
+`vibecompass docs-review --complete` after those changes are in place; it
+updates the marker to `status: "completed"` and preserves the `llm` / `model`
+fields so future sessions know what reviewed the architecture.
 
 ### Prompt commands
 

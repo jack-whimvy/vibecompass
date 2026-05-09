@@ -424,6 +424,75 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       /requires ANTHROPIC_API_KEY/,
     );
 
+    const localStdout = [];
+    const localStderr = [];
+    const localFetchCalls = [];
+    await runCli(
+      [
+        'docs-review',
+        '--root',
+        localOnlyRoot,
+        '--run-local-anthropic',
+        '--llm',
+        'claude',
+        '--model',
+        'claude-sonnet-4-6',
+        '--max-tokens',
+        '20000',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            localStdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            localStderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        env: { ANTHROPIC_API_KEY: 'anthropic_test' },
+        async fetch(url, request) {
+          localFetchCalls.push({ url, request });
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                stop_reason: 'max_tokens',
+                content: [
+                  {
+                    type: 'text',
+                    text: '## Review metadata\n- Confidence: medium\n- Coverage: partial\n\nGenerated review.',
+                  },
+                ],
+              };
+            },
+          };
+        },
+      },
+    );
+    const localMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+    const localOutput = await readFile(path.join(localOnlyRoot, 'state/docs-review-output.md'), 'utf8');
+    const localBody = JSON.parse(localFetchCalls[0].request.body);
+
+    assert.equal(localFetchCalls.length, 1);
+    assert.equal(localFetchCalls[0].url, 'https://api.anthropic.com/v1/messages');
+    assert.equal(localFetchCalls[0].request.headers['x-api-key'], 'anthropic_test');
+    assert.equal(localBody.model, 'claude-sonnet-4-6');
+    assert.equal(localBody.max_tokens, 20000);
+    assert.match(localBody.messages[0].content, /Confidence: high \| medium \| low/);
+    assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
+    assert.match(localStdout.join(''), /Local review output:/);
+    assert.match(localStderr.join(''), /stopped at max_tokens/);
+    assert.equal(localMarker.status, 'local-review-generated');
+    assert.equal(localMarker.local_review.provider, 'anthropic');
+    assert.equal(localMarker.local_review.truncated, true);
+    assert.match(localOutput, /Generated review/);
+
     await initializeProjectMemory({
       cwd: tempDir,
       rootDir: localPrimaryRoot,
@@ -477,6 +546,84 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(marker.status, 'external-review-requested');
     assert.equal(marker.llm, 'codex');
     assert.equal(marker.model, 'gpt-5.3-codex');
+
+    const hostedStdout = [];
+    const fetchCalls = [];
+    await runCli(
+      ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--llm', 'claude', '--model', 'claude-sonnet-4-6'],
+      {
+        stdout: {
+          write(chunk) {
+            hostedStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+        env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' },
+        async fetch(url, request) {
+          fetchCalls.push({ url, request });
+          return {
+            ok: true,
+            status: 202,
+            async json() {
+              return { run_id: 'run_docs_review_123', status: 'accepted' };
+            },
+          };
+        },
+      },
+    );
+    const hostedMarker = JSON.parse(await readFile(path.join(localPrimaryRoot, 'state/docs-review.json'), 'utf8'));
+    const hostedBody = JSON.parse(fetchCalls[0].request.body);
+
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(fetchCalls[0].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_review/docs-review');
+    assert.equal(fetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
+    assert.equal(hostedBody.llm, 'claude');
+    assert.equal(Object.hasOwn(hostedBody, 'project_memory_root'), false);
+    assert.match(hostedBody.prompt, /Run a comprehensive VibeCompass architecture documentation review/);
+    assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
+    assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
+    assert.equal(hostedMarker.status, 'hosted-review-requested');
+    assert.equal(hostedMarker.hosted.run_id, 'run_docs_review_123');
+    assert.equal(hostedMarker.runtime.credential_env_var, 'VIBECOMPASS_SYNC_TOKEN');
+
+    const completeStdout = [];
+    await runCli(
+      ['docs-review', '--root', localPrimaryRoot, '--complete'],
+      {
+        stdout: {
+          write(chunk) {
+            completeStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const completedMarker = JSON.parse(await readFile(path.join(localPrimaryRoot, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(completeStdout.join(''), /Docs-review: completed/);
+    assert.doesNotMatch(completeStdout.join(''), /Architecture review prompt:/);
+    assert.equal(completedMarker.status, 'completed');
+    assert.equal(completedMarker.hosted.run_id, 'run_docs_review_123');
+    assert.equal(completedMarker.llm, 'claude');
+    assert.equal(completedMarker.model, 'claude-sonnet-4-6');
+    assert.ok(completedMarker.completed_at);
+
+    await assert.rejects(
+      () =>
+        runCli(
+          ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--run-local-anthropic'],
+          {
+            stdout: { write() {} },
+            stderr: { write() {} },
+          },
+          { cwd: tempDir, env: { ANTHROPIC_API_KEY: 'anthropic_test' } },
+        ),
+      /only one execution mode/,
+    );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

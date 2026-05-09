@@ -2,6 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { localRevisionFromManifestHash, stableHash } from './hash.js';
 import { scanProjectMemory } from './project-memory.js';
+import { listProjectSessions } from './session.js';
 
 export const STATE_VERSION = 1;
 
@@ -50,13 +51,18 @@ export function generateStateManifest(scanResult, options = {}) {
       warning_count: warningCount,
     },
     documents: manifestDocuments,
+    ...(options.activeSessions ? { active_sessions: options.activeSessions } : {}),
     ...(options.sync ? { sync: options.sync } : {}),
   };
 }
 
 export async function writeStateManifest(rootDir, options = {}) {
   const scanResult = await scanProjectMemory(rootDir);
-  const manifest = generateStateManifest(scanResult, options);
+  const activeSessions = await readActiveSessionsForManifest(rootDir);
+  const manifest = generateStateManifest(scanResult, {
+    ...options,
+    ...(activeSessions ? { activeSessions } : {}),
+  });
   const stateDir = path.join(rootDir, 'state');
   const manifestPath = path.join(stateDir, 'manifest.json');
 
@@ -67,6 +73,33 @@ export async function writeStateManifest(rootDir, options = {}) {
     manifest,
     manifestPath,
     scanResult,
+  };
+}
+
+async function readActiveSessionsForManifest(rootDir) {
+  const sessions = await listProjectSessions({ rootDir });
+  if (sessions.lanes.length === 0 && !sessions.current) {
+    return null;
+  }
+
+  return {
+    current: sessions.current,
+    lanes: sessions.lanes.map((lane) => ({
+      id: lane.id,
+      status: lane.status ?? 'active',
+      working_on: lane.workingOn,
+      feature_slugs: lane.features ?? [],
+      repos: lane.repos ?? [],
+      claimed_paths: lane.claims ?? [],
+      started_at: lane.startedAt ?? null,
+      ...(lane.decisionSnapshot
+        ? {
+          decision_snapshot: {
+            highest_decision_id: lane.decisionSnapshot.highestDecisionId ?? null,
+          },
+        }
+        : {}),
+    })),
   };
 }
 

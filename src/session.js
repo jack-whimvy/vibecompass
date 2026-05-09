@@ -1,5 +1,6 @@
 import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -36,6 +37,18 @@ export async function startProjectSession(options) {
   const claude = await readClaudeFile(normalized.claudePath);
   const sessionId = await resolveStartSessionId(normalized, options);
   const lanePaths = getLanePaths(normalized, sessionId);
+  const features = normalizeStringArray(options?.features);
+  const repos = normalizeStringArray(options?.repos);
+  const claims = normalizeStringArray(options?.claims);
+  const existingLanes = await listActiveSessionLanes(normalized);
+  const overlapWarnings = buildOverlapWarnings({
+    sessionId,
+    features,
+    repos,
+    claims,
+    existingLanes,
+  });
+  const highestDecisionId = await readHighestDecisionId(normalized.rootDir);
 
   const nextSessionNumber = await getNextSessionNumber(normalized.sessionsDir, sessionDate);
   const currentSession = parseCurrentSessionBlock(claude.content);
@@ -68,9 +81,10 @@ export async function startProjectSession(options) {
       sessionDate,
       sessionNumber: nextSessionNumber,
       workingOn,
-      features: normalizeStringArray(options?.features),
-      repos: normalizeStringArray(options?.repos),
-      claims: normalizeStringArray(options?.claims),
+      features,
+      repos,
+      claims,
+      highestDecisionId,
     }),
     'utf8',
   );
@@ -100,6 +114,7 @@ export async function startProjectSession(options) {
     workingOn,
   }, { current: sessionId });
   const auditWarnings = await buildDocsReviewWarnings(normalized);
+  const metadataWarnings = collectLaneMetadataWarnings(existingLanes);
   const agentFileSync = await syncAgentInstructionFilesSafely({
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
@@ -115,7 +130,11 @@ export async function startProjectSession(options) {
     handoffFilePath: lanePaths.handoffFilePath,
     sessionDate,
     sessionNumber: nextSessionNumber,
-    warnings: auditWarnings,
+    warnings: [
+      ...metadataWarnings,
+      ...overlapWarnings,
+      ...auditWarnings,
+    ],
     agentFileSync,
   };
 }
@@ -533,6 +552,9 @@ async function listActiveSessionLanes(normalized) {
         features: metadata.features,
         repos: metadata.repos,
         claims: metadata.claims,
+        startedAt: metadata.startedAt,
+        decisionSnapshot: metadata.decisionSnapshot,
+        warnings: metadata.warnings,
         sessionDate: metadata.sessionDate ?? wipSession?.sessionDate ?? null,
         sessionNumber: metadata.sessionNumber ?? wipSession?.sessionNumber ?? 0,
       });
@@ -566,18 +588,30 @@ async function readLaneMetadata(sessionFilePath) {
       features: normalizeStringArray(data.feature_slugs),
       repos: normalizeStringArray(data.repos),
       claims: normalizeStringArray(data.claimed_paths),
+      startedAt: normalizeOptionalString(data.started_at),
+      decisionSnapshot: {
+        highestDecisionId: parseNullableNumber(data.decision_snapshot?.highest_decision_id),
+      },
       sessionDate: normalizeOptionalString(data.session_date),
       sessionNumber: typeof data.session_number === 'number' ? data.session_number : Number(data.session_number) || null,
+      warnings: [],
     };
-  } catch {
+  } catch (error) {
     return {
       status: null,
       workingOn: null,
       features: [],
       repos: [],
       claims: [],
+      startedAt: null,
+      decisionSnapshot: {
+        highestDecisionId: null,
+      },
       sessionDate: null,
       sessionNumber: null,
+      warnings: [
+        `Could not parse ${sessionFilePath}: ${error instanceof Error ? error.message : String(error)}`,
+      ],
     };
   }
 }
@@ -800,9 +834,9 @@ function renderLaneMetadata(options) {
     renderYamlArray('feature_slugs', options.features),
     renderYamlArray('repos', options.repos),
     renderYamlArray('claimed_paths', options.claims),
-    `started_at: ${new Date().toISOString()}`,
+    `started_at: ${formatLocalDateTime(new Date())}`,
     'decision_snapshot:',
-    '  highest_decision_id: null',
+    `  highest_decision_id: ${options.highestDecisionId ?? 'null'}`,
     '',
   ].join('\n');
 }
@@ -912,6 +946,124 @@ function normalizeSessionDate(value) {
     String(date.getMonth() + 1).padStart(2, '0'),
     String(date.getDate()).padStart(2, '0'),
   ].join('-');
+}
+
+async function readHighestDecisionId(rootDir) {
+  try {
+    const scanResult = await scanProjectMemory(rootDir);
+    const decisionIds = scanResult.documents.flatMap((document) => document.extracted?.decision_ids ?? []);
+    return decisionIds.reduce((max, id) => Math.max(max, id), 0) || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildOverlapWarnings(options) {
+  const warnings = [];
+  for (const lane of options.existingLanes) {
+    const sharedFeatures = intersect(options.features, lane.features ?? []);
+    if (sharedFeatures.length > 0) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" overlaps "${lane.id}" on feature(s): ${sharedFeatures.join(', ')}.`,
+      );
+    }
+
+    const claimOverlaps = findClaimOverlaps(options.claims, lane.claims ?? []);
+    for (const overlap of claimOverlaps) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" overlaps "${lane.id}" on claimed path ${overlap.repo}:${overlap.path}.`,
+      );
+    }
+
+    const sharedRepos = intersect(options.repos, lane.repos ?? []);
+    if (sharedRepos.length > 0 && options.claims.length === 0 && (lane.claims ?? []).length === 0) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with "${lane.id}" without path claims; add --claim values to clarify ownership.`,
+      );
+    }
+  }
+
+  return warnings;
+}
+
+function collectLaneMetadataWarnings(lanes) {
+  return lanes.flatMap((lane) => lane.warnings ?? []);
+}
+
+function intersect(left, right) {
+  const rightSet = new Set(right);
+  return left.filter((item) => rightSet.has(item));
+}
+
+function findClaimOverlaps(leftClaims, rightClaims) {
+  const overlaps = [];
+  for (const left of leftClaims.map(parseClaim).filter(Boolean)) {
+    for (const right of rightClaims.map(parseClaim).filter(Boolean)) {
+      if (left.repo !== right.repo) {
+        continue;
+      }
+
+      if (pathPrefixesOverlap(left.path, right.path)) {
+        overlaps.push({
+          repo: left.repo,
+          path: left.path.length <= right.path.length ? left.path : right.path,
+        });
+      }
+    }
+  }
+
+  return overlaps;
+}
+
+function parseClaim(value) {
+  const separatorIndex = value.indexOf(':');
+  if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
+    return null;
+  }
+
+  return {
+    repo: value.slice(0, separatorIndex),
+    path: normalizeClaimPath(value.slice(separatorIndex + 1)),
+  };
+}
+
+function normalizeClaimPath(value) {
+  return value.replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+function pathPrefixesOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function parseNullableNumber(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function formatLocalDateTime(date) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absOffset = Math.abs(offsetMinutes);
+  const offset = `${sign}${String(Math.floor(absOffset / 60)).padStart(2, '0')}:${String(absOffset % 60).padStart(2, '0')}`;
+
+  return [
+    date.getFullYear(),
+    '-',
+    String(date.getMonth() + 1).padStart(2, '0'),
+    '-',
+    String(date.getDate()).padStart(2, '0'),
+    'T',
+    String(date.getHours()).padStart(2, '0'),
+    ':',
+    String(date.getMinutes()).padStart(2, '0'),
+    ':',
+    String(date.getSeconds()).padStart(2, '0'),
+    offset,
+  ].join('');
 }
 
 function requireNonEmptyString(value, message) {

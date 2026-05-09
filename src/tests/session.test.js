@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
+import { writeStateManifest } from '../manifest.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from '../session.js';
 
 test('startProjectSession creates scratch files and updates CLAUDE.md', async () => {
@@ -313,6 +314,17 @@ test('session lanes can run concurrently and switch current lane', async () => {
         claude: true,
       },
     });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '### D-124 — Local-first project memory becomes the primary product direction',
+        '**Timestamp:** 2026-04-19 00:01 PDT',
+        '**Decision:** Canonical project memory lives locally.',
+        '**Rationale:** Local ownership is the point.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
 
     await startProjectSession({
       cwd: tempDir,
@@ -321,27 +333,59 @@ test('session lanes can run concurrently and switch current lane', async () => {
       workingOn: 'Build the billing plans lane.',
       features: ['billing'],
       repos: ['app'],
-      claims: ['vibecompass-app/src/app/billing'],
+      claims: ['app:src/app/billing'],
       date: '2026-04-20',
     });
-    await startProjectSession({
+    const marketingResult = await startProjectSession({
       cwd: tempDir,
       rootDir,
       sessionId: 'marketing-copy',
       workingOn: 'Build the marketing copy lane.',
-      features: ['marketing'],
-      repos: ['docs'],
-      claims: ['vibecompass-docs/product'],
+      features: ['billing'],
+      repos: ['app'],
+      claims: ['app:src/app/billing/copy'],
       date: '2026-04-20',
     });
+
+    assert.match(marketingResult.warnings.join('\n'), /overlaps "billing-plans" on feature\(s\): billing/);
+    assert.match(marketingResult.warnings.join('\n'), /overlaps "billing-plans" on claimed path app:src\/app\/billing/);
 
     const listed = await listProjectSessions({ cwd: tempDir, rootDir });
     assert.equal(listed.current, 'marketing-copy');
     assert.deepEqual(listed.lanes.map((lane) => lane.id), ['billing-plans', 'marketing-copy']);
     assert.deepEqual(listed.lanes.map((lane) => lane.sessionNumber), [1, 2]);
+    assert.deepEqual(listed.lanes.map((lane) => lane.claims), [
+      ['app:src/app/billing'],
+      ['app:src/app/billing/copy'],
+    ]);
 
     const switched = await switchProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-plans' });
     assert.equal(switched.current, 'billing-plans');
+
+    const manifestResult = await writeStateManifest(rootDir);
+    assert.equal(manifestResult.manifest.active_sessions.current, 'billing-plans');
+    assert.deepEqual(
+      manifestResult.manifest.active_sessions.lanes.map((lane) => ({
+        id: lane.id,
+        feature_slugs: lane.feature_slugs,
+        claimed_paths: lane.claimed_paths,
+        highest: lane.decision_snapshot.highest_decision_id,
+      })),
+      [
+        {
+          id: 'billing-plans',
+          feature_slugs: ['billing'],
+          claimed_paths: ['app:src/app/billing'],
+          highest: 124,
+        },
+        {
+          id: 'marketing-copy',
+          feature_slugs: ['billing'],
+          claimed_paths: ['app:src/app/billing/copy'],
+          highest: 124,
+        },
+      ],
+    );
 
     const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
@@ -356,7 +400,9 @@ test('session lanes can run concurrently and switch current lane', async () => {
     assert.match(billingMetadata, /working_on: "Build the billing plans lane\."/);
     assert.match(billingMetadata, /feature_slugs:\n  - "billing"/);
     assert.match(billingMetadata, /repos:\n  - "app"/);
-    assert.match(billingMetadata, /claimed_paths:\n  - "vibecompass-app\/src\/app\/billing"/);
+    assert.match(billingMetadata, /claimed_paths:\n  - "app:src\/app\/billing"/);
+    assert.match(billingMetadata, /started_at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}/);
+    assert.match(billingMetadata, /decision_snapshot:\n  highest_decision_id: 124/);
 
     await assert.rejects(
       () =>
@@ -413,6 +459,53 @@ test('session lanes can run concurrently and switch current lane', async () => {
         }),
       /lowercase slug/i,
     );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('startProjectSession warns and falls back when an existing lane has corrupt metadata', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-corrupt-lane-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Corrupt Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'first-lane',
+      workingOn: 'Create the first lane.',
+      date: '2026-04-20',
+    });
+    await writeFile(
+      path.join(rootDir, 'sessions/active/first-lane/session.yaml'),
+      'id: first-lane\n  broken: true\n',
+      'utf8',
+    );
+
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'second-lane',
+      workingOn: 'Open a lane after corrupt metadata.',
+      date: '2026-04-20',
+    });
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+
+    assert.match(result.warnings.join('\n'), /Could not parse .*first-lane\/session\.yaml/);
+    assert.deepEqual(listed.lanes.map((lane) => lane.id), ['first-lane', 'second-lane']);
+    assert.equal(listed.lanes.find((lane) => lane.id === 'first-lane').sessionNumber, 1);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
