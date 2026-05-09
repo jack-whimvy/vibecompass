@@ -1,10 +1,49 @@
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { resolveWorkflowSettings } from './workflow.js';
 
 export async function scaffoldInitFiles(options) {
   const createdFiles = [];
   const skippedFiles = [];
+
+  await mkdir(path.join(options.rootDir, 'architecture'), { recursive: true });
+  await mkdir(path.join(options.rootDir, 'decisions'), { recursive: true });
+  await mkdir(path.join(options.rootDir, 'sessions'), { recursive: true });
+
+  const starterFiles = [
+    {
+      path: path.join(options.rootDir, 'decisions', 'EXAMPLE.md'),
+      content: generateDecisionExample(options.projectConfig),
+    },
+  ];
+
+  if (!(await hasCanonicalMarkdown(path.join(options.rootDir, 'architecture'), {
+    ignoredNames: new Set(['README.md']),
+  }))) {
+    starterFiles.push({
+      path: path.join(options.rootDir, 'architecture', 'overview', 'project-shape.md'),
+      content: generateStarterArchitectureDoc(options.projectConfig),
+    });
+  }
+
+  if (!(await hasCanonicalMarkdown(path.join(options.rootDir, 'sessions'), {
+    ignoredNames: new Set(['README.md', 'wip.md', 'handoff.md']),
+    ignoredDirectories: new Set(['active']),
+  }))) {
+    starterFiles.push({
+      path: path.join(options.rootDir, 'sessions', `${sessionDateFromGeneratedAt(options.generatedAt)}-1-project-memory-initialized.md`),
+      content: generateStarterSessionNote(options),
+    });
+  }
+
+  for (const file of starterFiles) {
+    const outcome = await writeIfMissing(file.path, file.content);
+    if (outcome.created) {
+      createdFiles.push(file.path);
+    } else {
+      skippedFiles.push(file.path);
+    }
+  }
 
   if (!options.workflow) {
     return {
@@ -13,10 +52,6 @@ export async function scaffoldInitFiles(options) {
       skippedFiles,
     };
   }
-
-  await mkdir(path.join(options.rootDir, 'architecture'), { recursive: true });
-  await mkdir(path.join(options.rootDir, 'decisions'), { recursive: true });
-  await mkdir(path.join(options.rootDir, 'sessions'), { recursive: true });
 
   const contextFilePath = path.join(options.rootDir, 'context.md');
   // context.md is a derived artifact owned by the package; regenerate it on rerun.
@@ -97,6 +132,43 @@ async function fileExists(filePath) {
   }
 }
 
+async function hasCanonicalMarkdown(directoryPath, options = {}) {
+  const ignoredNames = options.ignoredNames ?? new Set();
+  const ignoredDirectories = options.ignoredDirectories ?? new Set();
+
+  try {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        if (ignoredDirectories.has(entry.name)) {
+          continue;
+        }
+
+        if (await hasCanonicalMarkdown(path.join(directoryPath, entry.name), options)) {
+          return true;
+        }
+        continue;
+      }
+
+      if (entry.isFile() && entry.name.endsWith('.md') && !ignoredNames.has(entry.name)) {
+        return true;
+      }
+    }
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return false;
+    }
+
+    throw error;
+  }
+
+  return false;
+}
+
 function generateContextMarkdown(options) {
   const projectName = options.projectConfig.name;
   const rootRelativePath = options.rootRelativePath;
@@ -135,7 +207,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 ${repos}
 
 ## Session roles
-| Trigger | Role | Owns session lifecycle? |
+| Entry trigger | Role | Owns session lifecycle? |
 |---|---|---|
 | "start session" | Builder | Yes — opens the session, keeps scratch files current, and writes the final session note |
 | "join as reviewer" | Reviewer | No — reviews the builder's work, appends findings, and updates handoff guidance |
@@ -146,13 +218,19 @@ ${repos}
 - \`planning mode\` — optional prompt-level mode for scoping work before implementation
 - \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
 - \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is also accepted as an alias for \`vibecompass close-session\`; the canonical command name remains \`close-session\`.
 
 ## Workflow defaults
 ${renderWorkflowDefaults(workflow)}
+
+## Documentation coverage
+- The architecture, decision, and session files created by init are an initial scaffold, not a comprehensive codebase review.
+- Before risky implementation work, inspect the relevant code and update the affected architecture docs.
+- Run \`vibecompass docs-review --guided\` when you want a comprehensive documentation review. That command is explicit because it may inspect source files and use AI or hosted scan infrastructure.
 
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
@@ -240,6 +318,119 @@ automatically by package commands.
 `;
 }
 
+function generateStarterArchitectureDoc(projectConfig) {
+  const repos = projectConfig.repos.map((repo) => repo.id);
+  const repoLines = projectConfig.repos
+    .map((repo) => `- \`${repo.id}\` — ${repo.remote}${repo.default_branch ? ` (${repo.default_branch})` : ''}`)
+    .join('\n');
+  const repoEvidence = projectConfig.repos
+    .map((repo) => `- \`${repo.id}:/\` — declared repository root`)
+    .join('\n');
+
+  return `---
+domain: Project
+feature: Overview
+component: Project Shape
+status: In progress
+repos:
+${repos.map((repoId) => `  - ${quoteYamlString(repoId)}`).join('\n')}
+confidence: Initial scaffold
+coverage: Initial scaffold
+---
+
+## Description
+Initial project-memory scaffold for ${projectConfig.name}.
+
+${projectConfig.description ? `${projectConfig.description}\n` : ''}This document is a starting map, not a comprehensive architecture review.
+
+## Details
+- Mode: \`${projectConfig.mode}\`
+- Documentation coverage: initial scaffold
+- Repo inventory:
+${repoLines}
+
+## Coverage
+Confirmed:
+- Project identity and mode from \`project.yaml\`
+- Declared repository IDs and remotes from \`project.yaml\`
+- Project-memory root layout created by \`vibecompass init\`
+
+Not yet documented:
+- Runtime architecture and data flow
+- Auth/session model
+- Database or persistence ownership
+- External integrations
+- Deployment, jobs, and observability
+- Test strategy
+- Feature/domain/component map beyond this placeholder
+
+Before changing any undocumented area, inspect the relevant code and update or add architecture docs.
+
+## Next steps
+- Run \`vibecompass docs-review --guided\` for a comprehensive documentation review.
+- Replace this placeholder with domain/feature/component docs as the project map becomes evidence-backed.
+- Keep architecture docs aligned with implementation changes during each builder session.
+
+## Involved files
+- \`project.yaml\`
+${repoEvidence}
+`;
+}
+
+function generateDecisionExample(projectConfig) {
+  return `# Decision Examples
+
+This file is example-only guidance for ${projectConfig.name}. It is intentionally ignored by VibeCompass canonical decision parsing and must not be treated as a real decision log.
+
+Real decisions belong in domain-grouped files such as \`cross-cutting.md\`, with append-only entries:
+
+\`\`\`md
+### D-001 — Example decision title
+**Timestamp:** YYYY-MM-DD HH:MM TZ
+**Decision:** What was decided.
+**Rationale:** Why this was the correct tradeoff.
+\`\`\`
+
+Do not copy this example as-is. Allocate real decision IDs from the current canonical decision log when a decision is accepted.
+`;
+}
+
+function generateStarterSessionNote(options) {
+  const sessionDate = sessionDateFromGeneratedAt(options.generatedAt);
+  const projectConfig = options.projectConfig;
+  const repoLines = projectConfig.repos.map((repo) => `- \`${repo.id}\` — ${repo.remote}`).join('\n');
+
+  return `# Session — ${sessionDate}-1 — Project Memory Initialized
+
+Generated by \`vibecompass init\`; this is initialization history, not a builder/reviewer work session.
+
+## What we worked on
+Initialized VibeCompass project memory for ${projectConfig.name}.
+
+## Completed
+- Created the project-memory root and \`project.yaml\`.
+- Created lightweight starter architecture memory.
+- Created example-only decision guidance without seeding real decisions.
+- Generated local state manifest data from canonical files.
+
+## Decisions made
+- No real project decisions were seeded by init. Use \`decisions/EXAMPLE.md\` only as format guidance.
+
+## Models used
+- VibeCompass init scaffold.
+
+## Blockers / open questions
+- Comprehensive architecture documentation has not been reviewed yet.
+- Declared repos:
+${repoLines}
+
+## Next session should start with
+1. Run \`vibecompass docs-review --guided\` if you want a comprehensive documentation review.
+2. Inspect relevant code before making implementation changes in areas not covered by architecture docs.
+3. Replace starter placeholders with evidence-backed domain/feature/component docs.
+`;
+}
+
 function generateArchitectureGuide(projectConfig) {
   return `# Architecture
 
@@ -256,7 +447,7 @@ architecture/<domain-slug>/<feature-slug>/<component>.md
 - \`feature\`
 - \`component\`
 - \`status\`
-- optional \`repo\` or \`repos\`
+- \`repos\`: array of repo IDs, even for single-repo projects
 
 ## Recommended sections
 - \`## Description\`
@@ -328,7 +519,7 @@ Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
 
 ## Session roles
 
-| Trigger | Role | Owns session lifecycle? |
+| Entry trigger | Role | Owns session lifecycle? |
 |---|---|---|
 | "start session" | Builder | Yes |
 | "join as reviewer" | Reviewer | No |
@@ -341,9 +532,10 @@ Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
 - \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
 - \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
 - \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
 
 ## Current session
@@ -380,7 +572,7 @@ This workspace uses VibeCompass project memory rooted at \`${options.rootRelativ
 
 ## Session roles
 
-| Trigger | Role | Owns session lifecycle? |
+| Entry trigger | Role | Owns session lifecycle? |
 |---|---|---|
 | "start session" | Builder | Yes — opens and closes the session lifecycle |
 | "join as reviewer" | Reviewer | No — reviews the builder's work and updates the handoff |
@@ -393,9 +585,10 @@ This workspace uses VibeCompass project memory rooted at \`${options.rootRelativ
 - \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
 - \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
 - \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
+- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. Builder close-out uses \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
 
 ## Startup
@@ -441,4 +634,17 @@ function describeReviewerHandback(workflow) {
   }
 
   return workflow.reviewerHandback;
+}
+
+function sessionDateFromGeneratedAt(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function quoteYamlString(value) {
+  return JSON.stringify(value);
 }

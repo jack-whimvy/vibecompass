@@ -31,6 +31,7 @@ test('loadProjectReadModel builds grouped feature, decision, session, and file o
       ],
       generatedAt: new Date('2026-04-19T11:00:00Z'),
     });
+    await rm(path.join(rootDir, 'architecture/overview'), { recursive: true, force: true });
 
     await writeFile(
       path.join(rootDir, 'architecture/platform/project-memory/backend.md'),

@@ -12,12 +12,14 @@ Shipped today:
 
 - `vibecompass init` for scaffolding a project-memory root
 - interactive guided init for placement, workflow bootstrap, and first-session setup
+- lightweight starter architecture/session memory plus example-only decision guidance
 - generated `context.md` plus opt-in workflow guide files
 - opt-in starter `CLAUDE.md` / `AGENTS.md` templates that are created once and never overwritten
 - `vibecompass start-session` / `vibecompass close-session` for lane-aware local builder workflow
 - `vibecompass list-sessions` / `vibecompass switch-session` for multiple active session lanes
 - `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
+- `vibecompass docs-review --guided` runtime preflight for the explicit comprehensive documentation review workflow
 - canonical file scanning and validation
 - `state/manifest.json` generation
 - JavaScript read-model helpers for project, feature, decision, and file context
@@ -25,6 +27,7 @@ Shipped today:
 Not shipped yet:
 
 - hosted sync commands such as push, pull-preview, and pull-export
+- full docs-review execution adapters for local Anthropic or hosted scan pipelines
 
 The package is publishable now as the file-contract and read-model core. The
 broader local-primary sync workflow is still being built on top of it.
@@ -59,9 +62,9 @@ npx -y @vibecompass/vibecompass init --guided
 ```
 
 Guided init asks about repo topology, recommends a placement pattern
-(`workspace-root`, `dedicated-memory-repo`, or `primary-repo`), scaffolds the
-workflow files you opt into, and can open the first builder session
-immediately.
+(`workspace-root`, `dedicated-memory-repo`, or `primary-repo`), writes
+lightweight starter project memory, scaffolds the workflow files you opt into,
+and can open the first builder session immediately.
 
 When the owner directory is a workspace root or primary repo, the canonical
 root defaults to `.compass/` inside that directory. For a dedicated memory repo,
@@ -86,7 +89,22 @@ npx -y @vibecompass/vibecompass init \
   --session-working-on "Validate the local-first MCP workflow"
 ```
 
-That creates the canonical root plus, when workflow scaffolding is enabled:
+That creates the canonical root plus lightweight starter memory:
+
+```text
+PROJECT_MEMORY_ROOT/project.yaml
+PROJECT_MEMORY_ROOT/architecture/overview/project-shape.md
+PROJECT_MEMORY_ROOT/decisions/EXAMPLE.md      # example-only, ignored by canonical parsing
+PROJECT_MEMORY_ROOT/sessions/YYYY-MM-DD-1-project-memory-initialized.md
+PROJECT_MEMORY_ROOT/state/manifest.json
+```
+
+The starter architecture doc is intentionally marked as initial scaffold
+coverage. It is useful orientation, not a comprehensive review. Before risky
+implementation work, inspect the relevant code and replace or expand the
+starter docs with evidence-backed domain/feature/component docs.
+
+When workflow scaffolding is enabled, init also creates:
 
 ```text
 PROJECT_MEMORY_ROOT/context.md
@@ -99,6 +117,21 @@ AGENTS.md           # at the tooling root, only if missing and --with-agents is 
 
 `context.md` is a derived package-owned file. Re-running `init --force --with-workflow`
 regenerates it; do not treat it as a hand-edited source document.
+
+Run the explicit docs-review preflight when you are ready for the heavier
+documentation review workflow:
+
+```bash
+npx -y @vibecompass/vibecompass docs-review --guided
+```
+
+Today this asks which LLM/model will run the architecture review, records that
+selection in `state/docs-review.json`, checks whether the selected project mode
+has the required runtime available, and prints a review prompt to run in your
+preferred LLM. Guided mode suggests Claude, Codex, and Gemini, but custom
+provider names are accepted. A real comprehensive review still requires the
+selected LLM or hosted scan adapter to apply accepted documentation changes;
+init never makes an AI call.
 
 If you do not chain straight into a first session from `init`, open one later:
 
@@ -265,6 +298,10 @@ This command updates the `Current session` block in `CLAUDE.md` and creates
 `sessions/active/<lane-id>/session.yaml`, `wip.md`, and `handoff.md` for the
 next session number. It also updates `sessions/active/index.yaml`.
 
+If no completed docs-review marker exists under `state/docs-review.json`,
+`start-session` prints a non-blocking warning that starter docs are not a
+comprehensive architecture review.
+
 ### `vibecompass list-sessions`
 
 ```text
@@ -332,6 +369,38 @@ memory. It creates missing files with managed markers, replaces existing
 managed regions, preserves content outside markers, and warns instead of
 overwriting existing unmarked files.
 
+### `vibecompass docs-review`
+
+```text
+vibecompass docs-review --guided [options]
+```
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--guided`: accepted for the explicit comprehensive-review workflow
+- `--llm <name>`: preferred LLM/provider to run the external architecture review; common choices are `claude`, `codex`, and `gemini`
+- `--model <name>`: model name/version to record for the review
+- `--anthropic-env-var <name>`: env var to use for local Anthropic runtime; defaults to `ANTHROPIC_API_KEY`
+
+This command currently performs external-review handoff and runtime preflight.
+It records the preferred LLM/provider and model in `state/docs-review.json`,
+then prints an architecture-review prompt to run in that tool. The generated
+prompt tells the reviewer to include a `## Review metadata` section in generated
+architecture docs with provider, model/version, creation timestamp, project
+mode, project-memory root, evidence standard, and coverage status. It enforces
+the mode-aware contract from D-189 without pretending that a static scan is a
+comprehensive review:
+
+- `local-only`: requires a local Anthropic key
+- `local-primary`: prefers hosted sync binding, otherwise accepts a local Anthropic key
+- `hosted-only`: requires hosted sync binding
+
+The marker stays `external-review-requested` until the actual review runs and
+accepted docs changes are applied. A completed review should update the marker
+to `status: "completed"` and preserve the `llm` / `model` fields so future
+sessions know what reviewed the architecture.
+
 ### Prompt commands
 
 These are the default prompt commands used by the scaffolded workflow files:
@@ -340,19 +409,22 @@ These are the default prompt commands used by the scaffolded workflow files:
 - `join as reviewer`: reviewer role trigger
 - `review handoff`: reviewer reads the selected lane's latest `wip.md`, `handoff.md`, latest finalized note, and relevant diffs before appending findings
 - `address review`: builder reads the latest reviewer feedback in the selected lane's `wip.md` / `handoff.md`, responds inline, applies accepted changes, and refreshes the builder handoff
+- `close session`: builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>`; `end session` is accepted as a synonym
 
 They are prompt commands for AI-tool behavior, not package CLI commands.
 Reviewer handback ends when the reviewer has updated the selected lane's
 `wip.md` and `handoff.md`; there is no extra reviewer-exit step. The builder
 remains in builder role, uses `address review` until findings are resolved or
-explicitly deferred, and then runs `vibecompass close-session --session
-<lane-id>` using the workflow defaults recorded in `project.yaml`.
+explicitly deferred, and then uses the `close session` prompt to run
+`vibecompass close-session --session <lane-id>` using the workflow defaults
+recorded in `project.yaml`.
 
 ## JavaScript API
 
 ```js
 import {
   initializeProjectMemory,
+  preflightDocsReview,
   startProjectSession,
   closeProjectSession,
   syncAgentInstructionFiles,

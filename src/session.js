@@ -99,6 +99,7 @@ export async function startProjectSession(options) {
     status: 'active',
     workingOn,
   }, { current: sessionId });
+  const auditWarnings = await buildDocsReviewWarnings(normalized);
   const agentFileSync = await syncAgentInstructionFilesSafely({
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
@@ -114,6 +115,7 @@ export async function startProjectSession(options) {
     handoffFilePath: lanePaths.handoffFilePath,
     sessionDate,
     sessionNumber: nextSessionNumber,
+    warnings: auditWarnings,
     agentFileSync,
   };
 }
@@ -312,6 +314,26 @@ async function syncAgentInstructionFilesSafely(options) {
       ],
     };
   }
+}
+
+async function buildDocsReviewWarnings(normalized) {
+  const markerPath = path.join(normalized.rootDir, 'state', 'docs-review.json');
+  try {
+    const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+    if (marker && marker.status === 'completed') {
+      return [];
+    }
+  } catch (error) {
+    if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) {
+      return [
+        `Docs-review marker at ${markerPath} is unreadable. Starter docs are not a comprehensive architecture review; run "vibecompass docs-review --guided" before risky implementation work.`,
+      ];
+    }
+  }
+
+  return [
+    `No docs-review marker found at ${markerPath}. Starter docs are not a comprehensive architecture review; run "vibecompass docs-review --guided" before risky implementation work.`,
+  ];
 }
 
 function normalizeSessionPaths(options) {

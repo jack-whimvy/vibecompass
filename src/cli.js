@@ -3,6 +3,7 @@
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { initializeProjectMemory } from './init.js';
+import { preflightDocsReview } from './docs-review.js';
 import { resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -70,6 +71,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Updated ${sessionResult.claudePath}\n`);
       io.stdout.write(`Created ${sessionResult.wipFilePath}\n`);
       io.stdout.write(`Created ${sessionResult.handoffFilePath}\n`);
+      writeWarnings(io, sessionResult.warnings);
       writeAgentFileSyncResult(io, sessionResult.agentFileSync);
     }
 
@@ -85,6 +87,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Created ${result.wipFilePath}\n`);
     io.stdout.write(`Created ${result.handoffFilePath}\n`);
+    writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
   }
@@ -144,6 +147,26 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'docs-review') {
+    const result = await preflightDocsReview({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    }, {
+      io,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Docs-review: ${result.status}\n`);
+    io.stdout.write(`LLM: ${result.llm}\n`);
+    io.stdout.write(`Model: ${result.model}\n`);
+    io.stdout.write(`Runtime: ${result.runtime.provider}\n`);
+    io.stdout.write(`Recorded ${result.statePath}\n`);
+    io.stdout.write(`${result.message}\n`);
+    io.stdout.write('Architecture review prompt:\n');
+    io.stdout.write(`${result.reviewPrompt}\n`);
+    return 0;
+  }
+
   throw new Error(`Unknown command "${parsed.command}".`);
 }
 
@@ -173,6 +196,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'sync-agents') {
       return parseSyncAgentsArgs(rest);
+    }
+
+    if (command === 'docs-review') {
+      return parseDocsReviewArgs(rest);
     }
 
     return { command };
@@ -587,6 +614,51 @@ function parseSyncAgentsArgs(argv) {
   };
 }
 
+function parseDocsReviewArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--guided') {
+      parsed.guided = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--llm':
+        parsed.llm = value;
+        break;
+      case '--model':
+        parsed.model = value;
+        break;
+      case '--anthropic-env-var':
+        parsed.anthropicEnvVar = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'docs-review',
+    options: parsed,
+  };
+}
+
 function writeAgentFileSyncResult(io, result) {
   if (!result) {
     return;
@@ -597,6 +669,12 @@ function writeAgentFileSyncResult(io, result) {
     const suffix = item.warning ? ` — ${item.warning}` : '';
     const stream = item.warning ? io.stderr : io.stdout;
     stream.write(`- ${item.relativePath}: ${item.status}${suffix}\n`);
+  }
+}
+
+function writeWarnings(io, warnings = []) {
+  for (const warning of warnings) {
+    io.stderr.write(`Warning: ${warning}\n`);
   }
 }
 
@@ -619,6 +697,7 @@ function usageText() {
     '  vibecompass list-sessions [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass sync-agents [options]',
+    '  vibecompass docs-review --guided [options]',
     '',
     'Init options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -679,6 +758,13 @@ function usageText() {
     '  --tooling-root <path>                Directory where agent files are written. Defaults to cwd',
     '  --format <name>                      Optional format: claude_md, agents_md, cursor_rules, copilot_instructions',
     '  --dry-run                            Show planned writes without changing files',
+    '',
+    'Docs-review options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --guided                             Accepted for the explicit comprehensive-review workflow',
+    '  --llm <name>                         Preferred LLM/provider to run the external architecture review',
+    '  --model <name>                       Model name to record for the review',
+    '  --anthropic-env-var <name>           Env var to use for local Anthropic docs-review runtime',
   ].join('\n');
 }
 

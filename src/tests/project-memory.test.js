@@ -58,6 +58,14 @@ More detail.
 **Rationale:** Local ownership is the point.
 `,
     'decisions/INDEX.md': '# Decision Index\n',
+    'decisions/EXAMPLE.md': `
+# Decision Examples
+
+### D-001 — Example only
+**Timestamp:** YYYY-MM-DD HH:MM TZ
+**Decision:** Example decision.
+**Rationale:** Example rationale.
+`,
     'sessions/2026-04-19-1-local-first-bootstrap.md': `
 # Session — 2026-04-19-1 — Local First Bootstrap
 

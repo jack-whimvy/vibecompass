@@ -1,5 +1,6 @@
 export { STATE_VERSION, generateStateManifest, writeStateManifest } from './manifest.js';
 export { initializeProjectMemory } from './init.js';
+export { preflightDocsReview } from './docs-review.js';
 export { scanProjectMemory } from './project-memory.js';
 export {
   closeProjectSession,

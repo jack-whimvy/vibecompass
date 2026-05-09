@@ -42,6 +42,7 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
 
     assert.equal(result.sessionNumber, 1);
     assert.equal(result.sessionId, 'workflow-parity');
+    assert.match(result.warnings.join('\n'), /No docs-review marker found/);
     assert.match(claude, /Date: 2026-04-20 \(session 1, lane workflow-parity\)/);
     assert.match(claude, /Working on: Close the workflow parity gap\. \[workflow-parity\]/);
     assert.match(wip, /# WIP — 2026-04-20 \(session 1\)/);

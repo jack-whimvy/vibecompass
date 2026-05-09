@@ -21,10 +21,10 @@ export async function initializeProjectMemory(options) {
 
   await writeProjectFile(projectFilePath, normalized.projectConfig, normalized.force);
   const gitignoreUpdated = await ensureStateIgnored(gitignorePath);
+  const scaffoldResult = await scaffoldInitFiles(normalized.bootstrap);
   const manifestResult = await writeStateManifest(normalized.rootDir, {
     generatedAt: normalized.generatedAt,
   });
-  const scaffoldResult = await scaffoldInitFiles(normalized.bootstrap);
 
   return {
     rootDir: normalized.rootDir,
@@ -137,6 +137,7 @@ function normalizeInitOptions(options) {
     rootDir,
     toolingRootDir,
     projectConfig,
+    generatedAt: preparedOptions.generatedAt,
   });
 
   return {
@@ -182,6 +183,7 @@ function normalizeBootstrapOptions(bootstrap, context) {
     contextRelativeToToolingRoot: toPosix(
       path.relative(context.toolingRootDir, contextFilePath) || 'context.md',
     ),
+    generatedAt: context.generatedAt,
   };
 }
 
