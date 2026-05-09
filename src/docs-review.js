@@ -1,6 +1,7 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { parseFrontmatter } from './frontmatter.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 export async function preflightDocsReview(options = {}, environment = {}) {
@@ -8,6 +9,16 @@ export async function preflightDocsReview(options = {}, environment = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
   const statePath = path.join(rootDir, 'state', 'docs-review.json');
+
+  if (options.applyOutput) {
+    return applyDocsReviewOutput({
+      rootDir,
+      statePath,
+      outputPath: options.outputPath,
+      llm: options.llm,
+      model: options.model,
+    });
+  }
 
   if (options.complete) {
     return completeDocsReview({
@@ -26,11 +37,11 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     ? await promptForReviewConfig(options, environment)
     : normalizeReviewConfig(options);
   const env = environment.env ?? process.env;
-  const anthropicEnvVar = options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY';
+  const localProvider = resolveLocalProvider(options);
   const runtime = resolveDocsReviewRuntime(project, {
     env,
-    anthropicEnvVar,
-    preferLocalAnthropic: options.runLocalAnthropic,
+    localProvider,
+    runLocal: shouldRunLocal(options),
   });
   const reviewPrompt = renderReviewPrompt({
     project,
@@ -41,7 +52,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
 
   const status = options.submitHosted
     ? 'hosted-review-requested'
-    : options.runLocalAnthropic
+    : shouldRunLocal(options)
       ? 'local-review-generated'
       : 'external-review-requested';
   const hosted = options.submitHosted
@@ -55,8 +66,8 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       fetch: environment.runtime?.fetch ?? globalThis.fetch,
     })
     : null;
-  const localReview = options.runLocalAnthropic
-    ? await runLocalAnthropicDocsReview({
+  const localReview = shouldRunLocal(options)
+    ? await runLocalDocsReview({
       env,
       maxTokens: options.maxTokens,
       model: reviewConfig.model,
@@ -92,7 +103,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     localReview,
     reviewPrompt,
     warnings: [
-      ...(localReview?.truncated ? ['Local Anthropic docs-review stopped at max_tokens; saved output may be partial.'] : []),
+      ...(localReview?.truncated ? [`Local ${localReview.provider} docs-review stopped at max_tokens; saved output may be partial.`] : []),
     ],
     message: renderDocsReviewMessage(options),
   };
@@ -132,16 +143,90 @@ async function completeDocsReview(options) {
     model,
     runtime: current.runtime ?? null,
     hosted: current.hosted ?? null,
+    applied: current.applied ?? null,
     reviewPrompt: null,
     warnings: [],
     message: 'Docs-review marker completed. Future start-session warnings can treat this root as reviewed.',
   };
 }
 
+async function applyDocsReviewOutput(options) {
+  const current = await readDocsReviewMarker(options.statePath);
+  const outputPath = options.outputPath
+    ? path.resolve(options.rootDir, options.outputPath)
+    : path.join(path.dirname(options.statePath), 'docs-review-output.md');
+  const source = await readFile(outputPath, 'utf8');
+  const blocks = parseArchitectureDocBlocks(source);
+
+  if (blocks.length === 0) {
+    throw new Error(
+      `No accepted architecture doc blocks found in ${outputPath}. Expected fenced blocks like \`\`\`vibecompass-architecture-doc path=architecture/domain/feature/component.md\`.`,
+    );
+  }
+
+  for (const block of blocks) {
+    validateArchitectureDocBlock(block);
+  }
+
+  const applied = [];
+  for (const block of blocks) {
+    const absoluteTargetPath = path.join(options.rootDir, block.path);
+    await mkdir(path.dirname(absoluteTargetPath), { recursive: true });
+    const existed = await pathExists(absoluteTargetPath);
+    await writeFile(absoluteTargetPath, ensureTrailingNewline(block.content), 'utf8');
+    applied.push({ path: block.path, status: existed ? 'overwritten' : 'created' });
+  }
+
+  const llm = normalizeOptionalString(options.llm) ?? current.llm ?? null;
+  const model = normalizeOptionalString(options.model) ?? current.model ?? null;
+  const marker = {
+    ...current,
+    status: 'completed',
+    ...(llm ? { llm } : {}),
+    ...(model ? { model } : {}),
+    applied: {
+      output_path: outputPath,
+      architecture_docs: applied,
+      applied_at: new Date().toISOString(),
+    },
+    completed_at: new Date().toISOString(),
+  };
+
+  await writeDocsReviewMarker(options.statePath, marker);
+
+  return {
+    rootDir: options.rootDir,
+    statePath: options.statePath,
+    status: 'completed',
+    llm,
+    model,
+    runtime: current.runtime ?? null,
+    hosted: current.hosted ?? null,
+    applied: marker.applied,
+    reviewPrompt: null,
+    warnings: [],
+    message: `Applied ${applied.length} accepted architecture doc${applied.length === 1 ? '' : 's'} and completed the docs-review marker.`,
+  };
+}
+
+async function readDocsReviewMarker(statePath) {
+  try {
+    return JSON.parse(await readFile(statePath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw new Error(`No docs-review marker found at ${statePath}. Run docs-review before applying output.`);
+    }
+
+    throw new Error(`Could not read docs-review marker at ${statePath}: ${error.message}`);
+  }
+}
+
 function validateDocsReviewMode(options) {
   const enabled = [
     options.submitHosted ? '--submit-hosted' : null,
+    options.runLocal ? '--run-local' : null,
     options.runLocalAnthropic ? '--run-local-anthropic' : null,
+    options.applyOutput ? '--apply-output' : null,
     options.complete ? '--complete' : null,
   ].filter(Boolean);
 
@@ -170,7 +255,7 @@ async function promptForReviewConfig(options, environment) {
 }
 
 function normalizeReviewConfig(options) {
-  const llm = String(options.llm ?? 'claude').trim();
+  const llm = String(options.llm ?? options.provider ?? 'claude').trim();
   if (!llm) {
     throw new Error('docs-review requires a non-empty LLM provider name.');
   }
@@ -183,9 +268,40 @@ function normalizeReviewConfig(options) {
   return { llm, model };
 }
 
+function shouldRunLocal(options) {
+  return Boolean(options.runLocal || options.runLocalAnthropic);
+}
+
+function resolveLocalProvider(options) {
+  if (options.runLocalAnthropic) {
+    return {
+      provider: 'anthropic',
+      credentialEnvVar: options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY',
+    };
+  }
+
+  const provider = normalizeOptionalString(options.provider);
+  if (!provider) {
+    return null;
+  }
+
+  if (provider !== 'anthropic') {
+    throw new Error(`Unsupported local docs-review provider "${provider}". Supported providers: anthropic.`);
+  }
+
+  return {
+    provider,
+    credentialEnvVar: options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY',
+  };
+}
+
 function resolveDocsReviewRuntime(project, options) {
   const mode = project?.mode;
-  const hasLocalKey = typeof options.env?.[options.anthropicEnvVar] === 'string' && options.env[options.anthropicEnvVar].trim() !== '';
+  const localProvider = options.localProvider;
+  const hasLocalKey =
+    localProvider &&
+    typeof options.env?.[localProvider.credentialEnvVar] === 'string' &&
+    options.env[localProvider.credentialEnvVar].trim() !== '';
   const hasHostedBinding =
     project?.sync &&
     typeof project.sync === 'object' &&
@@ -193,23 +309,39 @@ function resolveDocsReviewRuntime(project, options) {
     typeof project.sync.project_id === 'string';
 
   if (mode === 'local-only') {
-    if (!hasLocalKey) {
+    if (options.runLocal && !localProvider) {
+      throw new Error('docs-review --run-local requires --provider <name>. Supported providers: anthropic.');
+    }
+
+    if (options.runLocal && !hasLocalKey) {
       throw new Error(
-        `docs-review for local-only projects requires ${options.anthropicEnvVar}. Set that environment variable or use local-primary/hosted sync.`,
+        `docs-review --run-local --provider ${localProvider.provider} requires ${localProvider.credentialEnvVar}.`,
       );
     }
 
-    return {
-      provider: 'local-anthropic',
-      credential_env_var: options.anthropicEnvVar,
-    };
+    return localProvider
+      ? {
+        provider: 'local',
+        local_provider: localProvider.provider,
+        credential_env_var: localProvider.credentialEnvVar,
+      }
+      : { provider: 'external' };
   }
 
   if (mode === 'local-primary') {
-    if (options.preferLocalAnthropic && hasLocalKey) {
+    if (options.runLocal) {
+      if (!localProvider) {
+        throw new Error('docs-review --run-local requires --provider <name>. Supported providers: anthropic.');
+      }
+
+      if (!hasLocalKey) {
+        throw new Error(`docs-review --run-local --provider ${localProvider.provider} requires ${localProvider.credentialEnvVar}.`);
+      }
+
       return {
-        provider: 'local-anthropic',
-        credential_env_var: options.anthropicEnvVar,
+        provider: 'local',
+        local_provider: localProvider.provider,
+        credential_env_var: localProvider.credentialEnvVar,
       };
     }
 
@@ -220,14 +352,15 @@ function resolveDocsReviewRuntime(project, options) {
         project_id: project.sync.project_id,
         ...(typeof project.sync.credential_env_var === 'string'
           ? { credential_env_var: project.sync.credential_env_var }
-          : {}),
+        : {}),
       };
     }
 
     if (hasLocalKey) {
       return {
-        provider: 'local-anthropic',
-        credential_env_var: options.anthropicEnvVar,
+        provider: 'local',
+        local_provider: localProvider.provider,
+        credential_env_var: localProvider.credentialEnvVar,
       };
     }
 
@@ -237,6 +370,10 @@ function resolveDocsReviewRuntime(project, options) {
   }
 
   if (mode === 'hosted-only') {
+    if (options.runLocal) {
+      throw new Error('docs-review --run-local is not supported for hosted-only projects. Use --submit-hosted, or switch the project to local-only/local-primary mode for direct local execution.');
+    }
+
     if (!hasHostedBinding) {
       throw new Error('docs-review for hosted-only projects requires a hosted sync binding in project.yaml.');
     }
@@ -254,18 +391,26 @@ function resolveDocsReviewRuntime(project, options) {
   throw new Error('docs-review requires project.yaml mode to be local-only, local-primary, or hosted-only.');
 }
 
-async function runLocalAnthropicDocsReview(options) {
-  if (options.runtime.provider !== 'local-anthropic') {
-    throw new Error('docs-review --run-local-anthropic requires local Anthropic runtime.');
+async function runLocalDocsReview(options) {
+  if (options.runtime.provider !== 'local') {
+    throw new Error('docs-review --run-local requires local runtime.');
   }
 
+  if (options.runtime.local_provider !== 'anthropic') {
+    throw new Error(`Unsupported local docs-review provider "${options.runtime.local_provider}". Supported providers: anthropic.`);
+  }
+
+  return runLocalAnthropicDocsReview(options);
+}
+
+async function runLocalAnthropicDocsReview(options) {
   if (typeof options.fetch !== 'function') {
-    throw new Error('docs-review --run-local-anthropic requires a fetch implementation.');
+    throw new Error('docs-review --run-local --provider anthropic requires a fetch implementation.');
   }
 
   const credential = normalizeOptionalString(options.env?.[options.runtime.credential_env_var]);
   if (!credential) {
-    throw new Error(`docs-review --run-local-anthropic requires ${options.runtime.credential_env_var}.`);
+    throw new Error(`docs-review --run-local --provider anthropic requires ${options.runtime.credential_env_var}.`);
   }
 
   const response = await options.fetch('https://api.anthropic.com/v1/messages', {
@@ -318,6 +463,52 @@ function extractAnthropicText(body) {
     .map((item) => item.text)
     .join('\n\n')
     .trim() || null;
+}
+
+function parseArchitectureDocBlocks(source) {
+  const blocks = [];
+  const pattern = /^```vibecompass-architecture-doc\s+path=([^\s`]+)\s*\n([\s\S]*?)^```[ \t]*$/gm;
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    blocks.push({
+      path: normalizeBlockPath(match[1]),
+      content: match[2].replace(/\n$/, ''),
+    });
+  }
+
+  return blocks;
+}
+
+function normalizeBlockPath(value) {
+  return String(value ?? '').trim().replaceAll('\\', '/');
+}
+
+function validateArchitectureDocBlock(block) {
+  if (!block.path.startsWith('architecture/') || !block.path.endsWith('.md')) {
+    throw new Error(`Accepted docs-review output can only write architecture/*.md files. Invalid path: ${block.path}`);
+  }
+
+  if (path.posix.isAbsolute(block.path) || block.path.split('/').includes('..')) {
+    throw new Error(`Accepted docs-review output path must stay inside architecture/. Invalid path: ${block.path}`);
+  }
+
+  if (block.path.split('/').length < 3) {
+    throw new Error(
+      `Accepted docs-review output path must include at least one subdirectory under architecture/. Invalid path: ${block.path}`,
+    );
+  }
+
+  const frontmatter = parseFrontmatter(block.content, { sourceName: block.path });
+  if (!frontmatter.hasFrontmatter || !frontmatter.data) {
+    throw new Error(`Accepted architecture doc ${block.path} must include frontmatter.`);
+  }
+
+  for (const field of ['domain', 'feature', 'component', 'status']) {
+    if (typeof frontmatter.data[field] !== 'string' || frontmatter.data[field].trim() === '') {
+      throw new Error(`Accepted architecture doc ${block.path} requires non-empty frontmatter field "${field}".`);
+    }
+  }
 }
 
 async function submitHostedDocsReview(options) {
@@ -386,6 +577,15 @@ async function writeDocsReviewMarker(statePath, marker) {
   await writeFile(statePath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
 }
 
+async function pathExists(targetPath) {
+  try {
+    await access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function normalizeOptionalString(value) {
   if (typeof value !== 'string') {
     return null;
@@ -417,45 +617,79 @@ function renderDocsReviewMessage(options) {
     return 'Hosted docs-review request submitted. Poll the hosted run, apply accepted docs changes locally, then run docs-review --complete.';
   }
 
-  if (options.runLocalAnthropic) {
-    return 'Local Anthropic docs-review completed. Review the generated output, apply accepted docs changes locally, then run docs-review --complete.';
+  if (shouldRunLocal(options)) {
+    const provider = options.provider ?? 'anthropic';
+    return `Local ${provider} docs-review completed. Review the generated output, then run docs-review --apply-output after accepting the architecture docs.`;
   }
 
   return 'Docs-review preflight passed. Run the generated architecture-review prompt in the selected LLM, then record completion after applying accepted docs changes.';
 }
 
 function renderReviewPrompt(options) {
-  const createdAt = new Date().toISOString();
-
   return [
-    'Run a comprehensive VibeCompass architecture documentation review.',
+    '# VibeCompass Docs Review Prompt v1',
     '',
-    'When creating or updating architecture docs, include this metadata sub-header near the top of every generated architecture doc:',
+    'Run a comprehensive VibeCompass architecture documentation review for the project-memory root below. Follow this prompt exactly; do not invent a different document structure.',
+    '',
+    '## Review Context',
+    `- Project memory root: ${options.rootDir}`,
+    `- Project: ${options.project.name}`,
+    `- Project mode: ${options.project.mode}`,
+    `- Review provider to record: ${options.llm}`,
+    `- Review model/version to record: ${options.model}`,
+    '',
+    '## Required Inputs',
+    '1. Read `project.yaml`.',
+    '2. Read `context.md` if present.',
+    '3. Read all canonical files under `architecture/`, `decisions/`, and finalized `sessions/`.',
+    '4. Inspect the declared repositories and cite concrete source, config, and test files before making implementation claims.',
+    '',
+    '## Architecture Doc Contract',
+    'When creating or updating architecture docs, use the existing VibeCompass structure:',
+    '- path: `architecture/<domain-slug>/<feature-slug>/<component-slug>.md` for component docs',
+    '- frontmatter fields: `domain`, `feature`, `component`, `status`, plus `repo` or `repos` when implementation-scoped',
+    '- body sections: `## Description`, `## Review metadata`, `## Details`, `## Next steps`, `## Involved files`',
+    '',
+    'Use this exact Review metadata sub-header in every generated architecture doc:',
     '',
     '## Review metadata',
-    `- Review created at: ${createdAt}`,
     `- Review provider: ${options.llm}`,
     `- Review model/version: ${options.model}`,
-    `- Project memory root: ${options.rootDir}`,
     `- Project mode: ${options.project.mode}`,
     '- Confidence: high | medium | low',
     '- Coverage: comprehensive | partial | initial',
     '- Evidence: repo:path references inspected before making implementation claims',
     '- Blindspots: explicit list, or "None identified" only when evidence is comprehensive',
     '',
-    `Project memory root: ${options.rootDir}`,
-    `Project: ${options.project.name}`,
-    `LLM/model recorded for review: ${options.llm} / ${options.model}`,
+    '## Review Rules',
+    '1. Do not delete `architecture/overview/project-shape.md`.',
+    '2. Add evidence-backed component docs alongside the overview.',
+    '3. Update `architecture/overview/project-shape.md` coverage and blindspot sections to summarize what has now been mapped.',
+    '4. Keep all implementation claims source-backed with `repo:path` evidence.',
+    '5. Use only the exact confidence and coverage enum values listed above.',
+    '6. Put uncertainty in `Blindspots`; do not fill gaps with guesses.',
+    '7. Do not append real `D-NNN` decisions without explicit user acceptance. Propose candidate decisions separately.',
+    '8. Do not edit `decisions/INDEX.md` directly unless a canonical decision file was explicitly accepted and appended.',
     '',
-    'Instructions:',
-    '1. Read project.yaml, context.md if present, and all canonical architecture/decision/session files.',
-    '2. Inspect the declared repositories and key source/config/test files before making claims.',
-    '3. Do not delete `architecture/overview/project-shape.md`. Add new `architecture/<domain>/<feature>/<component>.md` docs alongside it.',
-    '4. Update `architecture/overview/project-shape.md` so its coverage/blindspot sections summarize what has now been mapped.',
-    '5. Keep architecture docs honest: use only the exact confidence and coverage enums from Review metadata, include blindspots, and cite involved repo:path evidence.',
-    '6. Do not append real D-NNN decisions without explicit user acceptance; propose candidate decisions separately.',
-    '7. After accepted docs changes are applied, update state/docs-review.json to status "completed" with completed_at, llm, and model.',
+    '## Output Contract',
+    'First provide a concise findings summary with:',
+    '- mapped areas',
+    '- gaps/blindspots',
+    '- proposed architecture docs',
+    '- proposed decisions, if any',
+    '',
+    'Then, for each architecture doc the user accepts, output one fenced block exactly like this:',
+    '',
+    '```vibecompass-architecture-doc path=architecture/domain/feature/component.md',
+    '<complete markdown file content>',
+    '```',
+    '',
+    'Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks. After accepted docs are applied, `vibecompass docs-review --apply-output` records completion in `state/docs-review.json`.',
   ].join('\n');
+}
+
+function ensureTrailingNewline(value) {
+  return value.endsWith('\n') ? value : `${value}\n`;
 }
 
 function defaultModelForLlm(llm) {

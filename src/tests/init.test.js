@@ -411,17 +411,13 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
     });
 
-    await assert.rejects(
-      () =>
-        runCli(
-          ['docs-review', '--root', localOnlyRoot, '--llm', 'openai', '--model', 'gpt-5.5'],
-          {
-            stdout: { write() {} },
-            stderr: { write() {} },
-          },
-          { cwd: tempDir, env: {} },
-        ),
-      /requires ANTHROPIC_API_KEY/,
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--llm', 'openai', '--model', 'gpt-5.5'],
+      {
+        stdout: { write() {} },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
     );
 
     const localStdout = [];
@@ -432,7 +428,9 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
         'docs-review',
         '--root',
         localOnlyRoot,
-        '--run-local-anthropic',
+        '--run-local',
+        '--provider',
+        'anthropic',
         '--llm',
         'claude',
         '--model',
@@ -466,7 +464,31 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                 content: [
                   {
                     type: 'text',
-                    text: '## Review metadata\n- Confidence: medium\n- Coverage: partial\n\nGenerated review.',
+                    text: [
+                      'Generated review.',
+                      '',
+                      '```vibecompass-architecture-doc path=architecture/platform/docs-review/local-runtime.md',
+                      '---',
+                      'domain: Platform',
+                      'feature: Docs Review',
+                      'component: Local Runtime',
+                      'status: In progress',
+                      'repo: app',
+                      '---',
+                      '',
+                      '## Description',
+                      'Accepted local runtime docs.',
+                      '',
+                      '## Details',
+                      'Generated review details.',
+                      '',
+                      '## Next steps',
+                      '- Continue.',
+                      '',
+                      '## Involved files',
+                      '- `app:src/docs-review.js`',
+                      '```',
+                    ].join('\n'),
                   },
                 ],
               };
@@ -492,6 +514,55 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localMarker.local_review.provider, 'anthropic');
     assert.equal(localMarker.local_review.truncated, true);
     assert.match(localOutput, /Generated review/);
+    assert.match(localMarker.runtime.provider, /local/);
+    assert.equal(localMarker.runtime.local_provider, 'anthropic');
+
+    const applyStdout = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: {
+          write(chunk) {
+            applyStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const appliedDoc = await readFile(
+      path.join(localOnlyRoot, 'architecture/platform/docs-review/local-runtime.md'),
+      'utf8',
+    );
+    const appliedMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(applyStdout.join(''), /Applied architecture docs: 1/);
+    assert.match(applyStdout.join(''), /architecture\/platform\/docs-review\/local-runtime\.md \(created\)/);
+    assert.match(appliedDoc, /Accepted local runtime docs/);
+    assert.equal(appliedMarker.status, 'completed');
+    assert.deepEqual(appliedMarker.applied.architecture_docs, [
+      { path: 'architecture/platform/docs-review/local-runtime.md', status: 'created' },
+    ]);
+
+    const overwriteStdout = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: {
+          write(chunk) {
+            overwriteStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const overwrittenMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(overwriteStdout.join(''), /architecture\/platform\/docs-review\/local-runtime\.md \(overwritten\)/);
+    assert.deepEqual(overwrittenMarker.applied.architecture_docs, [
+      { path: 'architecture/platform/docs-review/local-runtime.md', status: 'overwritten' },
+    ]);
 
     await initializeProjectMemory({
       cwd: tempDir,
@@ -540,9 +611,12 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v1/);
+    assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Do not delete `architecture\/overview\/project-shape\.md`/);
+    assert.match(stdout.join(''), /body sections: `## Description`, `## Review metadata`, `## Details`, `## Next steps`, `## Involved files`/);
     assert.equal(marker.status, 'external-review-requested');
     assert.equal(marker.llm, 'codex');
     assert.equal(marker.model, 'gpt-5.3-codex');
@@ -582,7 +656,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(fetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
     assert.equal(hostedBody.llm, 'claude');
     assert.equal(Object.hasOwn(hostedBody, 'project_memory_root'), false);
-    assert.match(hostedBody.prompt, /Run a comprehensive VibeCompass architecture documentation review/);
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v1/);
+    assert.match(hostedBody.prompt, /Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
     assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
     assert.equal(hostedMarker.status, 'hosted-review-requested');
@@ -615,7 +690,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     await assert.rejects(
       () =>
         runCli(
-          ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--run-local-anthropic'],
+          ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--run-local'],
           {
             stdout: { write() {} },
             stderr: { write() {} },

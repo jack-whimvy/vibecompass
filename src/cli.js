@@ -172,6 +172,12 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.localReview) {
       io.stdout.write(`Local review output: ${result.localReview.output_path}\n`);
     }
+    if (result.applied) {
+      io.stdout.write(`Applied architecture docs: ${result.applied.architecture_docs.length}\n`);
+      for (const entry of result.applied.architecture_docs) {
+        io.stdout.write(`- ${entry.path} (${entry.status})\n`);
+      }
+    }
     writeWarnings(io, result.warnings);
     io.stdout.write(`Recorded ${result.statePath}\n`);
     io.stdout.write(`${result.message}\n`);
@@ -655,6 +661,16 @@ function parseDocsReviewArgs(argv) {
       continue;
     }
 
+    if (token === '--run-local') {
+      parsed.runLocal = true;
+      continue;
+    }
+
+    if (token === '--apply-output') {
+      parsed.applyOutput = true;
+      continue;
+    }
+
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
     }
@@ -677,6 +693,12 @@ function parseDocsReviewArgs(argv) {
         break;
       case '--anthropic-env-var':
         parsed.anthropicEnvVar = value;
+        break;
+      case '--provider':
+        parsed.provider = value;
+        break;
+      case '--output':
+        parsed.outputPath = value;
         break;
       case '--max-tokens':
         parsed.maxTokens = value;
@@ -797,7 +819,11 @@ function usageText() {
     '  --guided                             Accepted for the explicit comprehensive-review workflow',
     '  --submit-hosted                      Submit the generated review request to hosted sync',
     '  --complete                           Mark accepted docs-review changes as completed locally',
-    '  --run-local-anthropic                Run the generated review request with local Anthropic',
+    '  --run-local                          Run the generated review request with a local provider',
+    '  --provider <name>                    Local provider for --run-local. Currently: anthropic',
+    '  --run-local-anthropic                Compatibility alias for --run-local --provider anthropic',
+    '  --apply-output                       Apply accepted architecture doc blocks from review output',
+    '  --output <path>                      Review output path for --apply-output; defaults to state/docs-review-output.md',
     '  --llm <name>                         Preferred LLM/provider to run the external architecture review',
     '  --model <name>                       Model name to record for the review',
     '  --anthropic-env-var <name>           Env var to use for local Anthropic docs-review runtime',

@@ -21,7 +21,8 @@ Shipped today:
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
 - `vibecompass docs-review --guided` — print a comprehensive review prompt for your chosen LLM to run
 - `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app (execution paused; details below)
-- `vibecompass docs-review --run-local-anthropic` — interim Anthropic-only adapter that saves raw review output locally
+- `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
+- `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
 - canonical file scanning and validation
 - `state/manifest.json` generation
@@ -31,8 +32,8 @@ Not shipped yet:
 
 - hosted sync commands (push, pull-preview, pull-export)
 - hosted docs-review execution that runs the review and writes canonical docs
-- a provider-agnostic local docs-review runtime (today's `--run-local-anthropic` is interim and Anthropic-only)
-- automatic writing of review output into `architecture/` docs (your AI writes those after the review prompt)
+- additional local docs-review providers beyond Anthropic
+- automatic acceptance of review findings without a local apply step
 
 The package is publishable now as the file-contract and read-model core. The
 broader local-primary sync workflow is still being built on top of it.
@@ -138,14 +139,19 @@ remind you with a non-blocking warning if no completed review exists.
 
 What happens:
 
-1. The CLI asks which LLM you'll use, then prints a review prompt.
+1. The CLI asks which LLM you'll use, then prints a versioned prompt template with fixed review criteria.
 2. You paste that prompt into your AI tool (Claude Code, Codex, Cursor, etc.).
 3. The AI reads your repo and writes architecture docs under
    `architecture/<domain>/<feature>/<component>.md`.
-4. Run `vibecompass docs-review --complete` once the docs are in place.
-   The prompt also tells the AI to flip the marker itself, so this step is
-   often idempotent — it's the explicit/CLI path when you want to confirm
-   from the terminal.
+4. Run `vibecompass docs-review --apply-output` after accepting fenced
+   architecture-doc blocks, or `--complete` if accepted docs were written
+   manually.
+
+The guided prompt is deterministic apart from project-specific fields
+(`project`, `mode`, `root`, provider, and model). It uses the same structure
+VibeCompass dogfoods: read project memory first, inspect source evidence,
+write component docs with review metadata, preserve the starter overview, and
+emit accepted docs as `vibecompass-architecture-doc` blocks.
 
 The package never calls an AI itself — that's intentional. You stay in
 control of which provider runs the review and what gets saved.
@@ -156,10 +162,12 @@ control of which provider runs the review and what gets saved.
   run ID. The hosted worker that actually runs the review and writes docs
   isn't live yet, so the submission is durably accepted but no scan runs
   against it.
-- `--run-local-anthropic` calls Anthropic directly with your
+- `--run-local --provider anthropic` calls Anthropic directly with your
   `ANTHROPIC_API_KEY` and saves the raw output to
-  `state/docs-review-output.md`. This flag is interim — the long-term shape
-  is provider-agnostic (`--run-local --provider <name>`).
+  `state/docs-review-output.md`.
+- `--apply-output` writes accepted fenced architecture-doc blocks from
+  `state/docs-review-output.md` into canonical `architecture/` docs and
+  completes the local review marker.
 
 For most users, stick with `--guided`.
 
@@ -410,35 +418,55 @@ Options:
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--guided`: print a comprehensive review prompt for your chosen LLM to run (recommended)
 - `--submit-hosted`: submit the review request to the hosted app (execution paused; submission durable)
-- `--run-local-anthropic`: interim Anthropic-only adapter; saves raw output to `state/docs-review-output.md`
+- `--run-local`: run the generated review request with a local provider
+- `--provider <name>`: local provider for `--run-local`; currently `anthropic`
+- `--run-local-anthropic`: compatibility alias for `--run-local --provider anthropic`
+- `--apply-output`: apply accepted architecture-doc blocks from review output
+- `--output <path>`: review output path for `--apply-output`; defaults to `state/docs-review-output.md`
 - `--complete`: mark accepted docs-review changes as completed in local state
 - `--llm <name>`: preferred LLM/provider to record for the review (e.g. `claude`, `codex`, `gemini`)
 - `--model <name>`: model name/version to record for the review
 - `--anthropic-env-var <name>`: env var for local Anthropic runtime; defaults to `ANTHROPIC_API_KEY`
 - `--max-tokens <number>`: local Anthropic output budget, 1024–32000; defaults to 16000
 
-This command does not call an AI itself. `--guided` prints a review prompt
-your chosen LLM runs; `--submit-hosted` and `--run-local-anthropic` are
-alternative paths described above.
+Plain `--guided` does not call an AI itself; it prints a review prompt your
+chosen LLM runs. `--submit-hosted`, `--run-local`, and `--apply-output` are
+explicit alternative steps.
 
-Project-mode requirements (for `--guided` and `--submit-hosted`):
+Project-mode requirements:
 
-- `local-only` — local Anthropic key required
-- `local-primary` — hosted sync binding preferred; local Anthropic key accepted
+- `local-only` — `--guided` can use any external LLM; `--run-local` requires a supported local provider key
+- `local-primary` — hosted sync binding preferred for hosted submission; local provider key accepted for `--run-local`
 - `hosted-only` — hosted sync binding required
 
-`--run-local-anthropic` always uses local Anthropic regardless of binding,
-so the local-primary precedence above does not apply when that flag is set.
+`--run-local --provider anthropic` always uses local Anthropic regardless of
+hosted binding, so hosted precedence does not apply when that flag is set.
 
 `--submit-hosted` uses `sync.credential_env_var` and records the hosted run
 ID in `state/docs-review.json`. Submission is durable today; the hosted
 worker that runs the review and writes canonical docs is not yet live, so
 no scan executes against the submitted request. Local files stay untouched.
 
-`--run-local-anthropic` is an interim adapter and will be replaced by a
-provider-agnostic shape (`--run-local --provider <name>`). It saves raw
-output to `state/docs-review-output.md`; apply accepted changes manually.
-For new scripts, prefer `--guided`.
+`--run-local-anthropic` remains as a compatibility alias. New scripts should
+use `--run-local --provider anthropic`.
+
+`--apply-output` looks for accepted architecture docs in fenced blocks:
+
+````md
+```vibecompass-architecture-doc path=architecture/domain/feature/component.md
+---
+domain: Platform
+feature: Example
+component: Backend
+status: In progress
+---
+
+## Description
+Accepted review content.
+```
+````
+
+Only `architecture/*.md` paths are writable through this apply step.
 
 `vibecompass docs-review --complete` updates the marker in
 `state/docs-review.json` to `status: "completed"` once the docs have
