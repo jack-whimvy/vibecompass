@@ -187,6 +187,11 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         io.stdout.write(`- ${entry.path} (${entry.status})\n`);
       }
     }
+    if (result.appliedDecisionArtifact) {
+      io.stdout.write(`Applied decision artifact: ${result.appliedDecisionArtifact.artifact_id}\n`);
+      io.stdout.write(`Decision: D-${String(result.appliedDecisionArtifact.decision_id).padStart(3, '0')}\n`);
+      io.stdout.write(`Target: ${result.appliedDecisionArtifact.target_path}\n`);
+    }
     writeWarnings(io, result.warnings);
     io.stdout.write(`Recorded ${result.statePath}\n`);
     io.stdout.write(`${result.message}\n`);
@@ -769,6 +774,16 @@ function parseDocsReviewArgs(argv) {
       continue;
     }
 
+    if (token === '--apply-decision-artifact') {
+      parsed.applyDecisionArtifact = true;
+      continue;
+    }
+
+    if (token === '--refresh-index') {
+      parsed.refreshIndex = true;
+      continue;
+    }
+
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
     }
@@ -797,6 +812,9 @@ function parseDocsReviewArgs(argv) {
         break;
       case '--output':
         parsed.outputPath = value;
+        break;
+      case '--artifact':
+        parsed.artifactId = value;
         break;
       case '--max-tokens':
         parsed.maxTokens = value;
@@ -1081,6 +1099,9 @@ function usageText() {
     '  --run-local-anthropic                Compatibility alias for --run-local --provider anthropic',
     '  --apply-output                       Apply accepted architecture doc blocks from review output',
     '  --output <path>                      Review output path for --apply-output; defaults to state/docs-review-output.md',
+    '  --apply-decision-artifact            Append an accepted hosted decision artifact locally',
+    '  --artifact <id>                      Artifact ID for --apply-decision-artifact',
+    '  --refresh-index                      Also regenerate decisions/INDEX.md after applying a decision artifact',
     '  --llm <name>                         Preferred LLM/provider to run the external architecture review',
     '  --model <name>                       Model name to record for the review',
     '  --anthropic-env-var <name>           Env var to use for local Anthropic docs-review runtime',

@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
@@ -18,6 +18,15 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       outputPath: options.outputPath,
       llm: options.llm,
       model: options.model,
+    });
+  }
+
+  if (options.applyDecisionArtifact) {
+    return applyDecisionArtifact({
+      rootDir,
+      statePath,
+      artifactId: options.artifactId,
+      refreshIndex: options.refreshIndex,
     });
   }
 
@@ -155,6 +164,7 @@ async function completeDocsReview(options) {
     runtime: current.runtime ?? null,
     hosted: current.hosted ?? null,
     applied: current.applied ?? null,
+    appliedDecisionArtifact: current.applied_decision_artifact ?? null,
     reviewPrompt: null,
     warnings: [],
     message: 'Docs-review marker completed. Future start-session warnings can treat this root as reviewed.',
@@ -220,6 +230,104 @@ async function applyDocsReviewOutput(options) {
   };
 }
 
+async function applyDecisionArtifact(options) {
+  const current = await readDocsReviewMarker(options.statePath);
+  const artifactId = normalizeOptionalString(options.artifactId);
+  if (!artifactId) {
+    throw new Error('docs-review --apply-decision-artifact requires --artifact <artifact-id>.');
+  }
+
+  const artifact = (current.hosted?.artifacts ?? []).find(
+    (item) => item?.artifact_id === artifactId,
+  );
+  if (!artifact) {
+    throw new Error(`Decision artifact ${artifactId} was not found in ${options.statePath}. Run docs-review --poll-hosted first.`);
+  }
+  if (artifact.artifact_type !== 'decision_recommendation') {
+    throw new Error(`Artifact ${artifactId} is ${artifact.artifact_type}, not decision_recommendation.`);
+  }
+
+  const content = artifact.content ?? {};
+  const targetPath = normalizeDecisionTargetPath(
+    content.target_path ?? artifact.target_path ?? 'decisions/cross-cutting.md',
+  );
+  const title = normalizeOptionalString(content.title ?? artifact.title);
+  const decision = normalizeOptionalString(content.decision ?? artifact.summary);
+  const rationale = normalizeOptionalString(content.rationale);
+  const context = normalizeOptionalString(content.context);
+
+  if (!title || !decision) {
+    throw new Error(`Decision artifact ${artifactId} must include title and decision content.`);
+  }
+  if (!rationale) {
+    throw new Error(`Decision artifact ${artifactId} must include a non-empty rationale before it can be appended locally.`);
+  }
+
+  const nextDecisionId = await readNextDecisionId(options.rootDir);
+  const targetFilePath = path.join(options.rootDir, targetPath);
+  await mkdir(path.dirname(targetFilePath), { recursive: true });
+
+  let existingContent = '';
+  try {
+    existingContent = await readFile(targetFilePath, 'utf8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    existingContent = `# ${path.basename(targetPath, '.md')} decisions\n`;
+  }
+
+  const entry = renderDecisionEntry({
+    decisionId: nextDecisionId,
+    title,
+    decision,
+    rationale,
+    context,
+    artifactId,
+  });
+  await writeFile(targetFilePath, `${existingContent.trimEnd()}\n\n${entry}`, 'utf8');
+  const indexResult = options.refreshIndex
+    ? await refreshDecisionIndex(options.rootDir)
+    : {
+      refreshed: false,
+      warnings: [
+        'decisions/INDEX.md was not refreshed. Run again with --refresh-index if this root uses the package-generated flat index, or update the project-specific index manually.',
+      ],
+    };
+
+  const appliedDecisionArtifact = {
+    artifact_id: artifactId,
+    decision_id: nextDecisionId,
+    target_path: targetPath,
+    applied_at: new Date().toISOString(),
+    refreshed_index: indexResult.refreshed,
+  };
+  await writeDocsReviewMarker(options.statePath, {
+    ...current,
+    applied_decision_artifact: appliedDecisionArtifact,
+    hosted: {
+      ...current.hosted,
+      artifacts: (current.hosted?.artifacts ?? []).map((item) =>
+        item?.artifact_id === artifactId
+          ? { ...item, local_status: 'applied', local_decision_id: nextDecisionId }
+          : item,
+      ),
+    },
+  });
+
+  return {
+    rootDir: options.rootDir,
+    statePath: options.statePath,
+    status: current.status ?? 'hosted-review-completed',
+    llm: current.llm ?? null,
+    model: current.model ?? null,
+    runtime: current.runtime ?? null,
+    hosted: current.hosted ?? null,
+    appliedDecisionArtifact,
+    reviewPrompt: null,
+    warnings: indexResult.warnings,
+    message: `Applied decision artifact ${artifactId} as D-${String(nextDecisionId).padStart(3, '0')} in ${targetPath}.`,
+  };
+}
+
 async function readDocsReviewMarker(statePath) {
   try {
     return JSON.parse(await readFile(statePath, 'utf8'));
@@ -239,6 +347,7 @@ function validateDocsReviewMode(options) {
     options.runLocal ? '--run-local' : null,
     options.runLocalAnthropic ? '--run-local-anthropic' : null,
     options.applyOutput ? '--apply-output' : null,
+    options.applyDecisionArtifact ? '--apply-decision-artifact' : null,
     options.complete ? '--complete' : null,
   ].filter(Boolean);
 
@@ -644,6 +753,8 @@ async function pollHostedDocsReview(options) {
     prompt_version: _oldPromptVersion,
     parser_version: _oldParserVersion,
     proposal_ids: _oldProposalIds,
+    artifact_ids: _oldArtifactIds,
+    artifacts: _oldArtifacts,
     warnings: _oldWarnings,
     error_code: _oldErrorCode,
     error_message: _oldErrorMessage,
@@ -660,6 +771,8 @@ async function pollHostedDocsReview(options) {
     ...(normalizeOptionalString(body.prompt_version) ? { prompt_version: normalizeOptionalString(body.prompt_version) } : {}),
     ...(normalizeOptionalString(body.parser_version) ? { parser_version: normalizeOptionalString(body.parser_version) } : {}),
     ...(Array.isArray(body.proposal_ids) ? { proposal_ids: body.proposal_ids } : {}),
+    ...(Array.isArray(body.artifact_ids) ? { artifact_ids: body.artifact_ids } : {}),
+    ...(Array.isArray(body.artifacts) ? { artifacts: body.artifacts } : {}),
     ...(Array.isArray(body.warnings) ? { warnings: body.warnings } : {}),
     ...(normalizeOptionalString(body.error_code) ? { error_code: normalizeOptionalString(body.error_code) } : {}),
     ...(hostedErrorMessage ? { error_message: hostedErrorMessage } : {}),
@@ -724,6 +837,135 @@ function normalizeUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
     ? normalized
     : null;
+}
+
+function normalizeDecisionTargetPath(value) {
+  const normalized = normalizeBlockPath(value);
+  if (
+    !normalized.startsWith('decisions/') ||
+    !normalized.endsWith('.md') ||
+    normalized.split('/').length !== 2 ||
+    normalized.split('/').some((part) => part === '..' || part === '') ||
+    ['decisions/INDEX.md', 'decisions/README.md', 'decisions/EXAMPLE.md'].includes(normalized)
+  ) {
+    throw new Error(`Decision artifact target must be a decisions/*.md domain file. Invalid path: ${value}`);
+  }
+
+  return normalized;
+}
+
+async function readNextDecisionId(rootDir) {
+  const decisionsDir = path.join(rootDir, 'decisions');
+  let max = 0;
+
+  for (const fileName of await listDecisionFileNames(decisionsDir)) {
+    const content = await readFile(path.join(decisionsDir, fileName), 'utf8');
+    for (const match of content.matchAll(/^###\s+D-(\d+)\b/gm)) {
+      max = Math.max(max, Number(match[1]));
+    }
+  }
+
+  return max + 1;
+}
+
+async function listDecisionFileNames(decisionsDir) {
+  try {
+    return (await readdir(decisionsDir))
+      .filter((fileName) =>
+        fileName.endsWith('.md') &&
+        !['INDEX.md', 'README.md', 'EXAMPLE.md'].includes(fileName),
+      )
+      .sort((left, right) => left.localeCompare(right));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+function renderDecisionEntry(options) {
+  const decisionNumber = `D-${String(options.decisionId).padStart(3, '0')}`;
+  return [
+    `### ${decisionNumber} — ${options.title}`,
+    '',
+    `**Timestamp:** ${formatDecisionTimestamp(new Date())}`,
+    `**Decision:** ${options.decision}`,
+    `**Rationale:** ${options.rationale}`,
+    ...(options.context ? [`**Context:** ${options.context}`] : []),
+    '',
+  ].join('\n');
+}
+
+function formatDecisionTimestamp(date) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffset / 60)).padStart(2, '0');
+  const offsetRemainder = String(absoluteOffset % 60).padStart(2, '0');
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+
+  return `${yyyy}-${mm}-${dd} ${hh}:${min} ${formatTimeZoneAbbreviation(date) ?? `UTC${sign}${offsetHours}:${offsetRemainder}`}`;
+}
+
+function formatTimeZoneAbbreviation(date) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZoneName: 'short',
+    }).formatToParts(date);
+    const zone = parts.find((part) => part.type === 'timeZoneName')?.value;
+    return zone && !/^GMT[+-]/.test(zone) ? zone : null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshDecisionIndex(rootDir) {
+  const decisionsDir = path.join(rootDir, 'decisions');
+  const indexPath = path.join(decisionsDir, 'INDEX.md');
+  const warnings = [];
+  const rows = [];
+
+  for (const fileName of await listDecisionFileNames(decisionsDir)) {
+    const relativePath = `decisions/${fileName}`;
+    const content = await readFile(path.join(decisionsDir, fileName), 'utf8');
+    for (const match of content.matchAll(/^###\s+D-(\d+)\s+—\s+(.+)$/gm)) {
+      rows.push({
+        id: Number(match[1]),
+        title: match[2].trim(),
+        domainFile: fileName,
+      });
+    }
+    if (!content.match(/^###\s+D-(\d+)\s+—\s+(.+)$/m)) {
+      warnings.push(`No indexable decisions found in ${relativePath}.`);
+    }
+  }
+
+  rows.sort((left, right) => left.id - right.id);
+  await mkdir(decisionsDir, { recursive: true });
+  await writeFile(indexPath, renderDecisionIndex(rows), 'utf8');
+  return { refreshed: true, warnings };
+}
+
+function renderDecisionIndex(rows) {
+  return [
+    '# Decision Index',
+    '',
+    'All decisions in chronological order. Each entry links to its domain file.',
+    '',
+    '> **Rule:** Decisions are append-only — never modify existing entries.',
+    '',
+    '| # | Decision | Domain |',
+    '|---|----------|--------|',
+    ...rows.map((row) => {
+      const decisionNumber = `D-${String(row.id).padStart(3, '0')}`;
+      const domain = path.basename(row.domainFile, '.md');
+      return `| ${decisionNumber} | ${row.title} | [${domain}](${row.domainFile}) |`;
+    }),
+    '',
+  ].join('\n');
 }
 
 function markerStatusForHostedRunStatus(status) {

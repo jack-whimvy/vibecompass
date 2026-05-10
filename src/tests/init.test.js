@@ -1485,6 +1485,228 @@ test('initializeProjectMemory rejects sync configuration outside local-primary m
   );
 });
 
+test('docs-review applies hosted decision artifacts append-only with next D-number', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-decision-artifact-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-124 — Existing decision',
+        '',
+        '**Timestamp:** 2026-04-19 00:01 UTC-07:00',
+        '**Decision:** Existing decision text.',
+        '**Rationale:** Existing rationale.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({
+        status: 'hosted-review-completed',
+        hosted: {
+          run_id: 'run_docs_review_123',
+          artifacts: [
+            {
+              artifact_id: 'artifact_decision_1',
+              artifact_type: 'decision_recommendation',
+              title: 'Decision artifacts append locally',
+              summary: 'Decision recommendations append locally instead of overwriting decision files.',
+              target_path: 'decisions/cross-cutting.md',
+              content: {
+                target_path: 'decisions/cross-cutting.md',
+                title: 'Decision artifacts append locally',
+                decision: 'Decision recommendations append locally instead of overwriting decision files.',
+                rationale: 'Decision logs are append-only and D-numbers must be allocated from current local state.',
+              },
+            },
+          ],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const stdout = [];
+    const stderr = [];
+    await runCli(
+      [
+        'docs-review',
+        '--root',
+        rootDir,
+        '--apply-decision-artifact',
+        '--artifact',
+        'artifact_decision_1',
+      ],
+      {
+        stdout: { write(chunk) { stdout.push(chunk); } },
+        stderr: { write(chunk) { stderr.push(chunk); } },
+      },
+      { cwd: tempDir, env: {} },
+    );
+
+    const decisions = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(stdout.join(''), /Applied decision artifact: artifact_decision_1/);
+    assert.match(stderr.join(''), /decisions\/INDEX\.md was not refreshed/);
+    assert.match(decisions, /### D-125 — Decision artifacts append locally/);
+    assert.doesNotMatch(decisions, /\*\*Source:\*\*/);
+    await assert.rejects(
+      () => access(path.join(rootDir, 'decisions/INDEX.md')),
+      /ENOENT/,
+    );
+    assert.equal(marker.applied_decision_artifact.decision_id, 125);
+    assert.equal(marker.applied_decision_artifact.refreshed_index, false);
+    assert.equal(marker.hosted.artifacts[0].local_status, 'applied');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review rejects decision artifacts without rationale', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-decision-artifact-rationale-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-124 — Existing decision',
+        '',
+        '**Timestamp:** 2026-04-19 00:01 PDT',
+        '**Decision:** Existing decision text.',
+        '**Rationale:** Existing rationale.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({
+        status: 'hosted-review-completed',
+        hosted: {
+          run_id: 'run_docs_review_123',
+          artifacts: [
+            {
+              artifact_id: 'artifact_decision_missing_rationale',
+              artifact_type: 'decision_recommendation',
+              title: 'Missing rationale',
+              summary: 'This should not be accepted without rationale.',
+              target_path: 'decisions/cross-cutting.md',
+              content: {
+                target_path: 'decisions/cross-cutting.md',
+                title: 'Missing rationale',
+                decision: 'This should not be accepted without rationale.',
+              },
+            },
+          ],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    await assert.rejects(
+      () =>
+        runCli(
+          [
+            'docs-review',
+            '--root',
+            rootDir,
+            '--apply-decision-artifact',
+            '--artifact',
+            'artifact_decision_missing_rationale',
+          ],
+          { stdout: { write() {} }, stderr: { write() {} } },
+          { cwd: tempDir, env: {} },
+        ),
+      /must include a non-empty rationale/,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review can refresh the flat decision index when explicitly requested', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-decision-artifact-index-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-124 — Existing decision',
+        '',
+        '**Timestamp:** 2026-04-19 00:01 PDT',
+        '**Decision:** Existing decision text.',
+        '**Rationale:** Existing rationale.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({
+        status: 'hosted-review-completed',
+        hosted: {
+          run_id: 'run_docs_review_123',
+          artifacts: [
+            {
+              artifact_id: 'artifact_decision_refresh_index',
+              artifact_type: 'decision_recommendation',
+              title: 'Refresh index explicitly',
+              summary: 'The flat decision index refresh is explicit.',
+              target_path: 'decisions/cross-cutting.md',
+              content: {
+                target_path: 'decisions/cross-cutting.md',
+                title: 'Refresh index explicitly',
+                decision: 'The flat decision index refresh is explicit.',
+                rationale: 'Some roots intentionally use the package-generated flat decision index.',
+              },
+            },
+          ],
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    await runCli(
+      [
+        'docs-review',
+        '--root',
+        rootDir,
+        '--apply-decision-artifact',
+        '--artifact',
+        'artifact_decision_refresh_index',
+        '--refresh-index',
+      ],
+      { stdout: { write() {} }, stderr: { write() {} } },
+      { cwd: tempDir, env: {} },
+    );
+
+    const index = await readFile(path.join(rootDir, 'decisions/INDEX.md'), 'utf8');
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(index, /D-125 \| Refresh index explicitly/);
+    assert.equal(marker.applied_decision_artifact.refreshed_index, true);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('isDirectExecution resolves symlinked bin entry paths', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-bin-'));
   const cliPath = fileURLToPath(new URL('../cli.js', import.meta.url));
