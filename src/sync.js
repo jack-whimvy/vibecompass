@@ -57,6 +57,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
   const manifest = manifestResult.manifest;
 
   const response = await postJson(context, 'pull-preview', {
+    state_version: manifest.state_version,
     base_remote_revision_id: normalizeUuid(manifest.sync?.last_successful_remote_revision),
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
@@ -70,6 +71,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     target_remote_revision: response.target_remote_revision_id,
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
+    state_version: manifest.state_version,
     authoritative_change_set_hash: response.authoritative_change_set_hash,
     include_pending_proposals: options.includePendingProposals !== false,
     available_proposal_ids: Array.isArray(response.proposals)

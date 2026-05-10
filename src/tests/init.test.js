@@ -963,6 +963,7 @@ test('runCli sync transport pushes, previews, exports, and applies proposals', a
       { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
     );
     const previewBody = JSON.parse(fetchCalls[2].request.body);
+    assert.equal(previewBody.state_version, 1);
     assert.equal(previewBody.base_remote_revision_id, remoteRevisionId);
     assert.equal(previewBody.include_pending_proposals, true);
     assert.ok(previewBody.local_documents.some((document) => document.path === 'project.yaml'));

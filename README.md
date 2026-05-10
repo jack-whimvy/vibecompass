@@ -20,7 +20,7 @@ Shipped today:
 - `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
 - `vibecompass docs-review --guided` — print a comprehensive review prompt for your chosen LLM to run
-- `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app (execution paused; details below)
+- `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app and poll for proposal/artifact output
 - `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
 - `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
@@ -153,15 +153,17 @@ VibeCompass dogfoods: read project memory first, inspect source evidence,
 write component docs with review metadata, preserve the starter overview, and
 emit accepted docs as `vibecompass-architecture-doc` blocks.
 
-The package never calls an AI itself — that's intentional. You stay in
-control of which provider runs the review and what gets saved.
+Plain `--guided` never calls an AI itself. You stay in control of which
+provider runs the review and what gets saved. Use `--run-local --provider
+anthropic` when you want the package to execute the same review through your
+local Anthropic key.
 
 ### Other ways to run a review
 
 - `--submit-hosted` sends the review request to the hosted app and records a
-  run ID. The hosted worker that actually runs the review and writes docs
-  isn't live yet, so the submission is durably accepted but no scan runs
-  against it.
+  run ID. Hosted execution creates proposals and docs-review artifacts; for
+  local-primary projects, canonical local files change only after
+  pull-preview/export/apply and a confirming push.
 - `--run-local --provider anthropic` calls Anthropic directly with your
   `ANTHROPIC_API_KEY` and saves the raw output to
   `state/docs-review-output.md`.
@@ -417,7 +419,7 @@ Options:
 
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--guided`: print a comprehensive review prompt for your chosen LLM to run (recommended)
-- `--submit-hosted`: submit the review request to the hosted app (execution paused; submission durable)
+- `--submit-hosted`: submit the review request to the hosted app
 - `--run-local`: run the generated review request with a local provider
 - `--provider <name>`: local provider for `--run-local`; currently `anthropic`
 - `--run-local-anthropic`: compatibility alias for `--run-local --provider anthropic`
@@ -443,9 +445,11 @@ Project-mode requirements:
 hosted binding, so hosted precedence does not apply when that flag is set.
 
 `--submit-hosted` uses `sync.credential_env_var` and records the hosted run
-ID in `state/docs-review.json`. Submission is durable today; the hosted
-worker that runs the review and writes canonical docs is not yet live, so
-no scan executes against the submitted request. Local files stay untouched.
+ID in `state/docs-review.json`. Hosted execution creates review proposals and
+artifacts; for `local-primary` roots, local files stay untouched until you
+pull-preview, export, apply locally, and push to confirm the accepted output.
+Missing or stale hosted baselines fail with package-facing next-step guidance
+instead of running model work against the wrong source of truth.
 
 `--run-local-anthropic` remains as a compatibility alias. New scripts should
 use `--run-local --provider anthropic`.
