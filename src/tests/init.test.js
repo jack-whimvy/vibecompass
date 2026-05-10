@@ -10,6 +10,12 @@ import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
 
+function assertPromptsInclude(prompts, expectedPrompts) {
+  for (const expectedPrompt of expectedPrompts) {
+    assert.ok(prompts.includes(expectedPrompt), `Expected prompt "${expectedPrompt}" in ${JSON.stringify(prompts)}.`);
+  }
+}
+
 test('initializeProjectMemory scaffolds a new root and writes a manifest', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -289,7 +295,7 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.match(updatedClaude, /^User header/);
     assert.match(updatedClaude, /User footer\s*$/);
 
-    await writeFile(path.join(tempDir, 'AGENTS.md'), 'Hand-written agents file\n', 'utf8');
+    await writeFile(path.join(tempDir, 'AGENTS.md'), 'Hand-written agents file\nReview handoff locally.\n', 'utf8');
     stdout.length = 0;
     await runCli(
       ['sync-agents', '--root', '.compass', '--format', 'agents_md'],
@@ -309,7 +315,53 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     );
 
     assert.match(stderr.join(''), /AGENTS\.md: warning/);
-    assert.equal(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), 'Hand-written agents file\n');
+    assert.equal(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), 'Hand-written agents file\nReview handoff locally.\n');
+
+    stdout.length = 0;
+    stderr.length = 0;
+    await runCli(
+      ['sync-agents', '--root', '.compass', '--format', 'agents_md', '--adopt-existing'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    const adoptedAgents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
+    assert.match(stdout.join(''), /AGENTS\.md: adopt/);
+    assert.match(stderr.join(''), /possible workflow overlap on lines 2/);
+    assert.match(adoptedAgents, /^Hand-written agents file/);
+    assert.match(adoptedAgents, /vibecompass:start - managed by VibeCompass/);
+    assert.equal((adoptedAgents.match(/vibecompass:start/g) ?? []).length, 1);
+
+    stdout.length = 0;
+    await runCli(
+      ['sync-agents', '--root', '.compass', '--format', 'agents_md', '--adopt-existing'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    const readoptedAgents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
+    assert.match(stdout.join(''), /AGENTS\.md: update/);
+    assert.equal((readoptedAgents.match(/vibecompass:start/g) ?? []).length, 1);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -1192,6 +1244,193 @@ test('runCli parses init arguments and creates the root', async () => {
   }
 });
 
+test('runCli prints hosted next steps when init configures a sync binding', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-hosted-next-steps-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    const exitCode = await runCli(
+      [
+        'init',
+        '--name',
+        'Hosted Setup Project',
+        '--mode',
+        'local-primary',
+        '--repo',
+        'docs=https://github.com/example/docs.git',
+        '--sync-api-url',
+        'https://vibecompass.dev',
+        '--sync-project-id',
+        'vc_proj_hosted',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(output, /Hosted binding: configured for local-primary/);
+    assert.match(output, /Next step: set VIBECOMPASS_SYNC_TOKEN locally before your first hosted command\./);
+    assert.match(output, /Then run: vibecompass push\n/);
+    assert.match(output, /Hosted docs-review: vibecompass docs-review --submit-hosted\n/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli nudges hosted-only init when no sync binding is configured', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-hosted-only-nudge-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    const exitCode = await runCli(
+      [
+        'init',
+        '--name',
+        'Hosted Only Project',
+        '--mode',
+        'hosted-only',
+        '--repo',
+        'docs=https://github.com/example/docs.git',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(output, /Hosted-only projects need a hosted sync binding before hosted commands\./);
+    assert.match(output, /rerun init with --force and --sync-api-url\/--sync-project-id\/--sync-credential-env-var/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli connect-hosted adds a hosted sync binding later', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Connect Later Project',
+      mode: 'local-primary',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const exitCode = await runCli(
+      [
+        'connect-hosted',
+        '--sync-api-url',
+        'https://vibecompass.dev',
+        '--sync-project-id',
+        'vc_proj_later',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(projectYaml, /sync:/);
+    assert.match(projectYaml, /project_id: vc_proj_later/);
+    assert.match(projectYaml, /credential_env_var: VIBECOMPASS_SYNC_TOKEN/);
+    assert.match(output, /Connected hosted VibeCompass for local-primary/);
+    assert.match(output, /Then run: vibecompass push/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli connect-hosted tells users to init first when project.yaml is missing', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-missing-'));
+
+  try {
+    await assert.rejects(
+      () =>
+        runCli(
+          [
+            'connect-hosted',
+            '--sync-api-url',
+            'https://vibecompass.dev',
+            '--sync-project-id',
+            'vc_proj_missing',
+            '--sync-credential-env-var',
+            'VIBECOMPASS_SYNC_TOKEN',
+          ],
+          {
+            stdout: {
+              write() {},
+            },
+            stderr: {
+              write() {},
+            },
+          },
+          {
+            cwd: tempDir,
+          },
+        ),
+      /Run "vibecompass init" first/,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli can chain init directly into the first builder session', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-init-session-'));
   const stdout = [];
@@ -1255,7 +1494,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
   const prompts = [];
   const answers = new Map([
     ['Project name', 'Guided Project'],
-    ['Project mode', 'local-only'],
+    ['What should VibeCompass set up?', 'local-only'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
     ['Repo 1 remote', 'https://github.com/example/app.git'],
@@ -1307,9 +1546,9 @@ test('runCli supports guided init with placement recommendation and first-sessio
     assert.equal(exitCode, 0);
     assert.match(stderr.join(''), /CLAUDE\.md: warning/);
     await access(path.join(tempDir, 'AGENTS.md'));
-    assert.deepEqual(prompts, [
+    assertPromptsInclude(prompts, [
       'Project name',
-      'Project mode',
+      'What should VibeCompass set up?',
       'How many repos belong to this logical project?',
       'Repo 1 id',
       'Repo 1 remote',
@@ -1338,6 +1577,502 @@ test('runCli supports guided init with placement recommendation and first-sessio
   }
 });
 
+test('runCli guided init defaults project mode to local-primary', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-mode-default-'));
+  const prompts = [];
+  const answers = new Map([
+    ['Project name', 'Guided Default Mode'],
+    ['What should VibeCompass set up?', ''],
+    ['How many repos belong to this logical project?', '1'],
+    ['Repo 1 id', 'app'],
+    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 default branch', ''],
+    ['Use primary-repo?', ''],
+    ['Directory of the designated primary repo', '.'],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write() {},
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assertPromptsInclude(prompts, [
+      'Project name',
+      'What should VibeCompass set up?',
+      'How many repos belong to this logical project?',
+      'Repo 1 id',
+      'Repo 1 remote',
+      'Repo 1 default branch',
+      'Use primary-repo?',
+      'Directory of the designated primary repo',
+      'Scaffold workflow files (context.md plus guide READMEs)?',
+      'Open the first builder session immediately after init?',
+    ]);
+    assert.match(projectYaml, /mode: local-primary/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init can adopt existing unmarked agent files after confirmation', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-adopt-agents-'));
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const answers = new Map([
+    ['Project name', 'Guided Adopt Agents'],
+    ['What should VibeCompass set up?', 'local-only'],
+    ['How many repos belong to this logical project?', '1'],
+    ['Repo 1 id', 'app'],
+    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 default branch', ''],
+    ['Use primary-repo?', ''],
+    ['Directory of the designated primary repo', '.'],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', ''],
+    ['Create a starter CLAUDE.md if missing?', ''],
+    ['Create a starter AGENTS.md if missing?', ''],
+    ['Append VibeCompass managed sections to existing agent instruction files?', 'yes'],
+    ['Open the first builder session immediately after init?', 'no'],
+    ['Should close-session include a Git publish step?', 'no'],
+  ]);
+
+  try {
+    await writeFile(path.join(tempDir, 'CLAUDE.md'), '# Existing Claude\n\nUse existing session notes.\n', 'utf8');
+    await writeFile(path.join(tempDir, 'AGENTS.md'), '# Existing Agents\n\nCustom builder workflow.\n', 'utf8');
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    const agents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assertPromptsInclude(prompts, [
+      'Append VibeCompass managed sections to existing agent instruction files?',
+    ]);
+    assert.match(stdout.join(''), /Existing agent instruction files without VibeCompass markers/);
+    assert.match(stdout.join(''), /CLAUDE\.md: adopt/);
+    assert.match(stdout.join(''), /AGENTS\.md: adopt/);
+    assert.match(stderr.join(''), /possible workflow overlap/);
+    assert.match(claude, /^# Existing Claude/);
+    assert.match(claude, /vibecompass:start - managed by VibeCompass/);
+    assert.match(agents, /^# Existing Agents/);
+    assert.match(agents, /vibecompass:start - managed by VibeCompass/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init infers the current single Git repo', async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-infer-'));
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const remote = 'https://github.com/example/whimvy.git';
+  const answers = new Map([
+    ['Project name', ''],
+    ['What should VibeCompass set up?', ''],
+    [`Use detected Git repo (${remote})?`, ''],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is required for this inference test.');
+      return;
+    }
+
+    await writeFile(path.join(tempDir, 'package.json'), '{"name":"whimvy"}\n', 'utf8');
+    assert.equal(spawnSync('git', ['init'], { cwd: tempDir }).status, 0);
+    assert.equal(spawnSync('git', ['remote', 'add', 'origin', remote], { cwd: tempDir }).status, 0);
+    spawnSync('git', ['checkout', '-b', 'main'], { cwd: tempDir });
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.ok(!prompts.includes('How many repos belong to this logical project?'));
+    assert.ok(!prompts.includes('Repo 1 id'));
+    assert.match(projectYaml, /name: whimvy/);
+    assert.match(projectYaml, /mode: local-primary/);
+    assert.match(projectYaml, /id: whimvy/);
+    assert.match(projectYaml, /remote: https:\/\/github.com\/example\/whimvy.git/);
+    assert.match(projectYaml, /placement_pattern: primary-repo/);
+    assert.ok(stdout.join('').includes('Optional hosted setup later: vibecompass connect-hosted'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init infers a single child Git repo from a parent workspace', async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-infer-child-'));
+  const appDir = path.join(tempDir, 'app');
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const remote = 'https://github.com/example/app.git';
+  const answers = new Map([
+    ['Project name', ''],
+    ['What should VibeCompass set up?', ''],
+    [`Use detected Git repo in app (${remote})?`, ''],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is required for this inference test.');
+      return;
+    }
+
+    await mkdir(appDir, { recursive: true });
+    await writeFile(path.join(appDir, 'package.json'), '{"name":"app"}\n', 'utf8');
+    assert.equal(spawnSync('git', ['init'], { cwd: appDir }).status, 0);
+    assert.equal(spawnSync('git', ['remote', 'add', 'origin', remote], { cwd: appDir }).status, 0);
+    spawnSync('git', ['checkout', '-b', 'main'], { cwd: appDir });
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(appDir, '.compass/project.yaml'), 'utf8');
+
+    await assert.rejects(() => access(path.join(tempDir, '.compass/project.yaml')));
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.ok(!prompts.includes('How many repos belong to this logical project?'));
+    assert.ok(!prompts.includes('Repo 1 id'));
+    assert.match(projectYaml, /id: app/);
+    assert.match(projectYaml, /remote: https:\/\/github.com\/example\/app.git/);
+    assert.match(projectYaml, /placement_pattern: primary-repo/);
+    assert.ok(stdout.join('').includes(path.join(appDir, '.compass')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init infers multiple child Git repos from a parent workspace', async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-infer-workspace-'));
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const repos = [
+    ['vibecompass', 'https://github.com/example/vibecompass.git'],
+    ['vibecompass-app', 'https://github.com/example/vibecompass-app.git'],
+    ['vibecompass-docs', 'https://github.com/example/vibecompass-docs.git'],
+  ];
+  const answers = new Map([
+    ['Project name', ''],
+    ['What should VibeCompass set up?', ''],
+    ['Use 3 detected Git repos (vibecompass, vibecompass-app, vibecompass-docs)?', ''],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is required for this inference test.');
+      return;
+    }
+
+    for (const [directory, remote] of repos) {
+      const repoDir = path.join(tempDir, directory);
+      await mkdir(repoDir, { recursive: true });
+      assert.equal(spawnSync('git', ['init'], { cwd: repoDir }).status, 0);
+      assert.equal(spawnSync('git', ['remote', 'add', 'origin', remote], { cwd: repoDir }).status, 0);
+    }
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.ok(!prompts.includes('How many repos belong to this logical project?'));
+    assert.ok(!prompts.includes('Repo 1 id'));
+    assert.ok(!prompts.includes('Do you already work from a shared multi-repo workspace checkout?'));
+    assert.ok(stdout.join('').includes('Recommended placement: workspace-root'));
+    assert.match(projectYaml, /id: vibecompass\n\s+remote: https:\/\/github.com\/example\/vibecompass.git/);
+    assert.match(projectYaml, /id: vibecompass-app\n\s+remote: https:\/\/github.com\/example\/vibecompass-app.git/);
+    assert.match(projectYaml, /id: vibecompass-docs\n\s+remote: https:\/\/github.com\/example\/vibecompass-docs.git/);
+    assert.match(projectYaml, /placement_pattern: workspace-root/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init ignores non-git children when inferring a parent workspace', async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-infer-mixed-'));
+  const appDir = path.join(tempDir, 'app');
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const remote = 'https://github.com/example/app.git';
+  const answers = new Map([
+    ['Project name', ''],
+    ['What should VibeCompass set up?', ''],
+    [`Use detected Git repo in app (${remote})?`, ''],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is required for this inference test.');
+      return;
+    }
+
+    await mkdir(appDir, { recursive: true });
+    await mkdir(path.join(tempDir, 'notes'), { recursive: true });
+    await mkdir(path.join(tempDir, 'dist'), { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: appDir }).status, 0);
+    assert.equal(spawnSync('git', ['remote', 'add', 'origin', remote], { cwd: appDir }).status, 0);
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(appDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.ok(!prompts.includes('Use 2 detected Git repos (app, notes)?'));
+    assert.ok(!prompts.includes('How many repos belong to this logical project?'));
+    assert.match(projectYaml, /id: app/);
+    assert.match(projectYaml, /remote: https:\/\/github.com\/example\/app.git/);
+    assert.match(projectYaml, /placement_pattern: primary-repo/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init falls back to repo prompts when detected child repos are rejected', async (t) => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-infer-reject-'));
+  const appDir = path.join(tempDir, 'app');
+  const stdout = [];
+  const stderr = [];
+  const prompts = [];
+  const detectedRemote = 'https://github.com/example/app.git';
+  const manualRemote = 'https://github.com/example/manual.git';
+  const answers = new Map([
+    ['Project name', ''],
+    ['What should VibeCompass set up?', ''],
+    [`Use detected Git repo in app (${detectedRemote})?`, 'no'],
+    ['How many repos belong to this logical project?', '1'],
+    ['Repo 1 id', 'manual'],
+    ['Repo 1 remote', manualRemote],
+    ['Repo 1 default branch', ''],
+    ['Use primary-repo?', ''],
+    ['Directory of the designated primary repo', '.'],
+    ['Scaffold workflow files (context.md plus guide READMEs)?', 'no'],
+    ['Open the first builder session immediately after init?', 'no'],
+  ]);
+
+  try {
+    if (spawnSync('git', ['--version']).status !== 0) {
+      t.skip('git is required for this inference test.');
+      return;
+    }
+
+    await mkdir(appDir, { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: appDir }).status, 0);
+    assert.equal(spawnSync('git', ['remote', 'add', 'origin', detectedRemote], { cwd: appDir }).status, 0);
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          prompts.push(spec.message);
+          if (!answers.has(spec.message)) {
+            throw new Error(`Unexpected guided prompt: ${spec.message}`);
+          }
+
+          return answers.get(spec.message);
+        },
+      },
+    );
+
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assertPromptsInclude(prompts, [
+      'How many repos belong to this logical project?',
+      'Repo 1 id',
+      'Repo 1 remote',
+      'Use primary-repo?',
+      'Directory of the designated primary repo',
+    ]);
+    assert.match(projectYaml, /id: manual/);
+    assert.match(projectYaml, /remote: https:\/\/github.com\/example\/manual.git/);
+    assert.doesNotMatch(projectYaml, /remote: https:\/\/github.com\/example\/app.git/);
+    assert.ok(stdout.join('').includes(path.join(tempDir, '.compass')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli guided init defaults a single primary repo to the matching child directory', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-child-repo-'));
   const stdout = [];
@@ -1345,7 +2080,7 @@ test('runCli guided init defaults a single primary repo to the matching child di
   const prompts = [];
   const answers = new Map([
     ['Project name', 'Child Repo Project'],
-    ['Project mode', 'local-only'],
+    ['What should VibeCompass set up?', 'local-only'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
     ['Repo 1 remote', 'https://github.com/example/app.git'],
@@ -1392,9 +2127,9 @@ test('runCli guided init defaults a single primary repo to the matching child di
 
     assert.equal(exitCode, 0);
     assert.equal(stderr.length, 0);
-    assert.deepEqual(prompts, [
+    assertPromptsInclude(prompts, [
       'Project name',
-      'Project mode',
+      'What should VibeCompass set up?',
       'How many repos belong to this logical project?',
       'Repo 1 id',
       'Repo 1 remote',
@@ -1476,7 +2211,36 @@ test('initializeProjectMemory never overwrites an existing tool bootstrap file',
   }
 });
 
-test('initializeProjectMemory rejects sync configuration outside local-primary mode', async () => {
+test('initializeProjectMemory supports hosted-only sync configuration', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-hosted-only-sync-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    const result = await initializeProjectMemory({
+      rootDir,
+      name: 'Hosted Only Sync Project',
+      mode: 'hosted-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      sync: {
+        apiUrl: 'https://vibecompass.dev',
+        projectId: 'vc_proj_hosted_only',
+        credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
+      },
+    });
+
+    const projectYaml = await readFile(path.join(rootDir, 'project.yaml'), 'utf8');
+    const liveScan = await scanProjectMemory(rootDir);
+
+    assert.match(projectYaml, /mode: hosted-only/);
+    assert.match(projectYaml, /credential_env_var: VIBECOMPASS_SYNC_TOKEN/);
+    assert.equal(result.syncEnvVar, 'VIBECOMPASS_SYNC_TOKEN');
+    assert.equal(liveScan.errors.length, 0);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('initializeProjectMemory rejects sync configuration in local-only mode', async () => {
   await assert.rejects(
     () =>
       initializeProjectMemory({
@@ -1490,7 +2254,7 @@ test('initializeProjectMemory rejects sync configuration outside local-primary m
           credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
         },
       }),
-    /sync configuration is only supported when mode is local-primary/i,
+    /sync configuration is only supported when mode is local-primary or hosted-only/i,
   );
 });
 

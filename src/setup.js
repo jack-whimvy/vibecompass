@@ -1,6 +1,12 @@
-import { access } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, readFile, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { promisify } from 'node:util';
+import { getSupportedAgentFilePaths } from './generators/agent-files/index.js';
+import { END_MARKER, START_MARKER } from './generators/agent-files/markers.js';
+
+const execFileAsync = promisify(execFile);
 
 export const PLACEMENT_PATTERNS = {
   WORKSPACE_ROOT: 'workspace-root',
@@ -64,12 +70,54 @@ export async function resolveInitCliOptions(options, environment = {}) {
     },
     placementPattern: resolved.placementPattern ?? null,
     guidedSummary,
+    agentFileSyncPlan: resolved.adoptExistingAgentFiles
+      ? {
+          rootDir: resolved.rootDir,
+          toolingRootDir: resolved.toolingRootDir,
+          adoptExisting: true,
+          existingOnly: true,
+        }
+      : null,
     sessionPlan: resolved.startSession
       ? {
           sessionId: resolved.sessionId,
           workingOn: resolved.sessionWorkingOn,
         }
       : null,
+  };
+}
+
+export async function resolveConnectHostedCliOptions(options, environment = {}) {
+  const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
+  let resolved = {
+    ...options,
+    sync: isPlainObject(options?.sync) ? { ...options.sync } : {},
+  };
+
+  if (!resolved.sync.apiUrl || !resolved.sync.projectId || !resolved.sync.credentialEnvVar) {
+    const prompter = createPrompter(environment.io, environment.runtime);
+    try {
+      if (!resolved.sync.apiUrl) {
+        resolved.sync.apiUrl = await askInput(prompter, 'Hosted sync API URL', {
+          defaultValue: 'https://vibecompass.dev',
+        });
+      }
+      if (!resolved.sync.projectId) {
+        resolved.sync.projectId = await askInput(prompter, 'Hosted project id');
+      }
+      if (!resolved.sync.credentialEnvVar) {
+        resolved.sync.credentialEnvVar = await askInput(prompter, 'Credential env var', {
+          defaultValue: 'VIBECOMPASS_SYNC_TOKEN',
+        });
+      }
+    } finally {
+      await prompter.close();
+    }
+  }
+
+  return {
+    rootDir: resolved.rootDir ? toRelativeIfInsideCwd(resolved.rootDir, cwd) : undefined,
+    sync: resolved.sync,
   };
 }
 
@@ -153,7 +201,8 @@ async function completeGuidedInitOptions(options, environment) {
   let resolved = cloneInitOptions(options);
   const cwd = environment.cwd;
   const prompter = environment.prompter;
-  const projectNameDefault = path.basename(cwd);
+  const inferredProject = await inferProjectFromCwd(cwd);
+  const projectNameDefault = inferredProject.projectName ?? path.basename(cwd);
 
   if (!resolved.name) {
     resolved.name = await askInput(prompter, 'Project name', {
@@ -162,63 +211,96 @@ async function completeGuidedInitOptions(options, environment) {
   }
 
   if (!resolved.mode) {
-    resolved.mode = await askChoice(prompter, 'Project mode', [
+    const setupGoal = await askChoice(prompter, 'What should VibeCompass set up?', [
       {
-        value: 'local-only',
-        description: 'Local files only. No hosted dependency.',
+        value: 'share-later',
+        description: 'Recommended. Local notes, with the option to share or collaborate later.',
       },
       {
-        value: 'local-primary',
-        description: 'Local files stay authoritative, with optional hosted sync/projection.',
+        value: 'local-only',
+        description: 'Local files only. No hosted sync or hosted docs-review prompts.',
       },
       {
         value: 'hosted-only',
-        description: 'Compatibility mode when hosted state remains authoritative.',
+        description: 'Hosted VibeCompass is already the source of truth for this project.',
       },
     ], {
-      defaultValue: 'local-only',
+      defaultValue: 'share-later',
     });
+    resolved.mode = setupGoal === 'share-later' ? 'local-primary' : setupGoal;
   }
 
+  const detectedRepos = inferredProject.repos ?? [];
+
   if (!Array.isArray(resolved.repos) || resolved.repos.length === 0) {
-    resolved.repos = await promptForRepos(prompter, cwd);
+    if (detectedRepos.length > 0) {
+      const useDetectedRepos = await askConfirm(
+        prompter,
+        formatDetectedReposPrompt(detectedRepos),
+        true,
+      );
+      resolved.repos = useDetectedRepos
+        ? detectedRepos.map((repo) => toProjectRepo(repo))
+        : await promptForRepos(prompter, cwd);
+    } else {
+      resolved.repos = await promptForRepos(prompter, cwd);
+    }
   }
 
   let recommendation = null;
   if (!resolved.placementPattern) {
-    recommendation = await promptForPlacement(prompter, {
-      cwd,
-      repoCount: resolved.repos.length,
-    });
-    resolved.placementPattern = recommendation.pattern;
+    if (inferredProject.source === 'child-repos' && detectedRepos.length > 1 && reposMatchDetected(resolved.repos, detectedRepos)) {
+      recommendation = recommendPlacementPattern({
+        repoCount: detectedRepos.length,
+        usesSharedWorkspace: true,
+      });
+      resolved.placementPattern = recommendation.pattern;
+      prompter.write(`Recommended placement: ${recommendation.pattern}\n`);
+      prompter.write(`${recommendation.reason}\n`);
+    } else if (detectedRepos.length === 1 && reposMatchDetected(resolved.repos, detectedRepos)) {
+      recommendation = recommendPlacementPattern({ repoCount: 1 });
+      resolved.placementPattern = recommendation.pattern;
+    } else {
+      recommendation = await promptForPlacement(prompter, {
+        cwd,
+        repoCount: resolved.repos.length,
+      });
+      resolved.placementPattern = recommendation.pattern;
+    }
   }
 
   if (!resolved.toolingRootDir) {
-    const ownerLabel = describePlacementOwner(resolved.placementPattern);
-    const defaultOwnerDir = await suggestOwnerDirectory({
-      cwd,
-      placementPattern: resolved.placementPattern,
-      repos: resolved.repos,
-    });
-    resolved.toolingRootDir = await askInput(prompter, ownerLabel, {
-      defaultValue: defaultOwnerDir,
-      validate: async (value) => {
-        if (!(await directoryExists(path.resolve(cwd, value)))) {
-          return `${ownerLabel} must already exist relative to the current working directory.`;
-        }
+    if (resolved.placementPattern === PLACEMENT_PATTERNS.PRIMARY_REPO && detectedRepos.length === 1 && reposMatchDetected(resolved.repos, detectedRepos)) {
+      resolved.toolingRootDir = detectedRepos[0].directory;
+    } else if (resolved.placementPattern === PLACEMENT_PATTERNS.WORKSPACE_ROOT && inferredProject.source === 'child-repos' && detectedRepos.length > 1 && reposMatchDetected(resolved.repos, detectedRepos)) {
+      resolved.toolingRootDir = '.';
+    } else {
+      const ownerLabel = describePlacementOwner(resolved.placementPattern);
+      const defaultOwnerDir = await suggestOwnerDirectory({
+        cwd,
+        placementPattern: resolved.placementPattern,
+        repos: resolved.repos,
+      });
+      resolved.toolingRootDir = await askInput(prompter, ownerLabel, {
+        defaultValue: defaultOwnerDir,
+        validate: async (value) => {
+          if (!(await directoryExists(path.resolve(cwd, value)))) {
+            return `${ownerLabel} must already exist relative to the current working directory.`;
+          }
 
-        return null;
-      },
-    });
+          return null;
+        },
+      });
+    }
   }
 
   resolved = applyPlacementDefaults(resolved, { cwd });
 
-  if (!resolved.sync && resolved.mode === 'local-primary') {
+  if (!resolved.sync && resolved.mode === 'hosted-only') {
     const configureSync = await askConfirm(
       prompter,
-      'Configure hosted sync binding now?',
-      false,
+      'Connect hosted VibeCompass now?',
+      resolved.mode === 'hosted-only',
     );
 
     if (configureSync) {
@@ -260,6 +342,22 @@ async function completeGuidedInitOptions(options, environment) {
         prompter,
         'Create a starter AGENTS.md if missing?',
         true,
+      );
+    }
+  }
+
+  if (resolved.adoptExistingAgentFiles === undefined) {
+    const adoptionCandidates = await findExistingUnmarkedAgentFiles({
+      cwd,
+      toolingRootDir: resolved.toolingRootDir,
+    });
+
+    if (adoptionCandidates.length > 0) {
+      writeAgentAdoptionPreview(prompter, adoptionCandidates);
+      resolved.adoptExistingAgentFiles = await askConfirm(
+        prompter,
+        'Append VibeCompass managed sections to existing agent instruction files?',
+        false,
       );
     }
   }
@@ -320,6 +418,229 @@ async function completeGuidedInitOptions(options, environment) {
       autoEnabledSessionBootstrap,
     },
   };
+}
+
+async function inferProjectFromCwd(cwd) {
+  const [packageName, gitInfo, childRepos] = await Promise.all([
+    readPackageName(cwd),
+    readGitInfo(cwd),
+    discoverChildGitRepos(cwd),
+  ]);
+  const projectName = packageName ?? path.basename(cwd);
+
+  if (gitInfo?.remote) {
+    const remoteSlug = extractRemoteSlug(gitInfo.remote);
+    const repoId = suggestRepoId(remoteSlug ?? packageName ?? path.basename(gitInfo.root ?? cwd));
+
+    return {
+      projectName,
+      source: 'current-repo',
+      repos: [
+        {
+          id: repoId,
+          remote: gitInfo.remote,
+          directory: '.',
+          ...(gitInfo.branch ? { defaultBranch: gitInfo.branch } : {}),
+        },
+      ],
+    };
+  }
+
+  if (childRepos.length > 0) {
+    return {
+      projectName,
+      source: 'child-repos',
+      repos: childRepos,
+    };
+  }
+
+  return {
+    projectName,
+    source: 'none',
+    repos: [],
+  };
+}
+
+async function readPackageName(cwd) {
+  try {
+    const packageJson = JSON.parse(await readFile(path.join(cwd, 'package.json'), 'utf8'));
+    return typeof packageJson.name === 'string' && packageJson.name.trim()
+      ? packageJson.name.trim()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readGitInfo(cwd) {
+  try {
+    const [{ stdout: remote }, { stdout: root }, branchResult] = await Promise.all([
+      execFileAsync('git', ['remote', 'get-url', 'origin'], { cwd }),
+      execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd }),
+      execFileAsync('git', ['branch', '--show-current'], { cwd }).catch(() => ({ stdout: '' })),
+    ]);
+    const normalizedRemote = remote.trim();
+    if (!normalizedRemote) {
+      return null;
+    }
+
+    return {
+      remote: normalizedRemote,
+      root: root.trim() || null,
+      branch: branchResult.stdout.trim() || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function discoverChildGitRepos(cwd) {
+  let entries = [];
+  try {
+    entries = await readdir(cwd, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && isScannableWorkspaceChild(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  const discovered = await Promise.all(candidates.map(async (entry) => {
+    const directory = entry.name;
+    const absoluteDirectory = path.join(cwd, directory);
+    const [gitInfo, packageName] = await Promise.all([
+      readGitInfo(absoluteDirectory),
+      readPackageName(absoluteDirectory),
+    ]);
+
+    if (!gitInfo?.remote) {
+      return null;
+    }
+
+    if (gitInfo.root && !(await isSameDirectory(gitInfo.root, absoluteDirectory))) {
+      return null;
+    }
+
+    const remoteSlug = extractRemoteSlug(gitInfo.remote);
+    return {
+      id: suggestRepoId(remoteSlug ?? packageName ?? directory),
+      remote: gitInfo.remote,
+      directory,
+      ...(gitInfo.branch ? { defaultBranch: gitInfo.branch } : {}),
+    };
+  }));
+
+  const reposByDirectory = new Map();
+  for (const repo of discovered) {
+    if (repo && !reposByDirectory.has(repo.directory)) {
+      reposByDirectory.set(repo.directory, repo);
+    }
+  }
+
+  return [...reposByDirectory.values()].sort((left, right) => left.directory.localeCompare(right.directory));
+}
+
+function isScannableWorkspaceChild(name) {
+  if (!name || name.startsWith('.')) {
+    return false;
+  }
+
+  return !new Set([
+    'build',
+    'coverage',
+    'dist',
+    'node_modules',
+    'out',
+    'target',
+    'vendor',
+  ]).has(name);
+}
+
+function formatDetectedReposPrompt(repos) {
+  if (repos.length === 1) {
+    const repo = repos[0];
+    const location = repo.directory && repo.directory !== '.' ? ` in ${repo.directory}` : '';
+    return `Use detected Git repo${location} (${repo.remote})?`;
+  }
+
+  return `Use ${repos.length} detected Git repos (${repos.map((repo) => repo.directory).join(', ')})?`;
+}
+
+function toProjectRepo(repo) {
+  return {
+    id: repo.id,
+    remote: repo.remote,
+    ...(repo.defaultBranch ? { defaultBranch: repo.defaultBranch } : {}),
+  };
+}
+
+function reposMatchDetected(repos, detectedRepos) {
+  if (!Array.isArray(repos) || repos.length !== detectedRepos.length) {
+    return false;
+  }
+
+  const detectedKeys = new Set(detectedRepos.map((repo) => `${repo.id}\n${repo.remote}`));
+  return repos.every((repo) => detectedKeys.has(`${repo.id}\n${repo.remote}`));
+}
+
+async function findExistingUnmarkedAgentFiles(context) {
+  const toolingRootDir = path.resolve(context.cwd, context.toolingRootDir ?? '.');
+  const candidates = [];
+
+  for (const relativePath of getSupportedAgentFilePaths()) {
+    const filePath = path.join(toolingRootDir, relativePath);
+    let content = null;
+    try {
+      content = await readFile(filePath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    if (content.includes(START_MARKER) || content.includes(END_MARKER)) {
+      continue;
+    }
+
+    candidates.push({
+      relativePath,
+      conflicts: scanPotentialAgentWorkflowConflicts(content),
+    });
+  }
+
+  return candidates;
+}
+
+function writeAgentAdoptionPreview(prompter, candidates) {
+  prompter.write('Existing agent instruction files without VibeCompass markers:\n');
+  for (const candidate of candidates) {
+    prompter.write(`- ${candidate.relativePath}: VibeCompass can append a managed block at the end of this file.\n`);
+    if (candidate.conflicts.length > 0) {
+      prompter.write(`  possible workflow overlap on lines ${candidate.conflicts.map((conflict) => conflict.line).join(', ')}\n`);
+    }
+  }
+  prompter.write('Content outside the managed block stays user-owned and will not be rewritten.\n');
+}
+
+function scanPotentialAgentWorkflowConflicts(content) {
+  const patterns = [
+    'session',
+    'handoff',
+    'decisions',
+    'wip.md',
+    'review handoff',
+    'close-session',
+    'address review',
+    'builder',
+    'reviewer',
+  ];
+
+  return content
+    .split(/\r?\n/)
+    .map((line, index) => ({
+      line: index + 1,
+      normalized: line.toLowerCase(),
+    }))
+    .filter((entry) => patterns.some((pattern) => entry.normalized.includes(pattern)));
 }
 
 async function promptForRepos(prompter, cwd) {
@@ -754,6 +1075,18 @@ async function directoryExists(directoryPath) {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function isSameDirectory(left, right) {
+  try {
+    const [leftRealPath, rightRealPath] = await Promise.all([
+      realpath(left),
+      realpath(right),
+    ]);
+    return leftRealPath === rightRealPath;
+  } catch {
+    return path.resolve(left) === path.resolve(right);
   }
 }
 

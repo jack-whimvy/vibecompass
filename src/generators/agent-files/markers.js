@@ -6,7 +6,7 @@ export function renderManagedBlock(content) {
   return `${START_MARKER}\n${trimmed}\n${END_MARKER}\n`;
 }
 
-export function applyManagedBlock(existingContent, generatedContent) {
+export function applyManagedBlock(existingContent, generatedContent, options = {}) {
   const block = renderManagedBlock(generatedContent);
 
   if (existingContent === null) {
@@ -21,6 +21,15 @@ export function applyManagedBlock(existingContent, generatedContent) {
   const endIndex = existingContent.indexOf(END_MARKER);
 
   if (startIndex === -1 && endIndex === -1) {
+    if (options.adoptExisting) {
+      const separator = existingContent === '' || existingContent.endsWith('\n') ? '' : '\n';
+      return {
+        status: 'adopt',
+        content: `${existingContent}${separator}${block}`,
+        warning: null,
+      };
+    }
+
     return {
       status: 'warning',
       content: existingContent,

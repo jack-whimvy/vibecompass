@@ -17,6 +17,17 @@ const FORMATS = [
 ];
 
 const FORMAT_MAP = new Map(FORMATS.map((format) => [format.name, format]));
+const CONFLICT_SCAN_PATTERNS = [
+  'session',
+  'handoff',
+  'decisions',
+  'wip.md',
+  'review handoff',
+  'close-session',
+  'address review',
+  'builder',
+  'reviewer',
+];
 
 export async function syncAgentInstructionFiles(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
@@ -26,6 +37,8 @@ export async function syncAgentInstructionFiles(options = {}) {
     : cwd;
   const requestedFormat = normalizeOptionalString(options.format);
   const dryRun = Boolean(options.dryRun);
+  const adoptExisting = Boolean(options.adoptExisting);
+  const existingOnly = Boolean(options.existingOnly);
 
   const projectConfig = await readProjectConfig(rootDir);
   const selection = resolveEnabledFormats(projectConfig, requestedFormat);
@@ -56,8 +69,27 @@ export async function syncAgentInstructionFiles(options = {}) {
   for (const format of selection.formats) {
     const outputPath = path.join(toolingRootDir, format.path);
     const existingContent = await readExistingFile(outputPath);
+
+    if (existingOnly && existingContent === null) {
+      results.push({
+        format: format.name,
+        path: outputPath,
+        relativePath: toPosix(path.relative(toolingRootDir, outputPath)),
+        status: 'skipped-missing',
+        warning: null,
+        changed: false,
+        conflicts: [],
+      });
+      continue;
+    }
+
     const generatedContent = format.render(context);
-    const applied = applyManagedBlock(existingContent, generatedContent);
+    const applied = applyManagedBlock(existingContent, generatedContent, {
+      adoptExisting,
+    });
+    const conflicts = applied.status === 'adopt'
+      ? scanPotentialWorkflowConflicts(existingContent)
+      : [];
 
     if (!dryRun && applied.warning === null && applied.content !== existingContent) {
       await mkdir(path.dirname(outputPath), { recursive: true });
@@ -71,6 +103,7 @@ export async function syncAgentInstructionFiles(options = {}) {
       status: dryRun && applied.warning === null ? `dry-run-${applied.status}` : applied.status,
       warning: applied.warning,
       changed: applied.warning === null && applied.content !== existingContent,
+      conflicts,
     });
   }
 
@@ -84,6 +117,10 @@ export async function syncAgentInstructionFiles(options = {}) {
 
 export function getSupportedAgentFormats() {
   return FORMATS.map((format) => format.name);
+}
+
+export function getSupportedAgentFilePaths() {
+  return FORMATS.map((format) => format.path);
 }
 
 async function readProjectConfig(rootDir) {
@@ -144,4 +181,23 @@ function normalizeOptionalString(value) {
 
 function toPosix(value) {
   return value.split(path.sep).join('/');
+}
+
+function scanPotentialWorkflowConflicts(content) {
+  if (typeof content !== 'string' || content.trim() === '') {
+    return [];
+  }
+
+  return content
+    .split(/\r?\n/)
+    .map((line, index) => ({
+      line: index + 1,
+      text: line,
+      normalized: line.toLowerCase(),
+    }))
+    .filter((entry) => CONFLICT_SCAN_PATTERNS.some((pattern) => entry.normalized.includes(pattern)))
+    .map(({ line, text }) => ({
+      line,
+      text: text.trim(),
+    }));
 }

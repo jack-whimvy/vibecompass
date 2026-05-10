@@ -243,9 +243,34 @@ npx -y @vibecompass/vibecompass sync-agents --root .compass
 ```
 
 Content outside those markers is preserved. Existing files without markers are
-reported as warnings and left untouched.
+reported as warnings and left untouched unless you explicitly adopt them:
 
-Create a `local-primary` root when you also want the hosted sync binding written into `project.yaml`:
+```bash
+npx -y @vibecompass/vibecompass sync-agents --root .compass --adopt-existing
+```
+
+Adoption appends a managed VibeCompass block to the end of existing unmarked
+agent files, preserves everything outside the markers, and reports possible
+workflow-overlap lines before you rely on the result. Guided init may offer the
+same adoption step for existing files, but the prompt defaults to no.
+
+Connect hosted VibeCompass later when you want browser views, team sync, or hosted docs-review:
+
+```bash
+npx -y @vibecompass/vibecompass connect-hosted \
+  --sync-api-url https://vibecompass.dev \
+  --sync-project-id vc_proj_example \
+  --sync-credential-env-var VIBECOMPASS_SYNC_TOKEN
+```
+
+Then set the secret locally and push the first baseline:
+
+```bash
+export VIBECOMPASS_SYNC_TOKEN='your-sync-token'
+npx -y @vibecompass/vibecompass push
+```
+
+Create a `local-primary` root non-interactively when you also want the hosted sync binding written into `project.yaml` during init:
 
 ```bash
 npx -y @vibecompass/vibecompass init \
@@ -271,14 +296,8 @@ That creates:
     manifest.json
 ```
 
-Next step after init:
-
-```bash
-export VIBECOMPASS_SYNC_TOKEN='your-sync-token'
-```
-
-`vibecompass` does not yet perform hosted sync itself. The sync fields in
-`project.yaml` are the non-secret binding for the upcoming push/pull flows.
+The sync fields in `project.yaml` are non-secret. The token value stays in
+your environment and is never written to canonical project memory.
 
 ## CLI
 
@@ -298,12 +317,13 @@ Options:
 - `--guided`: ask placement and setup questions interactively
 - `--repo <id=remote>`: repeatable repo descriptor
 - `--repo-branch <id=branch>`: optional per-repo default branch
-- `--sync-api-url <url>`: hosted sync API URL for `local-primary`
-- `--sync-project-id <id>`: hosted sync project ID for `local-primary`
-- `--sync-credential-env-var <name>`: local env-var reference for `local-primary`
+- `--sync-api-url <url>`: hosted sync API URL for `local-primary` or `hosted-only`
+- `--sync-project-id <id>`: hosted sync project ID for `local-primary` or `hosted-only`
+- `--sync-credential-env-var <name>`: local env-var reference for `local-primary` or `hosted-only`
 - `--with-workflow`: generate `context.md` plus workflow guide files
 - `--with-claude`: create a starter `CLAUDE.md` if it does not already exist
 - `--with-agents`: create a starter `AGENTS.md` if it does not already exist
+- `--adopt-existing-agent-files`: append managed blocks to existing unmarked agent files
 - `--start-session`: open the first builder session after init
 - `--session-working-on <text>`: required with `--start-session` outside guided mode
 - `--session-id <lane-id>`: required with `--start-session`; names the first builder lane
@@ -316,6 +336,34 @@ workflow bootstrap required for that session: `context.md` plus `CLAUDE.md`.
 Guided init can also record workflow defaults in
 `project.yaml.metadata.workflow`, including whether close-session should
 include a Git publish step and which remote name to use for that step.
+
+Guided init is inference-first for common repo layouts: it reads `package.json`,
+detects the current Git `origin` when you run it inside a repo, or scans a
+parent workspace for immediate child repos when the parent is not itself a Git
+checkout. It asks once before using detected repos, maps a friendly setup goal
+to the stored project mode, places single-child repo memory under that child
+repo, and uses workspace-root placement for multi-repo parent folders. Hosted
+credentials are deferred by default; run `vibecompass connect-hosted` when you
+are ready to connect the local root to `vibecompass.dev`.
+
+### `vibecompass connect-hosted`
+
+```text
+vibecompass connect-hosted [options]
+```
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--sync-api-url <url>`: hosted sync API URL
+- `--sync-project-id <id>`: hosted sync project ID
+- `--sync-credential-env-var <name>`: local env-var reference
+
+Without all three sync flags, `connect-hosted` prompts for the missing fields.
+It updates only the non-secret `project.yaml.sync` binding; you still set the
+actual token in your environment before running hosted commands.
+Running it again replaces the existing hosted binding in `project.yaml`, which
+is the intended rotation path after you create a new sync credential.
 
 ### `vibecompass start-session`
 
@@ -402,12 +450,13 @@ Options:
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--tooling-root <path>`: directory where agent files are written; defaults to cwd
 - `--format <name>`: optional format filter: `claude_md`, `agents_md`, `cursor_rules`, or `copilot_instructions`
+- `--adopt-existing`: append managed blocks to existing unmarked files
 - `--dry-run`: show planned writes without changing files
 
 This command generates enabled agent-instruction files from canonical project
 memory. It creates missing files with managed markers, replaces existing
 managed regions, preserves content outside markers, and warns instead of
-overwriting existing unmarked files.
+overwriting existing unmarked files unless `--adopt-existing` is supplied.
 
 ### `vibecompass docs-review`
 

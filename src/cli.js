@@ -2,9 +2,9 @@
 
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { initializeProjectMemory } from './init.js';
+import { connectHostedProjectMemory, initializeProjectMemory } from './init.js';
 import { preflightDocsReview } from './docs-review.js';
-import { resolveInitCliOptions } from './setup.js';
+import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import {
@@ -47,7 +47,20 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     );
 
     if (result.syncEnvVar) {
-      io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first sync.\n`);
+      const rootFlag = formatOptionalRootFlag(initPlan.initOptions.rootDir);
+      io.stdout.write(`Hosted binding: configured for ${initPlan.initOptions.mode}\n`);
+      io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first hosted command.\n`);
+      if (initPlan.initOptions.mode === 'local-primary') {
+        io.stdout.write(`Then run: vibecompass push${rootFlag}\n`);
+        io.stdout.write(`Hosted docs-review: vibecompass docs-review --submit-hosted${rootFlag}\n`);
+      } else if (initPlan.initOptions.mode === 'hosted-only') {
+        io.stdout.write(`Hosted docs-review: vibecompass docs-review --submit-hosted${rootFlag}\n`);
+      }
+    } else if (initPlan.initOptions.mode === 'hosted-only') {
+      io.stdout.write('Hosted-only projects need a hosted sync binding before hosted commands.\n');
+      io.stdout.write('After creating a sync credential, rerun init with --force and --sync-api-url/--sync-project-id/--sync-credential-env-var, or add project.yaml.sync manually.\n');
+    } else if (initPlan.initOptions.mode === 'local-primary') {
+      io.stdout.write('Optional hosted setup later: vibecompass connect-hosted\n');
     }
 
     if (result.contextFilePath) {
@@ -63,6 +76,14 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
 
     for (const filePath of result.scaffoldSkippedFiles) {
       io.stdout.write(`Left existing ${filePath} untouched\n`);
+    }
+
+    if (initPlan.agentFileSyncPlan) {
+      const agentFileSync = await syncAgentInstructionFiles({
+        ...initPlan.agentFileSyncPlan,
+        ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+      });
+      writeAgentFileSyncResult(io, agentFileSync);
     }
 
     if (initPlan.sessionPlan) {
@@ -95,6 +116,28 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Created ${result.handoffFilePath}\n`);
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
+    return 0;
+  }
+
+  if (parsed.command === 'connect-hosted') {
+    const connectPlan = await resolveConnectHostedCliOptions(parsed.options, {
+      cwd: runtime.cwd,
+      io,
+      runtime,
+    });
+    const result = await connectHostedProjectMemory({
+      ...connectPlan,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    io.stdout.write(`Connected hosted VibeCompass for ${result.mode}\n`);
+    io.stdout.write(`Updated ${result.projectFilePath}\n`);
+    io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first hosted command.\n`);
+    if (result.mode === 'local-primary') {
+      io.stdout.write('Then run: vibecompass push\n');
+      io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
+    } else {
+      io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
+    }
     return 0;
   }
 
@@ -291,6 +334,10 @@ export function parseCliArgs(argv) {
       return parseStartSessionArgs(rest);
     }
 
+    if (command === 'connect-hosted') {
+      return parseConnectHostedArgs(rest);
+    }
+
     if (command === 'close-session' || command === 'end-session') {
       return parseCloseSessionArgs(rest);
     }
@@ -360,6 +407,11 @@ export function parseCliArgs(argv) {
 
     if (token === '--with-agents') {
       parsed.withAgents = true;
+      continue;
+    }
+
+    if (token === '--adopt-existing-agent-files') {
+      parsed.adoptExistingAgentFiles = true;
       continue;
     }
 
@@ -469,6 +521,7 @@ export function parseCliArgs(argv) {
       sessionId: parsed.sessionId,
       closeSessionGitPublish: parsed.closeSessionGitPublish,
       closeSessionGitRemote: parsed.closeSessionGitRemote,
+      adoptExistingAgentFiles: parsed.adoptExistingAgentFiles,
       ...(parsed.withWorkflow || parsed.withClaude || parsed.withAgents
         ? {
             bootstrap: {
@@ -549,6 +602,63 @@ function parseStartSessionArgs(argv) {
   return {
     command: 'start-session',
     options: parsed,
+  };
+}
+
+function parseConnectHostedArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-api-url':
+        parsed.syncApiUrl = value;
+        break;
+      case '--sync-project-id':
+        parsed.syncProjectId = value;
+        break;
+      case '--sync-credential-env-var':
+        parsed.syncCredentialEnvVar = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  const syncValues = [
+    parsed.syncApiUrl,
+    parsed.syncProjectId,
+    parsed.syncCredentialEnvVar,
+  ].filter(Boolean);
+
+  return {
+    command: 'connect-hosted',
+    options: {
+      rootDir: parsed.rootDir,
+      ...(syncValues.length > 0
+        ? {
+            sync: {
+              apiUrl: parsed.syncApiUrl,
+              projectId: parsed.syncProjectId,
+              credentialEnvVar: parsed.syncCredentialEnvVar,
+            },
+          }
+        : {}),
+    },
   };
 }
 
@@ -705,6 +815,11 @@ function parseSyncAgentsArgs(argv) {
 
     if (token === '--dry-run') {
       parsed.dryRun = true;
+      continue;
+    }
+
+    if (token === '--adopt-existing') {
+      parsed.adoptExisting = true;
       continue;
     }
 
@@ -991,6 +1106,10 @@ function writeAgentFileSyncResult(io, result) {
     const suffix = item.warning ? ` — ${item.warning}` : '';
     const stream = item.warning ? io.stderr : io.stdout;
     stream.write(`- ${item.relativePath}: ${item.status}${suffix}\n`);
+    if (item.conflicts?.length > 0) {
+      const lineNumbers = item.conflicts.map((conflict) => conflict.line).join(', ');
+      io.stderr.write(`  possible workflow overlap on lines ${lineNumbers}; review existing instructions if behavior conflicts.\n`);
+    }
   }
 }
 
@@ -1013,6 +1132,7 @@ function usageText() {
   return [
     'Usage:',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
+    '  vibecompass connect-hosted [options]',
     '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
     '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
     '  vibecompass end-session --title <text> --completed <text> --next-step <text> [options]  # alias',
@@ -1041,12 +1161,20 @@ function usageText() {
     '  --with-workflow                      Scaffold context.md and workflow guide files',
     '  --with-claude                        Create a starter CLAUDE.md if missing',
     '  --with-agents                        Create a starter AGENTS.md if missing',
+    '  --adopt-existing-agent-files         Adopt existing unmarked agent files after init',
     '  --start-session                      Open the first builder session after init',
     '  --session-working-on <text>          Required with --start-session outside guided mode',
     '  --session-id <lane-id>                Required with --start-session; names the first builder lane',
     '  --close-session-git-publish          Include a Git publish step in the stored close-session workflow',
     '  --close-session-git-remote <name>    Default Git remote name for that close-session publish step',
     '  --force                              Overwrite an existing project.yaml',
+    '',
+    'Connect-hosted options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --sync-api-url <url>                 Hosted sync api_url',
+    '  --sync-project-id <id>               Hosted sync project_id',
+    '  --sync-credential-env-var <name>     Hosted sync env var reference',
+    '                                        Replaces any existing project.yaml sync binding',
     '',
     'Start-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -1083,6 +1211,7 @@ function usageText() {
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --tooling-root <path>                Directory where agent files are written. Defaults to cwd',
     '  --format <name>                      Optional format: claude_md, agents_md, cursor_rules, copilot_instructions',
+    '  --adopt-existing                     Append managed blocks to existing unmarked files',
     '  --dry-run                            Show planned writes without changing files',
     '',
     'Sync transport options:',
@@ -1121,6 +1250,14 @@ function createDefaultIo() {
     stdout: process.stdout,
     stderr: process.stderr,
   };
+}
+
+function formatOptionalRootFlag(rootDir) {
+  if (!rootDir || rootDir === '.compass') {
+    return '';
+  }
+
+  return ` --root ${rootDir}`;
 }
 
 async function main() {

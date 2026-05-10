@@ -5,6 +5,7 @@ import { writeStateManifest } from './manifest.js';
 import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
 import { buildWorkflowMetadata } from './workflow.js';
+import { parseSimpleYaml } from './simple-yaml.js';
 
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 
@@ -38,6 +39,39 @@ export async function initializeProjectMemory(options) {
     contextFilePath: scaffoldResult.contextFilePath,
     scaffoldCreatedFiles: scaffoldResult.createdFiles,
     scaffoldSkippedFiles: scaffoldResult.skippedFiles,
+  };
+}
+
+export async function connectHostedProjectMemory(options) {
+  const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
+  const rootDir = path.resolve(cwd, options?.rootDir ?? '.compass');
+  const projectFilePath = path.join(rootDir, 'project.yaml');
+  let projectConfig;
+  try {
+    projectConfig = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+      sourceName: projectFilePath,
+    });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      throw new Error(`No project.yaml found in ${rootDir}. Run "vibecompass init" first.`);
+    }
+
+    throw error;
+  }
+
+  if (!['local-primary', 'hosted-only'].includes(projectConfig.mode)) {
+    throw new Error('connect-hosted requires project.yaml mode to be local-primary or hosted-only.');
+  }
+
+  const sync = normalizeSyncOptions(options?.sync, projectConfig.mode);
+  projectConfig.sync = sync;
+  await writeFile(projectFilePath, serializeProjectConfig(projectConfig), 'utf8');
+
+  return {
+    rootDir,
+    projectFilePath,
+    mode: projectConfig.mode,
+    syncEnvVar: sync.credential_env_var,
   };
 }
 
@@ -91,30 +125,9 @@ function normalizeInitOptions(options) {
     };
   });
 
-  const syncOptions = preparedOptions.sync ?? null;
-  let sync = undefined;
-  if (syncOptions) {
-    if (preparedOptions.mode !== 'local-primary') {
-      throw new Error('sync configuration is only supported when mode is local-primary.');
-    }
-
-    const requiredFields = ['apiUrl', 'projectId', 'credentialEnvVar'];
-    const missing = requiredFields.filter((field) => typeof syncOptions[field] !== 'string' || syncOptions[field].trim() === '');
-
-    if (missing.length > 0) {
-      throw new Error(
-        `sync configuration is incomplete. Missing: ${missing.join(', ')}.`,
-      );
-    }
-
-    sync = {
-      provider: 'vibecompass',
-      api_url: syncOptions.apiUrl,
-      project_id: syncOptions.projectId,
-      credential_source: 'env',
-      credential_env_var: syncOptions.credentialEnvVar,
-    };
-  }
+  const sync = preparedOptions.sync
+    ? normalizeSyncOptions(preparedOptions.sync, preparedOptions.mode)
+    : undefined;
 
   const projectConfig = {
     format_version: 1,
@@ -146,6 +159,33 @@ function normalizeInitOptions(options) {
     generatedAt: preparedOptions.generatedAt,
     projectConfig,
     bootstrap: bootstrapOptions,
+  };
+}
+
+function normalizeSyncOptions(syncOptions, mode) {
+  if (!syncOptions || typeof syncOptions !== 'object') {
+    throw new Error('sync configuration must be an object.');
+  }
+
+  if (!['local-primary', 'hosted-only'].includes(mode)) {
+    throw new Error('sync configuration is only supported when mode is local-primary or hosted-only.');
+  }
+
+  const requiredFields = ['apiUrl', 'projectId', 'credentialEnvVar'];
+  const missing = requiredFields.filter((field) => typeof syncOptions[field] !== 'string' || syncOptions[field].trim() === '');
+
+  if (missing.length > 0) {
+    throw new Error(
+      `sync configuration is incomplete. Missing: ${missing.join(', ')}.`,
+    );
+  }
+
+  return {
+    provider: 'vibecompass',
+    api_url: syncOptions.apiUrl,
+    project_id: syncOptions.projectId,
+    credential_source: 'env',
+    credential_env_var: syncOptions.credentialEnvVar,
   };
 }
 
