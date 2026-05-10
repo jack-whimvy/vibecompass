@@ -7,6 +7,12 @@ import { preflightDocsReview } from './docs-review.js';
 import { resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
+import {
+  applyPullExport,
+  pullExportProjectMemory,
+  pullPreviewProjectMemory,
+  pushProjectMemory,
+} from './sync.js';
 
 export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   const parsed = parseCliArgs(argv);
@@ -168,6 +174,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     if (result.hosted) {
       io.stdout.write(`Hosted run: ${result.hosted.run_id}\n`);
+      if (result.hosted.phase) {
+        io.stdout.write(`Hosted phase: ${result.hosted.phase}\n`);
+      }
     }
     if (result.localReview) {
       io.stdout.write(`Local review output: ${result.localReview.output_path}\n`);
@@ -185,6 +194,74 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write('Architecture review prompt:\n');
       io.stdout.write(`${result.reviewPrompt}\n`);
     }
+    return 0;
+  }
+
+  if (parsed.command === 'push') {
+    const result = await pushProjectMemory(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Push: ${result.status}\n`);
+    io.stdout.write(`Remote revision: ${result.remoteRevisionId}\n`);
+    io.stdout.write(`Run: ${result.runId}\n`);
+    if (result.appliedProposalIds.length > 0) {
+      io.stdout.write(`Applied proposals: ${result.appliedProposalIds.join(', ')}\n`);
+    }
+    if (result.staleProposalIds.length > 0) {
+      io.stdout.write(`Stale proposals: ${result.staleProposalIds.join(', ')}\n`);
+    }
+    io.stdout.write(`Recorded ${result.manifestPath}\n`);
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'pull-preview') {
+    const result = await pullPreviewProjectMemory(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Pull-preview: ${result.status}\n`);
+    io.stdout.write(`Preview token: ${result.previewToken}\n`);
+    io.stdout.write(`Pending proposals: ${result.proposals.length}\n`);
+    for (const proposal of result.proposals) {
+      io.stdout.write(`- ${proposal.proposal_id}: ${proposal.summary}\n`);
+    }
+    writeWarnings(io, result.warnings.map((warning) => `${warning.code}: ${warning.message}`));
+    io.stdout.write(`Recorded ${result.manifestPath}\n`);
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'pull-export') {
+    const result = await pullExportProjectMemory(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Pull-export: ${result.status}\n`);
+    io.stdout.write(`Run: ${result.runId}\n`);
+    io.stdout.write(`Proposal IDs: ${result.proposalIds.join(', ')}\n`);
+    io.stdout.write(`Operations: ${result.operationCount}\n`);
+    io.stdout.write(`Wrote ${result.outputPath}\n`);
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'apply-export') {
+    const result = await applyPullExport(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Apply-export: ${result.status}\n`);
+    for (const entry of result.applied) {
+      io.stdout.write(`- ${entry.path} (${entry.status})\n`);
+    }
+    io.stdout.write(`Recorded ${result.outputPath}\n`);
+    io.stdout.write(`${result.message}\n`);
     return 0;
   }
 
@@ -221,6 +298,22 @@ export function parseCliArgs(argv) {
 
     if (command === 'docs-review') {
       return parseDocsReviewArgs(rest);
+    }
+
+    if (command === 'push') {
+      return parsePushArgs(rest);
+    }
+
+    if (command === 'pull-preview') {
+      return parsePullPreviewArgs(rest);
+    }
+
+    if (command === 'pull-export') {
+      return parsePullExportArgs(rest);
+    }
+
+    if (command === 'apply-export') {
+      return parseApplyExportArgs(rest);
     }
 
     return { command };
@@ -651,6 +744,11 @@ function parseDocsReviewArgs(argv) {
       continue;
     }
 
+    if (token === '--poll-hosted') {
+      parsed.pollHosted = true;
+      continue;
+    }
+
     if (token === '--complete') {
       parsed.complete = true;
       continue;
@@ -714,6 +812,151 @@ function parseDocsReviewArgs(argv) {
   };
 }
 
+function parsePushArgs(argv) {
+  return {
+    command: 'push',
+    options: parseRootOnlyArgs(argv, 'push'),
+  };
+}
+
+function parsePullPreviewArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--no-pending-proposals') {
+      parsed.includePendingProposals = false;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'pull-preview',
+    options: parsed,
+  };
+}
+
+function parsePullExportArgs(argv) {
+  const parsed = {
+    proposalIds: [],
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--preview-token':
+        parsed.previewToken = value;
+        break;
+      case '--proposal':
+        parsed.proposalIds.push(value);
+        break;
+      case '--output':
+        parsed.outputPath = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'pull-export',
+    options: parsed,
+  };
+}
+
+function parseApplyExportArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--output':
+        parsed.outputPath = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'apply-export',
+    options: parsed,
+  };
+}
+
+function parseRootOnlyArgs(argv, commandName) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for ${commandName}.`);
+    }
+  }
+
+  return parsed;
+}
+
 function writeAgentFileSyncResult(io, result) {
   if (!result) {
     return;
@@ -752,6 +995,10 @@ function usageText() {
     '  vibecompass list-sessions [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass sync-agents [options]',
+    '  vibecompass push [options]',
+    '  vibecompass pull-preview [options]',
+    '  vibecompass pull-export [options]',
+    '  vibecompass apply-export [options]',
     '  vibecompass docs-review --guided [options]',
     '',
     'Init options:',
@@ -814,10 +1061,20 @@ function usageText() {
     '  --format <name>                      Optional format: claude_md, agents_md, cursor_rules, copilot_instructions',
     '  --dry-run                            Show planned writes without changing files',
     '',
+    'Sync transport options:',
+    '  push --root <path>                   Push canonical local project memory to hosted',
+    '  pull-preview --root <path>           Preview hosted proposals and remote state',
+    '  pull-preview --no-pending-proposals  Exclude pending proposals from preview',
+    '  pull-export --proposal <id>          Export a selected proposal; repeatable',
+    '  pull-export --preview-token <token>  Export from a specific preview token',
+    '  pull-export --output <path>          Output path under root; defaults to state/pull-export.json',
+    '  apply-export --output <path>         Apply exported bundle; defaults to state/pull-export.json',
+    '',
     'Docs-review options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --guided                             Accepted for the explicit comprehensive-review workflow',
     '  --submit-hosted                      Submit the generated review request to hosted sync',
+    '  --poll-hosted                        Poll hosted docs-review run status and update state/docs-review.json',
     '  --complete                           Mark accepted docs-review changes as completed locally',
     '  --run-local                          Run the generated review request with a local provider',
     '  --provider <name>                    Local provider for --run-local. Currently: anthropic',

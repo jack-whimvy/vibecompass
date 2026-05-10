@@ -2,6 +2,7 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
+import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 export async function preflightDocsReview(options = {}, environment = {}) {
@@ -26,6 +27,15 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       statePath,
       llm: options.llm,
       model: options.model,
+    });
+  }
+
+  if (options.pollHosted) {
+    return pollHostedDocsReview({
+      rootDir,
+      statePath,
+      env: environment.env ?? process.env,
+      fetch: environment.runtime?.fetch ?? globalThis.fetch,
     });
   }
 
@@ -63,6 +73,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       reviewPrompt,
       rootDir,
       runtime,
+      manifest: await writeStateManifest(rootDir),
       fetch: environment.runtime?.fetch ?? globalThis.fetch,
     })
     : null;
@@ -224,6 +235,7 @@ async function readDocsReviewMarker(statePath) {
 function validateDocsReviewMode(options) {
   const enabled = [
     options.submitHosted ? '--submit-hosted' : null,
+    options.pollHosted ? '--poll-hosted' : null,
     options.runLocal ? '--run-local' : null,
     options.runLocalAnthropic ? '--run-local-anthropic' : null,
     options.applyOutput ? '--apply-output' : null,
@@ -534,6 +546,9 @@ async function submitHostedDocsReview(options) {
     `api/sync/projects/${encodeURIComponent(options.runtime.project_id)}/docs-review`,
     ensureTrailingSlash(options.runtime.api_url),
   );
+  const baselineRemoteRevisionId = normalizeUuid(
+    options.manifest?.manifest?.sync?.last_successful_remote_revision,
+  );
   const response = await options.fetch(endpoint.href, {
     method: 'POST',
     headers: {
@@ -549,6 +564,15 @@ async function submitHostedDocsReview(options) {
         name: options.project.name,
         mode: options.project.mode,
         repos: Array.isArray(options.project.repos) ? options.project.repos : [],
+      },
+      ...(baselineRemoteRevisionId
+        ? { baseline_remote_revision_id: baselineRemoteRevisionId }
+        : {}),
+      local_root_revision: options.manifest?.manifest?.canonical?.local_root_revision,
+      evidence_scope: {
+        manifest_hash: options.manifest?.manifest?.canonical?.manifest_hash,
+        document_count: options.manifest?.manifest?.canonical?.document_count,
+        warning_count: options.manifest?.manifest?.canonical?.warning_count,
       },
     }),
   });
@@ -569,6 +593,102 @@ async function submitHostedDocsReview(options) {
     endpoint: endpoint.href,
     run_id: runId,
     status: normalizeOptionalString(body.status) ?? 'accepted',
+    phase: normalizeOptionalString(body.phase),
+  };
+}
+
+async function pollHostedDocsReview(options) {
+  const marker = await readDocsReviewMarker(options.statePath);
+  const runtime = marker.runtime;
+  const hosted = marker.hosted;
+
+  if (runtime?.provider !== 'hosted' || !runtime.api_url || !runtime.project_id) {
+    throw new Error('docs-review --poll-hosted requires a hosted docs-review marker.');
+  }
+
+  const runId = normalizeOptionalString(hosted?.run_id);
+  if (!runId) {
+    throw new Error('docs-review --poll-hosted requires hosted.run_id in state/docs-review.json.');
+  }
+
+  const credentialEnvVar = runtime.credential_env_var;
+  if (!credentialEnvVar) {
+    throw new Error('docs-review --poll-hosted requires runtime.credential_env_var in state/docs-review.json.');
+  }
+
+  const credential = normalizeOptionalString(options.env?.[credentialEnvVar]);
+  if (!credential) {
+    throw new Error(`docs-review --poll-hosted requires ${credentialEnvVar}.`);
+  }
+
+  const endpoint = new URL(
+    `api/sync/projects/${encodeURIComponent(runtime.project_id)}/runs/${encodeURIComponent(runId)}`,
+    ensureTrailingSlash(runtime.api_url),
+  );
+  const response = await options.fetch(endpoint.href, {
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      authorization: `Bearer ${credential}`,
+    },
+  });
+
+  if (!response.ok) {
+    const body = typeof response.text === 'function' ? await response.text() : '';
+    throw new Error(`Hosted docs-review poll failed with ${response.status}${body ? `: ${body}` : ''}`);
+  }
+
+  const body = typeof response.json === 'function' ? await response.json() : {};
+  const {
+    phase: _oldPhase,
+    prompt_version: _oldPromptVersion,
+    parser_version: _oldParserVersion,
+    proposal_ids: _oldProposalIds,
+    warnings: _oldWarnings,
+    error_code: _oldErrorCode,
+    error_message: _oldErrorMessage,
+    ...hostedBase
+  } = hosted;
+  const hostedStatus = normalizeOptionalString(body.status) ?? hosted.status ?? 'accepted';
+  const hostedErrorMessage = normalizeOptionalString(body.error_message);
+  const updatedHosted = {
+    ...hostedBase,
+    endpoint: hosted.endpoint,
+    run_id: runId,
+    status: hostedStatus,
+    ...(normalizeOptionalString(body.phase) ? { phase: normalizeOptionalString(body.phase) } : {}),
+    ...(normalizeOptionalString(body.prompt_version) ? { prompt_version: normalizeOptionalString(body.prompt_version) } : {}),
+    ...(normalizeOptionalString(body.parser_version) ? { parser_version: normalizeOptionalString(body.parser_version) } : {}),
+    ...(Array.isArray(body.proposal_ids) ? { proposal_ids: body.proposal_ids } : {}),
+    ...(Array.isArray(body.warnings) ? { warnings: body.warnings } : {}),
+    ...(normalizeOptionalString(body.error_code) ? { error_code: normalizeOptionalString(body.error_code) } : {}),
+    ...(hostedErrorMessage ? { error_message: hostedErrorMessage } : {}),
+  };
+  const markerStatus = markerStatusForHostedRunStatus(hostedStatus);
+  const message = hostedStatus === 'failed' && hostedErrorMessage
+    ? `Hosted docs-review run ${runId} is failed: ${hostedErrorMessage}`
+    : `Hosted docs-review run ${runId} is ${updatedHosted.status}.`;
+
+  const updatedMarker = {
+    ...marker,
+    status: markerStatus,
+    hosted: updatedHosted,
+  };
+  await writeDocsReviewMarker(options.statePath, updatedMarker);
+
+  return {
+    rootDir: options.rootDir,
+    statePath: options.statePath,
+    status: markerStatus,
+    llm: marker.llm ?? null,
+    model: marker.model ?? null,
+    runtime,
+    hosted: updatedHosted,
+    reviewPrompt: null,
+    warnings: (updatedHosted.warnings ?? []).map((warning) =>
+      warning?.message ? `${warning.code ?? 'hosted_warning'}: ${warning.message}` : String(warning),
+    ),
+    message,
   };
 }
 
@@ -593,6 +713,33 @@ function normalizeOptionalString(value) {
 
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeUuid(value) {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
+    ? normalized
+    : null;
+}
+
+function markerStatusForHostedRunStatus(status) {
+  if (status === 'completed') {
+    return 'hosted-review-completed';
+  }
+
+  if (status === 'failed') {
+    return 'hosted-review-failed';
+  }
+
+  if (status === 'needs_rebase') {
+    return 'hosted-review-needs-rebase';
+  }
+
+  return 'hosted-review-requested';
 }
 
 function normalizeMaxTokens(value) {

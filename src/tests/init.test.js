@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { scanProjectMemory } from '../project-memory.js';
+import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
 
@@ -622,7 +623,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(marker.model, 'gpt-5.3-codex');
 
     const hostedStdout = [];
-    const fetchCalls = [];
+    const submitFetchCalls = [];
     await runCli(
       ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--llm', 'claude', '--model', 'claude-sonnet-4-6'],
       {
@@ -637,7 +638,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
         cwd: tempDir,
         env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' },
         async fetch(url, request) {
-          fetchCalls.push({ url, request });
+          submitFetchCalls.push({ url, request });
           return {
             ok: true,
             status: 202,
@@ -649,13 +650,16 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       },
     );
     const hostedMarker = JSON.parse(await readFile(path.join(localPrimaryRoot, 'state/docs-review.json'), 'utf8'));
-    const hostedBody = JSON.parse(fetchCalls[0].request.body);
+    const hostedBody = JSON.parse(submitFetchCalls[0].request.body);
 
-    assert.equal(fetchCalls.length, 1);
-    assert.equal(fetchCalls[0].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_review/docs-review');
-    assert.equal(fetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
+    assert.equal(submitFetchCalls.length, 1);
+    assert.equal(submitFetchCalls[0].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_review/docs-review');
+    assert.equal(submitFetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
     assert.equal(hostedBody.llm, 'claude');
     assert.equal(Object.hasOwn(hostedBody, 'project_memory_root'), false);
+    assert.match(hostedBody.local_root_revision, /^loc_[a-f0-9]{24}$/);
+    assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
+    assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
     assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v1/);
     assert.match(hostedBody.prompt, /Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
@@ -663,6 +667,90 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(hostedMarker.status, 'hosted-review-requested');
     assert.equal(hostedMarker.hosted.run_id, 'run_docs_review_123');
     assert.equal(hostedMarker.runtime.credential_env_var, 'VIBECOMPASS_SYNC_TOKEN');
+
+    const pollStdout = [];
+    const pollFetchCalls = [];
+    await runCli(
+      ['docs-review', '--root', localPrimaryRoot, '--poll-hosted'],
+      {
+        stdout: {
+          write(chunk) {
+            pollStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+        env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' },
+        async fetch(url, request) {
+          pollFetchCalls.push({ url, request });
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                run_id: 'run_docs_review_123',
+                status: 'completed',
+                phase: null,
+                prompt_version: 'VibeCompass Docs Review Prompt v1',
+                parser_version: 'hosted-docs-review-parser-v1',
+                proposal_ids: ['proposal_1'],
+                warnings: [{ code: 'dropped_non_architecture_output', message: 'Dropped freeform text.' }],
+              };
+            },
+          };
+        },
+      },
+    );
+    const polledMarker = JSON.parse(await readFile(path.join(localPrimaryRoot, 'state/docs-review.json'), 'utf8'));
+    assert.equal(pollFetchCalls.length, 1);
+    assert.equal(pollFetchCalls[0].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_review/runs/run_docs_review_123');
+    assert.equal(pollFetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
+    assert.match(pollStdout.join(''), /Docs-review: hosted-review-completed/);
+    assert.match(pollStdout.join(''), /Hosted run: run_docs_review_123/);
+    assert.equal(polledMarker.status, 'hosted-review-completed');
+    assert.deepEqual(polledMarker.hosted.proposal_ids, ['proposal_1']);
+    assert.equal(polledMarker.hosted.parser_version, 'hosted-docs-review-parser-v1');
+    assert.equal(polledMarker.hosted.warnings[0].code, 'dropped_non_architecture_output');
+
+    const failedPollStdout = [];
+    await runCli(
+      ['docs-review', '--root', localPrimaryRoot, '--poll-hosted'],
+      {
+        stdout: {
+          write(chunk) {
+            failedPollStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+        env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' },
+        async fetch() {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                run_id: 'run_docs_review_123',
+                status: 'failed',
+                phase: null,
+                error_code: 'no_baseline',
+                error_message: 'No remote baseline revision was supplied.',
+              };
+            },
+          };
+        },
+      },
+    );
+    const failedPollMarker = JSON.parse(await readFile(path.join(localPrimaryRoot, 'state/docs-review.json'), 'utf8'));
+    assert.match(failedPollStdout.join(''), /Docs-review: hosted-review-failed/);
+    assert.match(failedPollStdout.join(''), /Hosted docs-review run run_docs_review_123 is failed: No remote baseline revision was supplied\./);
+    assert.equal(failedPollMarker.status, 'hosted-review-failed');
+    assert.equal(failedPollMarker.hosted.error_code, 'no_baseline');
+    assert.equal(failedPollMarker.hosted.error_message, 'No remote baseline revision was supplied.');
 
     const completeStdout = [];
     await runCli(
@@ -699,6 +787,210 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
         ),
       /only one execution mode/,
     );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli sync transport pushes, previews, exports, and applies proposals', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-flow-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      rootDir,
+      name: 'Sync Flow Project',
+      slug: 'sync-flow-project',
+      mode: 'local-primary',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      sync: {
+        apiUrl: 'https://vibecompass.dev',
+        projectId: 'vc_proj_sync',
+        credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
+      },
+      generatedAt: new Date('2026-05-09T10:00:00Z'),
+    });
+
+    const remoteRevisionId = '11111111-1111-4111-8111-111111111111';
+    const proposalId = '22222222-2222-4222-8222-222222222222';
+    const exportedText = [
+      '---',
+      'domain: Platform',
+      'feature: Sync Flow',
+      'component: Proposal Apply',
+      'status: In progress',
+      '---',
+      '',
+      '## Description',
+      'Exported proposal doc.',
+      '',
+      '## Details',
+      'Details.',
+      '',
+      '## Next steps',
+      '- Push to confirm.',
+      '',
+      '## Involved files',
+      '- `docs:architecture/platform/sync-flow/proposal-apply.md`',
+      '',
+    ].join('\n');
+    const exportedHash = sha256Text(exportedText);
+    const fetchCalls = [];
+
+    async function fetch(url, request) {
+      fetchCalls.push({ url, request });
+
+      if (url.endsWith('/push')) {
+        const body = JSON.parse(request.body);
+        return {
+          ok: true,
+          status: 202,
+          async json() {
+            return {
+              run_id: body.base_remote_revision_id ? 'run_push_confirm' : 'run_push_initial',
+              status: 'completed',
+              remote_revision_id: body.base_remote_revision_id
+                ? '33333333-3333-4333-8333-333333333333'
+                : remoteRevisionId,
+              applied_proposal_ids: body.base_remote_revision_id ? [proposalId] : [],
+              stale_proposal_ids: [],
+            };
+          },
+        };
+      }
+
+      if (url.endsWith('/docs-review')) {
+        return {
+          ok: true,
+          status: 202,
+          async json() {
+            return { run_id: 'run_docs_review_after_push', status: 'accepted' };
+          },
+        };
+      }
+
+      if (url.endsWith('/pull-preview')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              preview_token: 'preview_test_123',
+              created_at: '2026-05-09T10:01:00.000Z',
+              expires_at: '2026-05-09T10:31:00.000Z',
+              base_remote_revision_id: remoteRevisionId,
+              target_remote_revision_id: remoteRevisionId,
+              authoritative_change_set_hash: `sha256:${'b'.repeat(64)}`,
+              proposals: [
+                {
+                  proposal_id: proposalId,
+                  status: 'open',
+                  source: 'ai',
+                  summary: 'Add sync flow proposal doc',
+                  affected_paths: ['architecture/platform/sync-flow/proposal-apply.md'],
+                },
+              ],
+              warnings: [],
+            };
+          },
+        };
+      }
+
+      if (url.endsWith('/pull-export')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              run_id: 'run_export_123',
+              status: 'completed',
+              preview_token: 'preview_test_123',
+              target_remote_revision_id: remoteRevisionId,
+              proposal_ids: [proposalId],
+              operations: [
+                {
+                  proposal_id: proposalId,
+                  position: 0,
+                  op: 'write',
+                  path: 'architecture/platform/sync-flow/proposal-apply.md',
+                  kind: 'architecture',
+                  before_content_hash: null,
+                  after_content_hash: exportedHash,
+                  content_hash: exportedHash,
+                  raw_text: exportedText,
+                },
+              ],
+            };
+          },
+        };
+      }
+
+      throw new Error(`Unexpected fetch ${url}`);
+    }
+
+    const pushStdout = [];
+    await runCli(
+      ['push', '--root', rootDir],
+      { stdout: { write(chunk) { pushStdout.push(chunk); } }, stderr: { write() {} } },
+      { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
+    );
+    const initialPushBody = JSON.parse(fetchCalls[0].request.body);
+    assert.equal(fetchCalls[0].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_sync/push');
+    assert.equal(fetchCalls[0].request.headers.authorization, 'Bearer vc_sync_test');
+    assert.equal(Object.hasOwn(initialPushBody, 'base_remote_revision_id'), false);
+    assert.ok(initialPushBody.documents.some((document) => document.path === 'project.yaml' && document.raw_text.includes('Sync Flow Project')));
+    assert.match(pushStdout.join(''), /Remote revision: 11111111-1111-4111-8111-111111111111/);
+
+    await runCli(
+      ['docs-review', '--root', rootDir, '--submit-hosted', '--llm', 'claude', '--model', 'claude-sonnet-4-6'],
+      { stdout: { write() {} }, stderr: { write() {} } },
+      { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
+    );
+    const docsReviewBody = JSON.parse(fetchCalls[1].request.body);
+    assert.equal(fetchCalls[1].url, 'https://vibecompass.dev/api/sync/projects/vc_proj_sync/docs-review');
+    assert.equal(docsReviewBody.baseline_remote_revision_id, remoteRevisionId);
+
+    const previewStdout = [];
+    await runCli(
+      ['pull-preview', '--root', rootDir],
+      { stdout: { write(chunk) { previewStdout.push(chunk); } }, stderr: { write() {} } },
+      { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
+    );
+    const previewBody = JSON.parse(fetchCalls[2].request.body);
+    assert.equal(previewBody.base_remote_revision_id, remoteRevisionId);
+    assert.equal(previewBody.include_pending_proposals, true);
+    assert.match(previewStdout.join(''), new RegExp(proposalId));
+
+    const exportStdout = [];
+    await runCli(
+      ['pull-export', '--root', rootDir],
+      { stdout: { write(chunk) { exportStdout.push(chunk); } }, stderr: { write() {} } },
+      { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
+    );
+    const exportBody = JSON.parse(fetchCalls[3].request.body);
+    assert.equal(exportBody.preview_token, 'preview_test_123');
+    assert.deepEqual(exportBody.proposal_ids, [proposalId]);
+    assert.match(exportStdout.join(''), /Operations: 1/);
+
+    await runCli(
+      ['apply-export', '--root', rootDir],
+      { stdout: { write() {} }, stderr: { write() {} } },
+      { cwd: tempDir, env: {} },
+    );
+    const appliedDoc = await readFile(
+      path.join(rootDir, 'architecture/platform/sync-flow/proposal-apply.md'),
+      'utf8',
+    );
+    assert.match(appliedDoc, /Exported proposal doc/);
+
+    await runCli(
+      ['push', '--root', rootDir],
+      { stdout: { write() {} }, stderr: { write() {} } },
+      { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'vc_sync_test' }, fetch },
+    );
+    const confirmPushBody = JSON.parse(fetchCalls[4].request.body);
+    assert.equal(confirmPushBody.base_remote_revision_id, remoteRevisionId);
+    assert.ok(confirmPushBody.documents.some((document) => document.path === 'architecture/platform/sync-flow/proposal-apply.md'));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

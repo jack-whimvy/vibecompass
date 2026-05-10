@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { localRevisionFromManifestHash, stableHash } from './hash.js';
 import { scanProjectMemory } from './project-memory.js';
@@ -59,8 +59,12 @@ export function generateStateManifest(scanResult, options = {}) {
 export async function writeStateManifest(rootDir, options = {}) {
   const scanResult = await scanProjectMemory(rootDir);
   const activeSessions = await readActiveSessionsForManifest(rootDir);
+  const existingSync = Object.hasOwn(options, 'sync')
+    ? options.sync
+    : await readExistingSyncState(rootDir);
   const manifest = generateStateManifest(scanResult, {
     ...options,
+    ...(existingSync ? { sync: existingSync } : {}),
     ...(activeSessions ? { activeSessions } : {}),
   });
   const stateDir = path.join(rootDir, 'state');
@@ -74,6 +78,19 @@ export async function writeStateManifest(rootDir, options = {}) {
     manifestPath,
     scanResult,
   };
+}
+
+async function readExistingSyncState(rootDir) {
+  try {
+    const existing = JSON.parse(
+      await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'),
+    );
+    return existing?.sync && typeof existing.sync === 'object'
+      ? existing.sync
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 async function readActiveSessionsForManifest(rootDir) {
