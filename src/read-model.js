@@ -5,7 +5,7 @@ import { generateStateManifest } from './manifest.js';
 import { scanProjectMemory } from './project-memory.js';
 
 const SECTION_PATTERN = /^##\s+(.+)$/gm;
-const DECISION_HEADING_PATTERN = /^###\s+D-(\d+)\s+—\s+(.+)$/gm;
+const DECISION_HEADING_PATTERN = /^###\s+D-(\d{3,})\s+—\s+(.+)$/gm;
 
 export async function loadProjectReadModel(rootDir) {
   const scanResult = await scanProjectMemory(rootDir);

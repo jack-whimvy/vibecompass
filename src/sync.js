@@ -60,6 +60,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     base_remote_revision_id: normalizeUuid(manifest.sync?.last_successful_remote_revision),
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
+    local_documents: buildLocalDocumentSummaries(manifest.documents),
     include_pending_proposals: options.includePendingProposals !== false,
   });
 
@@ -74,6 +75,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     available_proposal_ids: Array.isArray(response.proposals)
       ? response.proposals.map((proposal) => proposal.proposal_id)
       : [],
+    conflicts: Array.isArray(response.conflicts) ? response.conflicts : [],
     created_at: response.created_at ?? new Date().toISOString(),
     expires_at: response.expires_at,
   };
@@ -92,6 +94,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     manifestPath: updatedManifest.manifestPath,
     previewToken: response.preview_token,
     proposals: response.proposals ?? [],
+    conflicts: response.conflicts ?? [],
     warnings: response.warnings ?? [],
     message: `Created pull preview with ${(response.proposals ?? []).length} pending proposal${(response.proposals ?? []).length === 1 ? '' : 's'}.`,
   };
@@ -264,6 +267,43 @@ async function readPushDocuments(rootDir, documents) {
 
   result.sort((left, right) => left.path.localeCompare(right.path));
   return result;
+}
+
+function buildLocalDocumentSummaries(documents) {
+  return Object.entries(documents ?? {}).map(([relativePath, metadata]) => ({
+    path: normalizeCanonicalPath(relativePath),
+    kind: metadata.kind,
+    content_hash: metadata.content_hash,
+    extracted: buildLocalDocumentExtractedSummary(metadata.kind, metadata.extracted),
+  }));
+}
+
+function buildLocalDocumentExtractedSummary(kind, extracted = {}) {
+  if (!extracted || typeof extracted !== 'object') return {};
+
+  if (kind === 'session') {
+    return {
+      ...(typeof extracted.title === 'string' ? { title: extracted.title } : {}),
+      ...(typeof extracted.session_date === 'string' ? { session_date: extracted.session_date } : {}),
+      ...(Number.isInteger(extracted.session_number)
+        ? { session_number: extracted.session_number }
+        : {}),
+    };
+  }
+
+  if (kind === 'decision') {
+    return {
+      ...(Array.isArray(extracted.decision_ids)
+        ? {
+          decision_ids: extracted.decision_ids.filter(
+            (value) => Number.isInteger(value) && value > 0,
+          ),
+        }
+        : {}),
+    };
+  }
+
+  return {};
 }
 
 function resolvePreview(manifest, previewToken) {

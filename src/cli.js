@@ -234,6 +234,12 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     for (const proposal of result.proposals) {
       io.stdout.write(`- ${proposal.proposal_id}: ${proposal.summary}\n`);
     }
+    if (result.conflicts.length > 0) {
+      io.stdout.write(`Conflicts: ${result.conflicts.length}\n`);
+      for (const conflict of result.conflicts) {
+        io.stdout.write(`- ${conflict.code}: ${conflict.message}\n`);
+      }
+    }
     writeWarnings(io, result.warnings.map((warning) => `${warning.code}: ${warning.message}`));
     io.stdout.write(`Recorded ${result.manifestPath}\n`);
     io.stdout.write(`${result.message}\n`);

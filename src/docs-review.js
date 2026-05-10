@@ -688,6 +688,14 @@ async function submitHostedDocsReview(options) {
 
   if (!response.ok) {
     const body = typeof response.text === 'function' ? await response.text() : '';
+    const details = parseJsonObject(body);
+    if (details?.error) {
+      const nextStep = details.next_step ? ` Next step: ${details.next_step}` : '';
+      throw new Error(
+        `Hosted docs-review request failed with ${response.status}: ${details.error}${nextStep}`,
+      );
+    }
+
     throw new Error(`Hosted docs-review request failed with ${response.status}${body ? `: ${body}` : ''}`);
   }
 
@@ -704,6 +712,16 @@ async function submitHostedDocsReview(options) {
     status: normalizeOptionalString(body.status) ?? 'accepted',
     phase: normalizeOptionalString(body.phase),
   };
+}
+
+function parseJsonObject(value) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 async function pollHostedDocsReview(options) {

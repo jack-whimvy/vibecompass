@@ -890,6 +890,12 @@ test('runCli sync transport pushes, previews, exports, and applies proposals', a
                   affected_paths: ['architecture/platform/sync-flow/proposal-apply.md'],
                 },
               ],
+              conflicts: [
+                {
+                  code: 'session_number_collision',
+                  message: 'Local and hosted roots both use the same session number.',
+                },
+              ],
               warnings: [],
             };
           },
@@ -959,7 +965,9 @@ test('runCli sync transport pushes, previews, exports, and applies proposals', a
     const previewBody = JSON.parse(fetchCalls[2].request.body);
     assert.equal(previewBody.base_remote_revision_id, remoteRevisionId);
     assert.equal(previewBody.include_pending_proposals, true);
+    assert.ok(previewBody.local_documents.some((document) => document.path === 'project.yaml'));
     assert.match(previewStdout.join(''), new RegExp(proposalId));
+    assert.match(previewStdout.join(''), /session_number_collision/);
 
     const exportStdout = [];
     await runCli(

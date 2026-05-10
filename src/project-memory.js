@@ -468,8 +468,23 @@ function parseDecisionDocument(options) {
   const warnings = [];
   const errors = [];
   const entries = extractDecisionEntries(options.content);
+  const malformedHeadings = extractMalformedDecisionHeadings(options.content);
+
+  for (const heading of malformedHeadings) {
+    errors.push(
+      createError(
+        options.relativePath,
+        'decision-invalid-id',
+        `Decision heading "${heading}" must use zero-padded D-NNN or higher.`,
+      ),
+    );
+  }
 
   if (entries.length === 0) {
+    if (malformedHeadings.length > 0) {
+      return { kind: 'decision', extracted: null, warnings, errors };
+    }
+
     errors.push(
       createError(options.relativePath, 'decision-missing-entries', 'Decision files must contain at least one resolvable decision entry.'),
     );
@@ -479,7 +494,7 @@ function parseDecisionDocument(options) {
   const decisionIds = [];
   for (const entry of entries) {
     if (!entry.decisionId || entry.decisionId <= 0) {
-      errors.push(createError(options.relativePath, 'decision-invalid-id', 'Decision heading must include D-<positive integer>.'));
+      errors.push(createError(options.relativePath, 'decision-invalid-id', 'Decision heading must include zero-padded D-<NNN>.'));
       continue;
     }
 
@@ -576,7 +591,7 @@ function parseSessionDocument(options) {
 }
 
 function extractDecisionEntries(content) {
-  const matches = [...content.matchAll(/^###\s+D-(\d+)\b.*$/gm)];
+  const matches = [...content.matchAll(/^###\s+D-(\d{3,})\b.*$/gm)];
 
   return matches.map((match, index) => {
     const bodyStart = match.index ?? 0;
@@ -588,6 +603,10 @@ function extractDecisionEntries(content) {
       body: content.slice(bodyStart, bodyEnd),
     };
   });
+}
+
+function extractMalformedDecisionHeadings(content) {
+  return [...content.matchAll(/^###\s+(D-\d{1,2})\b.*$/gm)].map((match) => match[1]);
 }
 
 function findDuplicateDecisionErrors(documents) {

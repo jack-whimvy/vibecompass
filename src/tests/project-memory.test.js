@@ -241,6 +241,39 @@ sync:
   }
 });
 
+test('scanProjectMemory requires zero-padded decision headings', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Decision Padding
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+    'decisions/cross-cutting.md': `
+### D-001 — Padded decision
+**Timestamp:** 2026-04-19 00:00 PDT
+**Decision:** This heading is canonical.
+**Rationale:** Decision IDs are zero-padded.
+
+### D-1 — Unpadded decision
+**Timestamp:** 2026-04-19 00:01 PDT
+**Decision:** This heading is not canonical.
+**Rationale:** Decision IDs are zero-padded.
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+
+    assert.ok(result.errors.some((error) => error.code === 'decision-invalid-id'));
+    assert.throws(() => generateStateManifest(result), /canonical parse errors/i);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test('scanProjectMemory supports singular repo, warns on unknown status, and accepts session heading fallback', async () => {
   const fixture = await createFixture({
     'project.yaml': `
