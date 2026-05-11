@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://vibecompass.dev">
+    <img src="https://raw.githubusercontent.com/jack-whimvy/vibecompass/main/brand/logo-a4.png" alt="VibeCompass" height="96" />
+  </a>
+</p>
+
 # @vibecompass/vibecompass
 
 Local-first project-memory core for [VibeCompass](https://vibecompass.dev).
