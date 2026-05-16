@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { access, readFile, readdir, realpath } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { promisify } from 'node:util';
@@ -148,54 +149,128 @@ async function resolveExistingGuidedProject(options, environment) {
   }
 
   if (candidates.length === 1) {
+    if (candidates[0].discovery === 'ancestor' && canPrompt(environment)) {
+      const prompter = createPrompter(environment.io, environment.runtime);
+      try {
+        const useExistingRoot = await askConfirm(
+          prompter,
+          `Found existing VibeCompass project memory root at ${candidates[0].displayPath}. Show its info instead of initializing a new root here?`,
+          true,
+        );
+        if (!useExistingRoot) {
+          return null;
+        }
+      } finally {
+        await prompter.close();
+      }
+    }
+
     return readExistingGuidedProject(candidates[0], environment.cwd);
   }
 
-  if (!canPrompt(environment)) {
-    return {
-      status: 'ambiguous',
-      candidates,
-    };
-  }
-
-  const prompter = createPrompter(environment.io, environment.runtime);
-  try {
-    const selectedRootDir = await askChoice(
-      prompter,
-      'Multiple VibeCompass project memory roots found. Which one should be shown? No files will be modified.',
-      candidates.map((candidate) => ({
-        value: candidate.rootDir,
-        description: candidate.displayPath,
-      })),
-      {
-        defaultValue: candidates[0].rootDir,
-      },
-    );
-    return readExistingGuidedProject(
-      candidates.find((candidate) => candidate.rootDir === selectedRootDir) ?? candidates[0],
-      environment.cwd,
-    );
-  } finally {
-    await prompter.close();
-  }
+  return {
+    status: 'ambiguous',
+    candidates,
+  };
 }
 
 async function findExistingGuidedProjectRoots(options, cwd) {
   const candidateRoots = options.rootDir
-    ? [path.resolve(cwd, options.rootDir)]
-    : [path.resolve(cwd, '.compass'), path.resolve(cwd)];
+    ? [{
+        rootDir: path.resolve(cwd, options.rootDir),
+        discovery: 'explicit',
+      }]
+    : await buildDefaultExistingRootCandidates(cwd);
 
   const existing = [];
-  for (const rootDir of [...new Set(candidateRoots)]) {
+  const seen = new Set();
+  for (const candidate of candidateRoots) {
+    const rootDir = candidate.rootDir;
+    if (seen.has(rootDir)) {
+      continue;
+    }
+    seen.add(rootDir);
+
     if (await fileExists(path.join(rootDir, 'project.yaml'))) {
       existing.push({
         rootDir,
         displayPath: toRelativeIfInsideCwd(rootDir, cwd),
+        discovery: candidate.discovery,
       });
     }
   }
 
   return existing;
+}
+
+async function buildDefaultExistingRootCandidates(cwd) {
+  const candidates = [
+    {
+      rootDir: path.resolve(cwd, '.compass'),
+      discovery: 'direct',
+    },
+    {
+      rootDir: path.resolve(cwd),
+      discovery: 'direct',
+    },
+  ];
+  const ancestorStopDir = await resolveAncestorSearchStopDir(cwd);
+  if (path.resolve(cwd) === ancestorStopDir) {
+    return candidates;
+  }
+
+  for (const directory of ancestorDirectories(path.dirname(cwd), ancestorStopDir)) {
+    candidates.push(
+      {
+        rootDir: path.join(directory, '.compass'),
+        discovery: 'ancestor',
+      },
+      {
+        rootDir: directory,
+        discovery: 'ancestor',
+      },
+    );
+  }
+
+  return candidates;
+}
+
+async function resolveAncestorSearchStopDir(cwd) {
+  const homeDir = path.resolve(os.homedir());
+  if (path.resolve(cwd) === homeDir) {
+    return homeDir;
+  }
+
+  const gitRoot = await readGitRoot(cwd);
+  if (!gitRoot) {
+    return isPathInside(cwd, homeDir) || path.resolve(cwd) === homeDir
+      ? homeDir
+      : path.parse(cwd).root;
+  }
+
+  const gitRootParent = path.dirname(path.resolve(gitRoot));
+  if (isPathInside(gitRootParent, homeDir) || gitRootParent === homeDir) {
+    return gitRootParent;
+  }
+
+  return isPathInside(cwd, homeDir) || path.resolve(cwd) === homeDir
+    ? homeDir
+    : path.parse(cwd).root;
+}
+
+function ancestorDirectories(startDir, stopDir) {
+  const directories = [];
+  let current = path.resolve(startDir);
+  const stop = path.resolve(stopDir);
+  while (true) {
+    directories.push(current);
+    if (current === stop || current === path.dirname(current)) {
+      break;
+    }
+    current = path.dirname(current);
+  }
+
+  return directories;
 }
 
 async function readExistingGuidedProject(candidate, cwd) {
@@ -641,6 +716,16 @@ async function readGitInfo(cwd) {
       root: root.trim() || null,
       branch: branchResult.stdout.trim() || null,
     };
+  } catch {
+    return null;
+  }
+}
+
+async function readGitRoot(cwd) {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd });
+    const root = stdout.trim();
+    return root ? path.resolve(root) : null;
   } catch {
     return null;
   }
@@ -1264,4 +1349,9 @@ function toRelativeIfInsideCwd(targetPath, cwd) {
   }
 
   return relative;
+}
+
+function isPathInside(candidatePath, parentPath) {
+  const relative = path.relative(path.resolve(parentPath), path.resolve(candidatePath));
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
 }

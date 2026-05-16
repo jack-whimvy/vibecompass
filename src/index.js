@@ -1,4 +1,8 @@
-export { STATE_VERSION, generateStateManifest, writeStateManifest } from './manifest.js';
+export { STATE_VERSION, generateStateManifest, prepareStateManifest, writeStateManifest } from './manifest.js';
+export { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
+export { PACKAGE_VERSION } from './version.js';
+export { refreshWorkflow } from './refresh-workflow.js';
+export { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 export { initializeProjectMemory } from './init.js';
 export { preflightDocsReview } from './docs-review.js';
 export {

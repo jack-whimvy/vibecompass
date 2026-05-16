@@ -6,6 +6,7 @@ import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
 import { buildWorkflowMetadata } from './workflow.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import { PACKAGE_VERSION } from './version.js';
 
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 
@@ -141,7 +142,10 @@ function normalizeInitOptions(options) {
     mode: preparedOptions.mode,
     repos,
     ...(sync ? { sync } : {}),
-    metadata: buildAgentFilesMetadata(buildWorkflowMetadata(preparedOptions.metadata, {
+    metadata: buildAgentFilesMetadata(buildWorkflowMetadata({
+      ...(preparedOptions.metadata && typeof preparedOptions.metadata === 'object' ? preparedOptions.metadata : {}),
+      package_version: PACKAGE_VERSION,
+    }, {
       gitPublish:
         typeof preparedOptions.closeSessionGitPublish === 'boolean'
           ? preparedOptions.closeSessionGitPublish

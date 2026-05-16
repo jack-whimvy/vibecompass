@@ -14,7 +14,7 @@ export async function loadProjectReadModel(rootDir) {
     throw new Error(`Cannot build read model with canonical parse errors.\n${details}`);
   }
 
-  const existingManifest = await readManifestIfPresent(rootDir);
+  const existingManifest = normalizeReadableManifest(await readManifestIfPresent(rootDir));
   const currentManifest = generateStateManifest(scanResult, {
     generatedAt: existingManifest?.generated_at ?? new Date(),
     sync: existingManifest?.sync,
@@ -554,4 +554,20 @@ async function readManifestIfPresent(rootDir) {
   } catch {
     return null;
   }
+}
+
+function normalizeReadableManifest(manifest) {
+  if (!manifest || typeof manifest !== 'object') {
+    return null;
+  }
+
+  if (!manifest.canonical || typeof manifest.canonical !== 'object') {
+    return null;
+  }
+
+  if (typeof manifest.canonical.manifest_hash !== 'string') {
+    return null;
+  }
+
+  return manifest;
 }

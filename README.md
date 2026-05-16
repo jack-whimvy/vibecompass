@@ -25,24 +25,27 @@ Shipped today:
 - `vibecompass list-sessions` / `vibecompass switch-session` for multiple active session lanes
 - `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
+- `vibecompass status` for a read-only project-memory health and drift report
+- `vibecompass refresh-workflow` for explicit dry-run/apply refresh of package-owned derived workflow files
 - `vibecompass docs-review --guided` — print a comprehensive review prompt for your chosen LLM to run
 - `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app and poll for proposal/artifact output
 - `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
 - `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
+- hosted sync commands: `push`, `pull-preview`, `pull-export`, and `apply-export`
 - canonical file scanning and validation
 - `state/manifest.json` generation
 - JavaScript read-model helpers for project, feature, decision, and file context
 
 Not shipped yet:
 
-- hosted sync commands (push, pull-preview, pull-export)
-- hosted docs-review execution that runs the review and writes canonical docs
+- one-command hosted docs-review that directly writes canonical local docs
 - additional local docs-review providers beyond Anthropic
 - automatic acceptance of review findings without a local apply step
 
-The package is publishable now as the file-contract and read-model core. The
-broader local-primary sync workflow is still being built on top of it.
+The package is useful today as the local project-memory CLI and JavaScript
+core. Use it to create a root, keep project memory current, run local sessions,
+and sync with hosted VibeCompass when you have a hosted project binding.
 
 ## Requirements
 
@@ -67,7 +70,7 @@ npm install @vibecompass/vibecompass
 
 ## Quickstart
 
-Run the guided bootstrap:
+Most users should start with the guided bootstrap:
 
 ```bash
 npx -y @vibecompass/vibecompass init --guided
@@ -77,6 +80,18 @@ Guided init asks about repo topology, recommends a placement pattern
 (`workspace-root`, `dedicated-memory-repo`, or `primary-repo`), writes
 lightweight starter project memory, scaffolds the workflow files you opt into,
 and can open the first builder session immediately.
+
+After init, the usual loop is:
+
+```bash
+npx -y @vibecompass/vibecompass status --root .compass
+npx -y @vibecompass/vibecompass start-session --root .compass --id feature-lane --working-on "Build the next feature"
+npx -y @vibecompass/vibecompass docs-review --root .compass --guided
+npx -y @vibecompass/vibecompass close-session --root .compass --session feature-lane --title "Feature Lane" --completed "Shipped the slice" --next-step "Review and publish"
+```
+
+Run `vibecompass status` when you are not sure what to do next. It is
+read-only and prints the safest follow-up commands for the current root.
 
 When the owner directory is a workspace root or primary repo, the canonical
 root defaults to `.compass/` inside that directory. For a dedicated memory repo,
@@ -129,6 +144,34 @@ AGENTS.md           # at the tooling root, only if missing and --with-agents is 
 
 `context.md` is a derived package-owned file. Re-running `init --force --with-workflow`
 regenerates it; do not treat it as a hand-edited source document.
+
+Check an initialized root without writing files:
+
+```bash
+npx -y @vibecompass/vibecompass status --root .compass
+```
+
+Use `status --json` when another tool needs the typed diagnostic model. The
+JSON output intentionally excludes raw hosted preview tokens and resolved
+credential values.
+
+Preview package-owned workflow refreshes without mutating files:
+
+```bash
+npx -y @vibecompass/vibecompass refresh-workflow --root .compass --dry-run
+```
+
+Apply the refresh explicitly when the plan looks right:
+
+```bash
+npx -y @vibecompass/vibecompass refresh-workflow --root .compass --apply
+```
+
+`refresh-workflow` updates generated workflow artifacts such as `context.md`,
+workflow guide READMEs, managed agent-file blocks, and the local
+`state/manifest.json`. Existing package-version stamps are sticky by default;
+pass `--update-package-stamp` when you intentionally want to move the
+canonical `project.yaml.metadata.package_version` stamp to the current CLI.
 
 ## After init: generate real architecture docs
 
@@ -336,6 +379,7 @@ Options:
 - `--close-session-git-publish`: store that the close-session workflow includes a Git publish step
 - `--close-session-git-remote <name>`: optional default Git remote name for that stored publish step
 - `--force`: overwrite an existing `project.yaml`
+- `--replace-active-lanes`: allow `--force` to replace a root that has active session lanes
 
 When `--start-session` is used, `init` automatically enables the minimum
 workflow bootstrap required for that session: `context.md` plus `CLAUDE.md`.
@@ -371,6 +415,51 @@ actual token in your environment before running hosted commands.
 Running it again replaces the existing hosted binding in `project.yaml`, which
 is the intended rotation path after you create a new sync credential.
 
+### `vibecompass status`
+
+```text
+vibecompass status [options]
+```
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--tooling-root <path>`: directory where agent files are inspected; defaults to cwd
+- `--json`: print the typed status model as JSON
+
+`status` is strictly read-only. It reports project identity, active session
+lanes, package-version drift, local manifest compatibility, docs-review
+marker state, generated agent-file drift, warnings, and recommended next
+commands. It does not write canonical files, generated workflow files, agent
+instruction files, or `state/manifest.json`.
+
+### `vibecompass refresh-workflow`
+
+```text
+vibecompass refresh-workflow [--dry-run|--apply] [options]
+```
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--tooling-root <path>`: directory where agent files are refreshed; defaults to cwd
+- `--dry-run`: show planned refresh without changing files; this is the default
+- `--apply`: apply the planned workflow refresh
+- `--update-package-stamp`: update an existing `project.yaml` package-version stamp
+- `--allow-downgrade-templates`: allow applying templates with a CLI older than the root stamp
+
+`refresh-workflow` is the explicit upgrade path for package-owned derived
+artifacts. Dry-run mode is read-only. Apply mode can regenerate `context.md`,
+workflow guide READMEs that still match the package-generated shape, managed
+agent-file blocks, and `state/manifest.json`. It leaves user-authored workflow
+guide files untouched when they no longer match the generated guide shape.
+
+Package-version stamps are intentionally conservative: missing legacy stamps
+can be created by apply mode, existing older or invalid stamps are left
+untouched unless `--update-package-stamp` is passed, and roots stamped by a
+newer CLI require `--allow-downgrade-templates` before older templates are
+applied.
+
 ### `vibecompass start-session`
 
 ```text
@@ -387,6 +476,9 @@ Options:
 - `--repo <id>`: repeatable repo ID for the lane
 - `--claim <path>`: repeatable path claim for overlap warnings
 - `--date <YYYY-MM-DD>`: optional explicit session date
+- `--last-thing-completed <text>`: optional override for the `CLAUDE.md` current-session block
+- `--blockers <text>`: optional current blockers summary
+- `--next-session-should <text>`: optional current-session handoff summary
 
 This command updates the `Current session` block in `CLAUDE.md` and creates
 `sessions/active/<lane-id>/session.yaml`, `wip.md`, and `handoff.md` for the
@@ -404,6 +496,10 @@ vibecompass list-sessions [options]
 
 Lists active session lanes and marks the current lane.
 
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+
 ### `vibecompass switch-session`
 
 ```text
@@ -411,6 +507,11 @@ vibecompass switch-session <lane-id> [options]
 ```
 
 Changes the current lane in `sessions/active/index.yaml`.
+
+Options:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+- `--session <lane-id>`: lane ID; positional ID is also accepted
 
 ### `vibecompass close-session`
 
@@ -434,6 +535,8 @@ Options:
 - `--model <text>`: optional repeatable model contribution entry
 - `--blocker <text>`: repeatable blocker or open question
 - `--next-step <text>`: repeatable next-session instruction
+- `--last-thing-completed <text>`: optional override for the `CLAUDE.md` completed summary
+- `--next-session-should <text>`: optional override for the `CLAUDE.md` next-session summary
 
 This command finalizes the active scratchpad into
 `sessions/YYYY-MM-DD-N-display-title.md`, deletes the closed lane directory
@@ -464,6 +567,38 @@ memory. It creates missing files with managed markers, replaces existing
 managed regions, preserves content outside markers, and warns instead of
 overwriting existing unmarked files unless `--adopt-existing` is supplied.
 
+### Hosted sync commands
+
+```text
+vibecompass push [options]
+vibecompass pull-preview [options]
+vibecompass pull-export [options]
+vibecompass apply-export [options]
+```
+
+Common option:
+
+- `--root <path>`: project-memory root; defaults to `.compass`
+
+Hosted sync commands require `project.yaml` mode `local-primary`, a
+non-secret `project.yaml.sync` binding, and the token named by
+`sync.credential_env_var` in your environment.
+
+`push` sends canonical local project memory to the hosted sync API.
+
+`pull-preview` asks hosted sync for pending proposal state without changing
+canonical local files. It records preview metadata in local `state/`. Pass
+`--no-pending-proposals` when you only want remote state and conflict data.
+
+`pull-export` exports accepted hosted proposal operations into a local bundle
+under `state/pull-export.json` by default. Use `--proposal <id>` to select
+proposal IDs, `--preview-token <token>` to export from a specific preview, and
+`--output <path>` to choose a different output path under the root.
+
+`apply-export` applies a local export bundle to canonical project-memory files
+and records the resulting state. Use `--output <path>` when the export bundle
+is not at the default `state/pull-export.json`.
+
 ### `vibecompass docs-review`
 
 ```text
@@ -475,10 +610,14 @@ Options:
 - `--root <path>`: project-memory root; defaults to `.compass`
 - `--guided`: print a comprehensive review prompt for your chosen LLM to run (recommended)
 - `--submit-hosted`: submit the review request to the hosted app
+- `--poll-hosted`: poll a hosted docs-review run and update `state/docs-review.json`
 - `--run-local`: run the generated review request with a local provider
 - `--provider <name>`: local provider for `--run-local`; currently `anthropic`
 - `--run-local-anthropic`: compatibility alias for `--run-local --provider anthropic`
 - `--apply-output`: apply accepted architecture-doc blocks from review output
+- `--apply-decision-artifact`: append an accepted hosted decision artifact locally
+- `--artifact <id>`: artifact ID for `--apply-decision-artifact`
+- `--refresh-index`: also regenerate `decisions/INDEX.md` after applying a decision artifact
 - `--output <path>`: review output path for `--apply-output`; defaults to `state/docs-review-output.md`
 - `--complete`: mark accepted docs-review changes as completed in local state
 - `--llm <name>`: preferred LLM/provider to record for the review (e.g. `claude`, `codex`, `gemini`)
@@ -500,9 +639,10 @@ Project-mode requirements:
 hosted binding, so hosted precedence does not apply when that flag is set.
 
 `--submit-hosted` uses `sync.credential_env_var` and records the hosted run
-ID in `state/docs-review.json`. Hosted execution creates review proposals and
-artifacts; for `local-primary` roots, local files stay untouched until you
-pull-preview, export, apply locally, and push to confirm the accepted output.
+ID in `state/docs-review.json`. Use `--poll-hosted` to refresh the run marker.
+Hosted execution creates review proposals and artifacts; for `local-primary`
+roots, local files stay untouched until you pull-preview, export, apply
+locally, and push to confirm the accepted output.
 Missing or stale hosted baselines fail with package-facing next-step guidance
 instead of running model work against the wrong source of truth.
 
@@ -554,19 +694,36 @@ recorded in `project.yaml`.
 
 ```js
 import {
+  PACKAGE_VERSION,
+  STATE_VERSION,
   initializeProjectMemory,
+  inspectProjectCompatibility,
+  formatCompatibilityWarnings,
   preflightDocsReview,
   startProjectSession,
+  listProjectSessions,
+  switchProjectSession,
   closeProjectSession,
   syncAgentInstructionFiles,
+  getSupportedAgentFormats,
+  getProjectStatus,
+  renderStatusText,
+  toStatusJson,
+  refreshWorkflow,
   scanProjectMemory,
+  generateStateManifest,
+  prepareStateManifest,
   writeStateManifest,
+  pushProjectMemory,
+  pullPreviewProjectMemory,
+  pullExportProjectMemory,
+  applyPullExport,
   loadProjectReadModel,
   getProjectContext,
   getFeatureContext,
   getDecisionLog,
   getFileContext,
-} from "vibecompass";
+} from "@vibecompass/vibecompass";
 ```
 
 Typical flow:

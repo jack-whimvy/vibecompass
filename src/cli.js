@@ -7,6 +7,9 @@ import { preflightDocsReview } from './docs-review.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
+import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
+import { refreshWorkflow } from './refresh-workflow.js';
+import { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
 import {
   applyPullExport,
   pullExportProjectMemory,
@@ -110,6 +113,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'start-session') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await startProjectSession({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -124,6 +128,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'connect-hosted') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const connectPlan = await resolveConnectHostedCliOptions(parsed.options, {
       cwd: runtime.cwd,
       io,
@@ -145,7 +150,30 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'status') {
+    const result = await getProjectStatus({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify(toStatusJson(result), null, 2)}\n`);
+    } else {
+      io.stdout.write(renderStatusText(result));
+    }
+    return 0;
+  }
+
+  if (parsed.command === 'refresh-workflow') {
+    const result = await refreshWorkflow({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    writeRefreshWorkflowResult(io, result);
+    return 0;
+  }
+
   if (parsed.command === 'close-session' || parsed.command === 'end-session') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await closeProjectSession({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -164,6 +192,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'list-sessions') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await listProjectSessions({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -181,6 +210,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'switch-session') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await switchProjectSession({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -192,6 +222,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'sync-agents') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await syncAgentInstructionFiles({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -201,6 +232,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'docs-review') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await preflightDocsReview({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -250,6 +282,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'push') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await pushProjectMemory(parsed.options, {
       cwd: runtime.cwd,
       env: runtime.env,
@@ -270,6 +303,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'pull-preview') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await pullPreviewProjectMemory(parsed.options, {
       cwd: runtime.cwd,
       env: runtime.env,
@@ -294,6 +328,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'pull-export') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await pullExportProjectMemory(parsed.options, {
       cwd: runtime.cwd,
       env: runtime.env,
@@ -309,6 +344,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   }
 
   if (parsed.command === 'apply-export') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await applyPullExport(parsed.options, {
       cwd: runtime.cwd,
       env: runtime.env,
@@ -340,6 +376,14 @@ export function parseCliArgs(argv) {
 
     if (command === 'connect-hosted') {
       return parseConnectHostedArgs(rest);
+    }
+
+    if (command === 'status') {
+      return parseStatusArgs(rest);
+    }
+
+    if (command === 'refresh-workflow') {
+      return parseRefreshWorkflowArgs(rest);
     }
 
     if (command === 'close-session' || command === 'end-session') {
@@ -669,6 +713,99 @@ function parseConnectHostedArgs(argv) {
           }
         : {}),
     },
+  };
+}
+
+function parseStatusArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--tooling-root':
+        parsed.toolingRootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'status',
+    options: parsed,
+  };
+}
+
+function parseRefreshWorkflowArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--dry-run') {
+      parsed.apply = false;
+      continue;
+    }
+
+    if (token === '--apply') {
+      parsed.apply = true;
+      continue;
+    }
+
+    if (token === '--update-package-stamp') {
+      parsed.updatePackageStamp = true;
+      continue;
+    }
+
+    if (token === '--allow-downgrade-templates') {
+      parsed.allowDowngradeTemplates = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--tooling-root':
+        parsed.toolingRootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'refresh-workflow',
+    options: parsed,
   };
 }
 
@@ -1123,6 +1260,46 @@ function writeAgentFileSyncResult(io, result) {
   }
 }
 
+function writeRefreshWorkflowResult(io, result) {
+  io.stdout.write(`${result.dryRun ? 'Planned' : 'Applied'} workflow refresh for ${result.rootDir}\n`);
+  writeCompatibilityWarnings(io, result.compatibility);
+  io.stdout.write('Project package stamp:\n');
+  const projectSuffix = result.projectFile.warning ? ` — ${result.projectFile.warning}` : '';
+  const projectStatus = result.dryRun && result.projectFile.changed
+    ? `dry-run-${result.projectFile.status}`
+    : result.projectFile.status;
+  io.stdout.write(`- project.yaml: ${projectStatus}${projectSuffix}\n`);
+
+  io.stdout.write('Workflow files:\n');
+  for (const file of result.workflowFiles) {
+    const suffix = file.warning ? ` — ${file.warning}` : '';
+    io.stdout.write(`- ${file.relativePath}: ${result.dryRun && file.changed ? `dry-run-${file.status}` : file.status}${suffix}\n`);
+  }
+
+  io.stdout.write('State manifest:\n');
+  io.stdout.write(`- ${result.manifest.path}: ${result.manifest.status} (${result.manifest.documentCount} canonical docs, ${result.manifest.warningCount} warnings)\n`);
+  writeAgentFileSyncResult(io, result.agentFileSync);
+}
+
+async function writeCompatibilityPreflightWarnings(io, options = {}, runtime = {}) {
+  const result = await inspectProjectCompatibility({
+    ...options,
+    ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+  });
+  writeCompatibilityWarnings(io, result);
+}
+
+function writeCompatibilityWarnings(io, result) {
+  const warnings = formatCompatibilityWarnings(result);
+  if (warnings.length === 0) {
+    return;
+  }
+
+  io.stderr.write('Compatibility warnings:\n');
+  writeWarnings(io, warnings);
+  io.stderr.write('Run `vibecompass status` for detail.\n');
+}
+
 function writeWarnings(io, warnings = []) {
   for (const warning of warnings) {
     io.stderr.write(`Warning: ${warning}\n`);
@@ -1143,6 +1320,8 @@ function usageText() {
     'Usage:',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
     '  vibecompass connect-hosted [options]',
+    '  vibecompass status [options]',
+    '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
     '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
     '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
     '  vibecompass end-session --title <text> --completed <text> --next-step <text> [options]  # alias',
@@ -1186,6 +1365,19 @@ function usageText() {
     '  --sync-project-id <id>               Hosted sync project_id',
     '  --sync-credential-env-var <name>     Hosted sync env var reference',
     '                                        Replaces any existing project.yaml sync binding',
+    '',
+    'Status options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --tooling-root <path>                Directory where agent files are inspected. Defaults to cwd',
+    '  --json                               Print the typed status model as JSON',
+    '',
+    'Refresh-workflow options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --tooling-root <path>                Directory where agent files are refreshed. Defaults to cwd',
+    '  --dry-run                            Show planned refresh without changing files (default)',
+    '  --apply                              Apply the planned workflow refresh',
+    '  --update-package-stamp               Update an existing project.yaml package_version stamp',
+    '  --allow-downgrade-templates          Allow applying templates with a CLI older than the root stamp',
     '',
     'Start-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -1277,7 +1469,12 @@ function writeExistingInitProjectResult(io, existingProject) {
 
   if (existingProject.status === 'ambiguous') {
     (io.stderr ?? process.stderr).write(
-      `Multiple VibeCompass project memory roots found: ${existingProject.candidates.map((candidate) => candidate.displayPath).join(', ')}. Pass --root explicitly.\n`,
+      [
+        'Multiple VibeCompass project memory roots found:',
+        ...existingProject.candidates.map((candidate) => `- ${candidate.displayPath}`),
+        'Pass --root explicitly to choose one.',
+        '',
+      ].join('\n'),
     );
     return 1;
   }
@@ -1307,8 +1504,9 @@ function writeExistingInitProjectResult(io, existingProject) {
   io.stdout.write(`Repos: ${repos.length > 0 ? repos.join(', ') : 'None recorded'}\n`);
   io.stdout.write(`Active lanes: ${formatActiveLaneSummary(active)}\n`);
   io.stdout.write('Next commands:\n');
+  io.stdout.write(`- vibecompass status${rootFlag}\n`);
   io.stdout.write(`- vibecompass list-sessions${rootFlag}\n`);
-  io.stdout.write(`- vibecompass start-session${rootFlag} --id <lane-id> --working-on "<task>"\n`);
+  io.stdout.write(`- vibecompass start-session${rootFlag} --id LANE_ID --working-on "TASK"\n`);
   io.stdout.write(`- vibecompass docs-review${rootFlag} --guided\n`);
   io.stdout.write(`- vibecompass sync-agents${rootFlag}\n`);
   if (['local-primary', 'hosted-only'].includes(config.mode)) {

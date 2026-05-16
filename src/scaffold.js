@@ -53,27 +53,13 @@ export async function scaffoldInitFiles(options) {
     };
   }
 
-  const contextFilePath = path.join(options.rootDir, 'context.md');
+  const workflowScaffold = buildWorkflowScaffoldFiles(options);
+  const contextFilePath = workflowScaffold.contextFilePath;
   // context.md is a derived artifact owned by the package; regenerate it on rerun.
-  await writeFile(contextFilePath, generateContextMarkdown(options), 'utf8');
+  await writeFile(contextFilePath, workflowScaffold.context.content, 'utf8');
   createdFiles.push(contextFilePath);
 
-  const workflowFiles = [
-    {
-      path: path.join(options.rootDir, 'architecture', 'README.md'),
-      content: generateArchitectureGuide(options.projectConfig),
-    },
-    {
-      path: path.join(options.rootDir, 'decisions', 'README.md'),
-      content: generateDecisionsGuide(options.projectConfig),
-    },
-    {
-      path: path.join(options.rootDir, 'sessions', 'README.md'),
-      content: generateSessionsGuide(options.projectConfig),
-    },
-  ];
-
-  for (const file of workflowFiles) {
+  for (const file of workflowScaffold.guides) {
     const outcome = await writeIfMissing(file.path, file.content);
     if (outcome.created) {
       createdFiles.push(file.path);
@@ -110,6 +96,40 @@ export async function scaffoldInitFiles(options) {
     contextFilePath,
     createdFiles,
     skippedFiles,
+  };
+}
+
+export function buildWorkflowScaffoldFiles(options) {
+  const contextFilePath = path.join(options.rootDir, 'context.md');
+  const context = {
+    kind: 'context',
+    path: contextFilePath,
+    content: generateContextMarkdown(options),
+  };
+
+  const guides = [
+    {
+      kind: 'architecture-guide',
+      path: path.join(options.rootDir, 'architecture', 'README.md'),
+      content: generateArchitectureGuide(options.projectConfig),
+    },
+    {
+      kind: 'decisions-guide',
+      path: path.join(options.rootDir, 'decisions', 'README.md'),
+      content: generateDecisionsGuide(options.projectConfig),
+    },
+    {
+      kind: 'sessions-guide',
+      path: path.join(options.rootDir, 'sessions', 'README.md'),
+      content: generateSessionsGuide(options.projectConfig),
+    },
+  ];
+
+  return {
+    contextFilePath,
+    context,
+    guides,
+    files: [context, ...guides],
   };
 }
 

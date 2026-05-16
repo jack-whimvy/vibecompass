@@ -3,6 +3,7 @@ import path from 'node:path';
 import { localRevisionFromManifestHash, stableHash } from './hash.js';
 import { scanProjectMemory } from './project-memory.js';
 import { listProjectSessions } from './session.js';
+import { PACKAGE_VERSION } from './version.js';
 
 export const STATE_VERSION = 1;
 
@@ -50,13 +51,17 @@ export function generateStateManifest(scanResult, options = {}) {
       document_count: manifestInventory.length,
       warning_count: warningCount,
     },
+    package: {
+      observed_version: options.packageVersion ?? PACKAGE_VERSION,
+      observed_at: generatedAt,
+    },
     documents: manifestDocuments,
     ...(options.activeSessions ? { active_sessions: options.activeSessions } : {}),
     ...(options.sync ? { sync: options.sync } : {}),
   };
 }
 
-export async function writeStateManifest(rootDir, options = {}) {
+export async function prepareStateManifest(rootDir, options = {}) {
   const scanResult = await scanProjectMemory(rootDir);
   const activeSessions = await readActiveSessionsForManifest(rootDir);
   const existingSync = Object.hasOwn(options, 'sync')
@@ -70,14 +75,21 @@ export async function writeStateManifest(rootDir, options = {}) {
   const stateDir = path.join(rootDir, 'state');
   const manifestPath = path.join(stateDir, 'manifest.json');
 
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-
   return {
     manifest,
     manifestPath,
     scanResult,
   };
+}
+
+export async function writeStateManifest(rootDir, options = {}) {
+  const prepared = await prepareStateManifest(rootDir, options);
+  const stateDir = path.dirname(prepared.manifestPath);
+
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(prepared.manifestPath, `${JSON.stringify(prepared.manifest, null, 2)}\n`, 'utf8');
+
+  return prepared;
 }
 
 async function readExistingSyncState(rootDir) {

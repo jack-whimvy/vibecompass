@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  inspectProjectCompatibility,
+  PACKAGE_VERSION,
   generateStateManifest,
   scanProjectMemory,
   writeStateManifest,
@@ -179,6 +181,10 @@ Manifest generation.
 
     assert.equal(manifest.state_version, 1);
     assert.equal(manifest.generated_at, '2026-04-19T08:30:00.000Z');
+    assert.deepEqual(manifest.package, {
+      observed_version: PACKAGE_VERSION,
+      observed_at: '2026-04-19T08:30:00.000Z',
+    });
     assert.equal(manifest.canonical.format_version, 1);
     assert.equal(manifest.canonical.mode, 'local-only');
     assert.equal(manifest.canonical.document_count, 4);
@@ -198,6 +204,167 @@ Manifest generation.
     const fileContent = JSON.parse(await readFile(written.manifestPath, 'utf8'));
 
     assert.deepEqual(fileContent, manifest);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('inspectProjectCompatibility separates legacy package stamps from state version drift', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Legacy Root
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+    'architecture/platform/project-memory/file-schema.md': `
+---
+domain: Platform
+feature: Project Memory
+component: File Schema
+status: Complete
+repo: docs
+---
+
+## Description
+Schema docs.
+`,
+    'sessions/2026-04-19-1-legacy-root.md': `
+# Session — 2026-04-19-1 — Legacy Root
+
+## What we worked on
+Created a legacy root.
+`,
+  });
+
+  try {
+    await mkdir(path.join(fixture.rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(fixture.rootDir, 'state/manifest.json'),
+      `${JSON.stringify({ state_version: 999, package: { observed_version: '0.1.0' } }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const result = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '0.3.4',
+    });
+
+    assert.equal(result.package.status, 'legacy');
+    assert.equal(result.state.status, 'unsupported');
+    assert.deepEqual(
+      result.warnings.map((warning) => warning.code),
+      ['package-version-legacy-root', 'state-version-unsupported'],
+    );
+
+    const projectYaml = await readFile(path.join(fixture.rootDir, 'project.yaml'), 'utf8');
+    assert.doesNotMatch(projectYaml, /package_version/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('inspectProjectCompatibility reports package version current, behind, ahead, and invalid', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Versioned Root
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+metadata:
+  package_version: 0.3.4
+`,
+  });
+
+  try {
+    const current = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '0.3.4',
+    });
+    assert.equal(current.package.status, 'current');
+    assert.equal(current.warnings.some((warning) => warning.code.startsWith('package-version-')), false);
+
+    const behind = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '0.4.0',
+    });
+    assert.equal(behind.package.status, 'behind');
+    assert.deepEqual(
+      behind.warnings.find((warning) => warning.code === 'package-version-behind'),
+      {
+        code: 'package-version-behind',
+        message: 'project.yaml metadata.package_version 0.3.4 is older than CLI package 0.4.0.',
+        rootVersion: '0.3.4',
+        cliVersion: '0.4.0',
+      },
+    );
+
+    const ahead = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '0.3.4-rc.1',
+    });
+    assert.equal(ahead.package.status, 'ahead');
+    assert.deepEqual(
+      ahead.warnings.find((warning) => warning.code === 'package-version-ahead'),
+      {
+        code: 'package-version-ahead',
+        message: 'project.yaml metadata.package_version 0.3.4 is newer than CLI package 0.3.4-rc.1.',
+        rootVersion: '0.3.4',
+        cliVersion: '0.3.4-rc.1',
+      },
+    );
+
+    await writeFile(
+      path.join(fixture.rootDir, 'project.yaml'),
+      `
+format_version: 1
+name: Versioned Root
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+metadata:
+  package_version: 1.x.0
+`.replace(/^\n/, ''),
+      'utf8',
+    );
+    const invalid = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '1.0.0',
+    });
+    assert.equal(invalid.package.status, 'invalid');
+    assert.equal(invalid.warnings.find((warning) => warning.code === 'package-version-invalid')?.rootVersion, '1.x.0');
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('inspectProjectCompatibility distinguishes unreadable project and corrupt manifest', async () => {
+  const fixture = await createFixture({
+    'project.yaml': 'format_version:\n  - 1\n    bad: value\n',
+  });
+
+  try {
+    await mkdir(path.join(fixture.rootDir, 'state'), { recursive: true });
+    await writeFile(path.join(fixture.rootDir, 'state/manifest.json'), '{not-json', 'utf8');
+
+    const result = await inspectProjectCompatibility({
+      rootDir: fixture.rootDir,
+      packageVersion: '0.3.4',
+    });
+
+    assert.equal(result.package.status, 'unknown');
+    assert.equal(result.state.status, 'unreadable');
+    assert.deepEqual(
+      result.warnings.map((warning) => warning.code),
+      ['project-yaml-unreadable', 'state-manifest-unreadable'],
+    );
+    assert.ok(result.warnings[0].errorMessage);
+    assert.ok(result.warnings[1].errorMessage);
   } finally {
     await fixture.cleanup();
   }
