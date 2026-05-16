@@ -1638,6 +1638,231 @@ test('runCli guided init defaults project mode to local-primary', async () => {
   }
 });
 
+test('runCli guided init on an existing project reports how to continue without prompting', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-existing-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      name: 'Existing Guided Project',
+      mode: 'local-primary',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    const beforeProjectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          throw new Error(`Unexpected guided prompt: ${spec.message}`);
+        },
+      },
+    );
+
+    const afterProjectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.join(''), '');
+    assert.equal(afterProjectYaml, beforeProjectYaml);
+    assert.match(stdout.join(''), /already initialized/);
+    assert.match(stdout.join(''), /Project: Existing Guided Project/);
+    assert.match(stdout.join(''), /Mode: local-primary/);
+    assert.match(stdout.join(''), /Active lanes: none/);
+    assert.match(stdout.join(''), /vibecompass list-sessions/);
+    assert.match(stdout.join(''), /vibecompass connect-hosted/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init refuses non-interactive ambiguous existing roots', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-ambiguous-'));
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Nested Memory',
+      mode: 'local-only',
+      repos: [{ id: 'nested', remote: 'https://github.com/example/nested.git' }],
+    });
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.',
+      name: 'Dedicated Memory',
+      mode: 'local-only',
+      repos: [{ id: 'dedicated', remote: 'https://github.com/example/dedicated.git' }],
+    });
+
+    const stderr = [];
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: { write() {} },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        stdin: { isTTY: false },
+      },
+    );
+
+    assert.equal(exitCode, 1);
+    assert.match(stderr.join(''), /Multiple VibeCompass project memory roots found.*Pass --root explicitly/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli guided init reports unreadable existing project yaml without first-time init', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-unreadable-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await mkdir(path.join(tempDir, '.compass'), { recursive: true });
+    await writeFile(path.join(tempDir, '.compass/project.yaml'), 'not yaml\n', 'utf8');
+
+    const exitCode = await runCli(
+      ['init', '--guided'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+        async prompt(spec) {
+          throw new Error(`Unexpected guided prompt: ${spec.message}`);
+        },
+      },
+    );
+
+    assert.equal(exitCode, 1);
+    assert.equal(stdout.join(''), '');
+    assert.match(stderr.join(''), /project.yaml is unreadable/);
+    assert.match(stderr.join(''), /Fix project.yaml manually/);
+    await assert.rejects(() => access(path.join(tempDir, '.compass/state/manifest.json')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli init --force ignores empty active directory but refuses active lanes without override', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-force-active-'));
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      name: 'Original Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(tempDir, '.compass/sessions/active'), { recursive: true });
+
+    const emptyActiveExitCode = await runCli(
+      [
+        'init',
+        '--force',
+        '--name',
+        'Forced Project',
+        '--mode',
+        'local-only',
+        '--repo',
+        'app=https://github.com/example/app.git',
+      ],
+      {
+        stdout: { write() {} },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+    assert.equal(emptyActiveExitCode, 0);
+
+    await mkdir(path.join(tempDir, '.compass/sessions/active/current-work'), { recursive: true });
+    await writeFile(path.join(tempDir, '.compass/sessions/active/current-work/wip.md'), '# WIP\n', 'utf8');
+
+    await assert.rejects(
+      () =>
+        runCli(
+          [
+            'init',
+            '--force',
+            '--name',
+            'Refused Project',
+            '--mode',
+            'local-only',
+            '--repo',
+            'app=https://github.com/example/app.git',
+          ],
+          {
+            stdout: { write() {} },
+            stderr: { write() {} },
+          },
+          {
+            cwd: tempDir,
+          },
+        ),
+      /Cannot overwrite project memory while active session lanes exist: current-work/,
+    );
+
+    const overrideExitCode = await runCli(
+      [
+        'init',
+        '--force',
+        '--replace-active-lanes',
+        '--name',
+        'Override Project',
+        '--mode',
+        'local-only',
+        '--repo',
+        'app=https://github.com/example/app.git',
+      ],
+      {
+        stdout: { write() {} },
+        stderr: { write() {} },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(overrideExitCode, 0);
+    assert.match(projectYaml, /name: Override Project/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli guided init can adopt existing unmarked agent files after confirmation', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-guided-adopt-agents-'));
   const stdout = [];

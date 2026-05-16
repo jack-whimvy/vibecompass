@@ -28,6 +28,10 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io,
       runtime,
     });
+    if (initPlan.existingProject) {
+      return writeExistingInitProjectResult(io, initPlan.existingProject);
+    }
+
     const result = await initializeProjectMemory({
       ...initPlan.initOptions,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
@@ -390,6 +394,11 @@ export function parseCliArgs(argv) {
       continue;
     }
 
+    if (token === '--replace-active-lanes') {
+      parsed.replaceActiveLanes = true;
+      continue;
+    }
+
     if (token === '--guided') {
       parsed.guided = true;
       continue;
@@ -516,6 +525,7 @@ export function parseCliArgs(argv) {
       mode: parsed.mode,
       repos: parsed.repos,
       force: parsed.force,
+      replaceActiveLanes: parsed.replaceActiveLanes,
       startSession: parsed.startSession,
       sessionWorkingOn: parsed.sessionWorkingOn,
       sessionId: parsed.sessionId,
@@ -1168,6 +1178,7 @@ function usageText() {
     '  --close-session-git-publish          Include a Git publish step in the stored close-session workflow',
     '  --close-session-git-remote <name>    Default Git remote name for that close-session publish step',
     '  --force                              Overwrite an existing project.yaml',
+    '  --replace-active-lanes               Allow --force to replace a root that has active session lanes',
     '',
     'Connect-hosted options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -1258,6 +1269,60 @@ function formatOptionalRootFlag(rootDir) {
   }
 
   return ` --root ${rootDir}`;
+}
+
+function writeExistingInitProjectResult(io, existingProject) {
+  const rootFlag = formatOptionalRootFlag(existingProject.displayPath);
+  const active = existingProject.activeSummary ?? { count: 0, current: null };
+
+  if (existingProject.status === 'ambiguous') {
+    (io.stderr ?? process.stderr).write(
+      `Multiple VibeCompass project memory roots found: ${existingProject.candidates.map((candidate) => candidate.displayPath).join(', ')}. Pass --root explicitly.\n`,
+    );
+    return 1;
+  }
+
+  if (existingProject.status === 'unreadable') {
+    (io.stderr ?? process.stderr).write('VibeCompass project memory already exists, but project.yaml is unreadable.\n');
+    (io.stderr ?? process.stderr).write(`Root: ${existingProject.displayPath}\n`);
+    (io.stderr ?? process.stderr).write(`Project file: ${existingProject.projectFilePath}\n`);
+    (io.stderr ?? process.stderr).write(`Error: ${existingProject.errorMessage}\n`);
+    if (active.count > 0) {
+      (io.stderr ?? process.stderr).write(`Active lanes: ${formatActiveLaneSummary(active)}\n`);
+      (io.stderr ?? process.stderr).write('Close active lanes before replacing this root, or pass --force --replace-active-lanes if replacement is intentional.\n');
+    } else {
+      (io.stderr ?? process.stderr).write('Fix project.yaml manually, or rerun with --force if replacement is intentional.\n');
+    }
+    return 1;
+  }
+
+  const config = existingProject.projectConfig;
+  const repos = Array.isArray(config.repos)
+    ? config.repos.map((repo) => repo.id).filter(Boolean)
+    : [];
+  io.stdout.write('VibeCompass is already initialized — here is how to continue.\n');
+  io.stdout.write(`Project: ${config.name ?? 'Unknown'}\n`);
+  io.stdout.write(`Mode: ${config.mode ?? 'Unknown'}\n`);
+  io.stdout.write(`Root: ${existingProject.displayPath}\n`);
+  io.stdout.write(`Repos: ${repos.length > 0 ? repos.join(', ') : 'None recorded'}\n`);
+  io.stdout.write(`Active lanes: ${formatActiveLaneSummary(active)}\n`);
+  io.stdout.write('Next commands:\n');
+  io.stdout.write(`- vibecompass list-sessions${rootFlag}\n`);
+  io.stdout.write(`- vibecompass start-session${rootFlag} --id <lane-id> --working-on "<task>"\n`);
+  io.stdout.write(`- vibecompass docs-review${rootFlag} --guided\n`);
+  io.stdout.write(`- vibecompass sync-agents${rootFlag}\n`);
+  if (['local-primary', 'hosted-only'].includes(config.mode)) {
+    io.stdout.write(`- vibecompass connect-hosted${rootFlag}\n`);
+  }
+  return 0;
+}
+
+function formatActiveLaneSummary(activeSummary) {
+  if (!activeSummary || activeSummary.count === 0) {
+    return 'none';
+  }
+
+  return `${activeSummary.count}${activeSummary.current ? ` (current: ${activeSummary.current})` : ''}`;
 }
 
 async function main() {

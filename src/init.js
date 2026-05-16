@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { serializeProjectConfig } from './project-yaml.js';
 import { writeStateManifest } from './manifest.js';
@@ -11,6 +11,10 @@ const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 
 export async function initializeProjectMemory(options) {
   const normalized = normalizeInitOptions(options);
+
+  if (normalized.force && !normalized.replaceActiveLanes) {
+    await assertNoActiveSessionLanes(normalized.rootDir);
+  }
 
   await mkdir(normalized.rootDir, { recursive: true });
   await mkdir(path.join(normalized.rootDir, 'architecture'), { recursive: true });
@@ -156,10 +160,42 @@ function normalizeInitOptions(options) {
   return {
     rootDir,
     force: Boolean(preparedOptions.force),
+    replaceActiveLanes: Boolean(preparedOptions.replaceActiveLanes),
     generatedAt: preparedOptions.generatedAt,
     projectConfig,
     bootstrap: bootstrapOptions,
   };
+}
+
+async function assertNoActiveSessionLanes(rootDir) {
+  const activeDir = path.join(rootDir, 'sessions', 'active');
+  let entries = [];
+  try {
+    entries = await readdir(activeDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  const activeLaneIds = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const laneDir = path.join(activeDir, entry.name);
+    if (
+      (await fileExists(path.join(laneDir, 'session.yaml'))) ||
+      (await fileExists(path.join(laneDir, 'wip.md')))
+    ) {
+      activeLaneIds.push(entry.name);
+    }
+  }
+
+  if (activeLaneIds.length > 0) {
+    throw new Error(
+      `Cannot overwrite project memory while active session lanes exist: ${activeLaneIds.join(', ')}. Close the lanes first or pass --replace-active-lanes.`,
+    );
+  }
 }
 
 function normalizeSyncOptions(syncOptions, mode) {

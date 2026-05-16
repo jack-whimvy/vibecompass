@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { promisify } from 'node:util';
 import { getSupportedAgentFilePaths } from './generators/agent-files/index.js';
 import { END_MARKER, START_MARKER } from './generators/agent-files/markers.js';
+import { parseSimpleYaml } from './simple-yaml.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +23,24 @@ export async function resolveInitCliOptions(options, environment = {}) {
   let guidedSummary = null;
 
   if (resolved.guided) {
+    if (!resolved.force) {
+      const existingProject = await resolveExistingGuidedProject(resolved, {
+        cwd,
+        io: environment.io,
+        runtime: environment.runtime,
+      });
+      if (existingProject) {
+        return {
+          existingProject,
+          initOptions: null,
+          placementPattern: null,
+          guidedSummary: null,
+          agentFileSyncPlan: null,
+          sessionPlan: null,
+        };
+      }
+    }
+
     const prompter = createPrompter(environment.io, environment.runtime);
     try {
       const guided = await completeGuidedInitOptions(resolved, {
@@ -60,6 +79,7 @@ export async function resolveInitCliOptions(options, environment = {}) {
       mode: resolved.mode,
       repos: resolved.repos,
       force: resolved.force,
+      replaceActiveLanes: resolved.replaceActiveLanes,
       sync: resolved.sync,
       bootstrap: resolved.bootstrap,
       generatedAt: resolved.generatedAt,
@@ -119,6 +139,138 @@ export async function resolveConnectHostedCliOptions(options, environment = {}) 
     rootDir: resolved.rootDir ? toRelativeIfInsideCwd(resolved.rootDir, cwd) : undefined,
     sync: resolved.sync,
   };
+}
+
+async function resolveExistingGuidedProject(options, environment) {
+  const candidates = await findExistingGuidedProjectRoots(options, environment.cwd);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  if (candidates.length === 1) {
+    return readExistingGuidedProject(candidates[0], environment.cwd);
+  }
+
+  if (!canPrompt(environment)) {
+    return {
+      status: 'ambiguous',
+      candidates,
+    };
+  }
+
+  const prompter = createPrompter(environment.io, environment.runtime);
+  try {
+    const selectedRootDir = await askChoice(
+      prompter,
+      'Multiple VibeCompass project memory roots found. Which one should be shown? No files will be modified.',
+      candidates.map((candidate) => ({
+        value: candidate.rootDir,
+        description: candidate.displayPath,
+      })),
+      {
+        defaultValue: candidates[0].rootDir,
+      },
+    );
+    return readExistingGuidedProject(
+      candidates.find((candidate) => candidate.rootDir === selectedRootDir) ?? candidates[0],
+      environment.cwd,
+    );
+  } finally {
+    await prompter.close();
+  }
+}
+
+async function findExistingGuidedProjectRoots(options, cwd) {
+  const candidateRoots = options.rootDir
+    ? [path.resolve(cwd, options.rootDir)]
+    : [path.resolve(cwd, '.compass'), path.resolve(cwd)];
+
+  const existing = [];
+  for (const rootDir of [...new Set(candidateRoots)]) {
+    if (await fileExists(path.join(rootDir, 'project.yaml'))) {
+      existing.push({
+        rootDir,
+        displayPath: toRelativeIfInsideCwd(rootDir, cwd),
+      });
+    }
+  }
+
+  return existing;
+}
+
+async function readExistingGuidedProject(candidate, cwd) {
+  const projectFilePath = path.join(candidate.rootDir, 'project.yaml');
+  const activeSummary = await readActiveLaneSummary(candidate.rootDir);
+  try {
+    const projectConfig = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+      sourceName: projectFilePath,
+    });
+
+    return {
+      status: 'ok',
+      rootDir: candidate.rootDir,
+      displayPath: candidate.displayPath ?? toRelativeIfInsideCwd(candidate.rootDir, cwd),
+      projectFilePath,
+      projectConfig,
+      activeSummary,
+    };
+  } catch (error) {
+    return {
+      status: 'unreadable',
+      rootDir: candidate.rootDir,
+      displayPath: candidate.displayPath ?? toRelativeIfInsideCwd(candidate.rootDir, cwd),
+      projectFilePath,
+      errorMessage: error instanceof Error ? error.message : 'Unable to read project.yaml.',
+      activeSummary,
+    };
+  }
+}
+
+async function readActiveLaneSummary(rootDir) {
+  const activeDir = path.join(rootDir, 'sessions', 'active');
+  let count = 0;
+  try {
+    const entries = await readdir(activeDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+
+      const laneDir = path.join(activeDir, entry.name);
+      if (
+        (await fileExists(path.join(laneDir, 'session.yaml'))) ||
+        (await fileExists(path.join(laneDir, 'wip.md')))
+      ) {
+        count += 1;
+      }
+    }
+  } catch {
+    count = 0;
+  }
+
+  let current = null;
+  try {
+    const indexPath = path.join(activeDir, 'index.yaml');
+    const activeIndex = parseSimpleYaml(await readFile(indexPath, 'utf8'), {
+      sourceName: indexPath,
+    });
+    current = typeof activeIndex.current === 'string' && activeIndex.current !== 'null'
+      ? activeIndex.current
+      : null;
+  } catch {
+    current = null;
+  }
+
+  return { count, current };
+}
+
+function canPrompt(environment) {
+  if (typeof environment.runtime?.prompt === 'function') {
+    return true;
+  }
+
+  const input = environment.runtime?.stdin ?? environment.io?.stdin ?? process.stdin;
+  return Boolean(input?.isTTY);
 }
 
 export function applyPlacementDefaults(options, environment = {}) {
@@ -1072,6 +1224,15 @@ function extractRemoteSlug(remote) {
 async function directoryExists(directoryPath) {
   try {
     await access(directoryPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fileExists(filePath) {
+  try {
+    await access(filePath);
     return true;
   } catch {
     return false;
