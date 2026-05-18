@@ -1,3 +1,5 @@
+import { renderPromptCommandLines } from '../../workflows/registry.js';
+
 export function buildAgentContext(readModel) {
   return {
     projectName: readModel.project.name ?? 'Unnamed project',
@@ -39,14 +41,15 @@ export function renderSharedInstructionBody(context, options = {}) {
     '',
     '## Workflow Rules',
     '- VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream; finalized session notes are append-only history under `sessions/YYYY-MM-DD-N-title.md`.',
-    '- Use `start session` for builder work, `join as reviewer` for review work, and `close session` / `end session` when the builder is ready to close the selected lane.',
     '- Use `vibecompass start-session --id <lane-id>` to open a named lane for every active feature or workstream.',
     '- Use `vibecompass list-sessions` and `vibecompass switch-session <lane-id>` to inspect or change the current lane.',
     '- Treat `sessions/active/index.yaml` as the current lane source of truth; tool-specific Current session blocks are continuity summaries.',
-    '- Use optional planning mode for risky or ambiguous work: read the same context, propose scope, and record the agreed plan in the selected lane `wip.md` before implementation.',
-    '- Use `review handoff` to ask a reviewer to inspect the active handoff.',
-    '- Use `address review` to process reviewer feedback from the selected lane `wip.md` and `handoff.md`.',
-    '- End the active builder session with the `close session` prompt, which runs close-out and ends with `vibecompass close-session --session <lane-id>`; `end session` and `vibecompass end-session` are accepted aliases.',
+    '',
+    '### Prompt Commands',
+    ...renderPromptCommandLines({ rootRelativePath: context.rootDir }),
+    '- The prompt commands above are agent behaviors. The `vibecompass` CLI commands remain the filesystem mechanics behind them.',
+    '',
+    '### Operating Rules',
     '- If stale scratch files block `start-session`, read them first, then close, recover, move, or delete them intentionally before retrying.',
     '- Keep decisions append-only in `decisions/`. Session notes may reference decisions, but decisions are the durable source of truth.',
     '- Treat generated agent files as views. Update canonical VibeCompass project memory instead of editing managed regions.',

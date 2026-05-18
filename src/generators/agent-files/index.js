@@ -8,6 +8,7 @@ import { claudeMdFormat } from './claude-md.js';
 import { agentsMdFormat } from './agents-md.js';
 import { cursorRulesFormat } from './cursor-rules.js';
 import { copilotInstructionsFormat } from './copilot-instructions.js';
+import { getWorkflowConflictScanPatterns } from '../../workflows/registry.js';
 
 const FORMATS = [
   claudeMdFormat,
@@ -17,17 +18,7 @@ const FORMATS = [
 ];
 
 const FORMAT_MAP = new Map(FORMATS.map((format) => [format.name, format]));
-const CONFLICT_SCAN_PATTERNS = [
-  'session',
-  'handoff',
-  'decisions',
-  'wip.md',
-  'review handoff',
-  'close-session',
-  'address review',
-  'builder',
-  'reviewer',
-];
+const CONFLICT_SCAN_PATTERNS = getWorkflowConflictScanPatterns();
 
 export async function syncAgentInstructionFiles(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();

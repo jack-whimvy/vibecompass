@@ -1,6 +1,7 @@
 import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { resolveWorkflowSettings } from './workflow.js';
+import { getGeneratedWorkflowFiles, renderPromptCommandLines } from './workflows/registry.js';
 
 export async function scaffoldInitFiles(options) {
   const createdFiles = [];
@@ -59,7 +60,7 @@ export async function scaffoldInitFiles(options) {
   await writeFile(contextFilePath, workflowScaffold.context.content, 'utf8');
   createdFiles.push(contextFilePath);
 
-  for (const file of workflowScaffold.guides) {
+  for (const file of [...workflowScaffold.guides, ...workflowScaffold.workflowFiles]) {
     const outcome = await writeIfMissing(file.path, file.content);
     if (outcome.created) {
       createdFiles.push(file.path);
@@ -124,12 +125,20 @@ export function buildWorkflowScaffoldFiles(options) {
       content: generateSessionsGuide(options.projectConfig),
     },
   ];
+  const workflowFiles = getGeneratedWorkflowFiles({
+    rootRelativePath: options.rootRelativePath,
+  }).map((file) => ({
+    kind: file.kind,
+    path: path.join(options.rootDir, file.relativePath),
+    content: file.content,
+  }));
 
   return {
     contextFilePath,
     context,
     guides,
-    files: [context, ...guides],
+    workflowFiles,
+    files: [context, ...guides, ...workflowFiles],
   };
 }
 
@@ -193,6 +202,7 @@ function generateContextMarkdown(options) {
   const projectName = options.projectConfig.name;
   const rootRelativePath = options.rootRelativePath;
   const workflow = resolveWorkflowSettings(options.projectConfig);
+  const promptCommands = renderPromptCommandLines({ rootRelativePath }).join('\n');
   const repos = options.projectConfig.repos
     .map((repo) => `- \`${repo.id}\` → ${repo.remote}`)
     .join('\n');
@@ -233,12 +243,7 @@ ${repos}
 | "join as reviewer" | Reviewer | No — reviews the builder's work, appends findings, and updates handoff guidance |
 
 ## Session prompt commands
-- \`start session\` — builder role trigger
-- \`join as reviewer\` — reviewer role trigger
-- \`planning mode\` — optional prompt-level mode for scoping work before implementation
-- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
-- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
+${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
 Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
@@ -250,7 +255,7 @@ ${renderWorkflowDefaults(workflow)}
 ## Documentation coverage
 - The architecture, decision, and session files created by init are an initial scaffold, not a comprehensive codebase review.
 - Before risky implementation work, inspect the relevant code and update the affected architecture docs.
-- Run \`vibecompass docs-review --guided\` when you want a comprehensive documentation review. That command is explicit because it may inspect source files and use AI or hosted scan infrastructure.
+- Use the \`docs review\` prompt command when you want the current AI session to run a comprehensive documentation review. It may run \`vibecompass docs-review --guided\` as package mechanics to record marker state and print the canonical review contract.
 
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
@@ -387,7 +392,7 @@ Not yet documented:
 Before changing any undocumented area, inspect the relevant code and update or add architecture docs.
 
 ## Next steps
-- Run \`vibecompass docs-review --guided\` for a comprehensive documentation review.
+- Use the \`docs review\` prompt command for a comprehensive documentation review.
 - Replace this placeholder with domain/feature/component docs as the project map becomes evidence-backed.
 - Keep architecture docs aligned with implementation changes during each builder session.
 
@@ -445,7 +450,7 @@ Initialized VibeCompass project memory for ${projectConfig.name}.
 ${repoLines}
 
 ## Next session should start with
-1. Run \`vibecompass docs-review --guided\` if you want a comprehensive documentation review.
+1. Use the \`docs review\` prompt command if you want a comprehensive documentation review.
 2. Inspect relevant code before making implementation changes in areas not covered by architecture docs.
 3. Replace starter placeholders with evidence-backed domain/feature/component docs.
 `;
@@ -532,6 +537,9 @@ Those scratch files are session-scoped working artifacts, not finalized history.
 
 function generateClaudeTemplate(options) {
   const workflow = resolveWorkflowSettings(options.projectConfig);
+  const promptCommands = renderPromptCommandLines({
+    rootRelativePath: options.rootRelativePath,
+  }).join('\n');
 
   return `# ${options.projectConfig.name} Workspace
 
@@ -547,12 +555,7 @@ Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
 
 ## Prompt commands
 
-- \`start session\` — builder role trigger
-- \`join as reviewer\` — reviewer role trigger
-- \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
-- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
-- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
+${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
 Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
@@ -585,6 +588,9 @@ ${renderWorkflowDefaults(workflow)}
 
 function generateAgentsTemplate(options) {
   const workflow = resolveWorkflowSettings(options.projectConfig);
+  const promptCommands = renderPromptCommandLines({
+    rootRelativePath: options.rootRelativePath,
+  }).join('\n');
 
   return `# ${options.projectConfig.name} Workspace
 
@@ -600,12 +606,7 @@ This workspace uses VibeCompass project memory rooted at \`${options.rootRelativ
 
 ## Prompt commands
 
-- \`start session\` — builder role trigger
-- \`join as reviewer\` — reviewer role trigger
-- \`planning mode\` — optional prompt-level mode for scoping risky or ambiguous work before implementation
-- \`review handoff\` — reviewer reads the selected lane's \`wip.md\`, \`handoff.md\`, latest finalized note, and relevant diffs before appending findings
-- \`address review\` — builder reads reviewer feedback in the selected lane's \`wip.md\` / \`handoff.md\`, responds inline, applies accepted changes, and refreshes the builder handoff
-- \`close session\` — builder runs the close-out checklist and ends with \`vibecompass close-session --session <lane-id>\`; \`end session\` is accepted as a synonym
+${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
 Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.

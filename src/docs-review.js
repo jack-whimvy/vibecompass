@@ -59,8 +59,10 @@ export async function preflightDocsReview(options = {}, environment = {}) {
   const localProvider = resolveLocalProvider(options);
   const runtime = resolveDocsReviewRuntime(project, {
     env,
+    guided: Boolean(options.guided),
     localProvider,
     runLocal: shouldRunLocal(options),
+    anthropicEnvVar: options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY',
   });
   const reviewPrompt = renderReviewPrompt({
     project,
@@ -357,6 +359,13 @@ function validateDocsReviewMode(options) {
 }
 
 async function promptForReviewConfig(options, environment) {
+  if (options.llm && options.model) {
+    return normalizeReviewConfig({
+      llm: options.llm,
+      model: options.model,
+    });
+  }
+
   const prompter = createPrompter(environment.io, environment.runtime);
   try {
     if (!options.llm) {
@@ -483,6 +492,10 @@ function resolveDocsReviewRuntime(project, options) {
         local_provider: localProvider.provider,
         credential_env_var: localProvider.credentialEnvVar,
       };
+    }
+
+    if (options.guided) {
+      return { provider: 'external' };
     }
 
     throw new Error(

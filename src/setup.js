@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { getSupportedAgentFilePaths } from './generators/agent-files/index.js';
 import { END_MARKER, START_MARKER } from './generators/agent-files/markers.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import { getWorkflowConflictScanPatterns } from './workflows/registry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -859,17 +860,7 @@ function writeAgentAdoptionPreview(prompter, candidates) {
 }
 
 function scanPotentialAgentWorkflowConflicts(content) {
-  const patterns = [
-    'session',
-    'handoff',
-    'decisions',
-    'wip.md',
-    'review handoff',
-    'close-session',
-    'address review',
-    'builder',
-    'reviewer',
-  ];
+  const patterns = getWorkflowConflictScanPatterns();
 
   return content
     .split(/\r?\n/)

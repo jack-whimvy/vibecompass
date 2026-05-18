@@ -105,6 +105,7 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     const architectureGuide = await readFile(path.join(rootDir, 'architecture/README.md'), 'utf8');
     const decisionsGuide = await readFile(path.join(rootDir, 'decisions/README.md'), 'utf8');
     const sessionsGuide = await readFile(path.join(rootDir, 'sessions/README.md'), 'utf8');
+    const docsReviewWorkflow = await readFile(path.join(rootDir, 'workflows/docs-review.md'), 'utf8');
     const starterArchitecture = await readFile(path.join(rootDir, 'architecture/overview/project-shape.md'), 'utf8');
     const decisionExample = await readFile(path.join(rootDir, 'decisions/EXAMPLE.md'), 'utf8');
     const starterSession = await readFile(path.join(rootDir, 'sessions/2026-04-20-1-project-memory-initialized.md'), 'utf8');
@@ -119,6 +120,7 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /end-session` is also accepted as an alias/);
     assert.match(context, /reports stale scratch files/);
     assert.match(context, /Documentation coverage/);
+    assert.match(context, /`docs review` — agent-led architecture documentation review/);
     assert.match(context, /vibecompass docs-review --guided/);
     assert.match(context, /sessions\/active\/<lane-id>\/wip\.md/);
     assert.match(context, /include a Git publish step after finalization using remote `origin`/);
@@ -127,18 +129,22 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(architectureGuide, /`repos`: array of repo IDs/);
     assert.match(decisionsGuide, /Append-only decision log/);
     assert.match(sessionsGuide, /Finalized session notes/);
+    assert.match(docsReviewWorkflow, /VibeCompass Workflow — docs review/);
+    assert.match(docsReviewWorkflow, /vibecompass docs-review --apply-output/);
     assert.match(starterArchitecture, /Initial project-memory scaffold/);
     assert.match(decisionExample, /ignored by VibeCompass canonical decision parsing/);
     assert.match(starterSession, /Project Memory Initialized/);
     assert.match(claude, /Read `\.compass\/context\.md` before doing substantive work/);
     assert.match(claude, /Entry trigger/);
     assert.match(claude, /planning mode/);
+    assert.match(claude, /`docs review` — agent-led architecture documentation review/);
     assert.match(claude, /`close session` — builder runs the close-out checklist/);
     assert.match(claude, /end-session` is accepted as an alias/);
     assert.match(claude, /stale scratch files block `start-session`/);
     assert.match(agents, /Before doing substantive work/);
     assert.match(agents, /Entry trigger/);
     assert.match(agents, /planning mode/);
+    assert.match(agents, /`docs review` — agent-led architecture documentation review/);
     assert.match(agents, /`close session` — builder runs the close-out checklist/);
     assert.match(agents, /end-session` is accepted as an alias/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
@@ -276,7 +282,7 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.match(claude, /vibecompass:start - managed by VibeCompass/);
     assert.match(claude, /Agent File Project Claude Instructions/);
     assert.match(claude, /active builder sessions are named lanes/);
-    assert.match(claude, /optional planning mode/);
+    assert.match(claude, /planning mode/);
     assert.match(claude, /vibecompass end-session/);
     assert.match(claude, /stale scratch files block `start-session`/);
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
@@ -463,6 +469,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-'));
   const localOnlyRoot = path.join(tempDir, 'local-only');
   const localPrimaryRoot = path.join(tempDir, 'local-primary');
+  const localPrimaryNoSyncRoot = path.join(tempDir, 'local-primary-no-sync');
   const stdout = [];
 
   try {
@@ -626,6 +633,34 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.deepEqual(overwrittenMarker.applied.architecture_docs, [
       { path: 'architecture/platform/docs-review/local-runtime.md', status: 'overwritten' },
     ]);
+
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: localPrimaryNoSyncRoot,
+      name: 'Local Primary No Sync Review',
+      mode: 'local-primary',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const noSyncStdout = [];
+    await runCli(
+      ['docs-review', '--root', localPrimaryNoSyncRoot, '--guided', '--llm', 'codex', '--model', 'gpt-5.5'],
+      {
+        stdout: {
+          write(chunk) {
+            noSyncStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const noSyncMarker = JSON.parse(await readFile(path.join(localPrimaryNoSyncRoot, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(noSyncStdout.join(''), /Docs-review: external-review-requested/);
+    assert.match(noSyncStdout.join(''), /Runtime: external/);
+    assert.match(noSyncStdout.join(''), /Architecture review prompt:/);
+    assert.equal(noSyncMarker.runtime.provider, 'external');
 
     await initializeProjectMemory({
       cwd: tempDir,
@@ -1725,8 +1760,10 @@ test('runCli refresh-workflow --apply refreshes derived workflow files and stamp
       generatedAt: '2026-04-19T10:00:00.000Z',
     });
     const contextPath = path.join(tempDir, '.compass/context.md');
+    const docsReviewWorkflowPath = path.join(tempDir, '.compass/workflows/docs-review.md');
     const projectPath = path.join(tempDir, '.compass/project.yaml');
     await writeFile(contextPath, '# stale context\n', 'utf8');
+    await rm(docsReviewWorkflowPath, { force: true });
     await writeFile(
       projectPath,
       (await readFile(projectPath, 'utf8')).replace(new RegExp(`\\n  package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`), ''),
@@ -1750,8 +1787,10 @@ test('runCli refresh-workflow --apply refreshes derived workflow files and stamp
     assert.match(output, /Applied workflow refresh/);
     assert.match(output, /project\.yaml: stamp-create/);
     assert.match(output, /context\.md: update/);
+    assert.match(output, /workflows\/docs-review\.md: create/);
     assert.match(projectYaml, new RegExp(`package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`));
     assert.match(context, /# Project Context — Refresh Apply Project/);
+    assert.match(await readFile(docsReviewWorkflowPath, 'utf8'), /VibeCompass Workflow — docs review/);
     assert.equal(manifest.package.observed_version, PACKAGE_VERSION);
     assert.match(await readFile(path.join(tempDir, '.cursorrules'), 'utf8'), /vibecompass:start - managed by VibeCompass/);
   } finally {
@@ -1871,8 +1910,11 @@ test('runCli refresh-workflow --apply leaves user-authored workflow guides untou
       },
     });
     const guidePath = path.join(tempDir, '.compass/architecture/README.md');
+    const workflowPath = path.join(tempDir, '.compass/workflows/docs-review.md');
     const userGuide = '# Architecture\n\nTeam-owned architecture overview.\n';
+    const userWorkflow = '# Docs review\n\nTeam-owned docs-review protocol.\n';
     await writeFile(guidePath, userGuide, 'utf8');
+    await writeFile(workflowPath, userWorkflow, 'utf8');
 
     const exitCode = await runCli(
       ['refresh-workflow', '--root', '.compass', '--apply'],
@@ -1885,7 +1927,9 @@ test('runCli refresh-workflow --apply leaves user-authored workflow guides untou
 
     assert.equal(exitCode, 0);
     assert.match(stdout.join(''), /architecture\/README\.md: skipped.*Existing workflow guide does not match a VibeCompass-generated guide shape/);
+    assert.match(stdout.join(''), /workflows\/docs-review\.md: skipped.*Existing workflow guide does not match a VibeCompass-generated guide shape/);
     assert.equal(await readFile(guidePath, 'utf8'), userGuide);
+    assert.equal(await readFile(workflowPath, 'utf8'), userWorkflow);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
