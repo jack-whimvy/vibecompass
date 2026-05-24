@@ -2,6 +2,8 @@ import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { resolveWorkflowSettings } from './workflow.js';
 import { getGeneratedWorkflowFiles, renderPromptCommandLines } from './workflows/registry.js';
+import { renderManagedBlock } from './generators/agent-files/markers.js';
+import { renderSharedInstructionBody } from './generators/agent-files/template.js';
 
 export async function scaffoldInitFiles(options) {
   const createdFiles = [];
@@ -536,30 +538,20 @@ Those scratch files are session-scoped working artifacts, not finalized history.
 }
 
 function generateClaudeTemplate(options) {
-  const workflow = resolveWorkflowSettings(options.projectConfig);
-  const promptCommands = renderPromptCommandLines({
-    rootRelativePath: options.rootRelativePath,
-  }).join('\n');
+  return [
+    generateClaudeSessionHeader(options),
+    renderManagedBlock(renderSharedInstructionBody(buildScaffoldAgentContext(options), {
+      heading: `${options.projectConfig.name} Claude Instructions`,
+      intro:
+        'Claude should use VibeCompass project memory as the source of truth before planning, editing, or reviewing code.',
+    })),
+  ].join('\n');
+}
 
+function generateClaudeSessionHeader(options) {
   return `# ${options.projectConfig.name} Workspace
 
 Read \`${options.contextRelativeToToolingRoot}\` before doing substantive work.
-
-## Session roles
-
-| Entry trigger | Role | Owns session lifecycle? |
-|---|---|---|
-| "start session" | Builder | Yes |
-| "join as reviewer" | Reviewer | No |
-| "planning mode" | Planner | No — scopes work inside the selected active lane before implementation |
-
-## Prompt commands
-
-${promptCommands}
-
-These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
-\`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
 
 ## Current session
 
@@ -572,62 +564,28 @@ Last thing completed: Project memory bootstrap completed.
 Blockers: None recorded.
 Next session should: Read \`${options.contextRelativeToToolingRoot}\`, then open the first builder or reviewer session.
 \`\`\`
-
-## Startup
-- Read \`${options.contextRelativeToToolingRoot}\`
-- Follow the builder/reviewer protocol defined there
-- Use \`vibecompass start-session --id <lane-id>\`, \`vibecompass list-sessions\`, \`vibecompass switch-session <lane-id>\`, and \`vibecompass close-session --session <lane-id>\` to manage active lanes when possible
-- Treat \`${options.rootRelativePath}/sessions/active/index.yaml\` as the current lane source of truth; this Current session block is only a continuity summary
-- Keep the selected lane's \`${options.rootRelativePath}/sessions/active/<lane-id>/wip.md\` and \`${options.rootRelativePath}/sessions/active/<lane-id>/handoff.md\` current during an active session
-- Use planning mode when scope is unclear; record the agreed plan in the selected lane's \`wip.md\` before implementing
-- If stale scratch files block \`start-session\`, read them first, then close, recover, move, or delete them intentionally before retrying
-- Workflow defaults:
-${renderWorkflowDefaults(workflow)}
 `;
 }
 
 function generateAgentsTemplate(options) {
-  const workflow = resolveWorkflowSettings(options.projectConfig);
-  const promptCommands = renderPromptCommandLines({
-    rootRelativePath: options.rootRelativePath,
-  }).join('\n');
+  return renderManagedBlock(renderSharedInstructionBody(buildScaffoldAgentContext(options), {
+    heading: `${options.projectConfig.name} Agent Instructions`,
+    intro:
+      'Agents should use VibeCompass project memory as the source of truth before planning, editing, or reviewing code.',
+  }));
+}
 
-  return `# ${options.projectConfig.name} Workspace
-
-This workspace uses VibeCompass project memory rooted at \`${options.rootRelativePath}\`.
-
-## Session roles
-
-| Entry trigger | Role | Owns session lifecycle? |
-|---|---|---|
-| "start session" | Builder | Yes — opens and closes the session lifecycle |
-| "join as reviewer" | Reviewer | No — reviews the builder's work and updates the handoff |
-| "planning mode" | Planner | No — scopes work inside the selected active lane before implementation |
-
-## Prompt commands
-
-${promptCommands}
-
-These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${options.rootRelativePath}/project.yaml\`.
-\`vibecompass end-session\` is accepted as an alias for \`vibecompass close-session\`; \`close-session\` remains the canonical command name.
-
-## Startup
-Before doing substantive work:
-1. Read \`${options.contextRelativeToToolingRoot}\`.
-2. Read the latest finalized session note under \`${options.rootRelativePath}/sessions/\`.
-3. If present, read \`${options.rootRelativePath}/sessions/active/index.yaml\` and choose the selected or current lane.
-4. If present, read \`${options.rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
-5. If present, read \`${options.rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
-6. Read the relevant docs under \`${options.rootRelativePath}/architecture/\` and \`${options.rootRelativePath}/decisions/\`.
-
-## Working rule
-Treat \`${options.contextRelativeToToolingRoot}\` as the local workflow source of truth for the builder/reviewer protocol and session scratch-file structure. When the package provides \`start-session\` / \`close-session\`, prefer those commands over hand-editing boilerplate.
-Use planning mode when scope is unclear; record the agreed plan in the selected lane's \`wip.md\` before implementing.
-If stale scratch files block \`start-session\`, read them first, then close, recover, move, or delete them intentionally before retrying.
-- Workflow defaults:
-${renderWorkflowDefaults(workflow)}
-`;
+function buildScaffoldAgentContext(options) {
+  return {
+    projectName: options.projectConfig.name ?? 'Unnamed project',
+    description: options.projectConfig.description ?? null,
+    mode: options.projectConfig.mode ?? null,
+    rootDir: options.rootRelativePath,
+    repos: options.projectConfig.repos ?? [],
+    domains: [],
+    recentDecisions: [],
+    recentSessions: [],
+  };
 }
 
 function renderWorkflowDefaults(workflow) {

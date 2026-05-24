@@ -135,18 +135,18 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(decisionExample, /ignored by VibeCompass canonical decision parsing/);
     assert.match(starterSession, /Project Memory Initialized/);
     assert.match(claude, /Read `\.compass\/context\.md` before doing substantive work/);
-    assert.match(claude, /Entry trigger/);
+    assert.match(claude, /compact bootloader/);
+    assert.match(claude, /## Read Order/);
     assert.match(claude, /planning mode/);
     assert.match(claude, /`docs review` — agent-led architecture documentation review/);
     assert.match(claude, /`close session` — builder runs the close-out checklist/);
-    assert.match(claude, /end-session` is accepted as an alias/);
-    assert.match(claude, /stale scratch files block `start-session`/);
-    assert.match(agents, /Before doing substantive work/);
-    assert.match(agents, /Entry trigger/);
+    assert.match(claude, /tool-specific Current session blocks are continuity summaries/);
+    assert.match(agents, /compact bootloader/);
+    assert.match(agents, /## Prompt Commands/);
     assert.match(agents, /planning mode/);
     assert.match(agents, /`docs review` — agent-led architecture documentation review/);
     assert.match(agents, /`close session` — builder runs the close-out checklist/);
-    assert.match(agents, /end-session` is accepted as an alias/);
+    assert.match(agents, /vibecompass end-session` are accepted aliases/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'CLAUDE.md')));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'AGENTS.md')));
@@ -281,10 +281,10 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.equal(exitCode, 0);
     assert.match(claude, /vibecompass:start - managed by VibeCompass/);
     assert.match(claude, /Agent File Project Claude Instructions/);
-    assert.match(claude, /active builder sessions are named lanes/);
+    assert.match(claude, /compact bootloader/);
     assert.match(claude, /planning mode/);
     assert.match(claude, /vibecompass end-session/);
-    assert.match(claude, /stale scratch files block `start-session`/);
+    assert.match(claude, /tool-specific Current session blocks are continuity summaries/);
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
     assert.match(copilot, /Agent File Project Copilot Instructions/);
 
@@ -2148,9 +2148,10 @@ test('runCli can chain init directly into the first builder session', async () =
     const activeIndex = await readFile(path.join(tempDir, '.compass/sessions/active/index.yaml'), 'utf8');
 
     assert.equal(exitCode, 0);
-    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
+    assert.doesNotMatch(stderr.join(''), /CLAUDE\.md: warning/);
     assert.ok(stdout.join('').includes('Generated'));
     assert.ok(stdout.join('').includes('Started session'));
+    assert.match(claude, /vibecompass:start - managed by VibeCompass/);
     assert.match(claude, /Working on: Kick off the first builder session from init\./);
     assert.match(wip, /Kick off the first builder session from init\./);
     assert.match(handoff, /Kick off the first builder session from init\./);
@@ -2217,7 +2218,8 @@ test('runCli supports guided init with placement recommendation and first-sessio
     const wip = await readFile(path.join(tempDir, '.compass/sessions/active/guided-bootstrap/wip.md'), 'utf8');
 
     assert.equal(exitCode, 0);
-    assert.match(stderr.join(''), /CLAUDE\.md: warning/);
+    assert.doesNotMatch(stderr.join(''), /CLAUDE\.md: warning/);
+    assert.match(claude, /vibecompass:start - managed by VibeCompass/);
     await access(path.join(tempDir, 'AGENTS.md'));
     assertPromptsInclude(prompts, [
       'Project name',

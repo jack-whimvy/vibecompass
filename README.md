@@ -20,7 +20,7 @@ Shipped today:
 - interactive guided init for placement, workflow bootstrap, and first-session setup
 - lightweight starter architecture/session memory plus example-only decision guidance
 - generated `context.md` plus opt-in workflow guide files
-- opt-in starter `CLAUDE.md` / `AGENTS.md` templates that are created once and never overwritten
+- opt-in starter `CLAUDE.md` / `AGENTS.md` templates that are created only when missing, with VibeCompass-managed regions for future refreshes
 - `vibecompass start-session` / `vibecompass close-session` for lane-aware local builder workflow
 - `vibecompass list-sessions` / `vibecompass switch-session` for multiple active session lanes
 - `vibecompass end-session` as a discoverable alias for `close-session`
@@ -144,6 +144,11 @@ AGENTS.md           # at the tooling root, only if missing and --with-agents is 
 
 `context.md` is a derived package-owned file. Re-running `init --force --with-workflow`
 regenerates it; do not treat it as a hand-edited source document.
+Starter `CLAUDE.md` / `AGENTS.md` files include VibeCompass managed markers
+when the package creates them, so later `sync-agents` and session lifecycle
+commands can refresh the generated region without warning. If those files
+already exist without markers, init leaves them untouched unless you explicitly
+adopt them.
 
 Check an initialized root without writing files:
 
@@ -283,7 +288,7 @@ Generate agent-instruction files from project memory:
 npx -y @vibecompass/vibecompass sync-agents --root .compass
 ```
 
-`sync-agents` writes only VibeCompass managed regions:
+`sync-agents` writes compact VibeCompass bootloader regions:
 
 ```md
 <!-- vibecompass:start - managed by VibeCompass, do not edit -->
@@ -291,12 +296,22 @@ npx -y @vibecompass/vibecompass sync-agents --root .compass
 <!-- vibecompass:end -->
 ```
 
-Content outside those markers is preserved. Existing files without markers are
-reported as warnings and left untouched unless you explicitly adopt them:
+Content outside those markers is preserved. Package-created starter files
+include managed markers from the beginning. Existing user files without markers
+are reported as warnings and left untouched unless you explicitly adopt them:
 
 ```bash
 npx -y @vibecompass/vibecompass sync-agents --root .compass --adopt-existing
 ```
+
+The managed block intentionally stays short: project-memory root, read order,
+prompt-command routing, and hard safety rules. Detailed workflow lives in
+`context.md` and generated files under `workflows/`, so `CLAUDE.md`, `AGENTS.md`,
+`.cursorrules`, and Copilot instructions do not duplicate long protocol text.
+`CLAUDE.md` starters also keep the mutable `Current session` block above the
+managed region because session lifecycle commands update it. `AGENTS.md`
+starters are intentionally just the managed bootloader; add Codex/team notes
+before or after the marker block if needed, and `sync-agents` will preserve them.
 
 Adoption appends a managed VibeCompass block to the end of existing unmarked
 agent files, preserves everything outside the markers, and reports possible

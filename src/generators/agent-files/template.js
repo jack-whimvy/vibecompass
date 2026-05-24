@@ -18,48 +18,40 @@ export function renderSharedInstructionBody(context, options = {}) {
   const intro =
     options.intro ??
     'Use VibeCompass project memory as the source of truth before making code changes.';
+  const contextPath = `${context.rootDir}/context.md`;
 
   return [
     `# ${heading}`,
     '',
     intro,
     '',
-    `Read \`${context.rootDir}/context.md\` for the full VibeCompass workflow protocol when it exists.`,
+    `This managed block is a compact bootloader. Read \`${contextPath}\` for the full VibeCompass workflow protocol; workflow-specific details live under \`${context.rootDir}/workflows/\`.`,
     '',
     'Existing project-specific coding, style, framework, and safety instructions outside this managed block remain authoritative. This block owns only VibeCompass project-memory workflow: sessions, handoffs, decisions, docs-review, and close-out.',
     '',
-    '## Read First',
+    '## Project Snapshot',
     `- Project memory root: \`${context.rootDir}\``,
-    '- Read `project.yaml` for project identity, repos, mode, and workflow defaults.',
-    '- Read the latest finalized session note under `sessions/` before resuming work.',
-    '- Read `sessions/active/index.yaml` when it exists, then read the selected lane under `sessions/active/<lane-id>/`.',
-    '- Read the selected lane `wip.md` and `handoff.md` when they exist; they are the active builder/reviewer scratch files.',
-    '- Read relevant `architecture/` and `decisions/` files before changing implementation.',
+    ...renderProjectSnapshot(context),
     '',
-    '## Project Shape',
-    ...renderProjectShape(context),
+    '## Read Order',
+    `1. Read \`${contextPath}\`.`,
+    `2. Read the latest finalized session note under \`${context.rootDir}/sessions/\`.`,
+    `3. If present, read \`${context.rootDir}/sessions/active/index.yaml\`, then the selected lane's \`wip.md\` and \`handoff.md\`.`,
+    `4. Read relevant \`${context.rootDir}/architecture/\` and \`${context.rootDir}/decisions/\` docs before editing implementation.`,
     '',
-    '## Workflow Rules',
-    '- VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream; finalized session notes are append-only history under `sessions/YYYY-MM-DD-N-title.md`.',
-    '- Use `vibecompass start-session --id <lane-id>` to open a named lane for every active feature or workstream.',
-    '- Use `vibecompass list-sessions` and `vibecompass switch-session <lane-id>` to inspect or change the current lane.',
-    '- Treat `sessions/active/index.yaml` as the current lane source of truth; tool-specific Current session blocks are continuity summaries.',
-    '',
-    '### Prompt Commands',
+    '## Prompt Commands',
     ...renderPromptCommandLines({ rootRelativePath: context.rootDir }),
     '- The prompt commands above are agent behaviors. The `vibecompass` CLI commands remain the filesystem mechanics behind them.',
     '',
-    '### Operating Rules',
-    '- If stale scratch files block `start-session`, read them first, then close, recover, move, or delete them intentionally before retrying.',
-    '- Keep decisions append-only in `decisions/`. Session notes may reference decisions, but decisions are the durable source of truth.',
-    '- Treat generated agent files as views. Update canonical VibeCompass project memory instead of editing managed regions.',
-    '',
-    '## Recent Decisions',
-    ...renderDecisionLines(context.recentDecisions),
+    '## Hard Rules',
+    '- Treat `sessions/active/index.yaml` as the current lane source of truth; tool-specific Current session blocks are continuity summaries.',
+    '- Keep the selected lane `wip.md` and `handoff.md` current during active builder/reviewer work.',
+    '- Keep decisions append-only in `decisions/`; append accepted architectural decisions before implementing them.',
+    '- Do not edit this managed block directly. Update canonical VibeCompass memory, then rerun package commands such as `vibecompass sync-agents`.',
   ].join('\n');
 }
 
-function renderProjectShape(context) {
+function renderProjectSnapshot(context) {
   const lines = [];
 
   if (context.description) {
@@ -74,18 +66,22 @@ function renderProjectShape(context) {
     lines.push(`- Repo \`${repo.id}\`: ${repo.remote}`);
   }
 
-  for (const domain of context.domains.slice(0, 8)) {
-    const features = domain.features.map((feature) => feature.feature).join(', ');
-    lines.push(`- ${domain.domain}: ${features || 'No features recorded yet.'}`);
+  const domainCount = context.domains.length;
+  if (domainCount > 0) {
+    lines.push(`- Architecture domains recorded: ${domainCount}`);
   }
 
-  return lines.length > 0 ? lines : ['- No architecture domains recorded yet.'];
+  if (context.recentDecisions.length > 0) {
+    lines.push(`- Latest decision: ${renderDecisionLine(context.recentDecisions[0])}`);
+  }
+
+  if (context.recentSessions.length > 0) {
+    lines.push(`- Latest session: ${context.recentSessions[0].title ?? context.recentSessions[0].path}`);
+  }
+
+  return lines.length > 0 ? lines : ['- No project details recorded yet.'];
 }
 
-function renderDecisionLines(decisions) {
-  if (!decisions || decisions.length === 0) {
-    return ['- No decisions recorded yet.'];
-  }
-
-  return decisions.map((decision) => `- D-${String(decision.decision_id).padStart(3, '0')} — ${decision.title}`);
+function renderDecisionLine(decision) {
+  return `D-${String(decision.decision_id).padStart(3, '0')} — ${decision.title}`;
 }
