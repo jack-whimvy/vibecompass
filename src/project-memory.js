@@ -364,7 +364,9 @@ function parseArchitectureDocument(options) {
     }
 
     const data = frontmatter.data;
-    const requiredFields = ['domain', 'feature', 'component', 'status'];
+    const requiredFields = options.relativePath === 'architecture/overview/project-shape.md'
+      ? ['status']
+      : ['domain', 'feature', 'component', 'status'];
 
     for (const field of requiredFields) {
       if (typeof data[field] !== 'string' || data[field].trim() === '') {

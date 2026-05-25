@@ -518,6 +518,39 @@ Test the fallback.
   }
 });
 
+test('scanProjectMemory accepts project overview with status-only frontmatter', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Overview Root
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+    'architecture/overview/project-shape.md': `
+---
+status: In progress
+---
+
+## Description
+Project overview accepted by the overview path exception.
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+    const overviewDocument = result.documents.find(
+      (document) => document.path === 'architecture/overview/project-shape.md',
+    );
+
+    assert.equal(result.errors.length, 0);
+    assert.equal(overviewDocument.errors.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test('scanProjectMemory rejects secret-bearing sync fields in project.yaml', async () => {
   const fixture = await createFixture({
     'project.yaml': `

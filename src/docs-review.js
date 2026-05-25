@@ -182,14 +182,19 @@ async function applyDocsReviewOutput(options) {
   const blocks = parseArchitectureDocBlocks(source);
 
   if (blocks.length === 0) {
+    const malformedFenceCount = countMalformedArchitectureDocFences(source);
+    if (malformedFenceCount > 0) {
+      throw new Error(
+        `Malformed architecture doc fence found in ${outputPath}. Expected fence openings like \`\`\`vibecompass-architecture-doc path=architecture/domain/feature/component.md\` with exactly one path attribute and no extra attributes.`,
+      );
+    }
+
     throw new Error(
       `No accepted architecture doc blocks found in ${outputPath}. Expected fenced blocks like \`\`\`vibecompass-architecture-doc path=architecture/domain/feature/component.md\`.`,
     );
   }
 
-  for (const block of blocks) {
-    validateArchitectureDocBlock(block);
-  }
+  validateArchitectureDocBlocks(blocks);
 
   const applied = [];
   for (const block of blocks) {
@@ -614,6 +619,32 @@ function parseArchitectureDocBlocks(source) {
   return blocks;
 }
 
+function countMalformedArchitectureDocFences(source) {
+  const fencePattern = /^```vibecompass-architecture-doc\b.*$/gm;
+  const acceptedOpeningPattern = /^```vibecompass-architecture-doc\s+path=[^\s`]+\s*$/;
+  let count = 0;
+  let match;
+
+  while ((match = fencePattern.exec(source)) !== null) {
+    if (!acceptedOpeningPattern.test(match[0])) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function validateArchitectureDocBlocks(blocks) {
+  const seenPaths = new Set();
+  for (const block of blocks) {
+    if (seenPaths.has(block.path)) {
+      throw new Error(`Accepted docs-review output contains duplicate architecture doc path: ${block.path}`);
+    }
+    seenPaths.add(block.path);
+    validateArchitectureDocBlock(block);
+  }
+}
+
 function normalizeBlockPath(value) {
   return String(value ?? '').trim().replaceAll('\\', '/');
 }
@@ -638,7 +669,10 @@ function validateArchitectureDocBlock(block) {
     throw new Error(`Accepted architecture doc ${block.path} must include frontmatter.`);
   }
 
-  for (const field of ['domain', 'feature', 'component', 'status']) {
+  const requiredFields = block.path === 'architecture/overview/project-shape.md'
+    ? ['status']
+    : ['domain', 'feature', 'component', 'status'];
+  for (const field of requiredFields) {
     if (typeof frontmatter.data[field] !== 'string' || frontmatter.data[field].trim() === '') {
       throw new Error(`Accepted architecture doc ${block.path} requires non-empty frontmatter field "${field}".`);
     }

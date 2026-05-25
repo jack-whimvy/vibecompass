@@ -11,6 +11,8 @@ import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
 
+const docsReviewFixtureDir = fileURLToPath(new URL('fixtures/docs-review-output/', import.meta.url));
+
 function assertPromptsInclude(prompts, expectedPrompts) {
   for (const expectedPrompt of expectedPrompts) {
     assert.ok(prompts.includes(expectedPrompt), `Expected prompt "${expectedPrompt}" in ${JSON.stringify(prompts)}.`);
@@ -633,6 +635,87 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.deepEqual(overwrittenMarker.applied.architecture_docs, [
       { path: 'architecture/platform/docs-review/local-runtime.md', status: 'overwritten' },
     ]);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'overview-status-only.md'), 'utf8'),
+      'utf8',
+    );
+    const overviewStdout = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: {
+          write(chunk) {
+            overviewStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const appliedOverview = await readFile(
+      path.join(localOnlyRoot, 'architecture/overview/project-shape.md'),
+      'utf8',
+    );
+    assert.match(overviewStdout.join(''), /architecture\/overview\/project-shape\.md \(overwritten\)/);
+    assert.match(appliedOverview, /Updated overview from fixture/);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'extra-attribute.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Malformed architecture doc fence found/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-architecture-path.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /path must stay inside architecture\/\. Invalid path: architecture\/\.\.\/outside\.md/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'missing-frontmatter.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /must include frontmatter/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'duplicate-path.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /duplicate architecture doc path: architecture\/platform\/docs-review\/duplicate\.md/,
+    );
 
     await initializeProjectMemory({
       cwd: tempDir,

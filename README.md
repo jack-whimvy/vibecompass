@@ -31,6 +31,7 @@ Shipped today:
 - `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app and poll for proposal/artifact output
 - `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
 - `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
+- strict docs-review output validation for architecture-doc fences, duplicate paths, and required frontmatter
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
 - hosted sync commands: `push`, `pull-preview`, `pull-export`, and `apply-export`
 - canonical file scanning and validation
@@ -680,7 +681,18 @@ Accepted review content.
 ```
 ````
 
-Only `architecture/*.md` paths are writable through this apply step.
+The fence opening is strict: it must be exactly
+`vibecompass-architecture-doc path=<architecture/*.md>` with one `path`
+attribute and no extra attributes. Malformed architecture-doc fences report a
+targeted error instead of being treated as "no output found".
+
+Only `architecture/*.md` paths are writable through this apply step. Component
+docs require non-empty `domain`, `feature`, `component`, and `status`
+frontmatter. The project overview file,
+`architecture/overview/project-shape.md`, may use status-only frontmatter so it
+matches hosted docs-review proposal behavior. If one accepted output contains
+multiple blocks for the same architecture path, local apply fails rather than
+silently overwriting earlier accepted content.
 
 `vibecompass docs-review --complete` updates the marker in
 `state/docs-review.json` to `status: "completed"` once the docs have
