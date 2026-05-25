@@ -579,6 +579,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localBody.model, 'claude-sonnet-4-6');
     assert.equal(localBody.max_tokens, 20000);
     assert.match(localBody.messages[0].content, /Confidence: high \| medium \| low/);
+    assert.match(localBody.messages[0].content, /Stage 1 — Evidence inventory/);
+    assert.match(localBody.messages[0].content, /Soft size budget: keep each generated architecture doc under 12000 bytes/);
     assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
     assert.match(localStdout.join(''), /Local review output:/);
     assert.match(localStderr.join(''), /stopped at max_tokens/);
@@ -635,6 +637,56 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.deepEqual(overwrittenMarker.applied.architecture_docs, [
       { path: 'architecture/platform/docs-review/local-runtime.md', status: 'overwritten' },
     ]);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      [
+        '```vibecompass-architecture-doc path=architecture/platform/docs-review/oversized.md',
+        '---',
+        'domain: Platform',
+        'feature: Docs Review',
+        'component: Oversized',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Oversized fixture.',
+        '',
+        '## Details',
+        'x'.repeat(12100),
+        '',
+        '## Next steps',
+        '- Compact this doc.',
+        '',
+        '## Involved files',
+        '- `app:src/docs-review.js`',
+        '```',
+      ].join('\n'),
+      'utf8',
+    );
+    const oversizedStdout = [];
+    const oversizedStderr = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: {
+          write(chunk) {
+            oversizedStdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            oversizedStderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const oversizedMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+    assert.match(oversizedStdout.join(''), /architecture\/platform\/docs-review\/oversized\.md \(created\)/);
+    assert.match(oversizedStderr.join(''), /oversized_architecture_doc: architecture\/platform\/docs-review\/oversized\.md/);
+    assert.match(oversizedMarker.applied.warnings[0], /oversized_architecture_doc/);
 
     await writeFile(
       path.join(localOnlyRoot, 'state/docs-review-output.md'),
@@ -792,12 +844,14 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
-    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v1/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v2/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
+    assert.match(stdout.join(''), /## Staged Review Protocol/);
+    assert.match(stdout.join(''), /Retrieval scope: when future agents should load this doc/);
     assert.match(stdout.join(''), /Do not delete `architecture\/overview\/project-shape\.md`/);
-    assert.match(stdout.join(''), /body sections: `## Description`, `## Review metadata`, `## Details`, `## Next steps`, `## Involved files`/);
+    assert.match(stdout.join(''), /body sections: `## Description`, `## Review metadata`, `## Details`, `## Retrieval guidance`, `## Next steps`, `## Involved files`/);
     assert.equal(marker.status, 'external-review-requested');
     assert.equal(marker.llm, 'codex');
     assert.equal(marker.model, 'gpt-5.3-codex');
@@ -840,7 +894,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(hostedBody.local_root_revision, /^loc_[a-f0-9]{24}$/);
     assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
     assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
-    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v1/);
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v2/);
     assert.match(hostedBody.prompt, /Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
     assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
@@ -873,8 +927,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                 run_id: 'run_docs_review_123',
                 status: 'completed',
                 phase: null,
-                prompt_version: 'VibeCompass Docs Review Prompt v1',
-                parser_version: 'hosted-docs-review-parser-v1',
+                prompt_version: 'VibeCompass Docs Review Prompt v2',
+                parser_version: 'hosted-docs-review-parser-v2',
                 proposal_ids: ['proposal_1'],
                 warnings: [{ code: 'dropped_non_architecture_output', message: 'Dropped freeform text.' }],
               };
@@ -891,7 +945,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(pollStdout.join(''), /Hosted run: run_docs_review_123/);
     assert.equal(polledMarker.status, 'hosted-review-completed');
     assert.deepEqual(polledMarker.hosted.proposal_ids, ['proposal_1']);
-    assert.equal(polledMarker.hosted.parser_version, 'hosted-docs-review-parser-v1');
+    assert.equal(polledMarker.hosted.parser_version, 'hosted-docs-review-parser-v2');
     assert.equal(polledMarker.hosted.warnings[0].code, 'dropped_non_architecture_output');
 
     const failedPollStdout = [];

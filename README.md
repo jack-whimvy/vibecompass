@@ -31,6 +31,7 @@ Shipped today:
 - `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app and poll for proposal/artifact output
 - `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
 - `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
+- docs-review prompt v2 with staged evidence inventory, coverage planning, bounded doc generation, retrieval metadata, and soft oversized-doc warnings
 - strict docs-review output validation for architecture-doc fences, duplicate paths, and required frontmatter
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
 - hosted sync commands: `push`, `pull-preview`, `pull-export`, and `apply-export`
@@ -68,6 +69,15 @@ command is intentionally unscoped: `vibecompass`.
 ```bash
 npm install @vibecompass/vibecompass
 ```
+
+## Latest release
+
+`0.6.0` upgrades docs-review to `VibeCompass Docs Review Prompt v2`.
+The generated review prompt now guides the LLM through evidence inventory,
+coverage planning, bounded architecture-doc generation, and apply/verify.
+Accepted architecture docs over the 12000-byte soft budget are still applied,
+but surface an `oversized_architecture_doc` warning so users can compact them
+before future LLM sessions load that context.
 
 ## Quickstart
 
@@ -194,9 +204,9 @@ remind you with a non-blocking warning if no completed review exists.
 
 What happens:
 
-1. The CLI asks which LLM you'll use, then prints a versioned prompt template with fixed review criteria.
+1. The CLI asks which LLM you'll use, then prints a versioned staged review prompt with fixed review criteria.
 2. You paste that prompt into your AI tool (Claude Code, Codex, Cursor, etc.).
-3. The AI reads your repo and writes architecture docs under
+3. The AI inventories project memory and source evidence, proposes a coverage plan, then writes only accepted architecture docs under
    `architecture/<domain>/<feature>/<component>.md`.
 4. Run `vibecompass docs-review --apply-output` after accepting fenced
    architecture-doc blocks, or `--complete` if accepted docs were written
@@ -205,8 +215,11 @@ What happens:
 The guided prompt is deterministic apart from project-specific fields
 (`project`, `mode`, `root`, provider, and model). It uses the same structure
 VibeCompass dogfoods: read project memory first, inspect source evidence,
-write component docs with review metadata, preserve the starter overview, and
-emit accepted docs as `vibecompass-architecture-doc` blocks.
+build a coverage plan, write retrieval-oriented component docs with review
+metadata, preserve the starter overview, and emit accepted docs as
+`vibecompass-architecture-doc` blocks. The prompt includes a soft 12000-byte
+budget per generated architecture doc so future LLM sessions can load targeted
+context without pulling oversized narrative files by default.
 
 Plain `--guided` never calls an AI itself. You stay in control of which
 provider runs the review and what gets saved. Use `--run-local --provider
@@ -693,6 +706,11 @@ frontmatter. The project overview file,
 matches hosted docs-review proposal behavior. If one accepted output contains
 multiple blocks for the same architecture path, local apply fails rather than
 silently overwriting earlier accepted content.
+
+Accepted architecture docs over the soft 12000-byte size budget are applied
+with an `oversized_architecture_doc` warning instead of being rejected. Treat
+that warning as a prompt to compact the doc unless the extra detail is needed
+for future retrieval.
 
 `vibecompass docs-review --complete` updates the marker in
 `state/docs-review.json` to `status: "completed"` once the docs have

@@ -104,17 +104,23 @@ Turn starter project memory into evidence-backed architecture docs under \`archi
 ## Steps
 
 1. Read \`${projectYamlPath}\`, \`${contextPath}\`, existing \`${architecturePath}\`, \`${decisionsPath}\`, and finalized \`${sessionsPath}\` notes.
-2. Inspect the declared source repos before making implementation claims. Cite concrete files as \`repo:path\` evidence in generated docs.
+2. Inspect the declared source repos in stages:
+   - inventory paths, manifests, configs, route/job/test directories, and existing architecture frontmatter first
+   - produce a coverage plan before reading broad source bodies
+   - read targeted source files only when the coverage plan needs evidence
 3. Run \`vibecompass docs-review --guided --llm <tool-name> --model <model-name>\` to record the review marker and print the canonical docs-review contract. Use the current AI tool name and model when known.
-4. Draft only architecture docs the user accepts. Accepted docs must be fenced exactly as \`vibecompass-architecture-doc path=architecture/domain/feature/component.md\` blocks and must include required frontmatter: \`domain\`, \`feature\`, \`component\`, and \`status\`.
-5. Write the accepted fenced blocks to \`${outputPath}\`.
-6. Run \`vibecompass docs-review --apply-output\` to validate and apply the accepted blocks. If accepted docs were written manually outside the output file, run \`vibecompass docs-review --complete\` after confirming the marker should be completed.
-7. Run \`vibecompass status\` to confirm the docs-review marker is complete. Report the applied architecture paths from the \`--apply-output\` result and any blindspots documented in the accepted docs-review output.
+4. Present the evidence inventory, coverage plan, proposed architecture docs, blindspots, and token-budget risks before generating accepted docs.
+5. Draft only architecture docs the user accepts. Accepted docs must be fenced exactly as \`vibecompass-architecture-doc path=architecture/domain/feature/component.md\` blocks and must include required frontmatter: \`domain\`, \`feature\`, \`component\`, and \`status\`.
+6. Keep each generated architecture doc focused and retrieval-oriented. Soft budget: under 12000 bytes per doc unless the extra detail is necessary and called out in review metadata or retrieval guidance.
+7. Write the accepted fenced blocks to \`${outputPath}\`.
+8. Run \`vibecompass docs-review --apply-output\` to validate and apply the accepted blocks. If accepted docs were written manually outside the output file, run \`vibecompass docs-review --complete\` after confirming the marker should be completed.
+9. Run \`vibecompass status\` to confirm the docs-review marker is complete. Report the applied architecture paths, any parser warnings such as oversized docs, and any blindspots documented in the accepted docs-review output.
 
 ## Rules
 
 - Do not duplicate the full canonical review prompt in this file. The package command prints that contract from its current implementation.
 - Follow the canonical review prompt for evidence, blindspot, and decision-recommendation constraints.
+- Treat the package-owned prompt as the source of truth. Tool-specific skills may wrap this workflow, but should not define a divergent docs-review protocol.
 - Do not edit generated agent files directly. Update VibeCompass project memory or rerun package commands instead.
 `;
 }

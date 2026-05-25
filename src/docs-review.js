@@ -5,6 +5,9 @@ import { parseFrontmatter } from './frontmatter.js';
 import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
+const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v2';
+const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
+
 export async function preflightDocsReview(options = {}, environment = {}) {
   validateDocsReviewMode(options);
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
@@ -195,6 +198,7 @@ async function applyDocsReviewOutput(options) {
   }
 
   validateArchitectureDocBlocks(blocks);
+  const warnings = createArchitectureDocSizeWarnings(blocks);
 
   const applied = [];
   for (const block of blocks) {
@@ -215,6 +219,7 @@ async function applyDocsReviewOutput(options) {
     applied: {
       output_path: outputPath,
       architecture_docs: applied,
+      ...(warnings.length > 0 ? { warnings } : {}),
       applied_at: new Date().toISOString(),
     },
     completed_at: new Date().toISOString(),
@@ -232,7 +237,7 @@ async function applyDocsReviewOutput(options) {
     hosted: current.hosted ?? null,
     applied: marker.applied,
     reviewPrompt: null,
-    warnings: [],
+    warnings,
     message: `Applied ${applied.length} accepted architecture doc${applied.length === 1 ? '' : 's'} and completed the docs-review marker.`,
   };
 }
@@ -679,6 +684,19 @@ function validateArchitectureDocBlock(block) {
   }
 }
 
+function createArchitectureDocSizeWarnings(blocks) {
+  return blocks
+    .map((block) => {
+      const byteLength = Buffer.byteLength(ensureTrailingNewline(block.content), 'utf8');
+      if (byteLength <= ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES) {
+        return null;
+      }
+
+      return `oversized_architecture_doc: ${block.path} is ${byteLength} bytes; soft budget is ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes. Consider compacting the doc to preserve future LLM context budget.`;
+    })
+    .filter(Boolean);
+}
+
 async function submitHostedDocsReview(options) {
   if (options.runtime.provider !== 'hosted') {
     throw new Error('docs-review --submit-hosted requires a hosted sync binding in project.yaml.');
@@ -1081,9 +1099,9 @@ function renderDocsReviewMessage(options) {
 
 function renderReviewPrompt(options) {
   return [
-    '# VibeCompass Docs Review Prompt v1',
+    `# ${DOCS_REVIEW_PROMPT_VERSION}`,
     '',
-    'Run a comprehensive VibeCompass architecture documentation review for the project-memory root below. Follow this prompt exactly; do not invent a different document structure.',
+    'Run a staged VibeCompass architecture documentation review for the project-memory root below. Follow this prompt exactly; do not invent a different document structure.',
     '',
     '## Review Context',
     `- Project memory root: ${options.rootDir}`,
@@ -1096,13 +1114,35 @@ function renderReviewPrompt(options) {
     '1. Read `project.yaml`.',
     '2. Read `context.md` if present.',
     '3. Read all canonical files under `architecture/`, `decisions/`, and finalized `sessions/`.',
-    '4. Inspect the declared repositories and cite concrete source, config, and test files before making implementation claims.',
+    '4. Inspect declared repositories before making implementation claims.',
+    '',
+    '## Staged Review Protocol',
+    'Stage 1 — Evidence inventory:',
+    '- Build a compact repo inventory from file paths, manifests/config files, route/job/test directories, and existing architecture frontmatter before reading large file bodies.',
+    '- Identify candidate domains, features, components, and ownership boundaries with concrete `repo:path` evidence.',
+    '- Do not fetch or summarize broad source bodies until the coverage plan says a file is needed.',
+    '',
+    'Stage 2 — Coverage plan:',
+    '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
+    '- Prioritize entry points, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
+    '- Mark each proposed doc as `comprehensive`, `partial`, or `initial`, with the reason and blindspots.',
+    '- Ask for user acceptance before emitting fenced architecture-doc blocks.',
+    '',
+    'Stage 3 — Bounded doc generation:',
+    '- Generate only accepted docs, one complete fenced block per architecture path.',
+    '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
+    `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
+    '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
+    '',
+    'Stage 4 — Apply and verify:',
+    '- After accepted blocks are written to `state/docs-review-output.md`, run `vibecompass docs-review --apply-output`.',
+    '- Surface any parser warnings, especially oversized docs, so the user can decide whether to compact or accept the output.',
     '',
     '## Architecture Doc Contract',
     'When creating or updating architecture docs, use the existing VibeCompass structure:',
     '- path: `architecture/<domain-slug>/<feature-slug>/<component-slug>.md` for component docs',
     '- frontmatter fields: `domain`, `feature`, `component`, `status`, plus `repo` or `repos` when implementation-scoped',
-    '- body sections: `## Description`, `## Review metadata`, `## Details`, `## Next steps`, `## Involved files`',
+    '- body sections: `## Description`, `## Review metadata`, `## Details`, `## Retrieval guidance`, `## Next steps`, `## Involved files`',
     '',
     'Use this exact Review metadata sub-header in every generated architecture doc:',
     '',
@@ -1113,6 +1153,8 @@ function renderReviewPrompt(options) {
     '- Confidence: high | medium | low',
     '- Coverage: comprehensive | partial | initial',
     '- Evidence: repo:path references inspected before making implementation claims',
+    '- Retrieval scope: when future agents should load this doc',
+    `- Token posture: compact unless the doc intentionally exceeds ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes`,
     '- Blindspots: explicit list, or "None identified" only when evidence is comprehensive',
     '',
     '## Review Rules',
@@ -1124,12 +1166,15 @@ function renderReviewPrompt(options) {
     '6. Put uncertainty in `Blindspots`; do not fill gaps with guesses.',
     '7. Do not append real `D-NNN` decisions without explicit user acceptance. Propose candidate decisions separately.',
     '8. Do not edit `decisions/INDEX.md` directly unless a canonical decision file was explicitly accepted and appended.',
+    '9. Optimize for future retrieval: project-level docs stay compact; component docs carry focused context for a specific area.',
     '',
     '## Output Contract',
     'First provide a concise findings summary with:',
     '- mapped areas',
     '- gaps/blindspots',
-    '- proposed architecture docs',
+    '- evidence inventory summary',
+    '- coverage plan and proposed architecture docs',
+    '- token-budget risks or oversized-doc candidates',
     '- proposed decisions, if any',
     '',
     'Then, for each architecture doc the user accepts, output one fenced block exactly like this:',

@@ -1,6 +1,6 @@
 {
   "name": "@vibecompass/vibecompass",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Local-first project-memory core for VibeCompass",
   "type": "module",
   "bin": {
@@ -11,8 +11,10 @@
     ".": "./src/index.js"
   },
   "files": [
+    "CHANGELOG.md",
     "src/*.js",
-    "src/generators/**/*.js"
+    "src/generators/**/*.js",
+    "src/workflows/**/*.js"
   ],
   "scripts": {
     "test": "node --test src/tests/*.test.js",
