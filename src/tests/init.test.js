@@ -539,6 +539,25 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                     text: [
                       'Generated review.',
                       '',
+                      '```vibecompass-coverage-plan version=1',
+                      '{',
+                      '  "summary": "Local runtime coverage",',
+                      '  "areas": [',
+                      '    {',
+                      '      "id": "docs-review-local-runtime",',
+                      '      "domain": "Platform",',
+                      '      "feature": "Docs Review",',
+                      '      "component": "Local Runtime",',
+                      '      "status": "accepted",',
+                      '      "coverage": "partial",',
+                      '      "proposed_path": "architecture/platform/docs-review/local-runtime.md",',
+                      '      "evidence": ["app:src/docs-review.js"],',
+                      '      "blindspots": ["Hosted parser parity not inspected"]',
+                      '    }',
+                      '  ]',
+                      '}',
+                      '```',
+                      '',
                       '```vibecompass-architecture-doc path=architecture/platform/docs-review/local-runtime.md',
                       '---',
                       'domain: Platform',
@@ -551,8 +570,22 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                       '## Description',
                       'Accepted local runtime docs.',
                       '',
+                      '## Review metadata',
+                      '- Review provider: claude',
+                      '- Review model/version: claude-sonnet-4-6',
+                      '- Project mode: local-only',
+                      '- Confidence: medium',
+                      '- Coverage: partial',
+                      '- Evidence: app:src/docs-review.js',
+                      '- Retrieval scope: load before changing local docs-review runtime',
+                      '- Token posture: compact',
+                      '- Blindspots: Hosted parser parity not inspected',
+                      '',
                       '## Details',
                       'Generated review details.',
+                      '',
+                      '## Retrieval guidance',
+                      'Load before changing local docs-review runtime.',
                       '',
                       '## Next steps',
                       '- Continue.',
@@ -580,6 +613,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localBody.max_tokens, 20000);
     assert.match(localBody.messages[0].content, /Confidence: high \| medium \| low/);
     assert.match(localBody.messages[0].content, /Stage 1 — Evidence inventory/);
+    assert.match(localBody.messages[0].content, /vibecompass-coverage-plan version=1/);
     assert.match(localBody.messages[0].content, /Soft size budget: keep each generated architecture doc under 12000 bytes/);
     assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
     assert.match(localStdout.join(''), /Local review output:/);
@@ -617,6 +651,11 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.deepEqual(appliedMarker.applied.architecture_docs, [
       { path: 'architecture/platform/docs-review/local-runtime.md', status: 'created' },
     ]);
+    assert.equal(appliedMarker.applied.coverage.area_count, 1);
+    assert.equal(appliedMarker.applied.coverage.coverage_score, 1);
+    const coverageProjection = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review-coverage.json'), 'utf8'));
+    assert.equal(coverageProjection.summary, 'Local runtime coverage');
+    assert.equal(coverageProjection.areas[0].id, 'docs-review-local-runtime');
 
     const overwriteStdout = [];
     await runCli(
@@ -769,6 +808,34 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       /duplicate architecture doc path: architecture\/platform\/docs-review\/duplicate\.md/,
     );
 
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-coverage-plan-json.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Accepted coverage plan must contain valid JSON/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'duplicate-coverage-plan.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /multiple coverage-plan blocks/,
+    );
+
     await initializeProjectMemory({
       cwd: tempDir,
       rootDir: localPrimaryNoSyncRoot,
@@ -895,7 +962,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
     assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
     assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v2/);
-    assert.match(hostedBody.prompt, /Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks/);
+    assert.match(hostedBody.prompt, /Only include accepted coverage, architecture, and decision-recommendation blocks/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
     assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
     assert.equal(hostedMarker.status, 'hosted-review-requested');
@@ -1752,6 +1819,63 @@ test('runCli status --json returns a redacted typed model', async () => {
     assert.doesNotMatch(output, /super-secret-token-value/);
     assert.doesNotMatch(output, /preview_secret_token/);
     assert.doesNotMatch(output, /pending_previews/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli status surfaces docs-review output drift', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-status-docs-review-drift-'));
+  const stdout = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Status Docs Review Drift Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    const rootDir = path.join(tempDir, '.compass');
+    const outputPath = path.join(rootDir, 'state/docs-review-output.md');
+    const acceptedOutput = '```vibecompass-coverage-plan version=1\n{"areas":[]}\n```\n';
+
+    await writeFile(outputPath, acceptedOutput, 'utf8');
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({
+        status: 'completed',
+        applied: {
+          output_path: outputPath,
+          output_hash: sha256Text(acceptedOutput),
+          manifest_hash: 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+          applied_at: '2026-05-26T10:00:00.000Z',
+        },
+        completed_at: '2026-05-26T10:00:00.000Z',
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(outputPath, `${acceptedOutput}\nManual edit after apply.\n`, 'utf8');
+
+    const exitCode = await runCli(
+      ['status', '--root', '.compass'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir },
+    );
+
+    const output = stdout.join('');
+    assert.equal(exitCode, 0);
+    assert.match(output, /Docs review:\n- completed/);
+    assert.match(output, /Output drift: state\/docs-review-output\.md changed since apply/);
+    assert.doesNotMatch(output, /canonical manifest changed since apply/);
+    assert.match(output, /vibecompass docs-review --apply-output/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -3675,6 +3799,136 @@ test('docs-review can refresh the flat decision index when explicitly requested'
 
     assert.match(index, /D-125 \| Refresh index explicitly/);
     assert.equal(marker.applied_decision_artifact.refreshed_index, true);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review apply-output projects coverage and appends local decision recommendations', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-local-artifacts-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      rootDir,
+      name: 'Local Artifact Review',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-124 — Existing local decision',
+        '',
+        '**Timestamp:** 2026-04-19 00:01 PDT',
+        '**Decision:** Existing decision text.',
+        '**Rationale:** Existing rationale.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({ status: 'local-review-generated', llm: 'codex', model: 'gpt-5' }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review-output.md'),
+      [
+        await readFile(path.join(docsReviewFixtureDir, 'coverage-plan-valid.md'), 'utf8'),
+        await readFile(path.join(docsReviewFixtureDir, 'decision-recommendation-valid.md'), 'utf8'),
+      ].join('\n'),
+      'utf8',
+    );
+
+    const stdout = [];
+    await runCli(
+      ['docs-review', '--root', rootDir, '--apply-output', '--refresh-index'],
+      {
+        stdout: { write(chunk) { stdout.push(chunk); } },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+
+    const coverage = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review-coverage.json'), 'utf8'));
+    const decisions = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    const index = await readFile(path.join(rootDir, 'decisions/INDEX.md'), 'utf8');
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(stdout.join(''), /Applied coverage plan: 2 areas \(50% accepted\)/);
+    assert.match(stdout.join(''), /Applied decision recommendations: 1/);
+    assert.equal(coverage.area_count, 2);
+    assert.equal(coverage.coverage_score, 0.5);
+    assert.deepEqual(coverage.statuses, { accepted: 1, missing: 1 });
+    assert.match(decisions, /### D-125 — Coverage plans are projected locally/);
+    assert.match(index, /D-125 \| Coverage plans are projected locally/);
+    assert.equal(marker.applied.coverage.area_count, 2);
+    assert.equal(marker.applied.decision_candidates[0].decision_id, 125);
+    assert.match(marker.applied.output_hash, /^sha256:/);
+    assert.match(marker.applied.manifest_hash, /^sha256:/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review apply-output appends repeated local decision recommendations independently', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-repeated-decisions-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      rootDir,
+      name: 'Repeated Local Decisions Review',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-124 — Existing local decision',
+        '',
+        '**Timestamp:** 2026-04-19 00:01 PDT',
+        '**Decision:** Existing decision text.',
+        '**Rationale:** Existing rationale.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({ status: 'local-review-generated' }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'repeated-decision-recommendations.md'), 'utf8'),
+      'utf8',
+    );
+
+    await runCli(
+      ['docs-review', '--root', rootDir, '--apply-output', '--refresh-index'],
+      { stdout: { write() {} }, stderr: { write() {} } },
+      { cwd: tempDir, env: {} },
+    );
+
+    const decisions = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+
+    assert.match(decisions, /### D-125 — First repeated local decision/);
+    assert.match(decisions, /### D-126 — Second repeated local decision/);
+    assert.deepEqual(
+      marker.applied.decision_candidates.map((candidate) => candidate.decision_id),
+      [125, 126],
+    );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

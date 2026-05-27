@@ -2,11 +2,15 @@ import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
+import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v2';
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
+const COVERAGE_PLAN_OUTPUT_VERSION = 1;
+const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
+const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
 
 export async function preflightDocsReview(options = {}, environment = {}) {
   validateDocsReviewMode(options);
@@ -21,6 +25,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       outputPath: options.outputPath,
       llm: options.llm,
       model: options.model,
+      refreshIndex: options.refreshIndex,
     });
   }
 
@@ -183,8 +188,10 @@ async function applyDocsReviewOutput(options) {
     : path.join(path.dirname(options.statePath), 'docs-review-output.md');
   const source = await readFile(outputPath, 'utf8');
   const blocks = parseArchitectureDocBlocks(source);
+  const coverageBlocks = parseCoveragePlanBlocks(source);
+  const decisionRecommendationBlocks = parseDecisionRecommendationBlocks(source);
 
-  if (blocks.length === 0) {
+  if (blocks.length === 0 && coverageBlocks.length === 0 && decisionRecommendationBlocks.length === 0) {
     const malformedFenceCount = countMalformedArchitectureDocFences(source);
     if (malformedFenceCount > 0) {
       throw new Error(
@@ -192,13 +199,35 @@ async function applyDocsReviewOutput(options) {
       );
     }
 
+    const malformedCoveragePlanFenceCount = countMalformedCoveragePlanFences(source);
+    if (malformedCoveragePlanFenceCount > 0) {
+      throw new Error(
+        `Malformed coverage-plan fence found in ${outputPath}. Expected fence openings like \`\`\`vibecompass-coverage-plan version=1\`.`,
+      );
+    }
+
+    const malformedDecisionRecommendationFenceCount = countMalformedDecisionRecommendationFences(source);
+    if (malformedDecisionRecommendationFenceCount > 0) {
+      throw new Error(
+        `Malformed decision recommendation fence found in ${outputPath}. Expected fence openings like \`\`\`vibecompass-decision-recommendation target=decisions/domain.md\`.`,
+      );
+    }
+
     throw new Error(
-      `No accepted architecture doc blocks found in ${outputPath}. Expected fenced blocks like \`\`\`vibecompass-architecture-doc path=architecture/domain/feature/component.md\`.`,
+      `No accepted docs-review output blocks found in ${outputPath}. Expected fenced blocks like \`\`\`vibecompass-architecture-doc path=architecture/domain/feature/component.md\`, \`\`\`vibecompass-coverage-plan version=1\`, or \`\`\`vibecompass-decision-recommendation target=decisions/domain.md\`.`,
     );
   }
 
   validateArchitectureDocBlocks(blocks);
-  const warnings = createArchitectureDocSizeWarnings(blocks);
+  const coverageProjection = buildCoverageProjection(coverageBlocks, {
+    outputPath,
+    outputHash: sha256Text(source),
+  });
+  const decisionRecommendations = validateDecisionRecommendationBlocks(decisionRecommendationBlocks);
+  const warnings = [
+    ...createArchitectureDocSizeWarnings(blocks),
+    ...createArchitectureDocQualityWarnings(blocks),
+  ];
 
   const applied = [];
   for (const block of blocks) {
@@ -209,8 +238,31 @@ async function applyDocsReviewOutput(options) {
     applied.push({ path: block.path, status: existed ? 'overwritten' : 'created' });
   }
 
+  let appliedCoverage = null;
+  if (coverageProjection) {
+    const coveragePath = path.join(path.dirname(options.statePath), 'docs-review-coverage.json');
+    await writeFile(coveragePath, `${JSON.stringify(coverageProjection, null, 2)}\n`, 'utf8');
+    appliedCoverage = {
+      path: coveragePath,
+      area_count: coverageProjection.area_count,
+      coverage_score: coverageProjection.coverage_score,
+      statuses: coverageProjection.statuses,
+    };
+  }
+
+  const appliedDecisionCandidates = decisionRecommendations.length > 0
+    ? await applyDecisionRecommendations({
+      rootDir: options.rootDir,
+      recommendations: decisionRecommendations,
+      refreshIndex: options.refreshIndex,
+    })
+    : { applied: [], warnings: [] };
+  warnings.push(...appliedDecisionCandidates.warnings);
+
+  const manifestResult = await writeStateManifest(options.rootDir);
   const llm = normalizeOptionalString(options.llm) ?? current.llm ?? null;
   const model = normalizeOptionalString(options.model) ?? current.model ?? null;
+  const appliedAt = new Date().toISOString();
   const marker = {
     ...current,
     status: 'completed',
@@ -218,11 +270,16 @@ async function applyDocsReviewOutput(options) {
     ...(model ? { model } : {}),
     applied: {
       output_path: outputPath,
+      output_hash: sha256Text(source),
+      local_root_revision: manifestResult.manifest.canonical.local_root_revision,
+      manifest_hash: manifestResult.manifest.canonical.manifest_hash,
       architecture_docs: applied,
+      ...(appliedCoverage ? { coverage: appliedCoverage } : {}),
+      ...(appliedDecisionCandidates.applied.length > 0 ? { decision_candidates: appliedDecisionCandidates.applied } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
-      applied_at: new Date().toISOString(),
+      applied_at: appliedAt,
     },
-    completed_at: new Date().toISOString(),
+    completed_at: appliedAt,
   };
 
   await writeDocsReviewMarker(options.statePath, marker);
@@ -238,7 +295,11 @@ async function applyDocsReviewOutput(options) {
     applied: marker.applied,
     reviewPrompt: null,
     warnings,
-    message: `Applied ${applied.length} accepted architecture doc${applied.length === 1 ? '' : 's'} and completed the docs-review marker.`,
+    message: renderApplyOutputMessage({
+      architectureCount: applied.length,
+      coverageApplied: Boolean(appliedCoverage),
+      decisionCount: appliedDecisionCandidates.applied.length,
+    }),
   };
 }
 
@@ -624,9 +685,69 @@ function parseArchitectureDocBlocks(source) {
   return blocks;
 }
 
+function parseCoveragePlanBlocks(source) {
+  const blocks = [];
+  const pattern = /^```vibecompass-coverage-plan\s+version=1\s*\n([\s\S]*?)^```[ \t]*$/gm;
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    blocks.push({
+      version: COVERAGE_PLAN_OUTPUT_VERSION,
+      content: match[1].replace(/\n$/, ''),
+    });
+  }
+
+  return blocks;
+}
+
+function parseDecisionRecommendationBlocks(source) {
+  const blocks = [];
+  const pattern = /^```vibecompass-decision-recommendation\s+target=([^\s`]+)\s*\n([\s\S]*?)^```[ \t]*$/gm;
+  let match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    blocks.push({
+      targetPath: normalizeDecisionTargetPath(match[1]),
+      content: match[2].replace(/\n$/, ''),
+    });
+  }
+
+  return blocks;
+}
+
 function countMalformedArchitectureDocFences(source) {
   const fencePattern = /^```vibecompass-architecture-doc\b.*$/gm;
   const acceptedOpeningPattern = /^```vibecompass-architecture-doc\s+path=[^\s`]+\s*$/;
+  let count = 0;
+  let match;
+
+  while ((match = fencePattern.exec(source)) !== null) {
+    if (!acceptedOpeningPattern.test(match[0])) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function countMalformedCoveragePlanFences(source) {
+  const fencePattern = /^```vibecompass-coverage-plan\b.*$/gm;
+  const acceptedOpeningPattern = /^```vibecompass-coverage-plan\s+version=1\s*$/;
+  let count = 0;
+  let match;
+
+  while ((match = fencePattern.exec(source)) !== null) {
+    if (!acceptedOpeningPattern.test(match[0])) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function countMalformedDecisionRecommendationFences(source) {
+  const fencePattern = /^```vibecompass-decision-recommendation\b.*$/gm;
+  const acceptedOpeningPattern = /^```vibecompass-decision-recommendation\s+target=[^\s`]+\s*$/;
   let count = 0;
   let match;
 
@@ -648,6 +769,115 @@ function validateArchitectureDocBlocks(blocks) {
     seenPaths.add(block.path);
     validateArchitectureDocBlock(block);
   }
+}
+
+function buildCoverageProjection(blocks, options) {
+  if (blocks.length === 0) {
+    return null;
+  }
+  if (blocks.length > 1) {
+    throw new Error('Accepted docs-review output contains multiple coverage-plan blocks. Include at most one `vibecompass-coverage-plan version=1` block.');
+  }
+
+  let plan;
+  try {
+    plan = JSON.parse(blocks[0].content);
+  } catch (error) {
+    throw new Error(`Accepted coverage plan must contain valid JSON. ${error instanceof Error ? error.message : ''}`.trim());
+  }
+
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+    throw new Error('Accepted coverage plan must contain a JSON object.');
+  }
+  if (!Array.isArray(plan.areas)) {
+    throw new Error('Accepted coverage plan requires an "areas" array.');
+  }
+
+  const ids = new Set();
+  const areas = plan.areas.map((area, index) => normalizeCoverageArea(area, index, ids));
+  const statuses = countBy(areas, 'status');
+  const coverage_levels = countBy(areas, 'coverage');
+  const denominator = areas.length;
+  const acceptedCount = statuses.accepted ?? 0;
+
+  return {
+    version: COVERAGE_PLAN_OUTPUT_VERSION,
+    source: {
+      output_path: options.outputPath,
+      output_hash: options.outputHash,
+    },
+    projected_at: new Date().toISOString(),
+    summary: normalizeOptionalString(plan.summary),
+    area_count: areas.length,
+    coverage_score: denominator === 0 ? null : Number((acceptedCount / denominator).toFixed(4)),
+    statuses,
+    coverage_levels,
+    areas,
+  };
+}
+
+function normalizeCoverageArea(area, index, ids) {
+  if (!area || typeof area !== 'object' || Array.isArray(area)) {
+    throw new Error(`Coverage plan area at index ${index} must be an object.`);
+  }
+
+  const id = normalizeOptionalString(area.id);
+  if (!id) {
+    throw new Error(`Coverage plan area at index ${index} requires non-empty "id".`);
+  }
+  if (ids.has(id)) {
+    throw new Error(`Coverage plan contains duplicate area id: ${id}`);
+  }
+  ids.add(id);
+
+  const status = normalizeOptionalString(area.status);
+  if (!COVERAGE_PLAN_STATUSES.has(status)) {
+    throw new Error(`Coverage plan area "${id}" requires status to be accepted, deferred, or missing.`);
+  }
+
+  const coverage = normalizeOptionalString(area.coverage);
+  if (!COVERAGE_LEVELS.has(coverage)) {
+    throw new Error(`Coverage plan area "${id}" requires coverage to be comprehensive, partial, initial, or missing.`);
+  }
+
+  const proposedPath = normalizeOptionalString(area.proposed_path);
+  if (proposedPath) {
+    const normalizedPath = normalizeBlockPath(proposedPath);
+    if (
+      !normalizedPath.startsWith('architecture/') ||
+      !normalizedPath.endsWith('.md') ||
+      path.posix.isAbsolute(normalizedPath) ||
+      normalizedPath.split('/').includes('..')
+    ) {
+      throw new Error(`Coverage plan area "${id}" has invalid proposed_path: ${proposedPath}`);
+    }
+  }
+
+  return {
+    id,
+    domain: normalizeOptionalString(area.domain),
+    feature: normalizeOptionalString(area.feature),
+    component: normalizeOptionalString(area.component),
+    status,
+    coverage,
+    ...(proposedPath ? { proposed_path: normalizeBlockPath(proposedPath) } : {}),
+    evidence: normalizeStringArray(area.evidence),
+    blindspots: normalizeStringArray(area.blindspots),
+    ...(normalizeOptionalString(area.reason) ? { reason: normalizeOptionalString(area.reason) } : {}),
+  };
+}
+
+function countBy(items, key) {
+  return items.reduce((counts, item) => {
+    counts[item[key]] = (counts[item[key]] ?? 0) + 1;
+    return counts;
+  }, {});
+}
+
+function normalizeStringArray(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
+    : [];
 }
 
 function normalizeBlockPath(value) {
@@ -695,6 +925,49 @@ function createArchitectureDocSizeWarnings(blocks) {
       return `oversized_architecture_doc: ${block.path} is ${byteLength} bytes; soft budget is ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes. Consider compacting the doc to preserve future LLM context budget.`;
     })
     .filter(Boolean);
+}
+
+function createArchitectureDocQualityWarnings(blocks) {
+  const warnings = [];
+
+  for (const block of blocks) {
+    const frontmatter = parseFrontmatter(block.content, { sourceName: block.path });
+    const body = frontmatter.body ?? '';
+    const sections = extractLevelTwoSections(body);
+    const data = frontmatter.data ?? {};
+
+    if (!sections.has('review metadata')) {
+      warnings.push(`missing_review_metadata: ${block.path} is missing "## Review metadata".`);
+    }
+    if (!/^\s*-\s*Evidence:\s+\S/im.test(body)) {
+      warnings.push(`missing_evidence_metadata: ${block.path} is missing review metadata "Evidence".`);
+    }
+    if (!/^\s*-\s*Blindspots:\s+\S/im.test(body)) {
+      warnings.push(`missing_blindspots_metadata: ${block.path} is missing review metadata "Blindspots".`);
+    }
+    if (!sections.has('retrieval guidance')) {
+      warnings.push(`missing_retrieval_guidance: ${block.path} is missing "## Retrieval guidance".`);
+    }
+    if (!sections.has('involved files')) {
+      warnings.push(`missing_involved_files: ${block.path} is missing "## Involved files".`);
+    }
+    if (
+      block.path !== 'architecture/overview/project-shape.md' &&
+      data.repo === undefined &&
+      data.repos === undefined
+    ) {
+      warnings.push(`missing_repo_scope: ${block.path} should declare repo or repos in frontmatter when implementation-scoped.`);
+    }
+  }
+
+  return warnings;
+}
+
+function extractLevelTwoSections(markdown) {
+  return new Set(
+    [...String(markdown ?? '').matchAll(/^##\s+(.+)$/gm)]
+      .map((match) => match[1].trim().toLowerCase()),
+  );
 }
 
 async function submitHostedDocsReview(options) {
@@ -937,6 +1210,106 @@ function normalizeDecisionTargetPath(value) {
   return normalized;
 }
 
+function validateDecisionRecommendationBlocks(blocks) {
+  return blocks.map((block, index) => {
+    const fields = parseDecisionRecommendationFields(block.content);
+    const title = normalizeOptionalString(fields.title);
+    const decision = normalizeOptionalString(fields.decision);
+    const rationale = normalizeOptionalString(fields.rationale);
+    const context = normalizeOptionalString(fields.context);
+
+    if (!title) {
+      throw new Error(`Decision recommendation ${index + 1} must include a non-empty Title.`);
+    }
+    if (!decision) {
+      throw new Error(`Decision recommendation ${index + 1} must include non-empty Decision content.`);
+    }
+    if (!rationale) {
+      throw new Error(`Decision recommendation ${index + 1} must include a non-empty Rationale.`);
+    }
+
+    return {
+      targetPath: block.targetPath,
+      title,
+      decision,
+      rationale,
+      context,
+    };
+  });
+}
+
+function parseDecisionRecommendationFields(content) {
+  const fields = {};
+  let currentKey = null;
+
+  for (const line of String(content ?? '').split(/\r?\n/)) {
+    const labelMatch = line.match(/^\*\*(Title|Decision|Rationale|Context):\*\*\s*(.*)$/i);
+    if (labelMatch) {
+      currentKey = labelMatch[1].toLowerCase();
+      fields[currentKey] = labelMatch[2].trim();
+      continue;
+    }
+
+    if (currentKey && line.trim()) {
+      fields[currentKey] = `${fields[currentKey] ? `${fields[currentKey]}\n` : ''}${line.trim()}`;
+    }
+  }
+
+  return fields;
+}
+
+async function applyDecisionRecommendations(options) {
+  const applied = [];
+  for (const recommendation of options.recommendations) {
+    const nextDecisionId = await readNextDecisionId(options.rootDir);
+    const targetFilePath = path.join(options.rootDir, recommendation.targetPath);
+    await mkdir(path.dirname(targetFilePath), { recursive: true });
+
+    let existingContent = '';
+    try {
+      existingContent = await readFile(targetFilePath, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      existingContent = `# ${path.basename(recommendation.targetPath, '.md')} decisions\n`;
+    }
+
+    const entry = renderDecisionEntry({
+      decisionId: nextDecisionId,
+      title: recommendation.title,
+      decision: recommendation.decision,
+      rationale: recommendation.rationale,
+      context: recommendation.context,
+    });
+    await writeFile(targetFilePath, `${existingContent.trimEnd()}\n\n${entry}`, 'utf8');
+    applied.push({
+      decision_id: nextDecisionId,
+      target_path: recommendation.targetPath,
+      title: recommendation.title,
+    });
+  }
+
+  if (applied.length === 0) {
+    return { applied, warnings: [] };
+  }
+
+  const indexResult = options.refreshIndex
+    ? await refreshDecisionIndex(options.rootDir)
+    : {
+      refreshed: false,
+      warnings: [
+        'decisions/INDEX.md was not refreshed after applying docs-review decision recommendations. Run again with --refresh-index if this root uses the package-generated flat index, or update the project-specific index manually.',
+      ],
+    };
+
+  return {
+    applied: applied.map((item) => ({
+      ...item,
+      refreshed_index: indexResult.refreshed,
+    })),
+    warnings: indexResult.warnings,
+  };
+}
+
 async function readNextDecisionId(rootDir) {
   const decisionsDir = path.join(rootDir, 'decisions');
   let max = 0;
@@ -1097,6 +1470,21 @@ function renderDocsReviewMessage(options) {
   return 'Docs-review preflight passed. Run the generated architecture-review prompt in the selected LLM, then record completion after applying accepted docs changes.';
 }
 
+function renderApplyOutputMessage(options) {
+  const parts = [];
+  if (options.architectureCount > 0) {
+    parts.push(`${options.architectureCount} accepted architecture doc${options.architectureCount === 1 ? '' : 's'}`);
+  }
+  if (options.coverageApplied) {
+    parts.push('coverage plan');
+  }
+  if (options.decisionCount > 0) {
+    parts.push(`${options.decisionCount} decision recommendation${options.decisionCount === 1 ? '' : 's'}`);
+  }
+
+  return `Applied ${parts.length > 0 ? parts.join(', ') : 'accepted docs-review output'} and completed the docs-review marker.`;
+}
+
 function renderReviewPrompt(options) {
   return [
     `# ${DOCS_REVIEW_PROMPT_VERSION}`,
@@ -1119,6 +1507,7 @@ function renderReviewPrompt(options) {
     '## Staged Review Protocol',
     'Stage 1 — Evidence inventory:',
     '- Build a compact repo inventory from file paths, manifests/config files, route/job/test directories, and existing architecture frontmatter before reading large file bodies.',
+    '- Mine finalized session notes for decision candidates and product constraints, but cap proposed decisions to the five highest-value architecture choices.',
     '- Identify candidate domains, features, components, and ownership boundaries with concrete `repo:path` evidence.',
     '- Do not fetch or summarize broad source bodies until the coverage plan says a file is needed.',
     '',
@@ -1126,6 +1515,7 @@ function renderReviewPrompt(options) {
     '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
     '- Prioritize entry points, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
     '- Mark each proposed doc as `comprehensive`, `partial`, or `initial`, with the reason and blindspots.',
+    '- Emit the accepted plan as one `vibecompass-coverage-plan version=1` JSON fence before architecture-doc blocks.',
     '- Ask for user acceptance before emitting fenced architecture-doc blocks.',
     '',
     'Stage 3 — Bounded doc generation:',
@@ -1177,13 +1567,43 @@ function renderReviewPrompt(options) {
     '- token-budget risks or oversized-doc candidates',
     '- proposed decisions, if any',
     '',
+    'Then output one machine-readable coverage-plan block for the accepted plan:',
+    '',
+    '```vibecompass-coverage-plan version=1',
+    '{',
+    '  "summary": "Short coverage plan summary",',
+    '  "areas": [',
+    '    {',
+    '      "id": "stable-area-id",',
+    '      "domain": "Domain",',
+    '      "feature": "Feature",',
+    '      "component": "Component",',
+    '      "status": "accepted | deferred | missing",',
+    '      "coverage": "comprehensive | partial | initial | missing",',
+    '      "proposed_path": "architecture/domain/feature/component.md",',
+    '      "evidence": ["repo:path"],',
+    '      "blindspots": ["explicit blindspot"]',
+    '    }',
+    '  ]',
+    '}',
+    '```',
+    '',
     'Then, for each architecture doc the user accepts, output one fenced block exactly like this:',
     '',
     '```vibecompass-architecture-doc path=architecture/domain/feature/component.md',
     '<complete markdown file content>',
     '```',
     '',
-    'Only include docs the user has accepted in fenced `vibecompass-architecture-doc` blocks. After accepted docs are applied, `vibecompass docs-review --apply-output` records completion in `state/docs-review.json`.',
+    'If the review surfaced accepted decision candidates, output each candidate as a separate block without assigning a D-number:',
+    '',
+    '```vibecompass-decision-recommendation target=decisions/cross-cutting.md',
+    '**Title:** Short decision title',
+    '**Decision:** Accepted decision statement to append after local review.',
+    '**Rationale:** Why this choice matters.',
+    '**Context:** Optional supporting context.',
+    '```',
+    '',
+    'Only include accepted coverage, architecture, and decision-recommendation blocks. After accepted output is applied, `vibecompass docs-review --apply-output` records completion in `state/docs-review.json`.',
   ].join('\n');
 }
 

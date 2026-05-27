@@ -25,14 +25,14 @@ Shipped today:
 - `vibecompass list-sessions` / `vibecompass switch-session` for multiple active session lanes
 - `vibecompass end-session` as a discoverable alias for `close-session`
 - `vibecompass sync-agents` for generated `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and `.github/copilot-instructions.md` views
-- `vibecompass status` for a read-only project-memory health and drift report
+- `vibecompass status` for a read-only project-memory health and drift report, including docs-review output drift
 - `vibecompass refresh-workflow` for explicit dry-run/apply refresh of package-owned derived workflow files
 - `vibecompass docs-review --guided` — print a comprehensive review prompt for your chosen LLM to run
 - `vibecompass docs-review --submit-hosted` — submit the review request to the hosted app and poll for proposal/artifact output
 - `vibecompass docs-review --run-local --provider anthropic` — local provider adapter that saves review output locally
-- `vibecompass docs-review --apply-output` — apply accepted architecture-doc blocks into canonical `architecture/` docs
+- `vibecompass docs-review --apply-output` — apply accepted architecture-doc, coverage-plan, and local decision-recommendation blocks
 - docs-review prompt v2 with staged evidence inventory, coverage planning, bounded doc generation, retrieval metadata, and soft oversized-doc warnings
-- strict docs-review output validation for architecture-doc fences, duplicate paths, and required frontmatter
+- strict docs-review output validation for architecture-doc, coverage-plan, and decision-recommendation fences, duplicate paths, required frontmatter, and missing quality metadata warnings
 - `vibecompass docs-review --complete` — mark the review accepted after the docs land
 - hosted sync commands: `push`, `pull-preview`, `pull-export`, and `apply-export`
 - canonical file scanning and validation
@@ -206,20 +206,19 @@ What happens:
 
 1. The CLI asks which LLM you'll use, then prints a versioned staged review prompt with fixed review criteria.
 2. You paste that prompt into your AI tool (Claude Code, Codex, Cursor, etc.).
-3. The AI inventories project memory and source evidence, proposes a coverage plan, then writes only accepted architecture docs under
-   `architecture/<domain>/<feature>/<component>.md`.
+3. The AI inventories project memory and source evidence, proposes a coverage plan, then writes only accepted coverage, architecture, and decision-recommendation blocks.
 4. Run `vibecompass docs-review --apply-output` after accepting fenced
-   architecture-doc blocks, or `--complete` if accepted docs were written
-   manually.
+   output blocks, or `--complete` if accepted docs were written manually.
 
 The guided prompt is deterministic apart from project-specific fields
 (`project`, `mode`, `root`, provider, and model). It uses the same structure
 VibeCompass dogfoods: read project memory first, inspect source evidence,
 build a coverage plan, write retrieval-oriented component docs with review
 metadata, preserve the starter overview, and emit accepted docs as
-`vibecompass-architecture-doc` blocks. The prompt includes a soft 12000-byte
-budget per generated architecture doc so future LLM sessions can load targeted
-context without pulling oversized narrative files by default.
+`vibecompass-coverage-plan`, `vibecompass-architecture-doc`, and optional
+`vibecompass-decision-recommendation` blocks. The prompt includes a soft
+12000-byte budget per generated architecture doc so future LLM sessions can
+load targeted context without pulling oversized narrative files by default.
 
 Plain `--guided` never calls an AI itself. You stay in control of which
 provider runs the review and what gets saved. Use `--run-local --provider
@@ -236,8 +235,9 @@ local Anthropic key.
   `ANTHROPIC_API_KEY` and saves the raw output to
   `state/docs-review-output.md`.
 - `--apply-output` writes accepted fenced architecture-doc blocks from
-  `state/docs-review-output.md` into canonical `architecture/` docs and
-  completes the local review marker.
+  `state/docs-review-output.md` into canonical `architecture/` docs, projects
+  accepted coverage plans into `state/docs-review-coverage.json`, appends
+  accepted local decision recommendations, and completes the local review marker.
 
 For most users, stick with `--guided`.
 
@@ -643,10 +643,10 @@ Options:
 - `--run-local`: run the generated review request with a local provider
 - `--provider <name>`: local provider for `--run-local`; currently `anthropic`
 - `--run-local-anthropic`: compatibility alias for `--run-local --provider anthropic`
-- `--apply-output`: apply accepted architecture-doc blocks from review output
+- `--apply-output`: apply accepted architecture-doc, coverage-plan, and local decision-recommendation blocks from review output
 - `--apply-decision-artifact`: append an accepted hosted decision artifact locally
 - `--artifact <id>`: artifact ID for `--apply-decision-artifact`
-- `--refresh-index`: also regenerate `decisions/INDEX.md` after applying a decision artifact
+- `--refresh-index`: also regenerate `decisions/INDEX.md` after applying a decision artifact or local decision recommendation
 - `--output <path>`: review output path for `--apply-output`; defaults to `state/docs-review-output.md`
 - `--complete`: mark accepted docs-review changes as completed in local state
 - `--llm <name>`: preferred LLM/provider to record for the review (e.g. `claude`, `codex`, `gemini`)
@@ -678,7 +678,19 @@ instead of running model work against the wrong source of truth.
 `--run-local-anthropic` remains as a compatibility alias. New scripts should
 use `--run-local --provider anthropic`.
 
-`--apply-output` looks for accepted architecture docs in fenced blocks:
+`--apply-output` looks for accepted docs-review output in fenced blocks. A
+coverage plan is projected into `state/docs-review-coverage.json`:
+
+````md
+```vibecompass-coverage-plan version=1
+{
+  "summary": "Accepted review coverage",
+  "areas": []
+}
+```
+````
+
+Accepted architecture docs are written into canonical `architecture/` files:
 
 ````md
 ```vibecompass-architecture-doc path=architecture/domain/feature/component.md
@@ -710,7 +722,23 @@ silently overwriting earlier accepted content.
 Accepted architecture docs over the soft 12000-byte size budget are applied
 with an `oversized_architecture_doc` warning instead of being rejected. Treat
 that warning as a prompt to compact the doc unless the extra detail is needed
-for future retrieval.
+for future retrieval. The apply step also warns when generated docs are missing
+review metadata, evidence, blindspots, retrieval guidance, involved files, or
+repo scope.
+
+Accepted local decision recommendations can be appended with fresh D-numbers:
+
+````md
+```vibecompass-decision-recommendation target=decisions/cross-cutting.md
+**Title:** Short decision title
+**Decision:** Accepted decision statement.
+**Rationale:** Why this choice matters.
+```
+````
+
+After apply, `state/docs-review.json` stores output and manifest hashes.
+`vibecompass status` reports output drift if `state/docs-review-output.md`
+changes after apply.
 
 `vibecompass docs-review --complete` updates the marker in
 `state/docs-review.json` to `status: "completed"` once the docs have

@@ -265,6 +265,19 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       for (const entry of result.applied.architecture_docs) {
         io.stdout.write(`- ${entry.path} (${entry.status})\n`);
       }
+      if (result.applied.coverage) {
+        io.stdout.write(`Applied coverage plan: ${result.applied.coverage.area_count} areas`);
+        if (typeof result.applied.coverage.coverage_score === 'number') {
+          io.stdout.write(` (${Math.round(result.applied.coverage.coverage_score * 100)}% accepted)`);
+        }
+        io.stdout.write('\n');
+      }
+      if (Array.isArray(result.applied.decision_candidates) && result.applied.decision_candidates.length > 0) {
+        io.stdout.write(`Applied decision recommendations: ${result.applied.decision_candidates.length}\n`);
+        for (const entry of result.applied.decision_candidates) {
+          io.stdout.write(`- D-${String(entry.decision_id).padStart(3, '0')}: ${entry.title} (${entry.target_path})\n`);
+        }
+      }
     }
     if (result.appliedDecisionArtifact) {
       io.stdout.write(`Applied decision artifact: ${result.appliedDecisionArtifact.artifact_id}\n`);

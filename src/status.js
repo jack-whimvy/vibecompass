@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { inspectProjectCompatibility } from './compatibility.js';
+import { sha256Text } from './hash.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { listProjectSessions } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -94,6 +95,9 @@ export function renderStatusText(status) {
     '',
     'Docs review:',
     `- ${formatDocsReviewStatus(status.docsReview)}`,
+    ...(status.docsReview.outputDrift?.hasDrift
+      ? [`- Output drift: ${status.docsReview.outputDrift.reasons.join('; ')}`]
+      : []),
     '',
     'Agent files:',
     ...formatAgentFileStatus(status.agentFiles),
@@ -192,12 +196,15 @@ async function readDocsReviewStatus(rootDir) {
   const markerPath = path.join(rootDir, 'state', 'docs-review.json');
   try {
     const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+    const outputDrift = await readDocsReviewOutputDrift(rootDir, marker);
     return {
       status: typeof marker.status === 'string' ? marker.status : 'unknown',
       markerPath,
       completedAt: typeof marker.completed_at === 'string' ? marker.completed_at : null,
       provider: typeof marker.provider === 'string' ? marker.provider : null,
       model: typeof marker.model === 'string' ? marker.model : null,
+      applied: marker.applied ?? null,
+      outputDrift,
     };
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
@@ -213,6 +220,36 @@ async function readDocsReviewStatus(rootDir) {
       errorMessage: error instanceof Error ? error.message : 'Unable to read docs-review marker.',
     };
   }
+}
+
+async function readDocsReviewOutputDrift(rootDir, marker) {
+  const applied = marker?.applied;
+  if (!applied || typeof applied !== 'object') {
+    return { status: 'not-tracked', hasDrift: false, reasons: [] };
+  }
+
+  const reasons = [];
+  if (typeof applied.output_path === 'string' && typeof applied.output_hash === 'string') {
+    try {
+      const outputContent = await readFile(applied.output_path, 'utf8');
+      const currentOutputHash = sha256Text(outputContent);
+      if (currentOutputHash !== applied.output_hash) {
+        reasons.push('state/docs-review-output.md changed since apply');
+      }
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+        reasons.push('state/docs-review-output.md is missing since apply');
+      } else {
+        reasons.push('state/docs-review-output.md could not be read for drift check');
+      }
+    }
+  }
+
+  return {
+    status: reasons.length > 0 ? 'drift' : 'current',
+    hasDrift: reasons.length > 0,
+    reasons,
+  };
 }
 
 async function readAgentFileStatus(rootDir, toolingRootDir) {
@@ -259,6 +296,8 @@ function buildRecommendations({ project, compatibility, sessions, docsReview, ag
 
   if (docsReview.status === 'missing') {
     recommendations.push('vibecompass docs-review --guided');
+  } else if (docsReview.outputDrift?.hasDrift) {
+    recommendations.push('vibecompass docs-review --apply-output');
   }
 
   if (agentFiles.status === 'ok' && agentFiles.results.some((item) => item.changed || item.warning)) {
@@ -278,6 +317,7 @@ function hasStatusDrift(status) {
   return (
     status.compatibility.warnings.length > 0 ||
     status.docsReview.status !== 'completed' ||
+    Boolean(status.docsReview.outputDrift?.hasDrift) ||
     status.agentFiles.status !== 'ok' ||
     status.agentFiles.results.some((item) => item.changed || item.warning)
   );
