@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0 - 2026-05-30
+
+- Add `docs-review --rebuild` with dry-run preview, scoped architecture paths, and archive-based stale-doc preparation.
+- Simplify the npm README into a short package entrypoint with links to the developer docs.
+
 ## 0.6.0 - 2026-05-25
 
 - Bump docs-review to `VibeCompass Docs Review Prompt v2`.

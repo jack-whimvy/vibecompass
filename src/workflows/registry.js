@@ -116,6 +116,10 @@ Turn starter project memory into evidence-backed architecture docs under \`archi
 8. Run \`vibecompass docs-review --apply-output\` to validate and apply the accepted blocks. If accepted docs were written manually outside the output file, run \`vibecompass docs-review --complete\` after confirming the marker should be completed.
 9. Run \`vibecompass status\` to confirm the docs-review marker is complete and not drifted. Report the applied architecture paths, coverage projection, decision recommendations, parser warnings such as oversized docs or missing review metadata, and any blindspots documented in the accepted docs-review output.
 
+## Rebuild option
+
+If the user explicitly wants to rerun docs-review from a clean or narrower architecture-doc slate, preview the scope first with \`vibecompass docs-review --rebuild --path architecture/<scope>\`. Only apply cleanup after the user accepts the preview; use \`vibecompass docs-review --rebuild --apply --stale-policy archive --path architecture/<scope>\` when the user explicitly wants selected stale docs archived before the next review. Rebuild archives selected \`architecture/**/*.md\` docs under \`state/docs-review-archive/\`; it does not mutate decisions, sessions, project.yaml, workflow files, agent instruction files, \`architecture/README.md\`, or \`architecture/overview/project-shape.md\`.
+
 ## Rules
 
 - Do not duplicate the full canonical review prompt in this file. The package command prints that contract from its current implementation.

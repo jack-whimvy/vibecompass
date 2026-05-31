@@ -1093,6 +1093,214 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
   }
 });
 
+test('docs-review rebuild previews and archives scoped architecture docs', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-rebuild-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Rebuild Review',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(rootDir, 'architecture/web/features'), { recursive: true });
+    await mkdir(path.join(rootDir, 'architecture/mobile/features'), { recursive: true });
+    await mkdir(path.join(rootDir, 'architecture/overview'), { recursive: true });
+    await writeFile(path.join(rootDir, 'architecture/README.md'), '# Architecture\n', 'utf8');
+    await writeFile(
+      path.join(rootDir, 'architecture/overview/project-shape.md'),
+      [
+        '---',
+        'status: In progress',
+        '---',
+        '',
+        'project overview',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'architecture/web/features/trips.md'),
+      [
+        '---',
+        'domain: Web',
+        'feature: Trips',
+        'component: Planning',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        'web trips',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'architecture/mobile/features/trips.md'),
+      [
+        '---',
+        'domain: Mobile',
+        'feature: Trips',
+        'component: Planning',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        'mobile trips',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const previewStdout = [];
+    await runCli(
+      ['docs-review', '--root', rootDir, '--rebuild', '--path', 'architecture/web'],
+      {
+        stdout: {
+          write(chunk) {
+            previewStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+
+    const previewOutput = previewStdout.join('');
+    assert.match(previewOutput, /Docs-review: rebuild-preview/);
+    assert.match(previewOutput, /Rebuild scope: architecture\/web/);
+    assert.match(previewOutput, /Architecture docs: 1/);
+    assert.match(previewOutput, /architecture\/web\/features\/trips\.md \(keep\)/);
+    assert.doesNotMatch(previewOutput, /Recorded .*docs-review\.json/);
+    await access(path.join(rootDir, 'architecture/web/features/trips.md'));
+
+    const archiveStdout = [];
+    await runCli(
+      [
+        'docs-review',
+        '--root',
+        rootDir,
+        '--rebuild',
+        '--apply',
+        '--stale-policy',
+        'archive',
+        '--path',
+        'architecture/web',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            archiveStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+
+    const archiveOutput = archiveStdout.join('');
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+    assert.match(archiveOutput, /Docs-review: rebuild-ready/);
+    assert.match(archiveOutput, /architecture\/web\/features\/trips\.md \(archive -> state\/docs-review-archive\//);
+    assert.equal(marker.status, 'rebuild-ready');
+    assert.equal(marker.rebuild.scope_path, 'architecture/web');
+    assert.equal(marker.rebuild.stale_policy, 'archive');
+    assert.equal(marker.rebuild.architecture_doc_count, 1);
+    assert.equal(marker.rebuild.architecture_docs[0].path, 'architecture/web/features/trips.md');
+    await assert.rejects(
+      access(path.join(rootDir, 'architecture/web/features/trips.md')),
+      /ENOENT/,
+    );
+    assert.equal(
+      await readFile(path.join(rootDir, marker.rebuild.architecture_docs[0].archive_path), 'utf8'),
+      [
+        '---',
+        'domain: Web',
+        'feature: Trips',
+        'component: Planning',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        'web trips',
+      ].join('\n'),
+    );
+    assert.equal(
+      await readFile(path.join(rootDir, 'architecture/mobile/features/trips.md'), 'utf8'),
+      [
+        '---',
+        'domain: Mobile',
+        'feature: Trips',
+        'component: Planning',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        'mobile trips',
+      ].join('\n'),
+    );
+    assert.equal(await readFile(path.join(rootDir, 'architecture/README.md'), 'utf8'), '# Architecture\n');
+
+    const fullArchiveStdout = [];
+    await runCli(
+      ['docs-review', '--root', rootDir, '--rebuild', '--apply', '--stale-policy', 'archive'],
+      {
+        stdout: {
+          write(chunk) {
+            fullArchiveStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+
+    const fullArchiveOutput = fullArchiveStdout.join('');
+    assert.match(fullArchiveOutput, /Architecture docs: 1/);
+    assert.match(fullArchiveOutput, /architecture\/mobile\/features\/trips\.md \(archive -> state\/docs-review-archive\//);
+    assert.doesNotMatch(fullArchiveOutput, /architecture\/overview\/project-shape\.md/);
+    assert.equal(
+      await readFile(path.join(rootDir, 'architecture/overview/project-shape.md'), 'utf8'),
+      [
+        '---',
+        'status: In progress',
+        '---',
+        '',
+        'project overview',
+      ].join('\n'),
+    );
+
+    const statusStdout = [];
+    await runCli(
+      ['status', '--root', rootDir],
+      {
+        stdout: {
+          write(chunk) {
+            statusStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    assert.match(statusStdout.join(''), /Docs review:\n- rebuild-ready/);
+    assert.match(statusStdout.join(''), /vibecompass docs-review --guided/);
+
+    await assert.rejects(
+      runCli(
+        ['docs-review', '--root', rootDir, '--rebuild', '--path', '../architecture'],
+        {
+          stdout: { write() {} },
+          stderr: { write() {} },
+        },
+        { cwd: tempDir, env: {} },
+      ),
+      /--path must point under architecture/,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli sync transport pushes, previews, exports, and applies proposals', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-flow-'));
   const rootDir = path.join(tempDir, '.compass');

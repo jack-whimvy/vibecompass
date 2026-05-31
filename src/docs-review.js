@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
@@ -11,6 +11,7 @@ const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
 const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
 const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
+const REBUILD_STALE_POLICIES = new Set(['keep', 'archive']);
 
 export async function preflightDocsReview(options = {}, environment = {}) {
   validateDocsReviewMode(options);
@@ -26,6 +27,17 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       llm: options.llm,
       model: options.model,
       refreshIndex: options.refreshIndex,
+    });
+  }
+
+  if (options.rebuild) {
+    return rebuildDocsReview({
+      rootDir,
+      statePath,
+      apply: options.apply,
+      dryRun: options.dryRun,
+      scopePath: options.scopePath,
+      stalePolicy: options.stalePolicy,
     });
   }
 
@@ -401,6 +413,92 @@ async function applyDecisionArtifact(options) {
   };
 }
 
+async function rebuildDocsReview(options) {
+  const scopePath = normalizeRebuildScopePath(options.scopePath);
+  const stalePolicy = normalizeRebuildStalePolicy(options.stalePolicy);
+  const apply = Boolean(options.apply);
+  const architectureDocs = await listArchitectureDocs(options.rootDir, scopePath);
+  const requestedAt = new Date();
+  const archiveRoot = stalePolicy === 'archive'
+    ? `state/docs-review-archive/${formatArchiveTimestamp(requestedAt)}`
+    : null;
+  const rebuildEntries = architectureDocs.map((docPath) => ({
+    path: docPath,
+    action: stalePolicy === 'archive' ? 'archive' : 'keep',
+    ...(archiveRoot ? { archive_path: `${archiveRoot}/${docPath}` } : {}),
+  }));
+
+  if (!apply) {
+    return {
+      rootDir: options.rootDir,
+      statePath: options.statePath,
+      status: 'rebuild-preview',
+      recorded: false,
+      runtime: null,
+      hosted: null,
+      applied: null,
+      reviewPrompt: null,
+      rebuild: {
+        scope_path: scopePath,
+        stale_policy: stalePolicy,
+        architecture_docs: rebuildEntries,
+        architecture_doc_count: rebuildEntries.length,
+        archive_root: archiveRoot,
+      },
+      warnings: [],
+      message: 'Docs-review rebuild preview complete. Re-run with --apply to record the rebuild marker and perform the selected stale-doc action.',
+    };
+  }
+
+  for (const entry of rebuildEntries) {
+    if (entry.action !== 'archive') {
+      continue;
+    }
+    const sourcePath = path.join(options.rootDir, entry.path);
+    const targetPath = path.join(options.rootDir, entry.archive_path);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await rename(sourcePath, targetPath);
+  }
+
+  const manifestResult = await writeStateManifest(options.rootDir);
+  const appliedAt = new Date().toISOString();
+  const marker = {
+    status: 'rebuild-ready',
+    requested_at: requestedAt.toISOString(),
+    runtime: {
+      provider: 'local',
+      operation: 'rebuild',
+    },
+    rebuild: {
+      scope_path: scopePath,
+      stale_policy: stalePolicy,
+      architecture_docs: rebuildEntries,
+      architecture_doc_count: rebuildEntries.length,
+      ...(archiveRoot ? { archive_root: path.join(options.rootDir, archiveRoot) } : {}),
+      local_root_revision: manifestResult.manifest.canonical.local_root_revision,
+      manifest_hash: manifestResult.manifest.canonical.manifest_hash,
+      applied_at: appliedAt,
+    },
+    completed_at: null,
+  };
+  await writeDocsReviewMarker(options.statePath, marker);
+
+  return {
+    rootDir: options.rootDir,
+    statePath: options.statePath,
+    status: 'rebuild-ready',
+    runtime: marker.runtime,
+    hosted: null,
+    applied: null,
+    reviewPrompt: null,
+    rebuild: marker.rebuild,
+    warnings: [],
+    message: stalePolicy === 'archive'
+      ? 'Archived selected architecture docs and recorded a rebuild marker. Run docs-review again, then apply accepted output.'
+      : 'Recorded a rebuild marker without moving architecture docs. Run docs-review again, then apply accepted output.',
+  };
+}
+
 async function readDocsReviewMarker(statePath) {
   try {
     return JSON.parse(await readFile(statePath, 'utf8'));
@@ -421,11 +519,27 @@ function validateDocsReviewMode(options) {
     options.runLocalAnthropic ? '--run-local-anthropic' : null,
     options.applyOutput ? '--apply-output' : null,
     options.applyDecisionArtifact ? '--apply-decision-artifact' : null,
+    options.rebuild ? '--rebuild' : null,
     options.complete ? '--complete' : null,
   ].filter(Boolean);
 
   if (enabled.length > 1) {
     throw new Error(`docs-review accepts only one execution mode at a time. Conflicting flags: ${enabled.join(', ')}.`);
+  }
+  if (options.apply && !options.rebuild) {
+    throw new Error('docs-review --apply is only valid with --rebuild.');
+  }
+  if (options.dryRun && !options.rebuild) {
+    throw new Error('docs-review --dry-run is only valid with --rebuild.');
+  }
+  if (options.stalePolicy && !options.rebuild) {
+    throw new Error('docs-review --stale-policy is only valid with --rebuild.');
+  }
+  if (options.scopePath && !options.rebuild) {
+    throw new Error('docs-review --path is only valid with --rebuild.');
+  }
+  if (options.apply && options.dryRun) {
+    throw new Error('docs-review --rebuild accepts only one of --dry-run or --apply.');
   }
 }
 
@@ -1173,6 +1287,83 @@ async function pathExists(targetPath) {
   } catch {
     return false;
   }
+}
+
+async function listArchitectureDocs(rootDir, scopePath) {
+  const scopeAbsolutePath = path.join(rootDir, scopePath);
+
+  if (!await pathExists(scopeAbsolutePath)) {
+    return [];
+  }
+
+  const docs = [];
+  await collectArchitectureDocs({
+    rootDir,
+    currentPath: scopeAbsolutePath,
+    docs,
+  });
+  return docs.sort();
+}
+
+async function collectArchitectureDocs(options) {
+  const entries = await readdir(options.currentPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const absolutePath = path.join(options.currentPath, entry.name);
+    if (entry.isDirectory()) {
+      await collectArchitectureDocs({
+        rootDir: options.rootDir,
+        currentPath: absolutePath,
+        docs: options.docs,
+      });
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith('.md')) {
+      continue;
+    }
+
+    const relativePath = normalizeBlockPath(path.relative(options.rootDir, absolutePath));
+    if (isProtectedArchitectureDoc(relativePath)) {
+      continue;
+    }
+    options.docs.push(relativePath);
+  }
+}
+
+function isProtectedArchitectureDoc(relativePath) {
+  return relativePath === 'architecture/README.md' ||
+    relativePath === 'architecture/overview/project-shape.md';
+}
+
+function normalizeRebuildScopePath(value) {
+  const normalized = normalizeBlockPath(value ?? 'architecture');
+  if (
+    normalized !== 'architecture' &&
+    !normalized.startsWith('architecture/')
+  ) {
+    throw new Error(`docs-review --rebuild --path must point under architecture/. Invalid path: ${value}`);
+  }
+  if (
+    path.posix.isAbsolute(normalized) ||
+    normalized.split('/').some((part) => part === '..' || part === '') ||
+    normalized.endsWith('.md')
+  ) {
+    throw new Error(`docs-review --rebuild --path must be a relative architecture directory. Invalid path: ${value}`);
+  }
+
+  return normalized;
+}
+
+function normalizeRebuildStalePolicy(value) {
+  const normalized = normalizeOptionalString(value) ?? 'keep';
+  if (!REBUILD_STALE_POLICIES.has(normalized)) {
+    throw new Error('docs-review --rebuild --stale-policy must be keep or archive.');
+  }
+
+  return normalized;
+}
+
+function formatArchiveTimestamp(date) {
+  return date.toISOString().replaceAll(':', '-').replaceAll('.', '-');
 }
 
 function normalizeOptionalString(value) {

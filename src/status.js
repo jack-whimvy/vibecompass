@@ -294,7 +294,7 @@ function buildRecommendations({ project, compatibility, sessions, docsReview, ag
     recommendations.push('vibecompass refresh-workflow --dry-run');
   }
 
-  if (docsReview.status === 'missing') {
+  if (docsReview.status === 'missing' || docsReview.status === 'rebuild-ready') {
     recommendations.push('vibecompass docs-review --guided');
   } else if (docsReview.outputDrift?.hasDrift) {
     recommendations.push('vibecompass docs-review --apply-output');

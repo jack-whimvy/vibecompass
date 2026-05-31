@@ -260,6 +260,14 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.localReview) {
       io.stdout.write(`Local review output: ${result.localReview.output_path}\n`);
     }
+    if (result.rebuild) {
+      io.stdout.write(`Rebuild scope: ${result.rebuild.scope_path}\n`);
+      io.stdout.write(`Stale policy: ${result.rebuild.stale_policy}\n`);
+      io.stdout.write(`Architecture docs: ${result.rebuild.architecture_doc_count}\n`);
+      for (const entry of result.rebuild.architecture_docs) {
+        io.stdout.write(`- ${entry.path} (${entry.action}${entry.archive_path ? ` -> ${entry.archive_path}` : ''})\n`);
+      }
+    }
     if (result.applied) {
       io.stdout.write(`Applied architecture docs: ${result.applied.architecture_docs.length}\n`);
       for (const entry of result.applied.architecture_docs) {
@@ -285,7 +293,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Target: ${result.appliedDecisionArtifact.target_path}\n`);
     }
     writeWarnings(io, result.warnings);
-    io.stdout.write(`Recorded ${result.statePath}\n`);
+    if (result.recorded !== false) {
+      io.stdout.write(`Recorded ${result.statePath}\n`);
+    }
     io.stdout.write(`${result.message}\n`);
     if (result.reviewPrompt) {
       io.stdout.write('Architecture review prompt:\n');
@@ -1055,6 +1065,21 @@ function parseDocsReviewArgs(argv) {
       continue;
     }
 
+    if (token === '--rebuild') {
+      parsed.rebuild = true;
+      continue;
+    }
+
+    if (token === '--dry-run') {
+      parsed.dryRun = true;
+      continue;
+    }
+
+    if (token === '--apply') {
+      parsed.apply = true;
+      continue;
+    }
+
     if (token === '--apply-decision-artifact') {
       parsed.applyDecisionArtifact = true;
       continue;
@@ -1093,6 +1118,12 @@ function parseDocsReviewArgs(argv) {
         break;
       case '--output':
         parsed.outputPath = value;
+        break;
+      case '--path':
+        parsed.scopePath = value;
+        break;
+      case '--stale-policy':
+        parsed.stalePolicy = value;
         break;
       case '--artifact':
         parsed.artifactId = value;
@@ -1450,6 +1481,11 @@ function usageText() {
     '  --run-local-anthropic                Compatibility alias for --run-local --provider anthropic',
     '  --apply-output                       Apply accepted architecture doc blocks from review output',
     '  --output <path>                      Review output path for --apply-output; defaults to state/docs-review-output.md',
+    '  --rebuild                            Preview or prepare an explicit architecture-doc rebuild',
+    '  --dry-run                            Preview docs-review rebuild changes; default with --rebuild',
+    '  --apply                              Apply docs-review rebuild preparation; only valid with --rebuild',
+    '  --path <architecture/path>           Scope --rebuild to an architecture directory',
+    '  --stale-policy <keep|archive>        Rebuild stale-doc handling; defaults to keep',
     '  --apply-decision-artifact            Append an accepted hosted decision artifact locally',
     '  --artifact <id>                      Artifact ID for --apply-decision-artifact',
     '  --refresh-index                      Also regenerate decisions/INDEX.md after applying a decision artifact',
