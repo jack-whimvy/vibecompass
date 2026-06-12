@@ -5,6 +5,7 @@ import { parseFrontmatter } from './frontmatter.js';
 import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 
 const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v2';
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
@@ -83,6 +84,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     localProvider,
     runLocal: shouldRunLocal(options),
     anthropicEnvVar: options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY',
+    syncTarget: options.syncTarget ?? null,
   });
   const reviewPrompt = renderReviewPrompt({
     project,
@@ -617,11 +619,10 @@ function resolveDocsReviewRuntime(project, options) {
     localProvider &&
     typeof options.env?.[localProvider.credentialEnvVar] === 'string' &&
     options.env[localProvider.credentialEnvVar].trim() !== '';
-  const hasHostedBinding =
-    project?.sync &&
-    typeof project.sync === 'object' &&
-    typeof project.sync.api_url === 'string' &&
-    typeof project.sync.project_id === 'string';
+  // Throws on an explicitly requested unknown/incomplete --sync-target so a
+  // typo can never fall back to a different environment (D-236).
+  const hostedBinding = resolveSyncBinding(project, options.syncTarget ?? null);
+  const hasHostedBinding = Boolean(hostedBinding);
 
   if (mode === 'local-only') {
     if (options.runLocal && !localProvider) {
@@ -663,11 +664,10 @@ function resolveDocsReviewRuntime(project, options) {
     if (hasHostedBinding) {
       return {
         provider: 'hosted',
-        api_url: project.sync.api_url,
-        project_id: project.sync.project_id,
-        ...(typeof project.sync.credential_env_var === 'string'
-          ? { credential_env_var: project.sync.credential_env_var }
-        : {}),
+        api_url: hostedBinding.apiUrl,
+        project_id: hostedBinding.projectId,
+        credential_env_var: hostedBinding.credentialEnvVar,
+        ...(hostedBinding.target ? { sync_target: hostedBinding.target } : {}),
       };
     }
 
@@ -699,11 +699,10 @@ function resolveDocsReviewRuntime(project, options) {
 
     return {
       provider: 'hosted',
-      api_url: project.sync.api_url,
-      project_id: project.sync.project_id,
-      ...(typeof project.sync.credential_env_var === 'string'
-        ? { credential_env_var: project.sync.credential_env_var }
-        : {}),
+      api_url: hostedBinding.apiUrl,
+      project_id: hostedBinding.projectId,
+      credential_env_var: hostedBinding.credentialEnvVar,
+      ...(hostedBinding.target ? { sync_target: hostedBinding.target } : {}),
     };
   }
 
@@ -1107,8 +1106,15 @@ async function submitHostedDocsReview(options) {
     `api/sync/projects/${encodeURIComponent(options.runtime.project_id)}/docs-review`,
     ensureTrailingSlash(options.runtime.api_url),
   );
+  // D-237: the baseline must come from the submitted target's own cursor so a
+  // dev revision can never be sent as another environment's baseline.
+  const submitCursor = readSyncCursor(options.manifest?.manifest?.sync, {
+    target: options.runtime.sync_target ?? null,
+    apiUrl: options.runtime.api_url,
+    projectId: options.runtime.project_id,
+  });
   const baselineRemoteRevisionId = normalizeUuid(
-    options.manifest?.manifest?.sync?.last_successful_remote_revision,
+    submitCursor.last_successful_remote_revision,
   );
   const response = await options.fetch(endpoint.href, {
     method: 'POST',

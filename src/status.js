@@ -155,6 +155,20 @@ async function readProjectSummary(projectFilePath) {
             projectId: typeof config.sync.project_id === 'string' ? config.sync.project_id : null,
             credentialSource: typeof config.sync.credential_source === 'string' ? config.sync.credential_source : null,
             credentialEnvVar: typeof config.sync.credential_env_var === 'string' ? config.sync.credential_env_var : null,
+            defaultTarget:
+              typeof config.sync.default_target === 'string' ? config.sync.default_target : null,
+            targets:
+              config.sync.targets && typeof config.sync.targets === 'object'
+                ? Object.entries(config.sync.targets)
+                    .filter(([, target]) => target && typeof target === 'object')
+                    .map(([name, target]) => ({
+                      name,
+                      apiUrl: typeof target.api_url === 'string' ? target.api_url : null,
+                      projectId: typeof target.project_id === 'string' ? target.project_id : null,
+                      credentialEnvVar:
+                        typeof target.credential_env_var === 'string' ? target.credential_env_var : null,
+                    }))
+                : [],
           }
         : null,
     };

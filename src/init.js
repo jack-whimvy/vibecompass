@@ -6,6 +6,13 @@ import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
 import { buildWorkflowMetadata } from './workflow.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import {
+  assertValidSyncTargetName,
+  buildSyncSectionWithTargets,
+  mirrorTargetCursorToFlat,
+  readSyncTargets,
+  reconcileCursorsAfterConnect,
+} from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
 
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
@@ -68,15 +75,146 @@ export async function connectHostedProjectMemory(options) {
     throw new Error('connect-hosted requires project.yaml mode to be local-primary or hosted-only.');
   }
 
+  const targetName = typeof options?.targetName === 'string' && options.targetName.trim() !== ''
+    ? assertValidSyncTargetName(options.targetName.trim())
+    : null;
+  const existingTargets = readSyncTargets(projectConfig);
+
+  if (!targetName && existingTargets) {
+    throw new Error(
+      `This project uses named sync targets (${Object.keys(existingTargets.targets).join(', ')}). Pass --target <name> to add or update one, or use "vibecompass sync-target <name>" to switch the default.`,
+    );
+  }
+
+  const previousFlatSync = projectConfig.sync && typeof projectConfig.sync === 'object'
+    ? projectConfig.sync
+    : null;
   const sync = normalizeSyncOptions(options?.sync, projectConfig.mode);
-  projectConfig.sync = sync;
+
+  let syncTarget = null;
+  if (targetName) {
+    const targets = { ...(existingTargets?.targets ?? {}) };
+    targets[targetName] = {
+      api_url: sync.api_url,
+      project_id: sync.project_id,
+      credential_env_var: sync.credential_env_var,
+    };
+    const defaultTarget = existingTargets?.defaultTarget ?? targetName;
+    projectConfig.sync = buildSyncSectionWithTargets(targets, defaultTarget);
+    syncTarget = { name: targetName, defaultTarget };
+  } else {
+    projectConfig.sync = sync;
+  }
+
   await writeFile(projectFilePath, serializeProjectConfig(projectConfig), 'utf8');
+
+  // D-237: reconcile manifest cursor state with the (re)bound target —
+  // first-conversion cursor migration, dropping a rebound target's stale
+  // cursor, and re-mirroring/clearing the flat cursor when the default
+  // target's binding changed (so ≤0.7.0 CLIs can't pair the new flat binding
+  // with a previous environment's cursor).
+  if (targetName) {
+    await updateManifestSyncState(rootDir, (manifestSync) =>
+      reconcileCursorsAfterConnect(
+        manifestSync,
+        targetName,
+        { apiUrl: sync.api_url, projectId: sync.project_id },
+        {
+          isDefault: syncTarget.defaultTarget === targetName,
+          isFirstConversion: !existingTargets,
+          flatBindingMatches: Boolean(
+            previousFlatSync &&
+              previousFlatSync.api_url === sync.api_url &&
+              previousFlatSync.project_id === sync.project_id,
+          ),
+        },
+      ),
+    );
+  }
 
   return {
     rootDir,
     projectFilePath,
     mode: projectConfig.mode,
     syncEnvVar: sync.credential_env_var,
+    syncTarget,
+  };
+}
+
+async function updateManifestSyncState(rootDir, updater) {
+  let manifest;
+  try {
+    manifest = JSON.parse(
+      await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'),
+    );
+  } catch {
+    return; // no manifest yet — nothing to migrate
+  }
+
+  const nextSync = updater(
+    manifest?.sync && typeof manifest.sync === 'object' ? manifest.sync : {},
+  );
+  if (!nextSync) {
+    return;
+  }
+
+  await writeStateManifest(rootDir, { sync: nextSync });
+}
+
+export async function setDefaultSyncTarget(options) {
+  const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
+  const rootDir = path.resolve(cwd, options?.rootDir ?? '.compass');
+  const projectFilePath = path.join(rootDir, 'project.yaml');
+  const projectConfig = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+    sourceName: projectFilePath,
+  });
+
+  const named = readSyncTargets(projectConfig);
+  if (!named) {
+    throw new Error(
+      'No named sync targets are defined in project.yaml. Run "vibecompass connect-hosted --target <name>" to add one.',
+    );
+  }
+
+  const targetName = typeof options?.targetName === 'string' && options.targetName.trim() !== ''
+    ? options.targetName.trim()
+    : null;
+
+  if (!targetName) {
+    return {
+      rootDir,
+      projectFilePath,
+      changed: false,
+      defaultTarget: named.defaultTarget,
+      targets: named.targets,
+    };
+  }
+
+  if (!named.targets[targetName]) {
+    throw new Error(
+      `Unknown sync target "${targetName}". Available targets: ${Object.keys(named.targets).join(', ')}.`,
+    );
+  }
+
+  projectConfig.sync = buildSyncSectionWithTargets(named.targets, targetName);
+  await writeFile(projectFilePath, serializeProjectConfig(projectConfig), 'utf8');
+
+  // D-237: the flat manifest cursor mirrors the default target so ≤0.7.0 CLIs
+  // stay correct; re-mirror it from the new default (clearing it when the new
+  // default has no identity-matching cursor yet).
+  await updateManifestSyncState(rootDir, (manifestSync) =>
+    mirrorTargetCursorToFlat(manifestSync, targetName, {
+      apiUrl: named.targets[targetName].api_url,
+      projectId: named.targets[targetName].project_id,
+    }),
+  );
+
+  return {
+    rootDir,
+    projectFilePath,
+    changed: named.defaultTarget !== targetName,
+    defaultTarget: targetName,
+    targets: named.targets,
   };
 }
 

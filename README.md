@@ -146,6 +146,28 @@ vibecompass connect-hosted \
 vibecompass push --root .compass
 ```
 
+### Multiple environments
+
+One project can have named sync targets (for example a local dev server and
+production) so you never have to rebind:
+
+```bash
+# add targets once — the first one becomes the default
+vibecompass connect-hosted --root .compass --target dev \
+  --sync-api-url http://localhost:3000 --sync-project-id vc_proj_dev \
+  --sync-credential-env-var VIBECOMPASS_SYNC_TOKEN
+vibecompass connect-hosted --root .compass --target prod \
+  --sync-api-url https://vibecompass.dev --sync-project-id vc_proj_prod \
+  --sync-credential-env-var VIBECOMPASS_SYNC_TOKEN_PROD
+
+# then pick per command, or switch the default
+vibecompass push --root .compass --sync-target prod
+vibecompass sync-target prod --root .compass
+```
+
+Tip: if you already have a single (flat) binding, add it as your first named
+target using the same URL and project id — its sync history carries over.
+
 See https://vibecompass.dev/developers for the full local-primary workflow.
 
 ## JavaScript API

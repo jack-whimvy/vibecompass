@@ -139,6 +139,7 @@ export async function resolveConnectHostedCliOptions(options, environment = {}) 
 
   return {
     rootDir: resolved.rootDir ? toRelativeIfInsideCwd(resolved.rootDir, cwd) : undefined,
+    ...(resolved.targetName ? { targetName: resolved.targetName } : {}),
     sync: resolved.sync,
   };
 }

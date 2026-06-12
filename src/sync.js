@@ -3,6 +3,11 @@ import path from 'node:path';
 import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import {
+  buildSyncStateWithCursor,
+  readSyncCursor,
+  resolveSyncBinding,
+} from './sync-binding.js';
 
 const DEFAULT_EXPORT_PATH = 'state/pull-export.json';
 
@@ -14,7 +19,8 @@ export async function pushProjectMemory(options = {}, environment = {}) {
   });
   const manifest = manifestResult.manifest;
   const documents = await readPushDocuments(context.rootDir, manifest.documents);
-  const baseRemoteRevisionId = normalizeUuid(manifest.sync?.last_successful_remote_revision);
+  const cursor = readSyncCursor(manifest.sync, context.binding);
+  const baseRemoteRevisionId = normalizeUuid(cursor.last_successful_remote_revision);
   const body = {
     ...(baseRemoteRevisionId ? { base_remote_revision_id: baseRemoteRevisionId } : {}),
     local_root_revision: manifest.canonical.local_root_revision,
@@ -25,15 +31,15 @@ export async function pushProjectMemory(options = {}, environment = {}) {
 
   const response = await postJson(context, 'push', body);
   const now = new Date().toISOString();
-  const sync = {
-    ...(manifest.sync ?? {}),
+  const sync = buildSyncStateWithCursor(manifest.sync, context.binding, {
+    ...cursor,
     last_successful_remote_revision: response.remote_revision_id,
     last_successful_local_root_revision: manifest.canonical.local_root_revision,
     last_successful_manifest_hash: manifest.canonical.manifest_hash,
     last_sync_direction: 'push',
     last_sync_at: now,
     pending_previews: [],
-  };
+  });
   const updatedManifest = await writeStateManifest(context.rootDir, { sync });
 
   return {
@@ -55,10 +61,11 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     sync: existingManifest?.sync,
   });
   const manifest = manifestResult.manifest;
+  const cursor = readSyncCursor(manifest.sync, context.binding);
 
   const response = await postJson(context, 'pull-preview', {
     state_version: manifest.state_version,
-    base_remote_revision_id: normalizeUuid(manifest.sync?.last_successful_remote_revision),
+    base_remote_revision_id: normalizeUuid(cursor.last_successful_remote_revision),
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
     local_documents: buildLocalDocumentSummaries(manifest.documents),
@@ -81,13 +88,13 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
     created_at: response.created_at ?? new Date().toISOString(),
     expires_at: response.expires_at,
   };
-  const sync = {
-    ...(manifest.sync ?? {}),
+  const sync = buildSyncStateWithCursor(manifest.sync, context.binding, {
+    ...cursor,
     pending_previews: [
-      ...(Array.isArray(manifest.sync?.pending_previews) ? manifest.sync.pending_previews : []),
+      ...(Array.isArray(cursor.pending_previews) ? cursor.pending_previews : []),
       previewRecord,
     ].slice(-5),
-  };
+  });
   const updatedManifest = await writeStateManifest(context.rootDir, { sync });
 
   return {
@@ -105,7 +112,7 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
 export async function pullExportProjectMemory(options = {}, environment = {}) {
   const context = await loadSyncContext(options, environment);
   const manifest = await readRequiredManifest(context.manifestPath);
-  const preview = resolvePreview(manifest, options.previewToken);
+  const preview = resolvePreview(manifest, options.previewToken, context.binding);
   const proposalIds = options.proposalIds?.length
     ? options.proposalIds
     : preview.available_proposal_ids ?? [];
@@ -200,18 +207,15 @@ async function loadSyncContext(options, environment) {
   if (project.mode !== 'local-primary') {
     throw new Error('Hosted sync commands require project.yaml mode: local-primary.');
   }
-  if (
-    !project.sync ||
-    typeof project.sync.api_url !== 'string' ||
-    typeof project.sync.project_id !== 'string' ||
-    typeof project.sync.credential_env_var !== 'string'
-  ) {
-    throw new Error('Hosted sync commands require sync.api_url, sync.project_id, and sync.credential_env_var in project.yaml.');
+
+  const binding = resolveSyncBinding(project, options.syncTarget ?? null);
+  if (!binding) {
+    throw new Error('Hosted sync commands require sync.api_url, sync.project_id, and sync.credential_env_var in project.yaml (or a named target under sync.targets).');
   }
 
-  const credential = normalizeOptionalString((environment.env ?? process.env)[project.sync.credential_env_var]);
+  const credential = normalizeOptionalString((environment.env ?? process.env)[binding.credentialEnvVar]);
   if (!credential) {
-    throw new Error(`Hosted sync command requires ${project.sync.credential_env_var}.`);
+    throw new Error(`Hosted sync command requires ${binding.credentialEnvVar}.`);
   }
 
   const fetchImpl = environment.runtime?.fetch ?? globalThis.fetch;
@@ -225,8 +229,10 @@ async function loadSyncContext(options, environment) {
     manifestPath,
     fetch: fetchImpl,
     credential,
-    apiUrl: project.sync.api_url,
-    projectId: project.sync.project_id,
+    apiUrl: binding.apiUrl,
+    projectId: binding.projectId,
+    syncTarget: binding.target,
+    binding,
   };
 }
 
@@ -308,9 +314,10 @@ function buildLocalDocumentExtractedSummary(kind, extracted = {}) {
   return {};
 }
 
-function resolvePreview(manifest, previewToken) {
-  const previews = Array.isArray(manifest.sync?.pending_previews)
-    ? manifest.sync.pending_previews
+function resolvePreview(manifest, previewToken, binding) {
+  const cursor = readSyncCursor(manifest.sync, binding);
+  const previews = Array.isArray(cursor.pending_previews)
+    ? cursor.pending_previews
     : [];
   if (previewToken) {
     const match = previews.find((preview) => preview.preview_token === previewToken);

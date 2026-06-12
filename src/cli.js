@@ -2,7 +2,7 @@
 
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { connectHostedProjectMemory, initializeProjectMemory } from './init.js';
+import { connectHostedProjectMemory, initializeProjectMemory, setDefaultSyncTarget } from './init.js';
 import { preflightDocsReview } from './docs-review.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
@@ -140,12 +140,38 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     });
     io.stdout.write(`Connected hosted VibeCompass for ${result.mode}\n`);
     io.stdout.write(`Updated ${result.projectFilePath}\n`);
+    if (result.syncTarget) {
+      io.stdout.write(`Sync target: ${result.syncTarget.name} (default: ${result.syncTarget.defaultTarget})\n`);
+      io.stdout.write(`Select per command with --sync-target ${result.syncTarget.name}, or switch the default with: vibecompass sync-target ${result.syncTarget.name}\n`);
+    }
     io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first hosted command.\n`);
     if (result.mode === 'local-primary') {
       io.stdout.write('Then run: vibecompass push\n');
       io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
     } else {
       io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
+    }
+    return 0;
+  }
+
+  if (parsed.command === 'sync-target') {
+    const result = await setDefaultSyncTarget({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.targetName) {
+      io.stdout.write(
+        result.changed
+          ? `Default sync target set to ${result.defaultTarget}\n`
+          : `Default sync target already ${result.defaultTarget}\n`,
+      );
+      io.stdout.write(`Updated ${result.projectFilePath}\n`);
+    } else {
+      io.stdout.write(`Default sync target: ${result.defaultTarget ?? '(none)'}\n`);
+    }
+    for (const [name, target] of Object.entries(result.targets)) {
+      const marker = name === result.defaultTarget ? '*' : ' ';
+      io.stdout.write(`${marker} ${name}: ${target.api_url} (project ${target.project_id}, env ${target.credential_env_var})\n`);
     }
     return 0;
   }
@@ -399,6 +425,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'connect-hosted') {
       return parseConnectHostedArgs(rest);
+    }
+
+    if (command === 'sync-target') {
+      return parseSyncTargetArgs(rest);
     }
 
     if (command === 'status') {
@@ -702,6 +732,9 @@ function parseConnectHostedArgs(argv) {
       case '--root':
         parsed.rootDir = value;
         break;
+      case '--target':
+        parsed.targetName = value;
+        break;
       case '--sync-api-url':
         parsed.syncApiUrl = value;
         break;
@@ -726,6 +759,7 @@ function parseConnectHostedArgs(argv) {
     command: 'connect-hosted',
     options: {
       rootDir: parsed.rootDir,
+      ...(parsed.targetName ? { targetName: parsed.targetName } : {}),
       ...(syncValues.length > 0
         ? {
             sync: {
@@ -1128,6 +1162,9 @@ function parseDocsReviewArgs(argv) {
       case '--artifact':
         parsed.artifactId = value;
         break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
       case '--max-tokens':
         parsed.maxTokens = value;
         break;
@@ -1145,7 +1182,72 @@ function parseDocsReviewArgs(argv) {
 function parsePushArgs(argv) {
   return {
     command: 'push',
-    options: parseRootOnlyArgs(argv, 'push'),
+    options: parseRootAndSyncTargetArgs(argv, 'push'),
+  };
+}
+
+function parseRootAndSyncTargetArgs(argv, commandName) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for ${commandName}.`);
+    }
+  }
+
+  return parsed;
+}
+
+function parseSyncTargetArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      if (parsed.targetName !== undefined) {
+        throw new Error(`Unexpected argument "${token}".`);
+      }
+      parsed.targetName = token;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for sync-target.`);
+    }
+  }
+
+  return {
+    command: 'sync-target',
+    options: parsed,
   };
 }
 
@@ -1172,6 +1274,9 @@ function parsePullPreviewArgs(argv) {
     switch (token) {
       case '--root':
         parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
         break;
       default:
         throw new Error(`Unknown flag "${token}".`);
@@ -1205,6 +1310,9 @@ function parsePullExportArgs(argv) {
     switch (token) {
       case '--root':
         parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
         break;
       case '--preview-token':
         parsed.previewToken = value;
@@ -1364,6 +1472,7 @@ function usageText() {
     'Usage:',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
     '  vibecompass connect-hosted [options]',
+    '  vibecompass sync-target [<name>] [options]',
     '  vibecompass status [options]',
     '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
     '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
@@ -1405,10 +1514,17 @@ function usageText() {
     '',
     'Connect-hosted options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --target <name>                      Add or update a named sync target (e.g. dev, prod)',
+    '                                        First named target becomes the default; flat sync fields mirror the default target',
     '  --sync-api-url <url>                 Hosted sync api_url',
     '  --sync-project-id <id>               Hosted sync project_id',
     '  --sync-credential-env-var <name>     Hosted sync env var reference',
-    '                                        Replaces any existing project.yaml sync binding',
+    '                                        Without --target, replaces any existing flat project.yaml sync binding',
+    '',
+    'Sync-target options:',
+    '  vibecompass sync-target              List named sync targets and the current default',
+    '  vibecompass sync-target <name>       Switch the default sync target (re-mirrors flat sync fields)',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
     '',
     'Status options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -1463,6 +1579,7 @@ function usageText() {
     '',
     'Sync transport options:',
     '  push --root <path>                   Push canonical local project memory to hosted',
+    '  --sync-target <name>                 Use a named sync target for this command (push, pull-preview, pull-export, docs-review)',
     '  pull-preview --root <path>           Preview hosted proposals and remote state',
     '  pull-preview --no-pending-proposals  Exclude pending proposals from preview',
     '  pull-export --proposal <id>          Export a selected proposal; repeatable',
