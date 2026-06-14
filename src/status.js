@@ -143,7 +143,9 @@ async function readProjectSummary(projectFilePath) {
             .filter((repo) => repo && typeof repo === 'object')
             .map((repo) => ({
               id: typeof repo.id === 'string' ? repo.id : null,
+              source: typeof repo.source === 'string' ? repo.source : (typeof repo.remote === 'string' ? 'git' : 'local'),
               remote: typeof repo.remote === 'string' ? repo.remote : null,
+              path: typeof repo.path === 'string' ? repo.path : null,
               defaultBranch: typeof repo.default_branch === 'string' ? repo.default_branch : null,
             }))
             .filter((repo) => repo.id)
@@ -279,7 +281,7 @@ async function readAgentFileStatus(rootDir, toolingRootDir) {
       results: result.results.map((item) => ({
         format: item.format,
         relativePath: item.relativePath,
-        status: item.status,
+        status: item.changed || item.warning ? item.status : 'current',
         warning: item.warning,
         changed: item.changed,
         conflicts: item.conflicts ?? [],

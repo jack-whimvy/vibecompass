@@ -63,7 +63,7 @@ function renderProjectSnapshot(context) {
   }
 
   for (const repo of context.repos) {
-    lines.push(`- Repo \`${repo.id}\`: ${repo.remote}`);
+    lines.push(`- Repo \`${repo.id}\`: ${formatRepoDescriptor(repo)}`);
   }
 
   const domainCount = context.domains.length;
@@ -80,6 +80,18 @@ function renderProjectSnapshot(context) {
   }
 
   return lines.length > 0 ? lines : ['- No project details recorded yet.'];
+}
+
+function formatRepoDescriptor(repo) {
+  if (repo?.source === 'local' || repo?.path) {
+    return `local folder ${repo.path ?? '.'}`;
+  }
+
+  if (repo?.remote) {
+    return repo.remote;
+  }
+
+  return 'source not recorded';
 }
 
 function renderDecisionLine(decision) {

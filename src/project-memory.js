@@ -34,7 +34,7 @@ const KNOWN_PROJECT_FIELDS = new Set([
   'sync',
   'metadata',
 ]);
-const KNOWN_REPO_FIELDS = new Set(['id', 'remote', 'default_branch']);
+const KNOWN_REPO_FIELDS = new Set(['id', 'source', 'remote', 'path', 'default_branch']);
 const KNOWN_SYNC_FIELDS = new Set([
   'provider',
   'api_url',
@@ -278,8 +278,25 @@ function validateProjectData(data, relativePath) {
         repoIds.push(repo.id);
       }
 
-      if (typeof repo.remote !== 'string' || repo.remote.trim() === '') {
-        errors.push(createError(relativePath, 'project-invalid-repo-remote', `${prefix}.remote must be a non-empty string.`));
+      const source = typeof repo.source === 'string' && repo.source.trim() !== ''
+        ? repo.source.trim()
+        : null;
+      const remote = typeof repo.remote === 'string' ? repo.remote.trim() : '';
+      const sourcePath = typeof repo.path === 'string' ? repo.path.trim() : '';
+
+      if (source && !['git', 'local'].includes(source)) {
+        errors.push(createError(relativePath, 'project-invalid-repo-source', `${prefix}.source must be git or local.`));
+      }
+
+      if (source === 'local' || (!source && !remote && sourcePath)) {
+        if (!['local-only', 'local-primary'].includes(data.mode)) {
+          errors.push(createError(relativePath, 'project-invalid-repo-source', `${prefix}.source local is supported only when mode is local-only or local-primary.`));
+        }
+        if (!sourcePath) {
+          errors.push(createError(relativePath, 'project-invalid-repo-path', `${prefix}.path must be a non-empty string for local sources.`));
+        }
+      } else if (!remote) {
+        errors.push(createError(relativePath, 'project-invalid-repo-remote', `${prefix}.remote must be a non-empty string for Git-backed sources.`));
       }
     }
   }
@@ -336,10 +353,12 @@ function validateProjectData(data, relativePath) {
       repo_ids: repoIds,
       repos: Array.isArray(data.repos)
         ? data.repos
-            .filter((repo) => isPlainObject(repo) && typeof repo.id === 'string' && typeof repo.remote === 'string')
+            .filter((repo) => isPlainObject(repo) && typeof repo.id === 'string')
             .map((repo) => ({
               id: repo.id,
-              remote: repo.remote,
+              source: typeof repo.source === 'string' ? repo.source : (typeof repo.remote === 'string' ? 'git' : 'local'),
+              remote: typeof repo.remote === 'string' ? repo.remote : null,
+              path: typeof repo.path === 'string' ? repo.path : null,
               default_branch: typeof repo.default_branch === 'string' ? repo.default_branch : null,
             }))
         : [],

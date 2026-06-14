@@ -206,7 +206,7 @@ function generateContextMarkdown(options) {
   const workflow = resolveWorkflowSettings(options.projectConfig);
   const promptCommands = renderPromptCommandLines({ rootRelativePath }).join('\n');
   const repos = options.projectConfig.repos
-    .map((repo) => `- \`${repo.id}\` → ${repo.remote}`)
+    .map((repo) => `- \`${repo.id}\` → ${formatRepoDescriptor(repo)}`)
     .join('\n');
 
   return `# Project Context — ${projectName}
@@ -348,7 +348,7 @@ automatically by package commands.
 function generateStarterArchitectureDoc(projectConfig) {
   const repos = projectConfig.repos.map((repo) => repo.id);
   const repoLines = projectConfig.repos
-    .map((repo) => `- \`${repo.id}\` — ${repo.remote}${repo.default_branch ? ` (${repo.default_branch})` : ''}`)
+    .map((repo) => `- \`${repo.id}\` — ${formatRepoDescriptor(repo)}${repo.default_branch ? ` (${repo.default_branch})` : ''}`)
     .join('\n');
   const repoEvidence = projectConfig.repos
     .map((repo) => `- \`${repo.id}:/\` — declared repository root`)
@@ -379,7 +379,7 @@ ${repoLines}
 ## Coverage
 Confirmed:
 - Project identity and mode from \`project.yaml\`
-- Declared repository IDs and remotes from \`project.yaml\`
+- Declared repository IDs and source descriptors from \`project.yaml\`
 - Project-memory root layout created by \`vibecompass init\`
 
 Not yet documented:
@@ -425,7 +425,7 @@ Do not copy this example as-is. Allocate real decision IDs from the current cano
 function generateStarterSessionNote(options) {
   const sessionDate = sessionDateFromGeneratedAt(options.generatedAt);
   const projectConfig = options.projectConfig;
-  const repoLines = projectConfig.repos.map((repo) => `- \`${repo.id}\` — ${repo.remote}`).join('\n');
+  const repoLines = projectConfig.repos.map((repo) => `- \`${repo.id}\` — ${formatRepoDescriptor(repo)}`).join('\n');
 
   return `# Session — ${sessionDate}-1 — Project Memory Initialized
 
@@ -456,6 +456,14 @@ ${repoLines}
 2. Inspect relevant code before making implementation changes in areas not covered by architecture docs.
 3. Replace starter placeholders with evidence-backed domain/feature/component docs.
 `;
+}
+
+function formatRepoDescriptor(repo) {
+  if (repo.source === 'local' || repo.path) {
+    return `local folder ${repo.path}`;
+  }
+
+  return repo.remote ?? 'source not recorded';
 }
 
 function generateArchitectureGuide(projectConfig) {

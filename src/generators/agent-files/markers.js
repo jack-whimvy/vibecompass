@@ -46,7 +46,8 @@ export function applyManagedBlock(existingContent, generatedContent, options = {
   }
 
   const before = existingContent.slice(0, startIndex);
-  const after = existingContent.slice(endIndex + END_MARKER.length);
+  const rawAfter = existingContent.slice(endIndex + END_MARKER.length);
+  const after = rawAfter.trim() === '' ? '' : rawAfter;
   const beforeSeparator = before === '' || before.endsWith('\n') ? '' : '\n';
   const afterSeparator = after === '' || after.startsWith('\n') ? '' : '\n';
 

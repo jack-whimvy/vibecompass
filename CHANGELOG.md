@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.2 - 2026-06-14
+
+- Clarify docs-review acceptance gates so agents state when no architecture docs have been applied yet and only report completion after apply succeeds.
+- Render local folder repo sources correctly in generated agent files instead of showing `null`.
+- Fix false agent-file drift in `status` after `sync-agents` when managed files are already current.
+
+## 0.9.1 - 2026-06-14
+
+- Make local docs-review prompts self-contained by printing the accepted output file, root-scoped apply command, and same-version `npx` fallback the agent should run after user acceptance.
+
+## 0.9.0 - 2026-06-14
+
+- Add explicit local folder sources for non-Git projects: `project.yaml.repos[]` may use `source: local` plus `path`, and `init` accepts `--repo-local <id=path>`.
+- Keep blank Git remotes invalid, but report an actionable `--repo-local` hint when `--repo <id=remote>` resolves to an empty value.
+- Update guided init, starter docs, status, scanning, and read-model output so local-source roots validate and render cleanly.
+- Bump docs-review to `VibeCompass Docs Review Prompt v3`, requiring first-pass docs to include a user journey, project/system map, and core journey-facing feature summaries.
+- Add `vibecompass-project-map version=1` support inside `architecture/overview/project-shape.md`, including nested-fence parsing so generated overview docs can round-trip the machine-readable journey map block.
+
 ## 0.8.0 - 2026-06-12
 
 - Add named sync targets (D-236): `connect-hosted --target <name>` binds one project root to multiple hosted environments (for example `dev` on localhost and `prod` on vibecompass.dev).

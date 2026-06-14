@@ -105,7 +105,9 @@ function buildProjectSummary(scanResult, currentManifest, freshness, existingMan
   const extracted = scanResult.project.extracted ?? {};
   const repos = (extracted.repos ?? []).map((repo) => ({
     id: repo.id,
+    source: repo.source,
     remote: repo.remote,
+    path: repo.path,
     default_branch: repo.default_branch,
   }));
 
@@ -451,10 +453,12 @@ function buildRepoAliasMap(repos) {
     aliases.set(repo.id, repo.id);
     aliases.set(repo.id.toLowerCase(), repo.id);
 
-    const remoteName = repo.remote
-      .replace(/\.git$/, '')
-      .split('/')
-      .pop();
+    const remoteName = typeof repo.remote === 'string'
+      ? repo.remote
+          .replace(/\.git$/, '')
+          .split('/')
+          .pop()
+      : null;
 
     if (remoteName) {
       aliases.set(remoteName, repo.id);

@@ -6,8 +6,9 @@ import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
+import { PACKAGE_VERSION } from './version.js';
 
-const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v2';
+const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v3';
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
 const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
@@ -785,13 +786,13 @@ function extractAnthropicText(body) {
 
 function parseArchitectureDocBlocks(source) {
   const blocks = [];
-  const pattern = /^```vibecompass-architecture-doc\s+path=([^\s`]+)\s*\n([\s\S]*?)^```[ \t]*$/gm;
+  const pattern = /^(`{3,})vibecompass-architecture-doc\s+path=([^\s`]+)\s*\n([\s\S]*?)^\1[ \t]*$/gm;
   let match;
 
   while ((match = pattern.exec(source)) !== null) {
     blocks.push({
-      path: normalizeBlockPath(match[1]),
-      content: match[2].replace(/\n$/, ''),
+      path: normalizeBlockPath(match[2]),
+      content: match[3].replace(/\n$/, ''),
     });
   }
 
@@ -829,8 +830,8 @@ function parseDecisionRecommendationBlocks(source) {
 }
 
 function countMalformedArchitectureDocFences(source) {
-  const fencePattern = /^```vibecompass-architecture-doc\b.*$/gm;
-  const acceptedOpeningPattern = /^```vibecompass-architecture-doc\s+path=[^\s`]+\s*$/;
+  const fencePattern = /^`{3,}vibecompass-architecture-doc\b.*$/gm;
+  const acceptedOpeningPattern = /^`{3,}vibecompass-architecture-doc\s+path=[^\s`]+\s*$/;
   let count = 0;
   let match;
 
@@ -1683,6 +1684,10 @@ function renderApplyOutputMessage(options) {
 }
 
 function renderReviewPrompt(options) {
+  const outputPath = path.join(options.rootDir, 'state', 'docs-review-output.md');
+  const applyCommand = `vibecompass docs-review --root ${shellQuote(options.rootDir)} --apply-output --output ${shellQuote(outputPath)}`;
+  const npxApplyCommand = `npx -y @vibecompass/vibecompass@${PACKAGE_VERSION} docs-review --root ${shellQuote(options.rootDir)} --apply-output --output ${shellQuote(outputPath)}`;
+
   return [
     `# ${DOCS_REVIEW_PROMPT_VERSION}`,
     '',
@@ -1694,6 +1699,9 @@ function renderReviewPrompt(options) {
     `- Project mode: ${options.project.mode}`,
     `- Review provider to record: ${options.llm}`,
     `- Review model/version to record: ${options.model}`,
+    `- Accepted output file: ${outputPath}`,
+    `- Apply command after user acceptance: ${applyCommand}`,
+    `- Apply command if the CLI is not installed on PATH: ${npxApplyCommand}`,
     '',
     '## Required Inputs',
     '1. Read `project.yaml`.',
@@ -1705,25 +1713,29 @@ function renderReviewPrompt(options) {
     'Stage 1 — Evidence inventory:',
     '- Build a compact repo inventory from file paths, manifests/config files, route/job/test directories, and existing architecture frontmatter before reading large file bodies.',
     '- Mine finalized session notes for decision candidates and product constraints, but cap proposed decisions to the five highest-value architecture choices.',
-    '- Identify candidate domains, features, components, and ownership boundaries with concrete `repo:path` evidence.',
+    '- Identify candidate domains, features, components, ownership boundaries, user journey entry points, feature-to-feature relationships, and system-layer connections with concrete `repo:path` evidence.',
     '- Do not fetch or summarize broad source bodies until the coverage plan says a file is needed.',
     '',
     'Stage 2 — Coverage plan:',
     '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
-    '- Prioritize entry points, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
+    '- The minimum useful set must cover: user journey, project/system map (frontend/backend/API/data/integration structure and connections), and summaries of the core journey-facing features.',
+    '- Prioritize entry points, user-flow/gating relationships, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
     '- Mark each proposed doc as `comprehensive`, `partial`, or `initial`, with the reason and blindspots.',
     '- Emit the accepted plan as one `vibecompass-coverage-plan version=1` JSON fence before architecture-doc blocks.',
-    '- Ask for user acceptance before emitting fenced architecture-doc blocks.',
+    '- Ask for user acceptance before emitting fenced architecture-doc blocks. When you stop for acceptance, state plainly that no architecture docs have been applied yet.',
     '',
     'Stage 3 — Bounded doc generation:',
     '- Generate only accepted docs, one complete fenced block per architecture path.',
+    '- Ensure `architecture/overview/project-shape.md` includes a concise system map plus one `vibecompass-project-map version=1` JSON fence that lists journey-facing features and supported relationships.',
     '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
     `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
     '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
     '',
     'Stage 4 — Apply and verify:',
-    '- After accepted blocks are written to `state/docs-review-output.md`, run `vibecompass docs-review --apply-output`.',
-    '- Surface any parser warnings, especially oversized docs, so the user can decide whether to compact or accept the output.',
+    `- After the user accepts Stage 2, write the complete accepted fenced output verbatim to \`${outputPath}\`.`,
+    `- Then run \`${applyCommand}\` to validate and apply the accepted blocks.`,
+    `- If \`vibecompass\` is not installed on PATH, run \`${npxApplyCommand}\` instead.`,
+    '- Only report docs-review as applied after the apply command succeeds. Surface any parser warnings, especially oversized docs, so the user can decide whether to compact or accept the output.',
     '',
     '## Architecture Doc Contract',
     'When creating or updating architecture docs, use the existing VibeCompass structure:',
@@ -1746,18 +1758,46 @@ function renderReviewPrompt(options) {
     '',
     '## Review Rules',
     '1. Do not delete `architecture/overview/project-shape.md`.',
-    '2. Add evidence-backed component docs alongside the overview.',
-    '3. Update `architecture/overview/project-shape.md` coverage and blindspot sections to summarize what has now been mapped.',
-    '4. Keep all implementation claims source-backed with `repo:path` evidence.',
-    '5. Use only the exact confidence and coverage enum values listed above.',
-    '6. Put uncertainty in `Blindspots`; do not fill gaps with guesses.',
-    '7. Do not append real `D-NNN` decisions without explicit user acceptance. Propose candidate decisions separately.',
-    '8. Do not edit `decisions/INDEX.md` directly unless a canonical decision file was explicitly accepted and appended.',
-    '9. Optimize for future retrieval: project-level docs stay compact; component docs carry focused context for a specific area.',
+    '2. Add or update `architecture/overview/project-shape.md` so it explains the project/system map and includes the accepted `vibecompass-project-map version=1` block.',
+    '3. Add evidence-backed component docs alongside the overview for core journey-facing features and important supporting systems.',
+    '4. Update `architecture/overview/project-shape.md` coverage and blindspot sections to summarize what has now been mapped.',
+    '5. Keep all implementation claims source-backed with `repo:path` evidence.',
+    '6. Use only the exact confidence and coverage enum values listed above.',
+    '7. Put uncertainty in `Blindspots`; do not fill gaps with guesses.',
+    '8. Do not append real `D-NNN` decisions without explicit user acceptance. Propose candidate decisions separately.',
+    '9. Do not edit `decisions/INDEX.md` directly unless a canonical decision file was explicitly accepted and appended.',
+    '10. Optimize for future retrieval: project-level docs stay compact; component docs carry focused context for a specific area.',
+    '',
+    '## Project Map Block',
+    'Include exactly one project-map block inside `architecture/overview/project-shape.md` when the user accepts journey/system mapping output:',
+    '',
+    '```vibecompass-project-map version=1',
+    '{',
+    '  "features": [',
+    '    {',
+    '      "domain": "Domain name matching architecture frontmatter",',
+    '      "feature": "Feature name matching architecture frontmatter",',
+    '      "is_entry_point": true,',
+    '      "summary": "Short user-facing feature summary"',
+    '    }',
+    '  ],',
+    '  "relationships": [',
+    '    {',
+    '      "from": { "domain": "Domain", "feature": "Feature" },',
+    '      "to": { "domain": "Domain", "feature": "Feature" },',
+    '      "kind": "gates | navigates_to | depends_on | writes_to",',
+    '      "label": "Short evidence-backed relationship label"',
+    '    }',
+    '  ]',
+    '}',
+    '```',
+    '',
+    'Only include relationships supported by evidence. Prefer `navigates_to` and `gates` for the main user journey; use `depends_on` and `writes_to` for supporting system relationships. If useful journey links cannot be inferred, state that as a coverage gap rather than inventing links.',
     '',
     '## Output Contract',
     'First provide a concise findings summary with:',
     '- mapped areas',
+    '- user journey and project/system map coverage',
     '- gaps/blindspots',
     '- evidence inventory summary',
     '- coverage plan and proposed architecture docs',
@@ -1791,6 +1831,8 @@ function renderReviewPrompt(options) {
     '<complete markdown file content>',
     '```',
     '',
+    'If the complete markdown file content contains its own fenced block, such as `vibecompass-project-map version=1`, use a longer outer fence for the architecture-doc block (for example four backticks) so the inner fence stays inside the document body.',
+    '',
     'If the review surfaced accepted decision candidates, output each candidate as a separate block without assigning a D-number:',
     '',
     '```vibecompass-decision-recommendation target=decisions/cross-cutting.md',
@@ -1800,8 +1842,12 @@ function renderReviewPrompt(options) {
     '**Context:** Optional supporting context.',
     '```',
     '',
-    'Only include accepted coverage, architecture, and decision-recommendation blocks. After accepted output is applied, `vibecompass docs-review --apply-output` records completion in `state/docs-review.json`.',
+    `Only include accepted coverage, architecture, and decision-recommendation blocks. After user acceptance, save the final accepted output to \`${outputPath}\`, run \`${applyCommand}\` or \`${npxApplyCommand}\`, and report applied paths plus parser warnings.`,
   ].join('\n');
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function ensureTrailingNewline(value) {

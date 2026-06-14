@@ -882,12 +882,13 @@ async function promptForRepos(prompter, cwd) {
 
   for (let index = 0; index < repoCount; index += 1) {
     const ordinal = index + 1;
-    const repo = {
-      id: await askInput(prompter, `Repo ${ordinal} id`, {
-        defaultValue: repoCount === 1 ? repoIdDefault : `repo-${ordinal}`,
-      }),
-      remote: await askInput(prompter, `Repo ${ordinal} remote`),
-    };
+    const repoId = await askInput(prompter, `Repo ${ordinal} id`, {
+      defaultValue: repoCount === 1 ? repoIdDefault : `repo-${ordinal}`,
+    });
+    const remote = await askOptionalInput(prompter, `Repo ${ordinal} remote (blank for local folder)`);
+    const repo = remote
+      ? { id: repoId, remote }
+      : { id: repoId, source: 'local', path: '.' };
 
     const defaultBranch = await askOptionalInput(prompter, `Repo ${ordinal} default branch`);
     if (defaultBranch) {

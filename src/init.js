@@ -257,13 +257,42 @@ function normalizeInitOptions(options) {
     }
     seenRepoIds.add(repo.id);
 
-    if (typeof repo.remote !== 'string' || repo.remote.trim() === '') {
-      throw new Error(`repo "${repo.id}" requires a non-empty remote.`);
+    const source = typeof repo.source === 'string' && repo.source.trim() !== ''
+      ? repo.source.trim()
+      : null;
+    const pathValue = typeof repo.path === 'string' && repo.path.trim() !== ''
+      ? repo.path.trim()
+      : null;
+    const remote = typeof repo.remote === 'string' ? repo.remote.trim() : '';
+
+    if (source && !['git', 'local'].includes(source)) {
+      throw new Error(`repo "${repo.id}" source must be git or local.`);
+    }
+
+    if (source === 'local' || (!source && !remote && pathValue)) {
+      if (!['local-only', 'local-primary'].includes(preparedOptions.mode)) {
+        throw new Error(`repo "${repo.id}" local sources are supported only in local-only or local-primary mode.`);
+      }
+
+      if (!pathValue) {
+        throw new Error(`repo "${repo.id}" source local requires a non-empty path.`);
+      }
+
+      return {
+        id: repo.id,
+        source: 'local',
+        path: pathValue,
+      };
+    }
+
+    if (!remote) {
+      throw new Error(`repo "${repo.id}" requires a non-empty remote, or use a local repo source with source: local and path.`);
     }
 
     return {
       id: repo.id,
-      remote: repo.remote,
+      ...(source === 'git' ? { source: 'git' } : {}),
+      remote,
       ...(repo.defaultBranch ? { default_branch: repo.defaultBranch } : {}),
     };
   });

@@ -82,6 +82,43 @@ test('initializeProjectMemory scaffolds a new root and writes a manifest', async
   }
 });
 
+test('initializeProjectMemory supports a non-Git local folder source', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-local-source-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    const result = await initializeProjectMemory({
+      rootDir,
+      name: 'Local Source Project',
+      mode: 'local-primary',
+      repos: [
+        {
+          id: 'app',
+          source: 'local',
+          path: '.',
+        },
+      ],
+      generatedAt: new Date('2026-06-13T21:30:00Z'),
+    });
+
+    const projectYaml = await readFile(path.join(rootDir, 'project.yaml'), 'utf8');
+    const starterArchitecture = await readFile(path.join(rootDir, 'architecture/overview/project-shape.md'), 'utf8');
+    const starterSession = await readFile(path.join(rootDir, 'sessions/2026-06-13-1-project-memory-initialized.md'), 'utf8');
+    const liveScan = await scanProjectMemory(rootDir);
+
+    assert.match(projectYaml, /source: local/);
+    assert.match(projectYaml, /path: \./);
+    assert.doesNotMatch(projectYaml, /remote:/);
+    assert.match(starterArchitecture, /`app` — local folder \./);
+    assert.match(starterArchitecture, /source descriptors from `project\.yaml`/);
+    assert.match(starterSession, /`app` — local folder \./);
+    assert.equal(result.scanResult.errors.length, 0);
+    assert.equal(liveScan.errors.length, 0);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('initializeProjectMemory can scaffold workflow guides and starter tool files', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-bootstrap-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -132,7 +169,12 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(decisionsGuide, /Append-only decision log/);
     assert.match(sessionsGuide, /Finalized session notes/);
     assert.match(docsReviewWorkflow, /VibeCompass Workflow — docs review/);
-    assert.match(docsReviewWorkflow, /vibecompass docs-review --apply-output/);
+    assert.match(docsReviewWorkflow, /Write the accepted fenced blocks verbatim to `\.compass\/state\/docs-review-output\.md`/);
+    assert.match(docsReviewWorkflow, /vibecompass docs-review --root \.compass --apply-output --output \.compass\/state\/docs-review-output\.md/);
+    assert.match(
+      docsReviewWorkflow,
+      new RegExp(`npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')} docs-review --root \\.compass --apply-output --output \\.compass/state/docs-review-output\\.md`),
+    );
     assert.match(starterArchitecture, /Initial project-memory scaffold/);
     assert.match(decisionExample, /ignored by VibeCompass canonical decision parsing/);
     assert.match(starterSession, /Project Memory Initialized/);
@@ -380,6 +422,76 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     const readoptedAgents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
     assert.match(stdout.join(''), /AGENTS\.md: update/);
     assert.equal((readoptedAgents.match(/vibecompass:start/g) ?? []).length, 1);
+    assert.equal(readoptedAgents, adoptedAgents);
+
+    stdout.length = 0;
+    await runCli(
+      ['status', '--root', '.compass'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write() {},
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    assert.match(stdout.join(''), /AGENTS\.md: current/);
+    assert.doesNotMatch(stdout.join(''), /AGENTS\.md: dry-run-update/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli sync-agents and status render local folder sources without false drift', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-agents-local-source-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const stdout = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Local Agent Project',
+      mode: 'local-primary',
+      repos: [{ id: 'app', source: 'local', path: '.' }],
+    });
+
+    await runCli(
+      ['sync-agents', '--root', '.compass'],
+      {
+        stdout: { write() {} },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir },
+    );
+
+    const agents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
+    assert.match(agents, /Repo `app`: local folder \./);
+    assert.doesNotMatch(agents, /Repo `app`: null/);
+
+    const exitCode = await runCli(
+      ['status', '--root', '.compass'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir },
+    );
+
+    const output = stdout.join('');
+    assert.equal(exitCode, 0);
+    assert.match(output, /AGENTS\.md: current/);
+    assert.doesNotMatch(output, /AGENTS\.md: dry-run-update/);
+    assert.doesNotMatch(output, /vibecompass sync-agents --dry-run/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -614,6 +726,14 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(localBody.messages[0].content, /Confidence: high \| medium \| low/);
     assert.match(localBody.messages[0].content, /Stage 1 — Evidence inventory/);
     assert.match(localBody.messages[0].content, /vibecompass-coverage-plan version=1/);
+    assert.match(localBody.messages[0].content, /Accepted output file: .*state\/docs-review-output\.md/);
+    assert.match(localBody.messages[0].content, /Apply command after user acceptance: vibecompass docs-review --root .* --apply-output --output .*/);
+    assert.match(
+      localBody.messages[0].content,
+      new RegExp(`Apply command if the CLI is not installed on PATH: npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')}`),
+    );
+    assert.match(localBody.messages[0].content, /no architecture docs have been applied yet/);
+    assert.match(localBody.messages[0].content, /Only report docs-review as applied after the apply command succeeds/);
     assert.match(localBody.messages[0].content, /Soft size budget: keep each generated architecture doc under 12000 bytes/);
     assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
     assert.match(localStdout.join(''), /Local review output:/);
@@ -751,6 +871,32 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     );
     assert.match(overviewStdout.join(''), /architecture\/overview\/project-shape\.md \(overwritten\)/);
     assert.match(appliedOverview, /Updated overview from fixture/);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'overview-project-map.md'), 'utf8'),
+      'utf8',
+    );
+    const overviewProjectMapStdout = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: {
+          write(chunk) {
+            overviewProjectMapStdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const appliedOverviewProjectMap = await readFile(
+      path.join(localOnlyRoot, 'architecture/overview/project-shape.md'),
+      'utf8',
+    );
+    assert.match(overviewProjectMapStdout.join(''), /architecture\/overview\/project-shape\.md \(overwritten\)/);
+    assert.match(appliedOverviewProjectMap, /```vibecompass-project-map version=1/);
+    assert.match(appliedOverviewProjectMap, /"is_entry_point": true/);
 
     await writeFile(
       path.join(localOnlyRoot, 'state/docs-review-output.md'),
@@ -911,13 +1057,22 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
-    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v2/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v3/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
+    assert.match(stdout.join(''), /Accepted output file: .*state\/docs-review-output\.md/);
+    assert.match(stdout.join(''), /Apply command after user acceptance: vibecompass docs-review --root .* --apply-output --output .*/);
+    assert.match(
+      stdout.join(''),
+      new RegExp(`Apply command if the CLI is not installed on PATH: npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')}`),
+    );
+    assert.match(stdout.join(''), /no architecture docs have been applied yet/);
+    assert.match(stdout.join(''), /Only report docs-review as applied after the apply command succeeds/);
     assert.match(stdout.join(''), /## Staged Review Protocol/);
     assert.match(stdout.join(''), /Retrieval scope: when future agents should load this doc/);
     assert.match(stdout.join(''), /Do not delete `architecture\/overview\/project-shape\.md`/);
+    assert.match(stdout.join(''), /vibecompass-project-map version=1/);
     assert.match(stdout.join(''), /body sections: `## Description`, `## Review metadata`, `## Details`, `## Retrieval guidance`, `## Next steps`, `## Involved files`/);
     assert.equal(marker.status, 'external-review-requested');
     assert.equal(marker.llm, 'codex');
@@ -961,8 +1116,9 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(hostedBody.local_root_revision, /^loc_[a-f0-9]{24}$/);
     assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
     assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
-    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v2/);
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v3/);
     assert.match(hostedBody.prompt, /Only include accepted coverage, architecture, and decision-recommendation blocks/);
+    assert.match(hostedBody.prompt, /project\/system map/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
     assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
     assert.equal(hostedMarker.status, 'hosted-review-requested');
@@ -1730,6 +1886,73 @@ test('runCli parses init arguments and creates the root', async () => {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test('runCli init supports explicit local folder sources', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-local-source-'));
+
+  try {
+    const parsed = parseCliArgs([
+      'init',
+      '--root',
+      '.compass',
+      '--name',
+      'CLI Local Source',
+      '--mode',
+      'local-primary',
+      '--repo-local',
+      'app=.',
+    ]);
+
+    assert.equal(parsed.command, 'init');
+    assert.deepEqual(parsed.options.repos, [{ id: 'app', source: 'local', path: '.' }]);
+
+    const exitCode = await runCli(
+      [
+        'init',
+        '--root',
+        '.compass',
+        '--name',
+        'CLI Local Source',
+        '--mode',
+        'local-primary',
+        '--repo-local',
+        'app=.',
+      ],
+      {
+        stdout: { write() {} },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir },
+    );
+
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+    const liveScan = await scanProjectMemory(path.join(tempDir, '.compass'));
+
+    assert.equal(exitCode, 0);
+    assert.match(projectYaml, /source: local/);
+    assert.match(projectYaml, /path: \./);
+    assert.doesNotMatch(projectYaml, /remote:/);
+    assert.equal(liveScan.errors.length, 0);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli init reports empty repo remotes as local-source guidance', () => {
+  assert.throws(
+    () =>
+      parseCliArgs([
+        'init',
+        '--name',
+        'Empty Remote',
+        '--mode',
+        'local-primary',
+        '--repo',
+        'app=',
+      ]),
+    /--repo remote resolved to empty.*--repo-local <id=path>/,
+  );
 });
 
 test('runCli prints hosted next steps when init configures a sync binding', async () => {
@@ -2640,7 +2863,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
     ['What should VibeCompass set up?', 'local-only'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
-    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 remote (blank for local folder)', 'https://github.com/example/app.git'],
     ['Repo 1 default branch', 'main'],
     ['Use primary-repo?', ''],
     ['Directory of the designated primary repo', '.'],
@@ -2695,7 +2918,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
       'What should VibeCompass set up?',
       'How many repos belong to this logical project?',
       'Repo 1 id',
-      'Repo 1 remote',
+      'Repo 1 remote (blank for local folder)',
       'Repo 1 default branch',
       'Use primary-repo?',
       'Directory of the designated primary repo',
@@ -2729,7 +2952,7 @@ test('runCli guided init defaults project mode to local-primary', async () => {
     ['What should VibeCompass set up?', ''],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
-    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 remote (blank for local folder)', 'https://github.com/example/app.git'],
     ['Repo 1 default branch', ''],
     ['Use primary-repo?', ''],
     ['Directory of the designated primary repo', '.'],
@@ -2769,7 +2992,7 @@ test('runCli guided init defaults project mode to local-primary', async () => {
       'What should VibeCompass set up?',
       'How many repos belong to this logical project?',
       'Repo 1 id',
-      'Repo 1 remote',
+      'Repo 1 remote (blank for local folder)',
       'Repo 1 default branch',
       'Use primary-repo?',
       'Directory of the designated primary repo',
@@ -3180,7 +3403,7 @@ test('runCli guided init can adopt existing unmarked agent files after confirmat
     ['What should VibeCompass set up?', 'local-only'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
-    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 remote (blank for local folder)', 'https://github.com/example/app.git'],
     ['Repo 1 default branch', ''],
     ['Use primary-repo?', ''],
     ['Directory of the designated primary repo', '.'],
@@ -3540,7 +3763,7 @@ test('runCli guided init falls back to repo prompts when detected child repos ar
     [`Use detected Git repo in app (${detectedRemote})?`, 'no'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'manual'],
-    ['Repo 1 remote', manualRemote],
+    ['Repo 1 remote (blank for local folder)', manualRemote],
     ['Repo 1 default branch', ''],
     ['Use primary-repo?', ''],
     ['Directory of the designated primary repo', '.'],
@@ -3592,7 +3815,7 @@ test('runCli guided init falls back to repo prompts when detected child repos ar
     assertPromptsInclude(prompts, [
       'How many repos belong to this logical project?',
       'Repo 1 id',
-      'Repo 1 remote',
+      'Repo 1 remote (blank for local folder)',
       'Use primary-repo?',
       'Directory of the designated primary repo',
     ]);
@@ -3615,7 +3838,7 @@ test('runCli guided init defaults a single primary repo to the matching child di
     ['What should VibeCompass set up?', 'local-only'],
     ['How many repos belong to this logical project?', '1'],
     ['Repo 1 id', 'app'],
-    ['Repo 1 remote', 'https://github.com/example/app.git'],
+    ['Repo 1 remote (blank for local folder)', 'https://github.com/example/app.git'],
     ['Repo 1 default branch', ''],
     ['Use primary-repo?', ''],
     ['Directory of the designated primary repo', ''],
@@ -3664,7 +3887,7 @@ test('runCli guided init defaults a single primary repo to the matching child di
       'What should VibeCompass set up?',
       'How many repos belong to this logical project?',
       'Repo 1 id',
-      'Repo 1 remote',
+      'Repo 1 remote (blank for local folder)',
       'Repo 1 default branch',
       'Use primary-repo?',
       'Directory of the designated primary repo',

@@ -568,6 +568,11 @@ export function parseCliArgs(argv) {
         parsed.repos.push({ id, remote });
         break;
       }
+      case '--repo-local': {
+        const [id, repoPath] = splitAssignment(value, '--repo-local');
+        parsed.repos.push({ id, source: 'local', path: repoPath });
+        break;
+      }
       case '--repo-branch': {
         const [id, defaultBranch] = splitAssignment(value, '--repo-branch');
         parsed.repoBranches.set(id, defaultBranch);
@@ -1461,6 +1466,11 @@ function writeWarnings(io, warnings = []) {
 function splitAssignment(value, flagName) {
   const separatorIndex = value.indexOf('=');
   if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
+    if (flagName === '--repo' && separatorIndex > 0 && separatorIndex === value.length - 1) {
+      throw new Error(
+        '--repo remote resolved to empty. For a non-Git folder, use --repo-local <id=path> instead of --repo <id=remote>.',
+      );
+    }
     throw new Error(`${flagName} expects id=value.`);
   }
 
@@ -1495,7 +1505,8 @@ function usageText() {
     '  --placement <workspace-root|dedicated-memory-repo|primary-repo>',
     '                                        Optional explicit placement pattern',
     '  --guided                             Ask placement and setup questions interactively',
-    '  --repo <id=remote>                   Repeatable repo descriptor',
+    '  --repo <id=remote>                   Repeatable Git-backed repo descriptor',
+    '  --repo-local <id=path>               Repeatable local folder source for non-Git projects',
     '  --repo-branch <id=branch>            Optional per-repo default branch',
     '  --sync-api-url <url>                 Optional hosted sync api_url',
     '  --sync-project-id <id>               Optional hosted sync project_id',
