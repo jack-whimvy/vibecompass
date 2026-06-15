@@ -1,6 +1,6 @@
 {
   "name": "@vibecompass/vibecompass",
-  "version": "0.9.2",
+  "version": "0.10.1",
   "description": "Local-first project-memory core for VibeCompass",
   "type": "module",
   "bin": {

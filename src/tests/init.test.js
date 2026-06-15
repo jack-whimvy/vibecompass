@@ -7,6 +7,7 @@ import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { PACKAGE_VERSION } from '../version.js';
 import { scanProjectMemory } from '../project-memory.js';
+import { buildDocsReviewAnchorContext } from '../docs-review.js';
 import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
@@ -579,6 +580,169 @@ test('runCli sync-agents validates format arguments', async () => {
   }
 });
 
+test('buildDocsReviewAnchorContext summarizes prior docs project-map and coverage state', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-anchors-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Anchor Context',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(rootDir, 'architecture/web/platform'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'architecture/web/platform/app-router.md'),
+      [
+        '---',
+        'domain: Web',
+        'feature: Platform',
+        'component: App Router',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Existing web routing doc.',
+        '',
+        '## Review metadata',
+        '- Review provider: codex',
+        '- Review model/version: gpt-5',
+        '- Project mode: local-only',
+        '- Confidence: medium',
+        '- Coverage: partial',
+        '- Evidence: app:src/app/page.tsx',
+        '- Retrieval scope: load for web routing',
+        '- Token posture: compact',
+        '- Blindspots: API internals',
+        '',
+        '## Details',
+        'Details.',
+        '',
+        '## Retrieval guidance',
+        'Load for web routing.',
+        '',
+        '## Next steps',
+        '- Continue.',
+        '',
+        '## Involved files',
+        '- `app:src/app/page.tsx`',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'architecture/overview/project-shape.md'),
+      [
+        '---',
+        'status: In progress',
+        '---',
+        '',
+        '```vibecompass-project-map version=1',
+        '{',
+        '  "features": [',
+        '    { "domain": "Web", "feature": "Platform", "is_entry_point": true }',
+        '  ],',
+        '  "relationships": []',
+        '}',
+        '```',
+      ].join('\n'),
+      'utf8',
+    );
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'state/docs-review-coverage.json'),
+      `${JSON.stringify({
+        summary: 'Existing coverage',
+        area_count: 1,
+        coverage_score: 1,
+        statuses: { accepted: 1 },
+        areas: [
+          {
+            id: 'web-platform',
+            proposed_path: 'architecture/web/platform/app-router.md',
+            status: 'accepted',
+            coverage: 'partial',
+          },
+        ],
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    const anchors = await buildDocsReviewAnchorContext(rootDir);
+
+    assert.equal(anchors.architectureDocs.length, 1);
+    assert.equal(anchors.architectureDocs[0].path, 'architecture/web/platform/app-router.md');
+    assert.equal(anchors.architectureDocs[0].domain, 'Web');
+    assert.deepEqual(anchors.architectureDocs[0].repos, ['app']);
+    assert.deepEqual(anchors.projectMapFeatures, [
+      { domain: 'Web', feature: 'Platform', isEntryPoint: true },
+    ]);
+    assert.equal(anchors.projectMapRelationshipCount, 0);
+    assert.equal(anchors.coverage.summary, 'Existing coverage');
+    assert.equal(anchors.coverage.areas[0].id, 'web-platform');
+    assert.deepEqual(anchors.warnings, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review apply-output does not warn about missing anchors on first runs', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-first-run-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'First Run Anchors',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'state/docs-review.json'),
+      `${JSON.stringify({ status: 'local-review-generated', llm: 'codex', model: 'gpt-5' }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'state/docs-review-output.md'),
+      [
+        '```vibecompass-coverage-plan version=1',
+        '{',
+        '  "summary": "First run coverage",',
+        '  "areas": [',
+        '    {',
+        '      "id": "first-run-area",',
+        '      "status": "accepted",',
+        '      "coverage": "partial"',
+        '    }',
+        '  ]',
+        '}',
+        '```',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const stderr = [];
+    await runCli(
+      ['docs-review', '--root', rootDir, '--apply-output'],
+      {
+        stdout: { write() {} },
+        stderr: { write(chunk) { stderr.push(chunk); } },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const marker = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review.json'), 'utf8'));
+
+    assert.doesNotMatch(stderr.join(''), /missing_anchor_/);
+    assert.deepEqual(marker.applied.warnings ?? [], []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli docs-review performs mode-aware runtime preflight', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-review-'));
   const localOnlyRoot = path.join(tempDir, 'local-only');
@@ -654,6 +818,22 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                       '```vibecompass-coverage-plan version=1',
                       '{',
                       '  "summary": "Local runtime coverage",',
+                      '  "topology": "single-repo",',
+                      '  "taxonomy": {',
+                      '    "primary_axis": "domain-first",',
+                      '    "rationale": "Single package root keeps platform docs under product domains."',
+                      '  },',
+                      '  "completeness_inventory": [',
+                      '    {',
+                      '      "id": "docs-review-local-runtime",',
+                      '      "kind": "feature",',
+                      '      "label": "Local docs-review runtime",',
+                      '      "status": "accepted",',
+                      '      "coverage_area_ids": ["docs-review-local-runtime"],',
+                      '      "evidence": ["app:src/docs-review.js"],',
+                      '      "blindspots": []',
+                      '    }',
+                      '  ],',
                       '  "areas": [',
                       '    {',
                       '      "id": "docs-review-local-runtime",',
@@ -663,6 +843,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
                       '      "status": "accepted",',
                       '      "coverage": "partial",',
                       '      "proposed_path": "architecture/platform/docs-review/local-runtime.md",',
+                      '      "anchor_action": "new",',
+                      '      "anchor_reason": "No prior local-runtime doc existed.",',
                       '      "evidence": ["app:src/docs-review.js"],',
                       '      "blindspots": ["Hosted parser parity not inspected"]',
                       '    }',
@@ -723,17 +905,32 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localFetchCalls[0].request.headers['x-api-key'], 'anthropic_test');
     assert.equal(localBody.model, 'claude-sonnet-4-6');
     assert.equal(localBody.max_tokens, 20000);
+    assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v6/);
+    assert.match(localBody.messages[0].content, /Execution mode: single-turn \(emit accepted proposal output now\)/);
+    assert.match(localBody.messages[0].content, /there is no mid-review user approval turn/);
+    assert.match(localBody.messages[0].content, /output the machine-readable coverage-plan block in this response/);
+    assert.doesNotMatch(localBody.messages[0].content, /Ask for user acceptance before emitting fenced coverage-plan or architecture-doc blocks/);
     assert.match(localBody.messages[0].content, /Confidence: high \| medium \| low/);
     assert.match(localBody.messages[0].content, /Stage 1 — Evidence inventory/);
+    assert.match(localBody.messages[0].content, /## Re-review Anchors/);
+    assert.match(localBody.messages[0].content, /Required prior-doc classifications for Stage 2/);
+    assert.match(localBody.messages[0].content, /choose one primary taxonomy axis from topology evidence/i);
+    assert.match(localBody.messages[0].content, /anchor_action/);
+    assert.match(localBody.messages[0].content, /Core feature inventory/);
+    assert.match(localBody.messages[0].content, /Project systems map/);
+    assert.match(localBody.messages[0].content, /completeness_inventory/);
+    assert.match(localBody.messages[0].content, /Surface matrix/);
+    assert.match(localBody.messages[0].content, /"systems": \[/);
     assert.match(localBody.messages[0].content, /vibecompass-coverage-plan version=1/);
     assert.match(localBody.messages[0].content, /Accepted output file: .*state\/docs-review-output\.md/);
-    assert.match(localBody.messages[0].content, /Apply command after user acceptance: vibecompass docs-review --root .* --apply-output --output .*/);
+    assert.match(localBody.messages[0].content, /Apply command after acceptance: vibecompass docs-review --root .* --apply-output --output .*/);
+    assert.match(localBody.messages[0].content, /Do not claim docs-review is applied in this response/);
     assert.match(
       localBody.messages[0].content,
       new RegExp(`Apply command if the CLI is not installed on PATH: npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')}`),
     );
-    assert.match(localBody.messages[0].content, /no architecture docs have been applied yet/);
-    assert.match(localBody.messages[0].content, /Only report docs-review as applied after the apply command succeeds/);
+    assert.match(localBody.messages[0].content, /generated output still requires local apply or hosted proposal acceptance before it is canonical/);
+    assert.doesNotMatch(localBody.messages[0].content, /Only report docs-review as applied after the apply command succeeds/);
     assert.match(localBody.messages[0].content, /Soft size budget: keep each generated architecture doc under 12000 bytes/);
     assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
     assert.match(localStdout.join(''), /Local review output:/);
@@ -775,7 +972,22 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(appliedMarker.applied.coverage.coverage_score, 1);
     const coverageProjection = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review-coverage.json'), 'utf8'));
     assert.equal(coverageProjection.summary, 'Local runtime coverage');
+    assert.equal(coverageProjection.topology, 'single-repo');
+    assert.equal(coverageProjection.taxonomy.primary_axis, 'domain-first');
+    assert.equal(coverageProjection.inventory_count, 1);
+    assert.deepEqual(coverageProjection.inventory_statuses, { accepted: 1 });
+    assert.deepEqual(coverageProjection.completeness_inventory[0], {
+      id: 'docs-review-local-runtime',
+      kind: 'feature',
+      label: 'Local docs-review runtime',
+      status: 'accepted',
+      coverage_area_ids: ['docs-review-local-runtime'],
+      evidence: ['app:src/docs-review.js'],
+      blindspots: [],
+    });
     assert.equal(coverageProjection.areas[0].id, 'docs-review-local-runtime');
+    assert.equal(coverageProjection.areas[0].anchor_action, 'new');
+    assert.equal(coverageProjection.areas[0].anchor_reason, 'No prior local-runtime doc existed.');
 
     const overwriteStdout = [];
     await runCli(
@@ -849,6 +1061,92 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
 
     await writeFile(
       path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'generic-evidence-metadata.md'), 'utf8'),
+      'utf8',
+    );
+    const genericEvidenceStderr = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: { write() {} },
+        stderr: {
+          write(chunk) {
+            genericEvidenceStderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const genericEvidenceMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+    assert.match(genericEvidenceStderr.join(''), /generic_evidence_metadata: architecture\/platform\/docs-review\/generic-evidence\.md/);
+    assert.match(genericEvidenceMarker.applied.warnings[0], /generic_evidence_metadata/);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'missing-anchor-classification.md'), 'utf8'),
+      'utf8',
+    );
+    const missingAnchorStderr = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: { write() {} },
+        stderr: {
+          write(chunk) {
+            missingAnchorStderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const missingAnchorMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+    assert.match(missingAnchorStderr.join(''), /missing_anchor_action: coverage area "existing-doc-without-anchor"/);
+    assert.match(missingAnchorMarker.applied.warnings[0], /missing_anchor_action/);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      [
+        '```vibecompass-coverage-plan version=1',
+        '{',
+        '  "summary": "Modern plan without inventory",',
+        '  "topology": "single-repo",',
+        '  "taxonomy": {',
+        '    "primary_axis": "domain-first",',
+        '    "rationale": "Fixture exercises missing completeness inventory warnings."',
+        '  },',
+        '  "areas": [',
+        '    {',
+        '      "id": "docs-review-modern-plan",',
+        '      "status": "accepted",',
+        '      "coverage": "partial",',
+        '      "proposed_path": "architecture/platform/docs-review/modern-plan.md",',
+        '      "anchor_action": "new"',
+        '    }',
+        '  ]',
+        '}',
+        '```',
+      ].join('\n'),
+      'utf8',
+    );
+    const missingInventoryStderr = [];
+    await runCli(
+      ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+      {
+        stdout: { write() {} },
+        stderr: {
+          write(chunk) {
+            missingInventoryStderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir, env: {} },
+    );
+    const missingInventoryMarker = JSON.parse(await readFile(path.join(localOnlyRoot, 'state/docs-review.json'), 'utf8'));
+    assert.match(missingInventoryStderr.join(''), /missing_completeness_inventory/);
+    assert.match(missingInventoryMarker.applied.warnings[0], /missing_completeness_inventory/);
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
       await readFile(path.join(docsReviewFixtureDir, 'overview-status-only.md'), 'utf8'),
       'utf8',
     );
@@ -897,6 +1195,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(overviewProjectMapStdout.join(''), /architecture\/overview\/project-shape\.md \(overwritten\)/);
     assert.match(appliedOverviewProjectMap, /```vibecompass-project-map version=1/);
     assert.match(appliedOverviewProjectMap, /"is_entry_point": true/);
+    assert.match(appliedOverviewProjectMap, /"systems": \[/);
 
     await writeFile(
       path.join(localOnlyRoot, 'state/docs-review-output.md'),
@@ -982,6 +1281,48 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       /multiple coverage-plan blocks/,
     );
 
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-anchor-action.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Coverage plan area "invalid-anchor" has invalid anchor_action: rename/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-anchor-paths.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Coverage plan area "invalid-anchor-paths" has invalid anchor_paths entry/,
+    );
+
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-completeness-inventory.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Coverage plan completeness_inventory item "unknown-subsystem" references unknown coverage area id: missing-area/,
+    );
+
     await initializeProjectMemory({
       cwd: tempDir,
       rootDir: localPrimaryNoSyncRoot,
@@ -1022,6 +1363,64 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
         credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
       },
     });
+    await mkdir(path.join(localPrimaryRoot, 'architecture/web/platform'), { recursive: true });
+    await writeFile(
+      path.join(localPrimaryRoot, 'architecture/web/platform/app-router.md'),
+      [
+        '---',
+        'domain: Web',
+        'feature: Platform',
+        'component: App Router',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Existing app router docs.',
+        '',
+        '## Review metadata',
+        '- Review provider: codex',
+        '- Review model/version: gpt-5',
+        '- Project mode: local-primary',
+        '- Confidence: medium',
+        '- Coverage: partial',
+        '- Evidence: app:src/app/page.tsx',
+        '- Retrieval scope: load for app router work',
+        '- Token posture: compact',
+        '- Blindspots: API internals',
+        '',
+        '## Details',
+        'Details.',
+        '',
+        '## Retrieval guidance',
+        'Load for app router work.',
+        '',
+        '## Next steps',
+        '- Continue.',
+        '',
+        '## Involved files',
+        '- `app:src/app/page.tsx`',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(localPrimaryRoot, 'state/docs-review-coverage.json'),
+      `${JSON.stringify({
+        summary: 'Prior coverage',
+        area_count: 1,
+        coverage_score: 1,
+        statuses: { accepted: 1 },
+        areas: [
+          {
+            id: 'web-platform',
+            proposed_path: 'architecture/web/platform/app-router.md',
+            status: 'accepted',
+            coverage: 'partial',
+          },
+        ],
+      }, null, 2)}\n`,
+      'utf8',
+    );
 
     const exitCode = await runCli(
       ['docs-review', '--root', localPrimaryRoot, '--guided'],
@@ -1057,10 +1456,20 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
-    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v3/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v6/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
+    assert.match(stdout.join(''), /Execution mode: interactive \(stop at coverage-plan approval gate\)/);
+    assert.match(stdout.join(''), /## Re-review Anchors/);
+    assert.match(stdout.join(''), /architecture\/web\/platform\/app-router\.md -> Web \/ Platform \/ App Router/);
+    assert.match(stdout.join(''), /Existing coverage projection: 1 areas, 100% accepted/);
+    assert.match(stdout.join(''), /topology and chosen taxonomy axis/);
+    assert.match(stdout.join(''), /coverage\/quality report/);
+    assert.match(stdout.join(''), /backbone outputs/i);
+    assert.match(stdout.join(''), /systems\[\]/);
+    assert.match(stdout.join(''), /Do not label proposed areas `accepted`/);
+    assert.match(stdout.join(''), /do not output the machine-readable fence below yet/);
     assert.match(stdout.join(''), /Accepted output file: .*state\/docs-review-output\.md/);
     assert.match(stdout.join(''), /Apply command after user acceptance: vibecompass docs-review --root .* --apply-output --output .*/);
     assert.match(
@@ -1116,8 +1525,14 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(hostedBody.local_root_revision, /^loc_[a-f0-9]{24}$/);
     assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
     assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
-    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v3/);
-    assert.match(hostedBody.prompt, /Only include accepted coverage, architecture, and decision-recommendation blocks/);
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v6/);
+    assert.match(hostedBody.prompt, /Execution mode: single-turn \(emit accepted proposal output now\)/);
+    assert.match(hostedBody.prompt, /there is no mid-review user approval turn/);
+    assert.match(hostedBody.prompt, /generated output is not canonical until accepted and applied/);
+    assert.doesNotMatch(hostedBody.prompt, /Ask for user acceptance before emitting fenced coverage-plan or architecture-doc blocks/);
+    assert.match(hostedBody.prompt, /`reuse`: keep path\/frontmatter identity/);
+    assert.match(hostedBody.prompt, /taxonomy/);
+    assert.match(hostedBody.prompt, /systems\[\]/);
     assert.match(hostedBody.prompt, /project\/system map/);
     assert.match(hostedStdout.join(''), /Docs-review: hosted-review-requested/);
     assert.match(hostedStdout.join(''), /Hosted run: run_docs_review_123/);
@@ -1326,6 +1741,7 @@ test('docs-review rebuild previews and archives scoped architecture docs', async
     assert.match(previewOutput, /Rebuild scope: architecture\/web/);
     assert.match(previewOutput, /Architecture docs: 1/);
     assert.match(previewOutput, /architecture\/web\/features\/trips\.md \(keep\)/);
+    assert.match(previewOutput, /anchor to the prior tree and reconcile taxonomy/);
     assert.doesNotMatch(previewOutput, /Recorded .*docs-review\.json/);
     await access(path.join(rootDir, 'architecture/web/features/trips.md'));
 
@@ -1360,6 +1776,7 @@ test('docs-review rebuild previews and archives scoped architecture docs', async
     assert.equal(marker.status, 'rebuild-ready');
     assert.equal(marker.rebuild.scope_path, 'architecture/web');
     assert.equal(marker.rebuild.stale_policy, 'archive');
+    assert.equal(marker.rebuild.anchor_reconcile_required, true);
     assert.equal(marker.rebuild.architecture_doc_count, 1);
     assert.equal(marker.rebuild.architecture_docs[0].path, 'architecture/web/features/trips.md');
     await assert.rejects(
@@ -4295,7 +4712,23 @@ test('docs-review apply-output projects coverage and appends local decision reco
     assert.match(stdout.join(''), /Applied decision recommendations: 1/);
     assert.equal(coverage.area_count, 2);
     assert.equal(coverage.coverage_score, 0.5);
+    assert.equal(coverage.topology, 'single-repo');
+    assert.equal(coverage.taxonomy.primary_axis, 'domain-first');
+    assert.equal(coverage.inventory_count, 2);
+    assert.deepEqual(coverage.inventory_statuses, { accepted: 1, missing: 1 });
+    assert.deepEqual(coverage.completeness_inventory[1], {
+      id: 'agent-file-audit',
+      kind: 'feature',
+      label: 'Agent file audit',
+      status: 'missing',
+      coverage_area_ids: ['agent-audit'],
+      evidence: [],
+      blindspots: ['Deferred to sync-agents audit'],
+    });
     assert.deepEqual(coverage.statuses, { accepted: 1, missing: 1 });
+    assert.equal(coverage.areas[0].anchor_action, 'update');
+    assert.deepEqual(coverage.areas[0].anchor_paths, ['architecture/platform/docs-review/local-artifacts.md']);
+    assert.equal(coverage.areas[1].anchor_action, 'new');
     assert.match(decisions, /### D-125 — Coverage plans are projected locally/);
     assert.match(index, /D-125 \| Coverage plans are projected locally/);
     assert.equal(marker.applied.coverage.area_count, 2);

@@ -28,6 +28,19 @@ Project shape with an accepted journey map.
       "kind": "navigates_to",
       "label": "After setup, users enter the dashboard."
     }
+  ],
+  "systems": [
+    {
+      "id": "web-app",
+      "name": "Web app",
+      "kind": "frontend",
+      "repos": ["app"],
+      "summary": "Browser-facing application surface.",
+      "owns_features": [
+        { "domain": "Product", "feature": "Onboarding" },
+        { "domain": "Product", "feature": "Dashboard" }
+      ]
+    }
   ]
 }
 ```

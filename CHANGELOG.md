@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.10.1 - 2026-06-14
+
+- Add completeness-inventory guidance to docs-review so coverage plans account for accepted, deferred, and missing subsystems instead of silently omitting large areas.
+- Score accepted coverage against the optional completeness inventory denominator when present, with a backwards-compatible fallback for older coverage plans.
+- Add soft parser warnings for modern coverage plans that omit completeness inventory or under-explain accepted/deferred/missing inventory items.
+- Add prose-only surface matrix guidance for feature docs while keeping `systems[]` as derived overview metadata rather than a second projected graph.
+
+## 0.10.0 - 2026-06-14
+
+- Make docs-review prompts mode-aware: interactive AI sessions stop at the coverage-plan approval gate, while `--run-local` and hosted single-turn runs emit fenced proposal material for later apply/proposal review.
+- Clarify that pre-approval coverage plans are proposed scope, not accepted output, so agents should not label proposed areas `accepted` before user approval.
+- Add docs-review Stage 0 quality guidance: topology-aware taxonomy rules, re-review anchoring, prior-doc reuse/update/split/merge/defer/replace classifications, and concrete evidence requirements.
+- Preserve optional topology, taxonomy, and anchor classification fields in accepted coverage-plan projections.
+- Surface quality warnings for architecture docs that keep generic evidence metadata instead of concrete repo:path references.
+- Add Stage 1 backbone guidance for topology, core feature inventory, user journey map, project systems map, coverage/quality summary, and minimal optional derived project-map `systems[]` metadata.
+- Update generated docs-review workflow guidance and prompt regression coverage for the interactive vs single-turn split, Stage 0 anchoring contract, and Stage 1 backbone outputs.
+
 ## 0.9.2 - 2026-06-14
 
 - Clarify docs-review acceptance gates so agents state when no architecture docs have been applied yet and only report completion after apply succeeds.

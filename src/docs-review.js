@@ -4,16 +4,19 @@ import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
 import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
+import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
 
-const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v3';
+const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v6';
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
 const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
 const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
+const ANCHOR_ACTIONS = new Set(['reuse', 'update', 'split', 'merge', 'defer', 'replace', 'new']);
 const REBUILD_STALE_POLICIES = new Set(['keep', 'archive']);
+const PROJECT_MAP_PATH = 'architecture/overview/project-shape.md';
 
 export async function preflightDocsReview(options = {}, environment = {}) {
   validateDocsReviewMode(options);
@@ -79,6 +82,9 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     : normalizeReviewConfig(options);
   const env = environment.env ?? process.env;
   const localProvider = resolveLocalProvider(options);
+  const promptExecutionMode = options.submitHosted || shouldRunLocal(options)
+    ? 'single-turn'
+    : 'interactive';
   const runtime = resolveDocsReviewRuntime(project, {
     env,
     guided: Boolean(options.guided),
@@ -92,6 +98,8 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     rootDir,
     llm: reviewConfig.llm,
     model: reviewConfig.model,
+    executionMode: promptExecutionMode,
+    anchors: await buildDocsReviewAnchorContext(rootDir),
   });
 
   const status = options.submitHosted
@@ -238,8 +246,10 @@ async function applyDocsReviewOutput(options) {
     outputPath,
     outputHash: sha256Text(source),
   });
+  const anchorContext = coverageProjection ? await buildDocsReviewAnchorContext(options.rootDir) : null;
   const decisionRecommendations = validateDecisionRecommendationBlocks(decisionRecommendationBlocks);
   const warnings = [
+    ...createCoveragePlanQualityWarnings(coverageProjection, anchorContext),
     ...createArchitectureDocSizeWarnings(blocks),
     ...createArchitectureDocQualityWarnings(blocks),
   ];
@@ -444,12 +454,13 @@ async function rebuildDocsReview(options) {
       rebuild: {
         scope_path: scopePath,
         stale_policy: stalePolicy,
+        anchor_reconcile_required: true,
         architecture_docs: rebuildEntries,
         architecture_doc_count: rebuildEntries.length,
         archive_root: archiveRoot,
       },
       warnings: [],
-      message: 'Docs-review rebuild preview complete. Re-run with --apply to record the rebuild marker and perform the selected stale-doc action.',
+      message: 'Docs-review rebuild preview complete. Re-run with --apply to record the rebuild marker and perform the selected stale-doc action. The next docs-review run must anchor to the prior tree and reconcile taxonomy changes instead of cold-regenerating from a blank slate.',
     };
   }
 
@@ -475,6 +486,7 @@ async function rebuildDocsReview(options) {
     rebuild: {
       scope_path: scopePath,
       stale_policy: stalePolicy,
+      anchor_reconcile_required: true,
       architecture_docs: rebuildEntries,
       architecture_doc_count: rebuildEntries.length,
       ...(archiveRoot ? { archive_root: path.join(options.rootDir, archiveRoot) } : {}),
@@ -497,8 +509,8 @@ async function rebuildDocsReview(options) {
     rebuild: marker.rebuild,
     warnings: [],
     message: stalePolicy === 'archive'
-      ? 'Archived selected architecture docs and recorded a rebuild marker. Run docs-review again, then apply accepted output.'
-      : 'Recorded a rebuild marker without moving architecture docs. Run docs-review again, then apply accepted output.',
+      ? 'Archived selected architecture docs and recorded a rebuild marker. Run docs-review again; the next coverage plan must reconcile against the prior tree and explain reuse/update/split/merge/defer/replace actions.'
+      : 'Recorded a rebuild marker without moving architecture docs. Run docs-review again; the next coverage plan must reconcile against the prior tree and explain reuse/update/split/merge/defer/replace actions.',
   };
 }
 
@@ -909,10 +921,12 @@ function buildCoverageProjection(blocks, options) {
 
   const ids = new Set();
   const areas = plan.areas.map((area, index) => normalizeCoverageArea(area, index, ids));
+  const areaById = new Map(areas.map((area) => [area.id, area]));
+  const hasCompletenessInventory = Object.prototype.hasOwnProperty.call(plan, 'completeness_inventory');
+  const completenessInventory = normalizeCompletenessInventory(plan.completeness_inventory, areaById);
   const statuses = countBy(areas, 'status');
   const coverage_levels = countBy(areas, 'coverage');
-  const denominator = areas.length;
-  const acceptedCount = statuses.accepted ?? 0;
+  const inventory_statuses = countBy(completenessInventory, 'status');
 
   return {
     version: COVERAGE_PLAN_OUTPUT_VERSION,
@@ -922,11 +936,96 @@ function buildCoverageProjection(blocks, options) {
     },
     projected_at: new Date().toISOString(),
     summary: normalizeOptionalString(plan.summary),
+    ...(normalizeOptionalString(plan.topology) ? { topology: normalizeOptionalString(plan.topology) } : {}),
+    ...(normalizeCoverageTaxonomy(plan.taxonomy) ? { taxonomy: normalizeCoverageTaxonomy(plan.taxonomy) } : {}),
     area_count: areas.length,
-    coverage_score: denominator === 0 ? null : Number((acceptedCount / denominator).toFixed(4)),
+    ...(hasCompletenessInventory ? {
+      completeness_inventory: completenessInventory,
+      inventory_count: completenessInventory.length,
+      inventory_statuses,
+    } : {}),
+    coverage_score: calculateCoverageScore({ areas, statuses, completenessInventory, hasCompletenessInventory }),
     statuses,
     coverage_levels,
     areas,
+  };
+}
+
+function calculateCoverageScore({ areas, statuses, completenessInventory, hasCompletenessInventory }) {
+  if (hasCompletenessInventory) {
+    const denominator = completenessInventory.length;
+    const acceptedCount = completenessInventory.filter((item) => item.status === 'accepted').length;
+    return denominator === 0 ? null : Number((acceptedCount / denominator).toFixed(4));
+  }
+
+  const denominator = areas.length;
+  const acceptedCount = statuses.accepted ?? 0;
+  return denominator === 0 ? null : Number((acceptedCount / denominator).toFixed(4));
+}
+
+function normalizeCoverageTaxonomy(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const primaryAxis = normalizeOptionalString(value.primary_axis);
+  const rationale = normalizeOptionalString(value.rationale);
+  if (!primaryAxis && !rationale) {
+    return null;
+  }
+
+  return {
+    ...(primaryAxis ? { primary_axis: primaryAxis } : {}),
+    ...(rationale ? { rationale } : {}),
+  };
+}
+
+function normalizeCompletenessInventory(value, areaById) {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error('Coverage plan completeness_inventory must be an array when present.');
+  }
+
+  const ids = new Set();
+  return value.map((item, index) => normalizeCompletenessInventoryItem(item, index, ids, areaById));
+}
+
+function normalizeCompletenessInventoryItem(item, index, ids, areaById) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error(`Coverage plan completeness_inventory item at index ${index} must be an object.`);
+  }
+
+  const id = normalizeOptionalString(item.id);
+  if (!id) {
+    throw new Error(`Coverage plan completeness_inventory item at index ${index} requires non-empty "id".`);
+  }
+  if (ids.has(id)) {
+    throw new Error(`Coverage plan completeness_inventory contains duplicate item id: ${id}`);
+  }
+  ids.add(id);
+
+  const status = normalizeOptionalString(item.status);
+  if (!COVERAGE_PLAN_STATUSES.has(status)) {
+    throw new Error(`Coverage plan completeness_inventory item "${id}" requires status to be accepted, deferred, or missing.`);
+  }
+
+  const coverageAreaIds = normalizeStringArray(item.coverage_area_ids);
+  for (const areaId of coverageAreaIds) {
+    if (!areaById.has(areaId)) {
+      throw new Error(`Coverage plan completeness_inventory item "${id}" references unknown coverage area id: ${areaId}`);
+    }
+  }
+
+  return {
+    id,
+    ...(normalizeOptionalString(item.kind) ? { kind: normalizeOptionalString(item.kind) } : {}),
+    ...(normalizeOptionalString(item.label) ? { label: normalizeOptionalString(item.label) } : {}),
+    status,
+    ...(coverageAreaIds.length > 0 ? { coverage_area_ids: coverageAreaIds } : {}),
+    evidence: normalizeStringArray(item.evidence),
+    blindspots: normalizeStringArray(item.blindspots),
   };
 }
 
@@ -967,6 +1066,22 @@ function normalizeCoverageArea(area, index, ids) {
     }
   }
 
+  const anchorAction = normalizeOptionalString(area.anchor_action);
+  if (anchorAction && !ANCHOR_ACTIONS.has(anchorAction)) {
+    throw new Error(`Coverage plan area "${id}" has invalid anchor_action: ${anchorAction}`);
+  }
+  const anchorPaths = normalizeStringArray(area.anchor_paths).map(normalizeBlockPath);
+  for (const anchorPath of anchorPaths) {
+    if (
+      !anchorPath.startsWith('architecture/') ||
+      !anchorPath.endsWith('.md') ||
+      path.posix.isAbsolute(anchorPath) ||
+      anchorPath.split('/').includes('..')
+    ) {
+      throw new Error(`Coverage plan area "${id}" has invalid anchor_paths entry: ${anchorPath}`);
+    }
+  }
+
   return {
     id,
     domain: normalizeOptionalString(area.domain),
@@ -978,6 +1093,9 @@ function normalizeCoverageArea(area, index, ids) {
     evidence: normalizeStringArray(area.evidence),
     blindspots: normalizeStringArray(area.blindspots),
     ...(normalizeOptionalString(area.reason) ? { reason: normalizeOptionalString(area.reason) } : {}),
+    ...(anchorAction ? { anchor_action: anchorAction } : {}),
+    ...(normalizeOptionalString(area.anchor_reason) ? { anchor_reason: normalizeOptionalString(area.anchor_reason) } : {}),
+    ...(anchorPaths.length > 0 ? { anchor_paths: anchorPaths } : {}),
   };
 }
 
@@ -1055,6 +1173,8 @@ function createArchitectureDocQualityWarnings(blocks) {
     }
     if (!/^\s*-\s*Evidence:\s+\S/im.test(body)) {
       warnings.push(`missing_evidence_metadata: ${block.path} is missing review metadata "Evidence".`);
+    } else if (/^\s*-\s*Evidence:\s*repo:path references inspected before making implementation claims\s*$/im.test(body)) {
+      warnings.push(`generic_evidence_metadata: ${block.path} uses generic evidence text; list concrete repo:path references instead.`);
     }
     if (!/^\s*-\s*Blindspots:\s+\S/im.test(body)) {
       warnings.push(`missing_blindspots_metadata: ${block.path} is missing review metadata "Blindspots".`);
@@ -1071,6 +1191,51 @@ function createArchitectureDocQualityWarnings(blocks) {
       data.repos === undefined
     ) {
       warnings.push(`missing_repo_scope: ${block.path} should declare repo or repos in frontmatter when implementation-scoped.`);
+    }
+  }
+
+  return warnings;
+}
+
+function createCoveragePlanQualityWarnings(coverageProjection, anchors) {
+  if (!coverageProjection) {
+    return [];
+  }
+
+  const warnings = [];
+  const hasModernCoverageMetadata = Boolean(coverageProjection.topology || coverageProjection.taxonomy);
+  const hasCompletenessInventory = Array.isArray(coverageProjection.completeness_inventory);
+  if (hasModernCoverageMetadata && !hasCompletenessInventory) {
+    warnings.push('missing_completeness_inventory: coverage plan should enumerate discovered subsystems so deferred or missing areas cannot be silently omitted.');
+  } else if (hasCompletenessInventory) {
+    for (const item of coverageProjection.completeness_inventory) {
+      if (item.status === 'accepted' && (!Array.isArray(item.coverage_area_ids) || item.coverage_area_ids.length === 0)) {
+        warnings.push(`accepted_inventory_without_area: completeness_inventory item "${item.id}" is accepted but does not reference coverage_area_ids.`);
+      }
+      if (item.status !== 'accepted' && (!Array.isArray(item.blindspots) || item.blindspots.length === 0)) {
+        warnings.push(`incomplete_inventory_blindspot: completeness_inventory item "${item.id}" is ${item.status} but does not explain the gap in blindspots.`);
+      }
+    }
+  }
+
+  const hasPriorAnchors =
+    (anchors?.architectureDocs?.length ?? 0) > 0 ||
+    (anchors?.projectMapFeatures?.length ?? 0) > 0 ||
+    Boolean(anchors?.coverage);
+  if (!hasPriorAnchors) {
+    return warnings;
+  }
+
+  for (const area of coverageProjection.areas) {
+    if (!area.anchor_action) {
+      warnings.push(`missing_anchor_action: coverage area "${area.id}" should classify prior docs or project-map identities when re-review anchors exist.`);
+      continue;
+    }
+    if (['split', 'merge', 'replace'].includes(area.anchor_action) && !area.anchor_reason) {
+      warnings.push(`missing_anchor_reason: coverage area "${area.id}" uses anchor_action "${area.anchor_action}" without an evidence-backed anchor_reason.`);
+    }
+    if (area.anchor_action !== 'new' && (!Array.isArray(area.anchor_paths) || area.anchor_paths.length === 0)) {
+      warnings.push(`missing_anchor_paths: coverage area "${area.id}" uses anchor_action "${area.anchor_action}" without anchor_paths.`);
     }
   }
 
@@ -1683,10 +1848,237 @@ function renderApplyOutputMessage(options) {
   return `Applied ${parts.length > 0 ? parts.join(', ') : 'accepted docs-review output'} and completed the docs-review marker.`;
 }
 
+export async function buildDocsReviewAnchorContext(rootDir) {
+  const context = {
+    architectureDocs: [],
+    projectMapFeatures: [],
+    projectMapRelationshipCount: 0,
+    coverage: null,
+    warnings: [],
+  };
+
+  try {
+    const scanned = await scanProjectMemory(rootDir);
+    context.architectureDocs = scanned.documents
+      .filter((document) => document.kind === 'architecture' && document.path !== PROJECT_MAP_PATH && document.extracted)
+      .map((document) => ({
+        path: document.path,
+        domain: document.extracted.domain,
+        feature: document.extracted.feature,
+        component: document.extracted.component,
+        status: document.extracted.status,
+        repos: document.extracted.repo_ids ?? [],
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+
+    if (scanned.errors.length > 0) {
+      context.warnings.push(`${scanned.errors.length} project-memory parse error(s) found while building anchors; inspect status before trusting prior docs.`);
+    }
+  } catch (error) {
+    context.warnings.push(`Could not scan existing project memory for anchors: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  try {
+    const projectMap = await readProjectMapAnchor(rootDir);
+    context.projectMapFeatures = projectMap.features;
+    context.projectMapRelationshipCount = projectMap.relationshipCount;
+  } catch (error) {
+    context.warnings.push(`Could not read existing project-map anchors: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  try {
+    context.coverage = await readCoverageAnchor(rootDir);
+  } catch (error) {
+    context.warnings.push(`Could not read docs-review coverage anchors: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return context;
+}
+
+async function readProjectMapAnchor(rootDir) {
+  const projectShapePath = path.join(rootDir, PROJECT_MAP_PATH);
+  let content;
+  try {
+    content = await readFile(projectShapePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return { features: [], relationshipCount: 0 };
+    }
+    throw error;
+  }
+
+  const match = content.match(/^```vibecompass-project-map\s+version=1\s*\n([\s\S]*?)^```[ \t]*$/m);
+  if (!match) {
+    return { features: [], relationshipCount: 0 };
+  }
+
+  const parsed = JSON.parse(match[1]);
+  const features = Array.isArray(parsed.features)
+    ? parsed.features
+      .map((feature) => ({
+        domain: normalizeOptionalString(feature?.domain),
+        feature: normalizeOptionalString(feature?.feature),
+        isEntryPoint: Boolean(feature?.is_entry_point),
+      }))
+      .filter((feature) => feature.domain && feature.feature)
+    : [];
+
+  return {
+    features,
+    relationshipCount: Array.isArray(parsed.relationships) ? parsed.relationships.length : 0,
+  };
+}
+
+async function readCoverageAnchor(rootDir) {
+  const coveragePath = path.join(rootDir, 'state', 'docs-review-coverage.json');
+  let content;
+  try {
+    content = await readFile(coveragePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+
+  const parsed = JSON.parse(content);
+  return {
+    summary: normalizeOptionalString(parsed.summary),
+    areaCount: Number.isInteger(parsed.area_count) ? parsed.area_count : null,
+    coverageScore: typeof parsed.coverage_score === 'number' ? parsed.coverage_score : null,
+    statuses: parsed.statuses && typeof parsed.statuses === 'object' && !Array.isArray(parsed.statuses)
+      ? parsed.statuses
+      : null,
+    areas: Array.isArray(parsed.areas)
+      ? parsed.areas
+        .map((area) => ({
+          id: normalizeOptionalString(area?.id),
+          path: normalizeOptionalString(area?.proposed_path),
+          status: normalizeOptionalString(area?.status),
+          coverage: normalizeOptionalString(area?.coverage),
+        }))
+        .filter((area) => area.id)
+      : [],
+  };
+}
+
+function renderAnchorContext(anchors) {
+  const lines = [
+    '## Re-review Anchors',
+    'Use these anchors to prevent taxonomy churn. Reuse prior slugs and doc identities when current evidence still supports them.',
+    'If you propose a taxonomy change, explain the evidence and classify the prior doc/slug action before writing prose.',
+    '',
+    'Required prior-doc classifications for Stage 2:',
+    '- `reuse`: keep path/frontmatter identity and update only if needed',
+    '- `update`: keep path/frontmatter identity but refresh content or coverage',
+    '- `split`: replace one broad prior doc with multiple focused docs',
+    '- `merge`: combine overlapping prior docs',
+    '- `defer`: leave prior area documented but out of the accepted generation scope',
+    '- `replace`: rename or move only when evidence strongly justifies it',
+    '- `new`: add a new area not represented by the prior tree',
+    '',
+  ];
+
+  if (anchors?.warnings?.length > 0) {
+    lines.push('Anchor warnings:');
+    for (const warning of anchors.warnings) {
+      lines.push(`- ${warning}`);
+    }
+    lines.push('');
+  }
+
+  if (anchors?.architectureDocs?.length > 0) {
+    lines.push(`Existing architecture docs (${anchors.architectureDocs.length}):`);
+    for (const doc of anchors.architectureDocs.slice(0, 40)) {
+      const identity = [doc.domain, doc.feature, doc.component].filter(Boolean).join(' / ');
+      const repos = doc.repos.length > 0 ? ` repos=${doc.repos.join(',')}` : '';
+      lines.push(`- ${doc.path} -> ${identity || 'unmapped'}; status=${doc.status ?? 'unknown'}${repos}`);
+    }
+    if (anchors.architectureDocs.length > 40) {
+      lines.push(`- ... ${anchors.architectureDocs.length - 40} additional architecture docs omitted from prompt anchor summary; still classify broad prior taxonomy before changing it.`);
+    }
+  } else {
+    lines.push('Existing architecture docs: none beyond the starter overview or none readable.');
+  }
+  lines.push('');
+
+  if (anchors?.projectMapFeatures?.length > 0) {
+    lines.push(`Existing project-map feature identities (${anchors.projectMapFeatures.length}; relationships=${anchors.projectMapRelationshipCount}):`);
+    for (const feature of anchors.projectMapFeatures.slice(0, 40)) {
+      lines.push(`- ${feature.domain} / ${feature.feature}${feature.isEntryPoint ? ' (entry point)' : ''}`);
+    }
+    if (anchors.projectMapFeatures.length > 40) {
+      lines.push(`- ... ${anchors.projectMapFeatures.length - 40} additional project-map features omitted from prompt anchor summary.`);
+    }
+  } else {
+    lines.push('Existing project-map feature identities: none found.');
+  }
+  lines.push('');
+
+  if (anchors?.coverage) {
+    const score = typeof anchors.coverage.coverageScore === 'number'
+      ? `${Math.round(anchors.coverage.coverageScore * 100)}% accepted`
+      : 'unscored';
+    lines.push(`Existing coverage projection: ${anchors.coverage.areaCount ?? anchors.coverage.areas.length} areas, ${score}.`);
+    if (anchors.coverage.summary) {
+      lines.push(`Coverage summary: ${anchors.coverage.summary}`);
+    }
+    for (const area of anchors.coverage.areas.slice(0, 20)) {
+      lines.push(`- ${area.id}: ${area.status || 'unknown'} / ${area.coverage || 'unknown'}${area.path ? ` -> ${area.path}` : ''}`);
+    }
+  } else {
+    lines.push('Existing coverage projection: none found.');
+  }
+
+  return lines.join('\n');
+}
+
 function renderReviewPrompt(options) {
   const outputPath = path.join(options.rootDir, 'state', 'docs-review-output.md');
   const applyCommand = `vibecompass docs-review --root ${shellQuote(options.rootDir)} --apply-output --output ${shellQuote(outputPath)}`;
   const npxApplyCommand = `npx -y @vibecompass/vibecompass@${PACKAGE_VERSION} docs-review --root ${shellQuote(options.rootDir)} --apply-output --output ${shellQuote(outputPath)}`;
+  const isSingleTurn = options.executionMode === 'single-turn';
+  const coveragePlanStageLines = isSingleTurn
+    ? [
+      '- This is a single-turn execution mode: there is no mid-review user approval turn.',
+      '- Treat the coverage plan you emit in this response as accepted proposal material, then emit the planned `vibecompass-coverage-plan`, architecture-doc, and decision-recommendation fences in the same response.',
+      '- Human review happens later at the local apply-output step or hosted proposal surface; generated output is not canonical until accepted and applied.',
+    ]
+    : [
+      '- Before user approval, present the coverage plan as human-readable proposed scope. Do not label proposed areas `accepted` and do not emit the `vibecompass-coverage-plan` fence yet.',
+      '- Ask for user acceptance before emitting fenced coverage-plan or architecture-doc blocks. When you stop for acceptance, state plainly that no architecture docs have been applied yet.',
+      '- After approval, emit the accepted plan as one `vibecompass-coverage-plan version=1` JSON fence before architecture-doc blocks.',
+    ];
+  const outputContractIntroLines = isSingleTurn
+    ? [
+      'Because this is a single-turn execution mode, output the machine-readable coverage-plan block in this response before architecture-doc blocks.',
+    ]
+    : [
+      'If you are stopping for user approval, do not output the machine-readable fence below yet; show the plan as proposed scope and ask the user to approve or revise it.',
+      '',
+      'After the user accepts the plan, output one machine-readable coverage-plan block for the accepted plan:',
+    ];
+  const stage4WriteLine = isSingleTurn
+    ? `- The package will save the model response to \`${outputPath}\`; local users or hosted proposal reviewers decide what becomes canonical later.`
+    : `- After the user accepts Stage 2, write the complete accepted fenced output verbatim to \`${outputPath}\`.`;
+  const applyCommandLabel = isSingleTurn ? 'Apply command after acceptance' : 'Apply command after user acceptance';
+  const stage4ApplyLines = isSingleTurn
+    ? [
+      '- Do not claim docs-review is applied in this response; generated output is proposal material until local apply or hosted proposal acceptance succeeds.',
+      `- Local apply command after acceptance: \`${applyCommand}\`.`,
+      `- If \`vibecompass\` is not installed on PATH, the local user can run \`${npxApplyCommand}\` instead.`,
+    ]
+    : [
+      `- Then run \`${applyCommand}\` to validate and apply the accepted blocks.`,
+      `- If \`vibecompass\` is not installed on PATH, run \`${npxApplyCommand}\` instead.`,
+      '- Only report docs-review as applied after the apply command succeeds. Surface any parser warnings, especially oversized docs, so the user can decide whether to compact or accept the output.',
+    ];
+  const finalOutputLine = isSingleTurn
+    ? `Only include accepted proposal-material blocks for coverage, architecture, and decision recommendations. The package or hosted worker saves the response to \`${outputPath}\`; report that generated output still requires local apply or hosted proposal acceptance before it is canonical.`
+    : `Only include accepted coverage, architecture, and decision-recommendation blocks. After user acceptance, save the final accepted output to \`${outputPath}\`, run \`${applyCommand}\` or \`${npxApplyCommand}\`, and report applied paths plus parser warnings.`;
+  const architectureDocBlockIntro = isSingleTurn
+    ? 'Then, for each planned architecture doc in this single-turn response, output one fenced block exactly like this:'
+    : 'Then, for each architecture doc the user accepts, output one fenced block exactly like this:';
 
   return [
     `# ${DOCS_REVIEW_PROMPT_VERSION}`,
@@ -1699,8 +2091,9 @@ function renderReviewPrompt(options) {
     `- Project mode: ${options.project.mode}`,
     `- Review provider to record: ${options.llm}`,
     `- Review model/version to record: ${options.model}`,
+    `- Execution mode: ${isSingleTurn ? 'single-turn (emit accepted proposal output now)' : 'interactive (stop at coverage-plan approval gate)'}`,
     `- Accepted output file: ${outputPath}`,
-    `- Apply command after user acceptance: ${applyCommand}`,
+    `- ${applyCommandLabel}: ${applyCommand}`,
     `- Apply command if the CLI is not installed on PATH: ${npxApplyCommand}`,
     '',
     '## Required Inputs',
@@ -1709,39 +2102,50 @@ function renderReviewPrompt(options) {
     '3. Read all canonical files under `architecture/`, `decisions/`, and finalized `sessions/`.',
     '4. Inspect declared repositories before making implementation claims.',
     '',
+    renderAnchorContext(options.anchors),
+    '',
     '## Staged Review Protocol',
     'Stage 1 — Evidence inventory:',
     '- Build a compact repo inventory from file paths, manifests/config files, route/job/test directories, and existing architecture frontmatter before reading large file bodies.',
+    '- Identify the project topology before choosing docs: single-repo/monolith, multi-repo, multi-surface, package/CLI, workers/services, mobile app, or mixed. State the topology in the coverage plan.',
+    '- Build a completeness inventory of discovered apps/repos, routes/screens, API endpoints, tables/storage, jobs/cron/tasks, auth/session flows, external integrations, platform surfaces, and product features. Keep it subsystem-level, not a raw file dump.',
     '- Mine finalized session notes for decision candidates and product constraints, but cap proposed decisions to the five highest-value architecture choices.',
     '- Identify candidate domains, features, components, ownership boundaries, user journey entry points, feature-to-feature relationships, and system-layer connections with concrete `repo:path` evidence.',
+    '- Separate product features from runtime surfaces. Web, mobile, backend/API, database/storage, jobs, external integrations, and deployment/runtime are surfaces or systems that participate in features; do not treat them as competing feature categories unless the project itself is a platform/tooling project.',
     '- Do not fetch or summarize broad source bodies until the coverage plan says a file is needed.',
     '',
     'Stage 2 — Coverage plan:',
     '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
     '- The minimum useful set must cover: user journey, project/system map (frontend/backend/API/data/integration structure and connections), and summaries of the core journey-facing features.',
     '- Prioritize entry points, user-flow/gating relationships, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
+    '- Account for each completeness-inventory item in the coverage plan as accepted, deferred, or missing. Do not inflate coverage by omitting large discovered subsystems; honest deferred/missing entries are expected when the first pass cannot cover everything.',
+    '- Choose one primary taxonomy axis from topology evidence and keep it stable: single-repo/monolith may default domain-first; multi-repo or multi-surface projects may use platform/repo-first or domain-first with per-surface components. Do not mix taxonomy axes at the same tier unless you explicitly propose and justify a restructuring.',
+    '- For every prior architecture doc or project-map feature identity in Re-review Anchors, classify the plan action as `reuse`, `update`, `split`, `merge`, `defer`, or `replace`. Use `new` only for areas not represented by the prior tree.',
+    '- Every `split`, `merge`, or `replace` action requires an evidence-backed anchor reason before prose generation. No unexplained slug rename is allowed.',
+    '- Treat the accepted Stage-2 plan as the taxonomy and feature-list freeze for this docs-review run.',
     '- Mark each proposed doc as `comprehensive`, `partial`, or `initial`, with the reason and blindspots.',
-    '- Emit the accepted plan as one `vibecompass-coverage-plan version=1` JSON fence before architecture-doc blocks.',
-    '- Ask for user acceptance before emitting fenced architecture-doc blocks. When you stop for acceptance, state plainly that no architecture docs have been applied yet.',
+    ...coveragePlanStageLines,
     '',
-    'Stage 3 — Bounded doc generation:',
+    'Stage 3 — Backbone output and bounded doc generation:',
     '- Generate only accepted docs, one complete fenced block per architecture path.',
-    '- Ensure `architecture/overview/project-shape.md` includes a concise system map plus one `vibecompass-project-map version=1` JSON fence that lists journey-facing features and supported relationships.',
+    '- Ensure `architecture/overview/project-shape.md` includes compact backbone sections for topology, core feature inventory, user journey map, project systems map, and coverage/quality summary.',
+    '- Ensure `architecture/overview/project-shape.md` includes exactly one `vibecompass-project-map version=1` JSON fence that lists journey-facing features, supported feature relationships, and minimal optional derived `systems[]` metadata.',
     '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
     `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
     '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
     '',
     'Stage 4 — Apply and verify:',
-    `- After the user accepts Stage 2, write the complete accepted fenced output verbatim to \`${outputPath}\`.`,
-    `- Then run \`${applyCommand}\` to validate and apply the accepted blocks.`,
-    `- If \`vibecompass\` is not installed on PATH, run \`${npxApplyCommand}\` instead.`,
-    '- Only report docs-review as applied after the apply command succeeds. Surface any parser warnings, especially oversized docs, so the user can decide whether to compact or accept the output.',
+    stage4WriteLine,
+    ...stage4ApplyLines,
     '',
     '## Architecture Doc Contract',
     'When creating or updating architecture docs, use the existing VibeCompass structure:',
     '- path: `architecture/<domain-slug>/<feature-slug>/<component-slug>.md` for component docs',
     '- frontmatter fields: `domain`, `feature`, `component`, `status`, plus `repo` or `repos` when implementation-scoped',
     '- body sections: `## Description`, `## Review metadata`, `## Details`, `## Retrieval guidance`, `## Next steps`, `## Involved files`',
+    '- overview docs may add compact peer sections for Stage 1 backbone outputs when useful: `## Topology`, `## Core feature inventory`, `## User journey map`, `## Project systems map`, and `## Coverage and quality summary`',
+    '- feature docs may add a compact `## Surface matrix` prose table when multiple surfaces participate. Keep it evidence-sized: include participating surfaces with concrete `repo:path` evidence and explicit N/A rows only when an absence is important to retrieval. Do not emit a new machine-readable surface block.',
+    '- surface/platform ownership docs should stay inside the existing contract, typically as `architecture/platform/<surface>/<component>.md`; do not introduce a top-level `systems/` tree.',
     '',
     'Use this exact Review metadata sub-header in every generated architecture doc:',
     '',
@@ -1751,14 +2155,14 @@ function renderReviewPrompt(options) {
     `- Project mode: ${options.project.mode}`,
     '- Confidence: high | medium | low',
     '- Coverage: comprehensive | partial | initial',
-    '- Evidence: repo:path references inspected before making implementation claims',
+    '- Evidence: concrete repo:path references inspected before making implementation claims',
     '- Retrieval scope: when future agents should load this doc',
     `- Token posture: compact unless the doc intentionally exceeds ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes`,
     '- Blindspots: explicit list, or "None identified" only when evidence is comprehensive',
     '',
     '## Review Rules',
     '1. Do not delete `architecture/overview/project-shape.md`.',
-    '2. Add or update `architecture/overview/project-shape.md` so it explains the project/system map and includes the accepted `vibecompass-project-map version=1` block.',
+    '2. Add or update `architecture/overview/project-shape.md` so it explains the topology, core feature inventory, user journey map, project systems map, coverage/quality summary, and accepted `vibecompass-project-map version=1` block.',
     '3. Add evidence-backed component docs alongside the overview for core journey-facing features and important supporting systems.',
     '4. Update `architecture/overview/project-shape.md` coverage and blindspot sections to summarize what has now been mapped.',
     '5. Keep all implementation claims source-backed with `repo:path` evidence.',
@@ -1767,6 +2171,7 @@ function renderReviewPrompt(options) {
     '8. Do not append real `D-NNN` decisions without explicit user acceptance. Propose candidate decisions separately.',
     '9. Do not edit `decisions/INDEX.md` directly unless a canonical decision file was explicitly accepted and appended.',
     '10. Optimize for future retrieval: project-level docs stay compact; component docs carry focused context for a specific area.',
+    '11. Evidence metadata must name concrete files such as `app:src/server.ts`; do not use generic placeholders like "repo:path references inspected before making implementation claims".',
     '',
     '## Project Map Block',
     'Include exactly one project-map block inside `architecture/overview/project-shape.md` when the user accepts journey/system mapping output:',
@@ -1788,27 +2193,60 @@ function renderReviewPrompt(options) {
     '      "kind": "gates | navigates_to | depends_on | writes_to",',
     '      "label": "Short evidence-backed relationship label"',
     '    }',
+    '  ],',
+    '  "systems": [',
+    '    {',
+    '      "id": "stable-system-id",',
+    '      "name": "System or runtime surface name",',
+    '      "kind": "frontend | backend | mobile | worker | cli | package | database | integration | mixed",',
+    '      "repos": ["repo-id"],',
+    '      "summary": "Short evidence-backed system summary",',
+    '      "owns_features": [{ "domain": "Domain", "feature": "Feature" }]',
+    '    }',
     '  ]',
     '}',
     '```',
     '',
     'Only include relationships supported by evidence. Prefer `navigates_to` and `gates` for the main user journey; use `depends_on` and `writes_to` for supporting system relationships. If useful journey links cannot be inferred, state that as a coverage gap rather than inventing links.',
+    '`systems[]` is optional derived overview metadata, not a new canonical taxonomy, relationship schema, or projection source. Include it only when evidence identifies runtime/deployable units or external systems; treat `owns_features` as documentation-only grouping, put user-journey links in `relationships[]`, and record uncertain systems or system-to-system connections as blindspots.',
+    'Per-feature surface matrices are derived prose. `systems[].owns_features` remains the only machine-readable system-to-feature hint in this release; do not duplicate that graph in another parsed block.',
     '',
     '## Output Contract',
     'First provide a concise findings summary with:',
     '- mapped areas',
+    '- backbone outputs: topology, core feature inventory, user journey map, project systems map, and coverage/quality summary',
     '- user journey and project/system map coverage',
     '- gaps/blindspots',
     '- evidence inventory summary',
+    '- completeness inventory summary with accepted/deferred/missing accounting',
+    '- topology and chosen taxonomy axis',
     '- coverage plan and proposed architecture docs',
+    '- prior-doc anchor classifications and reasons',
+    '- coverage/quality report, including missing/generic evidence, unmapped core features, oversized-doc candidates, and unresolved blindspots',
     '- token-budget risks or oversized-doc candidates',
     '- proposed decisions, if any',
     '',
-    'Then output one machine-readable coverage-plan block for the accepted plan:',
+    ...outputContractIntroLines,
     '',
     '```vibecompass-coverage-plan version=1',
     '{',
     '  "summary": "Short coverage plan summary",',
+    '  "topology": "single-repo | monolith | multi-repo | multi-surface | package-cli | mixed",',
+    '  "taxonomy": {',
+    '    "primary_axis": "domain-first | platform-first | repo-first | other",',
+    '    "rationale": "Why this axis matches the evidence and how it avoids mixed tiers"',
+    '  },',
+    '  "completeness_inventory": [',
+    '    {',
+    '      "id": "stable-subsystem-id",',
+    '      "kind": "feature | surface | route | screen | api | data | storage | job | integration | auth | deployment | other",',
+    '      "label": "Short discovered subsystem label",',
+    '      "status": "accepted | deferred | missing",',
+    '      "coverage_area_ids": ["stable-area-id"],',
+    '      "evidence": ["repo:path"],',
+    '      "blindspots": ["explicit blindspot for deferred or missing items"]',
+    '    }',
+    '  ],',
     '  "areas": [',
     '    {',
     '      "id": "stable-area-id",',
@@ -1818,6 +2256,9 @@ function renderReviewPrompt(options) {
     '      "status": "accepted | deferred | missing",',
     '      "coverage": "comprehensive | partial | initial | missing",',
     '      "proposed_path": "architecture/domain/feature/component.md",',
+    '      "anchor_action": "reuse | update | split | merge | defer | replace | new",',
+    '      "anchor_paths": ["architecture/existing/domain/component.md"],',
+    '      "anchor_reason": "Evidence-backed reason for changing or reusing the prior doc identity",',
     '      "evidence": ["repo:path"],',
     '      "blindspots": ["explicit blindspot"]',
     '    }',
@@ -1825,7 +2266,7 @@ function renderReviewPrompt(options) {
     '}',
     '```',
     '',
-    'Then, for each architecture doc the user accepts, output one fenced block exactly like this:',
+    architectureDocBlockIntro,
     '',
     '```vibecompass-architecture-doc path=architecture/domain/feature/component.md',
     '<complete markdown file content>',
@@ -1842,7 +2283,7 @@ function renderReviewPrompt(options) {
     '**Context:** Optional supporting context.',
     '```',
     '',
-    `Only include accepted coverage, architecture, and decision-recommendation blocks. After user acceptance, save the final accepted output to \`${outputPath}\`, run \`${applyCommand}\` or \`${npxApplyCommand}\`, and report applied paths plus parser warnings.`,
+    finalOutputLine,
   ].join('\n');
 }
 
