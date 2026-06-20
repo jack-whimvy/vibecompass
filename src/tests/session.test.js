@@ -123,6 +123,77 @@ test('startProjectSession finds the current-session fence even if another code b
   }
 });
 
+test('startProjectSession creates a current-session block for adopted existing CLAUDE.md files', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-adopted-claude-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Adopted Session Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: false,
+        agents: true,
+      },
+    });
+
+    await writeFile(
+      path.join(tempDir, 'CLAUDE.md'),
+      [
+        '# Existing Claude Instructions',
+        '',
+        'Keep these project-specific instructions.',
+        '',
+        '<!-- vibecompass:start - managed by VibeCompass, do not edit -->',
+        '# Adopted Session Project Claude Instructions',
+        '',
+        'Read `.compass/context.md`.',
+        '<!-- vibecompass:end -->',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'adopted-claude',
+      workingOn: 'Open a lane from an adopted existing CLAUDE file.',
+      date: '2026-04-20',
+    });
+
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    const currentSessionIndex = claude.indexOf('## Current session');
+    const managedBlockIndex = claude.indexOf('<!-- vibecompass:start');
+    assert.ok(currentSessionIndex > 0);
+    assert.ok(managedBlockIndex > currentSessionIndex);
+    assert.match(claude, /Keep these project-specific instructions\./);
+    assert.match(claude, /Date: 2026-04-20 \(session 1, lane adopted-claude\)/);
+    assert.match(claude, /Working on: Open a lane from an adopted existing CLAUDE file\. \[adopted-claude\]/);
+    assert.match(await readFile(path.join(rootDir, 'sessions/active/adopted-claude/wip.md'), 'utf8'), /Session lane: adopted-claude/);
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'second-adopted-claude',
+      workingOn: 'Open a second lane from the inserted Current session block.',
+      date: '2026-04-20',
+    });
+
+    const updatedClaude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    assert.equal((updatedClaude.match(/## Current session/g) ?? []).length, 1);
+    assert.match(updatedClaude, /Date: 2026-04-20 \(session 2, lane second-adopted-claude\)/);
+    assert.match(updatedClaude, /Working on: Open a second lane from the inserted Current session block\. \[second-adopted-claude\]/);
+    assert.match(await readFile(path.join(rootDir, 'sessions/active/second-adopted-claude/wip.md'), 'utf8'), /Session lane: second-adopted-claude/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('closeProjectSession finalizes the session note and removes scratch files', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-close-'));
   const rootDir = path.join(tempDir, '.compass');

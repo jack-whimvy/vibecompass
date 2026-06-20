@@ -120,6 +120,39 @@ test('initializeProjectMemory supports a non-Git local folder source', async () 
   }
 });
 
+test('initializeProjectMemory names starter session notes with the local date', async () => {
+  const previousTz = process.env.TZ;
+  process.env.TZ = 'America/Los_Angeles';
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-local-date-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      rootDir,
+      name: 'Local Date Project',
+      mode: 'local-only',
+      repos: [
+        {
+          id: 'docs',
+          remote: 'https://github.com/example/docs.git',
+        },
+      ],
+      generatedAt: new Date('2026-06-20T06:30:00Z'),
+    });
+
+    const starterSession = await readFile(path.join(rootDir, 'sessions/2026-06-19-1-project-memory-initialized.md'), 'utf8');
+    assert.match(starterSession, /# Session — 2026-06-19-1 — Project Memory Initialized/);
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/2026-06-20-1-project-memory-initialized.md')));
+  } finally {
+    if (previousTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = previousTz;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('initializeProjectMemory can scaffold workflow guides and starter tool files', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-bootstrap-'));
   const rootDir = path.join(tempDir, '.compass');

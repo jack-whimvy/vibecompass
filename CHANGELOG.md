@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.3 - 2026-06-19
+
+- Let `start-session` create a missing `## Current session` summary block in adopted existing `CLAUDE.md` files instead of failing after guided init.
+- Use the local calendar date, not UTC, when naming the starter `project-memory-initialized` session note during init.
+
 ## 0.10.2 - 2026-06-19
 
 - Add a package-owned docs-review source inventory scanner that writes `state/docs-review-source-inventory.json`, includes scanned subsystem inventory in the review prompt, and records `scanned_unaccounted` / `source_unavailable` reconciliation warnings without changing the primary coverage score basis.

@@ -627,10 +627,18 @@ function describeReviewerHandback(workflow) {
 function sessionDateFromGeneratedAt(value) {
   const date = value ? new Date(value) : new Date();
   if (Number.isNaN(date.getTime())) {
-    return new Date().toISOString().slice(0, 10);
+    return formatLocalDate(new Date());
   }
 
-  return date.toISOString().slice(0, 10);
+  return formatLocalDate(date);
+}
+
+function formatLocalDate(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
 }
 
 function quoteYamlString(value) {

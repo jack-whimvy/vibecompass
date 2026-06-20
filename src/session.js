@@ -4,6 +4,7 @@ import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
+import { START_MARKER } from './generators/agent-files/markers.js';
 
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
@@ -51,13 +52,13 @@ export async function startProjectSession(options) {
   const highestDecisionId = await readHighestDecisionId(normalized.rootDir);
 
   const nextSessionNumber = await getNextSessionNumber(normalized.sessionsDir, sessionDate);
-  const currentSession = parseCurrentSessionBlock(claude.content);
+  const currentSession = parseCurrentSessionBlock(claude.content, { optional: true });
   const updatedClaude = replaceCurrentSessionBlock(claude.content, {
     date: `${sessionDate} (session ${nextSessionNumber}, lane ${sessionId})`,
     workingOn: `${workingOn} [${sessionId}]`,
     lastThingCompleted:
       normalizeOptionalString(options?.lastThingCompleted) ??
-      currentSession.lastThingCompleted ??
+      currentSession?.lastThingCompleted ??
       'Project memory bootstrap completed.',
     blockers: normalizeOptionalString(options?.blockers) ?? 'No blocker yet.',
     nextSessionShould:
@@ -170,11 +171,11 @@ export async function closeProjectSession(options) {
 
   const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
   const activeSession = parseActiveSession(wipContent, lanePaths.wipFilePath);
-  const currentSession = parseCurrentSessionBlock(claude.content);
+  const currentSession = parseCurrentSessionBlock(claude.content, { optional: true });
   const workedOn =
     normalizeOptionalString(options?.workedOn) ??
     extractSectionBody(wipContent, 'Working on') ??
-    currentSession.workingOn;
+    currentSession?.workingOn;
 
   if (!workedOn) {
     throw new Error('session close could not determine what the session worked on. Pass workedOn explicitly.');
@@ -414,7 +415,7 @@ async function readWorkflowSettings(projectFilePath) {
 async function readClaudeFile(claudePath) {
   if (!(await fileExists(claudePath))) {
     throw new Error(
-      `No CLAUDE.md was found at ${claudePath}. Re-run "vibecompass init --with-claude" or create a compatible Current session block first.`,
+      `No CLAUDE.md was found at ${claudePath}. Re-run "vibecompass init --with-claude" or create the file before using session commands.`,
     );
   }
 
@@ -424,9 +425,13 @@ async function readClaudeFile(claudePath) {
   };
 }
 
-function parseCurrentSessionBlock(content) {
+function parseCurrentSessionBlock(content, options = {}) {
   const sessionFence = findCurrentSessionFence(content);
   if (!sessionFence) {
+    if (options.optional) {
+      return null;
+    }
+
     throw new Error('CLAUDE.md is missing a recognizable "## Current session" fenced block.');
   }
 
@@ -453,19 +458,46 @@ function parseCurrentSessionBlock(content) {
 
 function replaceCurrentSessionBlock(content, fields) {
   const sessionFence = findCurrentSessionFence(content);
+  const blockBody = renderCurrentSessionBlockBody(fields);
+
   if (!sessionFence) {
-    throw new Error('CLAUDE.md is missing a recognizable "## Current session" fenced block.');
+    return insertCurrentSessionBlock(content, blockBody);
   }
 
-  const blockBody = [
+  return `${content.slice(0, sessionFence.bodyStart)}${blockBody}${content.slice(sessionFence.bodyEnd)}`;
+}
+
+function renderCurrentSessionBlockBody(fields) {
+  return [
     `Date: ${fields.date}`,
     `Working on: ${fields.workingOn}`,
     `Last thing completed: ${fields.lastThingCompleted}`,
     `Blockers: ${fields.blockers}`,
     `Next session should: ${fields.nextSessionShould}`,
   ].join('\n');
+}
 
-  return `${content.slice(0, sessionFence.bodyStart)}${blockBody}${content.slice(sessionFence.bodyEnd)}`;
+function insertCurrentSessionBlock(content, blockBody) {
+  const currentSessionBlock = [
+    '## Current session',
+    '',
+    '**Update this block at the start and end of every session.**',
+    '',
+    '```',
+    blockBody,
+    '```',
+    '',
+  ].join('\n');
+  const markerIndex = content.indexOf(START_MARKER);
+  const normalizedContent = content.endsWith('\n') ? content : `${content}\n`;
+
+  if (markerIndex >= 0) {
+    const beforeMarker = content.slice(0, markerIndex).trimEnd();
+    const fromMarker = content.slice(markerIndex);
+    return `${beforeMarker}\n\n${currentSessionBlock}${fromMarker}`;
+  }
+
+  return `${normalizedContent}\n${currentSessionBlock}`;
 }
 
 function buildCurrentSessionFieldsForLane(lane, overrides = {}) {
