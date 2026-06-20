@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.5 - 2026-06-20
+
+- Include compact docs-review evidence summaries in hosted review submissions, covering coverage score basis, source-inventory totals, documentation-plan totals, reconciliation deltas, producer stamps, and warning provenance.
+- Bump docs-review to `VibeCompass Docs Review Prompt v7` and reject accepted coverage plans where `areas[].linked_inventory_ids[]` references inventory IDs missing from the same plan's `completeness_inventory[]`; hosted parsing now enforces the same contract under `hosted-docs-review-parser-v6`.
+- Preserve optional `completeness_inventory[].repo_id` and `confidence` fields in accepted coverage-plan projections for hosted source-inventory filtering.
+
 ## 0.10.4 - 2026-06-19
 
 - Add `vibecompass --version`, `vibecompass -v`, and `vibecompass version` CLI support.

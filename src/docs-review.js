@@ -17,8 +17,9 @@ import {
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
 
-const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v6';
+const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v7';
 const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v1';
+const DOCS_REVIEW_ACCEPTED_OUTPUT_CONTRACT_VERSION = 'docs-review-accepted-output-v7';
 const DOCS_REVIEW_DOCUMENTATION_PLAN_PROJECTION_VERSION = 'docs-review-documentation-plan-v1';
 const DOCUMENTATION_PLAN_STATE_VERSION = 1;
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
@@ -26,6 +27,7 @@ const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
 const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
 const ANCHOR_ACTIONS = new Set(['reuse', 'update', 'split', 'merge', 'defer', 'replace', 'new']);
+const SOURCE_CONFIDENCE_LEVELS = new Set(['high', 'medium', 'low']);
 const DOCUMENTATION_PLAN_RUN_SCOPES = new Set(['baseline', 'deepening']);
 const REBUILD_STALE_POLICIES = new Set(['keep', 'archive']);
 const PROJECT_MAP_PATH = 'architecture/overview/project-shape.md';
@@ -984,6 +986,7 @@ function buildCoverageProjection(blocks, options) {
   const areaById = new Map(areas.map((area) => [area.id, area]));
   const hasCompletenessInventory = Object.prototype.hasOwnProperty.call(plan, 'completeness_inventory');
   const completenessInventory = normalizeCompletenessInventory(plan.completeness_inventory, areaById);
+  validateCoverageAreaInventoryLinks(areas, completenessInventory);
   const statuses = countBy(areas, 'status');
   const coverage_levels = countBy(areas, 'coverage');
   const inventory_statuses = countBy(completenessInventory, 'status');
@@ -994,6 +997,7 @@ function buildCoverageProjection(blocks, options) {
       package_version: PACKAGE_VERSION,
       prompt_version: DOCS_REVIEW_PROMPT_VERSION,
       parser_version: DOCS_REVIEW_PARSER_VERSION,
+      accepted_output_contract: DOCS_REVIEW_ACCEPTED_OUTPUT_CONTRACT_VERSION,
       coverage_projection_version: COVERAGE_PLAN_OUTPUT_VERSION,
       ...(options.sourceInventory?.producer?.scanner_version
         ? { scanner_version: options.sourceInventory.producer.scanner_version }
@@ -1061,6 +1065,7 @@ function buildDocumentationPlanProjection(coverageProjection, sourceInventory, o
       package_version: PACKAGE_VERSION,
       prompt_version: DOCS_REVIEW_PROMPT_VERSION,
       parser_version: DOCS_REVIEW_PARSER_VERSION,
+      accepted_output_contract: DOCS_REVIEW_ACCEPTED_OUTPUT_CONTRACT_VERSION,
       documentation_plan_projection_version: DOCS_REVIEW_DOCUMENTATION_PLAN_PROJECTION_VERSION,
       coverage_projection_version: coverageProjection.version,
       ...(sourceInventory?.producer?.scanner_version
@@ -1177,8 +1182,12 @@ function normalizeCompletenessInventoryItem(item, index, ids, areaById, unknownC
 
   return {
     id,
+    ...(normalizeOptionalString(item.repo_id) ? { repo_id: normalizeOptionalString(item.repo_id) } : {}),
     ...(normalizeOptionalString(item.kind) ? { kind: normalizeOptionalString(item.kind) } : {}),
     ...(normalizeOptionalString(item.label) ? { label: normalizeOptionalString(item.label) } : {}),
+    ...(SOURCE_CONFIDENCE_LEVELS.has(normalizeOptionalString(item.confidence) ?? '')
+      ? { confidence: normalizeOptionalString(item.confidence) }
+      : {}),
     status,
     ...(coverageAreaIds.length > 0 ? { coverage_area_ids: coverageAreaIds } : {}),
     evidence: normalizeStringArray(item.evidence),
@@ -1191,6 +1200,28 @@ function formatUnknownCoverageAreaReferences(references) {
     .map((reference) => `"${reference.inventoryId}" -> "${reference.areaId}"`)
     .join(', ');
   return `Coverage plan completeness_inventory references unknown coverage area ids: ${formatted}`;
+}
+
+function validateCoverageAreaInventoryLinks(areas, completenessInventory) {
+  const inventoryIds = new Set(completenessInventory.map((item) => item.id));
+  const unknownInventoryReferences = [];
+  for (const area of areas) {
+    for (const inventoryId of area.linked_inventory_ids ?? []) {
+      if (!inventoryIds.has(inventoryId)) {
+        unknownInventoryReferences.push({ areaId: area.id, inventoryId });
+      }
+    }
+  }
+  if (unknownInventoryReferences.length > 0) {
+    throw new Error(formatUnknownLinkedInventoryReferences(unknownInventoryReferences));
+  }
+}
+
+function formatUnknownLinkedInventoryReferences(references) {
+  const formatted = references
+    .map((reference) => `"${reference.areaId}" -> "${reference.inventoryId}"`)
+    .join(', ');
+  return `Coverage plan areas reference unknown linked_inventory_ids: ${formatted}`;
 }
 
 function normalizeCoverageArea(area, index, ids) {
@@ -1461,6 +1492,7 @@ async function submitHostedDocsReview(options) {
   const baselineRemoteRevisionId = normalizeUuid(
     submitCursor.last_successful_remote_revision,
   );
+  const evidenceScope = await buildHostedDocsReviewEvidenceScope(options);
   const response = await options.fetch(endpoint.href, {
     method: 'POST',
     headers: {
@@ -1481,11 +1513,7 @@ async function submitHostedDocsReview(options) {
         ? { baseline_remote_revision_id: baselineRemoteRevisionId }
         : {}),
       local_root_revision: options.manifest?.manifest?.canonical?.local_root_revision,
-      evidence_scope: {
-        manifest_hash: options.manifest?.manifest?.canonical?.manifest_hash,
-        document_count: options.manifest?.manifest?.canonical?.document_count,
-        warning_count: options.manifest?.manifest?.canonical?.warning_count,
-      },
+      evidence_scope: evidenceScope,
     }),
   });
 
@@ -1514,6 +1542,75 @@ async function submitHostedDocsReview(options) {
     run_id: runId,
     status: normalizeOptionalString(body.status) ?? 'accepted',
     phase: normalizeOptionalString(body.phase),
+  };
+}
+
+async function buildHostedDocsReviewEvidenceScope(options) {
+  const rootDir = options.rootDir;
+  const coverage = rootDir
+    ? await readJsonOptional(path.join(rootDir, 'state', 'docs-review-coverage.json'))
+    : null;
+  const sourceInventory = rootDir
+    ? await readJsonOptional(docsReviewSourceInventoryPath(rootDir))
+    : null;
+  const documentationPlan = rootDir
+    ? await readJsonOptional(path.join(rootDir, 'state', 'docs-review-documentation-plan.json'))
+    : null;
+  const warnings = Array.isArray(coverage?.warnings) ? coverage.warnings : [];
+
+  return {
+    manifest_hash: options.manifest?.manifest?.canonical?.manifest_hash,
+    document_count: options.manifest?.manifest?.canonical?.document_count,
+    warning_count: options.manifest?.manifest?.canonical?.warning_count,
+    ...(coverage?.producer ? { producer: coverage.producer } : {}),
+    ...(coverage ? { coverage_summary: summarizeHostedCoverage(coverage) } : {}),
+    ...(coverage?.source_inventory_summary
+      ? { source_inventory_summary: coverage.source_inventory_summary }
+      : sourceInventory
+        ? { source_inventory_summary: summarizeSourceInventory(sourceInventory) }
+        : {}),
+    ...(coverage?.documentation_plan_summary
+      ? { documentation_plan_summary: coverage.documentation_plan_summary }
+      : documentationPlan
+        ? { documentation_plan_summary: summarizeDocumentationPlan(documentationPlan) }
+        : {}),
+    ...(coverage?.reconciliation_summary ? { reconciliation_summary: coverage.reconciliation_summary } : {}),
+    ...(warnings.length > 0 ? { warning_provenance: summarizeWarningProvenance(warnings) } : {}),
+  };
+}
+
+async function readJsonOptional(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function summarizeHostedCoverage(coverage) {
+  return {
+    path: 'state/docs-review-coverage.json',
+    ...(coverage.score_basis ? { score_basis: coverage.score_basis } : {}),
+    ...(typeof coverage.area_count === 'number' ? { area_count: coverage.area_count } : {}),
+    ...(typeof coverage.coverage_score === 'number' || coverage.coverage_score === null
+      ? { coverage_score: coverage.coverage_score }
+      : {}),
+    ...(coverage.statuses ? { statuses: coverage.statuses } : {}),
+    ...(coverage.coverage_levels ? { coverage_levels: coverage.coverage_levels } : {}),
+    ...(typeof coverage.inventory_count === 'number' ? { inventory_count: coverage.inventory_count } : {}),
+    ...(coverage.inventory_statuses ? { inventory_statuses: coverage.inventory_statuses } : {}),
+    ...(coverage.topology ? { topology: coverage.topology } : {}),
+    ...(coverage.taxonomy?.primary_axis ? { taxonomy_primary_axis: coverage.taxonomy.primary_axis } : {}),
+  };
+}
+
+function summarizeWarningProvenance(warnings) {
+  return {
+    warning_count: warnings.length,
+    codes: countBy(warnings, 'code'),
   };
 }
 
@@ -2352,6 +2449,7 @@ function renderReviewPrompt(options) {
     '- Prioritize entry points, user-flow/gating relationships, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
     '- Account for each completeness-inventory item in the coverage plan as accepted, deferred, or missing. Do not inflate coverage by omitting large discovered subsystems; honest deferred/missing entries are expected when the first pass cannot cover everything.',
     '- Before generating prose, self-check that every `completeness_inventory[].coverage_area_ids[]` value points to an `areas[].id` in the same accepted plan. Fix all dangling ids together at the plan gate.',
+    '- Before generating prose, self-check that every `areas[].linked_inventory_ids[]` value points to a `completeness_inventory[].id` in the same accepted plan. Fix all dangling ids together at the plan gate.',
     '- Choose one primary taxonomy axis from topology evidence and keep it stable: single-repo/monolith may default domain-first; multi-repo or multi-surface projects may use platform/repo-first or domain-first with per-surface components. Do not mix taxonomy axes at the same tier unless you explicitly propose and justify a restructuring.',
     '- For every prior architecture doc or project-map feature identity in Re-review Anchors, classify the plan action as `reuse`, `update`, `split`, `merge`, `defer`, or `replace`. Use `new` only for areas not represented by the prior tree.',
     '- Every `split`, `merge`, or `replace` action requires an evidence-backed anchor reason before prose generation. No unexplained slug rename is allowed.',

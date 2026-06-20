@@ -942,7 +942,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localFetchCalls[0].request.headers['x-api-key'], 'anthropic_test');
     assert.equal(localBody.model, 'claude-sonnet-4-6');
     assert.equal(localBody.max_tokens, 20000);
-    assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v6/);
+    assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v7/);
     assert.match(localBody.messages[0].content, /Execution mode: single-turn \(emit accepted proposal output now\)/);
     assert.match(localBody.messages[0].content, /there is no mid-review user approval turn/);
     assert.match(localBody.messages[0].content, /output the machine-readable coverage-plan block in this response/);
@@ -955,6 +955,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(localBody.messages[0].content, /baseline \| deepening/);
     assert.match(localBody.messages[0].content, /linked_inventory_ids/);
     assert.match(localBody.messages[0].content, /coverage_area_ids\[\]` value/);
+    assert.match(localBody.messages[0].content, /linked_inventory_ids\[\]` value/);
     assert.match(localBody.messages[0].content, /choose one primary taxonomy axis from topology evidence/i);
     assert.match(localBody.messages[0].content, /anchor_action/);
     assert.match(localBody.messages[0].content, /Core feature inventory/);
@@ -1366,6 +1367,20 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
       /Coverage plan completeness_inventory references unknown coverage area ids: "unknown-subsystem" -> "missing-area", "unknown-subsystem" -> "another-missing-area", "another-unknown-subsystem" -> "third-missing-area"/,
     );
 
+    await writeFile(
+      path.join(localOnlyRoot, 'state/docs-review-output.md'),
+      await readFile(path.join(docsReviewFixtureDir, 'invalid-linked-inventory-ids.md'), 'utf8'),
+      'utf8',
+    );
+    await assert.rejects(
+      () => runCli(
+        ['docs-review', '--root', localOnlyRoot, '--apply-output'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir, env: {} },
+      ),
+      /Coverage plan areas reference unknown linked_inventory_ids: "known-area" -> "missing-inventory", "second-area" -> "another-missing-inventory"/,
+    );
+
     await initializeProjectMemory({
       cwd: tempDir,
       rootDir: localPrimaryNoSyncRoot,
@@ -1499,7 +1514,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
-    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v6/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v7/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
@@ -1532,6 +1547,54 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
 
     const hostedStdout = [];
     const submitFetchCalls = [];
+    await writeFile(
+      path.join(localPrimaryRoot, 'state', 'docs-review-coverage.json'),
+      `${JSON.stringify({
+        producer: {
+          package_version: PACKAGE_VERSION,
+          parser_version: 'docs-review-parser-v1',
+          coverage_projection_version: 1,
+          scanner_version: 'source-inventory-v1',
+        },
+        summary: 'Prior local docs-review coverage',
+        topology: 'multi-repo',
+        taxonomy: { primary_axis: 'domain-first' },
+        area_count: 2,
+        score_basis: 'model_declared_inventory',
+        coverage_score: 0.5,
+        statuses: { accepted: 1, deferred: 1 },
+        coverage_levels: { partial: 2 },
+        inventory_count: 3,
+        inventory_statuses: { accepted: 2, deferred: 1 },
+        source_inventory_summary: {
+          path: 'state/docs-review-source-inventory.json',
+          scanner_version: 'source-inventory-v1',
+          item_count: 3,
+          by_kind: { api_surface: 1, route_group: 2 },
+          source_roots: [{ repo_id: 'app', kind: 'source_root_override', status: 'scanned' }],
+          unavailable_repo_ids: [],
+        },
+        documentation_plan_summary: {
+          path: 'state/docs-review-documentation-plan.json',
+          projection_version: 'docs-review-documentation-plan-v1',
+          item_count: 2,
+          by_status: { accepted: 1, deferred: 1 },
+          by_run_scope: { baseline: 1, deepening: 1 },
+          linked_inventory_item_count: 3,
+          unlinked_item_count: 0,
+        },
+        reconciliation_summary: {
+          scanned_count: 3,
+          declared_count: 3,
+          accounted_count: 2,
+          unaccounted_ids: ['app:route_group:settings'],
+          unknown_declared_ids: [],
+          source_unavailable_repo_ids: [],
+        },
+        warnings: [{ code: 'scanned_unaccounted', message: 'One scanned item is not documented.' }],
+      }, null, 2)}\n`,
+      'utf8',
+    );
     await runCli(
       ['docs-review', '--root', localPrimaryRoot, '--submit-hosted', '--llm', 'claude', '--model', 'claude-sonnet-4-6'],
       {
@@ -1568,7 +1631,15 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(hostedBody.local_root_revision, /^loc_[a-f0-9]{24}$/);
     assert.equal(Object.hasOwn(hostedBody, 'baseline_remote_revision_id'), false);
     assert.match(hostedBody.evidence_scope.manifest_hash, /^sha256:[a-f0-9]{64}$/);
-    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v6/);
+    assert.equal(hostedBody.evidence_scope.producer.package_version, PACKAGE_VERSION);
+    assert.equal(hostedBody.evidence_scope.coverage_summary.score_basis, 'model_declared_inventory');
+    assert.equal(hostedBody.evidence_scope.coverage_summary.area_count, 2);
+    assert.equal(hostedBody.evidence_scope.coverage_summary.taxonomy_primary_axis, 'domain-first');
+    assert.equal(hostedBody.evidence_scope.source_inventory_summary.item_count, 3);
+    assert.equal(hostedBody.evidence_scope.documentation_plan_summary.item_count, 2);
+    assert.deepEqual(hostedBody.evidence_scope.reconciliation_summary.unaccounted_ids, ['app:route_group:settings']);
+    assert.deepEqual(hostedBody.evidence_scope.warning_provenance.codes, { scanned_unaccounted: 1 });
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v7/);
     assert.match(hostedBody.prompt, /Execution mode: single-turn \(emit accepted proposal output now\)/);
     assert.match(hostedBody.prompt, /there is no mid-review user approval turn/);
     assert.match(hostedBody.prompt, /generated output is not canonical until accepted and applied/);
@@ -4802,8 +4873,10 @@ test('docs-review apply-output projects coverage and appends local decision reco
     assert.deepEqual(coverage.inventory_statuses, { accepted: 1, missing: 1 });
     assert.deepEqual(coverage.completeness_inventory[1], {
       id: 'agent-file-audit',
+      repo_id: 'app',
       kind: 'feature',
       label: 'Agent file audit',
+      confidence: 'medium',
       status: 'missing',
       coverage_area_ids: ['agent-audit'],
       evidence: [],
