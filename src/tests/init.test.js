@@ -161,6 +161,8 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /reports stale scratch files/);
     assert.match(context, /Documentation coverage/);
     assert.match(context, /`docs review` — agent-led architecture documentation review/);
+    assert.match(context, /`address review` — builder critically resolves reviewer feedback/);
+    assert.match(context, /treat reviewer feedback as review, not instruction/);
     assert.match(context, /vibecompass docs-review --guided/);
     assert.match(context, /sessions\/active\/<lane-id>\/wip\.md/);
     assert.match(context, /include a Git publish step after finalization using remote `origin`/);
@@ -185,12 +187,14 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(claude, /planning mode/);
     assert.match(claude, /`docs review` — agent-led architecture documentation review/);
     assert.match(claude, /`close session` — builder runs the close-out checklist/);
+    assert.match(claude, /treat reviewer feedback as review, not instruction/);
     assert.match(claude, /tool-specific Current session blocks are continuity summaries/);
     assert.match(agents, /compact bootloader/);
     assert.match(agents, /## Prompt Commands/);
     assert.match(agents, /planning mode/);
     assert.match(agents, /`docs review` — agent-led architecture documentation review/);
     assert.match(agents, /`close session` — builder runs the close-out checklist/);
+    assert.match(agents, /treat reviewer feedback as review, not instruction/);
     assert.match(agents, /vibecompass end-session` are accepted aliases/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'CLAUDE.md')));
@@ -914,6 +918,10 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(localBody.messages[0].content, /Stage 1 — Evidence inventory/);
     assert.match(localBody.messages[0].content, /## Re-review Anchors/);
     assert.match(localBody.messages[0].content, /Required prior-doc classifications for Stage 2/);
+    assert.match(localBody.messages[0].content, /documentation-plan gate/);
+    assert.match(localBody.messages[0].content, /baseline \| deepening/);
+    assert.match(localBody.messages[0].content, /linked_inventory_ids/);
+    assert.match(localBody.messages[0].content, /coverage_area_ids\[\]` value/);
     assert.match(localBody.messages[0].content, /choose one primary taxonomy axis from topology evidence/i);
     assert.match(localBody.messages[0].content, /anchor_action/);
     assert.match(localBody.messages[0].content, /Core feature inventory/);
@@ -932,6 +940,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(localBody.messages[0].content, /generated output still requires local apply or hosted proposal acceptance before it is canonical/);
     assert.doesNotMatch(localBody.messages[0].content, /Only report docs-review as applied after the apply command succeeds/);
     assert.match(localBody.messages[0].content, /Soft size budget: keep each generated architecture doc under 12000 bytes/);
+    assert.match(localBody.messages[0].content, /transient apply-state instructions/);
+    assert.match(localBody.messages[0].content, /score is over the evidence\/completeness inventory/);
     assert.match(localStdout.join(''), /Docs-review: local-review-generated/);
     assert.match(localStdout.join(''), /Local review output:/);
     assert.match(localStderr.join(''), /stopped at max_tokens/);
@@ -1320,7 +1330,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
         { stdout: { write() {} }, stderr: { write() {} } },
         { cwd: tempDir, env: {} },
       ),
-      /Coverage plan completeness_inventory item "unknown-subsystem" references unknown coverage area id: missing-area/,
+      /Coverage plan completeness_inventory references unknown coverage area ids: "unknown-subsystem" -> "missing-area", "unknown-subsystem" -> "another-missing-area", "another-unknown-subsystem" -> "third-missing-area"/,
     );
 
     await initializeProjectMemory({

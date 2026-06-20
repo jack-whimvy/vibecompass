@@ -286,6 +286,13 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.localReview) {
       io.stdout.write(`Local review output: ${result.localReview.output_path}\n`);
     }
+    if (result.sourceInventory) {
+      io.stdout.write(`Source inventory: ${result.sourceInventory.summary.item_count} items`);
+      if (result.sourceInventory.summary.warning_count > 0) {
+        io.stdout.write(` (${result.sourceInventory.summary.warning_count} warnings)`);
+      }
+      io.stdout.write('\n');
+    }
     if (result.rebuild) {
       io.stdout.write(`Rebuild scope: ${result.rebuild.scope_path}\n`);
       io.stdout.write(`Stale policy: ${result.rebuild.stale_policy}\n`);
@@ -1170,6 +1177,14 @@ function parseDocsReviewArgs(argv) {
       case '--sync-target':
         parsed.syncTarget = value;
         break;
+      case '--source-root': {
+        const [repoId, sourceRootPath] = splitAssignment(value, '--source-root');
+        parsed.sourceRootOverrides = [
+          ...(parsed.sourceRootOverrides ?? []),
+          { repoId, path: sourceRootPath },
+        ];
+        break;
+      }
       case '--max-tokens':
         parsed.maxTokens = value;
         break;
@@ -1605,6 +1620,7 @@ function usageText() {
     '  --poll-hosted                        Poll hosted docs-review run status and update state/docs-review.json',
     '  --complete                           Mark accepted docs-review changes as completed locally',
     '  --run-local                          Run the generated review request with a local provider',
+    '  --source-root <id=path>              Repeatable run-local source root override for Git-backed repos',
     '  --provider <name>                    Local provider for --run-local. Currently: anthropic',
     '  --run-local-anthropic                Compatibility alias for --run-local --provider anthropic',
     '  --apply-output                       Apply accepted architecture doc blocks from review output',

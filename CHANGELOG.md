@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.2 - 2026-06-19
+
+- Add a package-owned docs-review source inventory scanner that writes `state/docs-review-source-inventory.json`, includes scanned subsystem inventory in the review prompt, and records `scanned_unaccounted` / `source_unavailable` reconciliation warnings without changing the primary coverage score basis.
+- Add an accepted docs-review documentation-plan projection at `state/docs-review-documentation-plan.json`, preserving plan titles, purposes, parent groups, baseline/deepening scope, linked inventory ids, evidence, anchors, and producer stamps as derived state.
+- Add `docs-review --source-root <id=path>` so Git-backed repos can be scanned from local checkouts for a run without committing machine-local paths to `project.yaml`.
+- Add a source-inventory concurrency stress test script and run it during `prepublishOnly` to guard symlink root-containment regressions.
+- Ignore common OS metadata files such as `.DS_Store` during source inventory scans so package evidence does not create false route/API items.
+- Collapse nested `config/<group>/**` source-inventory evidence into one platform subsystem per config group instead of fragmenting every leaf config file into its own item.
+- Report all dangling `completeness_inventory[].coverage_area_ids[]` references in one docs-review apply error and prompt agents to fix them at the plan gate.
+- Clarify docs-review coverage reporting so scores are described as evidence/completeness-inventory accounting when present, not doc-count accounting.
+
 ## 0.10.1 - 2026-06-14
 
 - Add completeness-inventory guidance to docs-review so coverage plans account for accepted, deferred, and missing subsystems instead of silently omitting large areas.

@@ -5,7 +5,14 @@
     {
       "id": "unknown-subsystem",
       "status": "accepted",
-      "coverage_area_ids": ["missing-area"],
+      "coverage_area_ids": ["missing-area", "another-missing-area"],
+      "evidence": ["app:src/docs-review.js"],
+      "blindspots": []
+    },
+    {
+      "id": "another-unknown-subsystem",
+      "status": "accepted",
+      "coverage_area_ids": ["third-missing-area"],
       "evidence": ["app:src/docs-review.js"],
       "blindspots": []
     }

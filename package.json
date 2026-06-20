@@ -1,6 +1,6 @@
 {
   "name": "@vibecompass/vibecompass",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Local-first project-memory core for VibeCompass",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "test": "node --test src/tests/*.test.js",
-    "prepublishOnly": "npm test"
+    "test:source-inventory-stress": "node --test --test-concurrency=8 src/tests/source-inventory.test.js",
+    "prepublishOnly": "npm test && npm run test:source-inventory-stress"
   },
   "keywords": [
     "vibecompass",

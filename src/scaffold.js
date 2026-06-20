@@ -312,6 +312,7 @@ During the session:
 - keep \`handoff.md\` current after substantive work blocks
 - use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
+- during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\`
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them
 

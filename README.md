@@ -134,6 +134,7 @@ npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 
 # Architecture docs review
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided
+npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided --source-root app=../app
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --apply-output
 
 # Rerun docs review from an archived architecture-doc slate
@@ -152,6 +153,9 @@ npx -y @vibecompass/vibecompass@latest docs-review --root .compass --rebuild --a
   sessions/
   state/
 ```
+
+Docs review writes derived state under `state/`, including scanned source
+inventory, accepted coverage, and the accepted documentation-plan projection.
 
 Generated agent files can also include managed VibeCompass blocks:
 

@@ -6,15 +6,27 @@ import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import {
+  buildDocsReviewSourceInventory,
+  docsReviewSourceInventoryPath,
+  readDocsReviewSourceInventory,
+  reconcileCoverageWithSourceInventory,
+  summarizeSourceInventory,
+  writeDocsReviewSourceInventory,
+} from './source-inventory.js';
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
 
 const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v6';
+const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v1';
+const DOCS_REVIEW_DOCUMENTATION_PLAN_PROJECTION_VERSION = 'docs-review-documentation-plan-v1';
+const DOCUMENTATION_PLAN_STATE_VERSION = 1;
 const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
 const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
 const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
 const ANCHOR_ACTIONS = new Set(['reuse', 'update', 'split', 'merge', 'defer', 'replace', 'new']);
+const DOCUMENTATION_PLAN_RUN_SCOPES = new Set(['baseline', 'deepening']);
 const REBUILD_STALE_POLICIES = new Set(['keep', 'archive']);
 const PROJECT_MAP_PATH = 'architecture/overview/project-shape.md';
 
@@ -93,6 +105,12 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     anthropicEnvVar: options.anthropicEnvVar ?? 'ANTHROPIC_API_KEY',
     syncTarget: options.syncTarget ?? null,
   });
+  const sourceInventory = await buildDocsReviewSourceInventory(project, {
+    rootDir,
+    cwd,
+    sourceRootOverrides: options.sourceRootOverrides,
+  });
+  await writeDocsReviewSourceInventory(rootDir, sourceInventory);
   const reviewPrompt = renderReviewPrompt({
     project,
     rootDir,
@@ -100,6 +118,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     model: reviewConfig.model,
     executionMode: promptExecutionMode,
     anchors: await buildDocsReviewAnchorContext(rootDir),
+    sourceInventory,
   });
 
   const status = options.submitHosted
@@ -138,6 +157,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     llm: reviewConfig.llm,
     model: reviewConfig.model,
     runtime,
+    source_inventory: summarizeSourceInventory(sourceInventory),
     ...(hosted ? { hosted } : {}),
     ...(localReview ? { local_review: localReview } : {}),
     completed_at: null,
@@ -154,8 +174,10 @@ export async function preflightDocsReview(options = {}, environment = {}) {
     status,
     hosted,
     localReview,
+    sourceInventory,
     reviewPrompt,
     warnings: [
+      ...(sourceInventory.warnings ?? []).map((warning) => warning.message ?? `${warning.code}: ${warning.repo_id ?? warning.path ?? ''}`.trim()),
       ...(localReview?.truncated ? [`Local ${localReview.provider} docs-review stopped at max_tokens; saved output may be partial.`] : []),
     ],
     message: renderDocsReviewMessage(options),
@@ -242,14 +264,40 @@ async function applyDocsReviewOutput(options) {
   }
 
   validateArchitectureDocBlocks(blocks);
+  const sourceInventory = await readDocsReviewSourceInventory(options.rootDir);
   const coverageProjection = buildCoverageProjection(coverageBlocks, {
     outputPath,
     outputHash: sha256Text(source),
+    sourceInventory,
   });
   const anchorContext = coverageProjection ? await buildDocsReviewAnchorContext(options.rootDir) : null;
+  const sourceInventoryReconciliation = reconcileCoverageWithSourceInventory(coverageProjection, sourceInventory);
+  if (coverageProjection && sourceInventory) {
+    coverageProjection.source_inventory_summary = summarizeSourceInventory(sourceInventory);
+    coverageProjection.reconciliation_summary = sourceInventoryReconciliation
+      ? {
+        scanned_count: sourceInventoryReconciliation.scanned_count,
+        declared_count: sourceInventoryReconciliation.declared_count,
+        accounted_count: sourceInventoryReconciliation.accounted_count,
+        unaccounted_ids: sourceInventoryReconciliation.unaccounted_ids,
+        unknown_declared_ids: sourceInventoryReconciliation.unknown_declared_ids,
+        source_unavailable_repo_ids: sourceInventoryReconciliation.source_unavailable_repo_ids,
+      }
+      : null;
+    coverageProjection.warnings = sourceInventoryReconciliation?.warnings ?? [];
+  }
+  const documentationPlanProjection = coverageProjection
+    ? buildDocumentationPlanProjection(coverageProjection, sourceInventory, {
+      generatedAt: options.generatedAt,
+    })
+    : null;
+  if (coverageProjection && documentationPlanProjection) {
+    coverageProjection.documentation_plan_summary = summarizeDocumentationPlan(documentationPlanProjection);
+  }
   const decisionRecommendations = validateDecisionRecommendationBlocks(decisionRecommendationBlocks);
   const warnings = [
     ...createCoveragePlanQualityWarnings(coverageProjection, anchorContext),
+    ...(sourceInventoryReconciliation?.warnings ?? []).map((warning) => `${warning.code}: ${warning.message}`),
     ...createArchitectureDocSizeWarnings(blocks),
     ...createArchitectureDocQualityWarnings(blocks),
   ];
@@ -264,6 +312,7 @@ async function applyDocsReviewOutput(options) {
   }
 
   let appliedCoverage = null;
+  let appliedDocumentationPlan = null;
   if (coverageProjection) {
     const coveragePath = path.join(path.dirname(options.statePath), 'docs-review-coverage.json');
     await writeFile(coveragePath, `${JSON.stringify(coverageProjection, null, 2)}\n`, 'utf8');
@@ -272,6 +321,16 @@ async function applyDocsReviewOutput(options) {
       area_count: coverageProjection.area_count,
       coverage_score: coverageProjection.coverage_score,
       statuses: coverageProjection.statuses,
+    };
+  }
+  if (documentationPlanProjection) {
+    const documentationPlanPath = path.join(path.dirname(options.statePath), 'docs-review-documentation-plan.json');
+    await writeFile(documentationPlanPath, `${JSON.stringify(documentationPlanProjection, null, 2)}\n`, 'utf8');
+    appliedDocumentationPlan = {
+      path: documentationPlanPath,
+      item_count: documentationPlanProjection.summary.item_count,
+      by_status: documentationPlanProjection.summary.by_status,
+      by_run_scope: documentationPlanProjection.summary.by_run_scope,
     };
   }
 
@@ -300,6 +359,7 @@ async function applyDocsReviewOutput(options) {
       manifest_hash: manifestResult.manifest.canonical.manifest_hash,
       architecture_docs: applied,
       ...(appliedCoverage ? { coverage: appliedCoverage } : {}),
+      ...(appliedDocumentationPlan ? { documentation_plan: appliedDocumentationPlan } : {}),
       ...(appliedDecisionCandidates.applied.length > 0 ? { decision_candidates: appliedDecisionCandidates.applied } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       applied_at: appliedAt,
@@ -930,6 +990,15 @@ function buildCoverageProjection(blocks, options) {
 
   return {
     version: COVERAGE_PLAN_OUTPUT_VERSION,
+    producer: {
+      package_version: PACKAGE_VERSION,
+      prompt_version: DOCS_REVIEW_PROMPT_VERSION,
+      parser_version: DOCS_REVIEW_PARSER_VERSION,
+      coverage_projection_version: COVERAGE_PLAN_OUTPUT_VERSION,
+      ...(options.sourceInventory?.producer?.scanner_version
+        ? { scanner_version: options.sourceInventory.producer.scanner_version }
+        : {}),
+    },
     source: {
       output_path: options.outputPath,
       output_hash: options.outputHash,
@@ -944,11 +1013,88 @@ function buildCoverageProjection(blocks, options) {
       inventory_count: completenessInventory.length,
       inventory_statuses,
     } : {}),
+    score_basis: hasCompletenessInventory ? 'model_declared_inventory' : 'area_statuses',
     coverage_score: calculateCoverageScore({ areas, statuses, completenessInventory, hasCompletenessInventory }),
     statuses,
     coverage_levels,
     areas,
   };
+}
+
+function buildDocumentationPlanProjection(coverageProjection, sourceInventory, options = {}) {
+  const generatedAt = options.generatedAt instanceof Date ? options.generatedAt : new Date();
+  const inventoryIdsByArea = new Map();
+  for (const item of coverageProjection.completeness_inventory ?? []) {
+    for (const areaId of item.coverage_area_ids ?? []) {
+      const ids = inventoryIdsByArea.get(areaId) ?? [];
+      ids.push(item.id);
+      inventoryIdsByArea.set(areaId, ids);
+    }
+  }
+
+  const items = coverageProjection.areas.map((area) => {
+    const linkedInventoryIds = uniqueStrings([
+      ...(area.linked_inventory_ids ?? []),
+      ...(inventoryIdsByArea.get(area.id) ?? []),
+    ]);
+    return {
+      id: area.id,
+      title: area.title ?? buildCoverageAreaTitle(area),
+      status: area.status,
+      run_scope: area.run_scope ?? 'baseline',
+      expected_coverage: area.coverage,
+      ...(area.proposed_path ? { target_path: area.proposed_path } : {}),
+      ...(area.purpose ? { purpose: area.purpose } : {}),
+      ...(area.parent ? { parent: area.parent } : {}),
+      ...(linkedInventoryIds.length > 0 ? { linked_inventory_ids: linkedInventoryIds } : {}),
+      evidence: area.evidence ?? [],
+      blindspots: area.blindspots ?? [],
+      ...(area.anchor_action ? { anchor_action: area.anchor_action } : {}),
+      ...(area.anchor_paths?.length > 0 ? { anchor_paths: area.anchor_paths } : {}),
+      ...(area.anchor_reason ? { anchor_reason: area.anchor_reason } : {}),
+    };
+  });
+
+  return {
+    version: DOCUMENTATION_PLAN_STATE_VERSION,
+    producer: {
+      package_version: PACKAGE_VERSION,
+      prompt_version: DOCS_REVIEW_PROMPT_VERSION,
+      parser_version: DOCS_REVIEW_PARSER_VERSION,
+      documentation_plan_projection_version: DOCS_REVIEW_DOCUMENTATION_PLAN_PROJECTION_VERSION,
+      coverage_projection_version: coverageProjection.version,
+      ...(sourceInventory?.producer?.scanner_version
+        ? { scanner_version: sourceInventory.producer.scanner_version }
+        : {}),
+      generated_at: generatedAt.toISOString(),
+    },
+    source: coverageProjection.source,
+    summary: {
+      item_count: items.length,
+      by_status: countBy(items, 'status'),
+      by_run_scope: countBy(items, 'run_scope'),
+      linked_inventory_item_count: new Set(items.flatMap((item) => item.linked_inventory_ids ?? [])).size,
+      unlinked_item_count: items.filter((item) => !item.linked_inventory_ids || item.linked_inventory_ids.length === 0).length,
+    },
+    ...(sourceInventory ? { source_inventory_summary: summarizeSourceInventory(sourceInventory) } : {}),
+    items,
+  };
+}
+
+function summarizeDocumentationPlan(documentationPlan) {
+  return {
+    path: 'state/docs-review-documentation-plan.json',
+    projection_version: documentationPlan.producer.documentation_plan_projection_version,
+    item_count: documentationPlan.summary.item_count,
+    by_status: documentationPlan.summary.by_status,
+    by_run_scope: documentationPlan.summary.by_run_scope,
+    linked_inventory_item_count: documentationPlan.summary.linked_inventory_item_count,
+    unlinked_item_count: documentationPlan.summary.unlinked_item_count,
+  };
+}
+
+function buildCoverageAreaTitle(area) {
+  return [area.domain, area.feature, area.component].filter(Boolean).join(' / ') || area.id;
 }
 
 function calculateCoverageScore({ areas, statuses, completenessInventory, hasCompletenessInventory }) {
@@ -989,10 +1135,21 @@ function normalizeCompletenessInventory(value, areaById) {
   }
 
   const ids = new Set();
-  return value.map((item, index) => normalizeCompletenessInventoryItem(item, index, ids, areaById));
+  const unknownCoverageAreaReferences = [];
+  const normalized = value.map((item, index) => normalizeCompletenessInventoryItem(
+    item,
+    index,
+    ids,
+    areaById,
+    unknownCoverageAreaReferences,
+  ));
+  if (unknownCoverageAreaReferences.length > 0) {
+    throw new Error(formatUnknownCoverageAreaReferences(unknownCoverageAreaReferences));
+  }
+  return normalized;
 }
 
-function normalizeCompletenessInventoryItem(item, index, ids, areaById) {
+function normalizeCompletenessInventoryItem(item, index, ids, areaById, unknownCoverageAreaReferences) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) {
     throw new Error(`Coverage plan completeness_inventory item at index ${index} must be an object.`);
   }
@@ -1014,7 +1171,7 @@ function normalizeCompletenessInventoryItem(item, index, ids, areaById) {
   const coverageAreaIds = normalizeStringArray(item.coverage_area_ids);
   for (const areaId of coverageAreaIds) {
     if (!areaById.has(areaId)) {
-      throw new Error(`Coverage plan completeness_inventory item "${id}" references unknown coverage area id: ${areaId}`);
+      unknownCoverageAreaReferences.push({ inventoryId: id, areaId });
     }
   }
 
@@ -1027,6 +1184,13 @@ function normalizeCompletenessInventoryItem(item, index, ids, areaById) {
     evidence: normalizeStringArray(item.evidence),
     blindspots: normalizeStringArray(item.blindspots),
   };
+}
+
+function formatUnknownCoverageAreaReferences(references) {
+  const formatted = references
+    .map((reference) => `"${reference.inventoryId}" -> "${reference.areaId}"`)
+    .join(', ');
+  return `Coverage plan completeness_inventory references unknown coverage area ids: ${formatted}`;
 }
 
 function normalizeCoverageArea(area, index, ids) {
@@ -1070,6 +1234,10 @@ function normalizeCoverageArea(area, index, ids) {
   if (anchorAction && !ANCHOR_ACTIONS.has(anchorAction)) {
     throw new Error(`Coverage plan area "${id}" has invalid anchor_action: ${anchorAction}`);
   }
+  const runScope = normalizeOptionalString(area.run_scope);
+  if (runScope && !DOCUMENTATION_PLAN_RUN_SCOPES.has(runScope)) {
+    throw new Error(`Coverage plan area "${id}" has invalid run_scope: ${runScope}`);
+  }
   const anchorPaths = normalizeStringArray(area.anchor_paths).map(normalizeBlockPath);
   for (const anchorPath of anchorPaths) {
     if (
@@ -1089,7 +1257,14 @@ function normalizeCoverageArea(area, index, ids) {
     component: normalizeOptionalString(area.component),
     status,
     coverage,
+    ...(normalizeOptionalString(area.title) ? { title: normalizeOptionalString(area.title) } : {}),
+    ...(normalizeOptionalString(area.purpose) ? { purpose: normalizeOptionalString(area.purpose) } : {}),
+    ...(normalizeOptionalString(area.parent) ? { parent: normalizeOptionalString(area.parent) } : {}),
+    ...(runScope ? { run_scope: runScope } : {}),
     ...(proposedPath ? { proposed_path: normalizeBlockPath(proposedPath) } : {}),
+    ...(normalizeStringArray(area.linked_inventory_ids).length > 0
+      ? { linked_inventory_ids: normalizeStringArray(area.linked_inventory_ids) }
+      : {}),
     evidence: normalizeStringArray(area.evidence),
     blindspots: normalizeStringArray(area.blindspots),
     ...(normalizeOptionalString(area.reason) ? { reason: normalizeOptionalString(area.reason) } : {}),
@@ -1110,6 +1285,10 @@ function normalizeStringArray(value) {
   return Array.isArray(value)
     ? value.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean)
     : [];
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter((value) => typeof value === 'string' && value.trim() !== '').map((value) => value.trim()))];
 }
 
 function normalizeBlockPath(value) {
@@ -2033,6 +2212,55 @@ function renderAnchorContext(anchors) {
   return lines.join('\n');
 }
 
+function renderSourceInventoryContext(inventory) {
+  const lines = [
+    '## Package Source Inventory',
+    'Use this package-scanned inventory as the source-evidence denominator for coverage planning. Account for each scanned item as accepted, deferred, or missing in `completeness_inventory` when evidence is sufficient.',
+    '',
+  ];
+
+  if (!inventory) {
+    lines.push('No package source inventory was available.');
+    return lines.join('\n');
+  }
+
+  const itemCount = Array.isArray(inventory.items) ? inventory.items.length : 0;
+  lines.push(`Scanner: ${inventory.producer?.scanner_version ?? 'unknown'}; items=${itemCount}; warnings=${inventory.warnings?.length ?? 0}.`);
+  if (Array.isArray(inventory.source_roots) && inventory.source_roots.length > 0) {
+    lines.push('Source roots:');
+    for (const sourceRoot of inventory.source_roots) {
+      const details = [
+        `kind=${sourceRoot.kind}`,
+        `status=${sourceRoot.status}`,
+        sourceRoot.repo_root_path ? `repo_root_path=${sourceRoot.repo_root_path}` : null,
+      ].filter(Boolean).join('; ');
+      lines.push(`- ${sourceRoot.repo_id}: ${details}`);
+    }
+  }
+
+  if (Array.isArray(inventory.warnings) && inventory.warnings.length > 0) {
+    lines.push('Source inventory warnings:');
+    for (const warning of inventory.warnings.slice(0, 20)) {
+      lines.push(`- ${warning.code}: ${warning.message}`);
+    }
+  }
+
+  if (itemCount > 0) {
+    lines.push('Scanned inventory items:');
+    for (const item of inventory.items.slice(0, 80)) {
+      const evidence = item.evidence?.slice(0, 3).map((entry) => entry.path).join(', ');
+      lines.push(`- ${item.id} (${item.kind}, ${item.confidence}): ${item.label}${evidence ? `; evidence=${evidence}` : ''}`);
+    }
+    if (itemCount > 80) {
+      lines.push(`- ... ${itemCount - 80} additional scanned inventory items omitted from prompt summary.`);
+    }
+  } else {
+    lines.push('Scanned inventory items: none. If source roots are unavailable, say coverage is not source-backed for those repos.');
+  }
+
+  return lines.join('\n');
+}
+
 function renderReviewPrompt(options) {
   const outputPath = path.join(options.rootDir, 'state', 'docs-review-output.md');
   const applyCommand = `vibecompass docs-review --root ${shellQuote(options.rootDir)} --apply-output --output ${shellQuote(outputPath)}`;
@@ -2104,6 +2332,8 @@ function renderReviewPrompt(options) {
     '',
     renderAnchorContext(options.anchors),
     '',
+    renderSourceInventoryContext(options.sourceInventory),
+    '',
     '## Staged Review Protocol',
     'Stage 1 — Evidence inventory:',
     '- Build a compact repo inventory from file paths, manifests/config files, route/job/test directories, and existing architecture frontmatter before reading large file bodies.',
@@ -2117,12 +2347,16 @@ function renderReviewPrompt(options) {
     'Stage 2 — Coverage plan:',
     '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
     '- The minimum useful set must cover: user journey, project/system map (frontend/backend/API/data/integration structure and connections), and summaries of the core journey-facing features.',
+    '- Treat Stage 2 as a documentation-plan gate: each proposed doc needs a title, target path, purpose, parent/backbone grouping, linked inventory ids, evidence set, expected coverage level, prior-anchor action, and `baseline` or `deepening` run scope.',
+    '- Keep baseline docs breadth-first and compact. Use `deepening` only for scoped follow-up docs that should not block the first project-understanding baseline.',
     '- Prioritize entry points, user-flow/gating relationships, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
     '- Account for each completeness-inventory item in the coverage plan as accepted, deferred, or missing. Do not inflate coverage by omitting large discovered subsystems; honest deferred/missing entries are expected when the first pass cannot cover everything.',
+    '- Before generating prose, self-check that every `completeness_inventory[].coverage_area_ids[]` value points to an `areas[].id` in the same accepted plan. Fix all dangling ids together at the plan gate.',
     '- Choose one primary taxonomy axis from topology evidence and keep it stable: single-repo/monolith may default domain-first; multi-repo or multi-surface projects may use platform/repo-first or domain-first with per-surface components. Do not mix taxonomy axes at the same tier unless you explicitly propose and justify a restructuring.',
     '- For every prior architecture doc or project-map feature identity in Re-review Anchors, classify the plan action as `reuse`, `update`, `split`, `merge`, `defer`, or `replace`. Use `new` only for areas not represented by the prior tree.',
     '- Every `split`, `merge`, or `replace` action requires an evidence-backed anchor reason before prose generation. No unexplained slug rename is allowed.',
     '- Treat the accepted Stage-2 plan as the taxonomy and feature-list freeze for this docs-review run.',
+    '- The user can revise the Stage-2 plan by merging, splitting, demoting, deferring, or requesting deepening before prose generation.',
     '- Mark each proposed doc as `comprehensive`, `partial`, or `initial`, with the reason and blindspots.',
     ...coveragePlanStageLines,
     '',
@@ -2133,6 +2367,7 @@ function renderReviewPrompt(options) {
     '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
     `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
     '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
+    '- Do not put transient apply-state instructions inside architecture docs, such as "this artifact has not been applied". Apply state belongs in the chat response and package marker, not canonical docs.',
     '',
     'Stage 4 — Apply and verify:',
     stage4WriteLine,
@@ -2222,7 +2457,7 @@ function renderReviewPrompt(options) {
     '- topology and chosen taxonomy axis',
     '- coverage plan and proposed architecture docs',
     '- prior-doc anchor classifications and reasons',
-    '- coverage/quality report, including missing/generic evidence, unmapped core features, oversized-doc candidates, and unresolved blindspots',
+    '- coverage/quality report, including missing/generic evidence, unmapped core features, oversized-doc candidates, unresolved blindspots, and a note that the score is over the evidence/completeness inventory when present, not the number of doc files',
     '- token-budget risks or oversized-doc candidates',
     '- proposed decisions, if any',
     '',
@@ -2253,9 +2488,14 @@ function renderReviewPrompt(options) {
     '      "domain": "Domain",',
     '      "feature": "Feature",',
     '      "component": "Component",',
+    '      "title": "Human-readable planned doc title",',
+    '      "purpose": "Why this doc exists and what future agents should load it for",',
+    '      "parent": "Overview backbone | Feature inventory | Journey map | Systems map | Focused component docs | Deepening queue",',
+    '      "run_scope": "baseline | deepening",',
     '      "status": "accepted | deferred | missing",',
     '      "coverage": "comprehensive | partial | initial | missing",',
     '      "proposed_path": "architecture/domain/feature/component.md",',
+    '      "linked_inventory_ids": ["stable-subsystem-id"],',
     '      "anchor_action": "reuse | update | split | merge | defer | replace | new",',
     '      "anchor_paths": ["architecture/existing/domain/component.md"],',
     '      "anchor_reason": "Evidence-backed reason for changing or reusing the prior doc identity",',

@@ -46,6 +46,7 @@ export function renderSharedInstructionBody(context, options = {}) {
     '## Hard Rules',
     '- Treat `sessions/active/index.yaml` as the current lane source of truth; tool-specific Current session blocks are continuity summaries.',
     '- Keep the selected lane `wip.md` and `handoff.md` current during active builder/reviewer work.',
+    '- During `address review`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing.',
     '- Keep decisions append-only in `decisions/`; append accepted architectural decisions before implementing them.',
     '- Do not edit this managed block directly. Update canonical VibeCompass memory, then rerun package commands such as `vibecompass sync-agents`.',
   ].join('\n');
