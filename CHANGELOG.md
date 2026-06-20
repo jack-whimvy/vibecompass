@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.4 - 2026-06-19
+
+- Add `vibecompass --version`, `vibecompass -v`, and `vibecompass version` CLI support.
+- Make bare `vibecompass init` errors point users to `vibecompass init --guided`.
+- Clarify guided first-session prompts so lane IDs are presented as short kebab-case slugs and reserved yes/no answers explain that pressing Enter accepts the suggested slug.
+- Propagate declared project repo ids into the first lane opened by guided init.
+
 ## 0.10.3 - 2026-06-19
 
 - Let `start-session` create a missing `## Current session` summary block in adopted existing `CLAUDE.md` files instead of failing after guided init.

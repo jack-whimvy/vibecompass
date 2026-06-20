@@ -2415,6 +2415,40 @@ test('runCli init reports empty repo remotes as local-source guidance', () => {
   );
 });
 
+test('runCli prints package version for version commands', async () => {
+  for (const argv of [['--version'], ['-v'], ['version']]) {
+    const stdout = [];
+    const exitCode = await runCli(
+      argv,
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: { write() {} },
+      },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.join(''), `${PACKAGE_VERSION}\n`);
+  }
+});
+
+test('runCli init without guided flags explains the recovery path', async () => {
+  await assert.rejects(
+    () =>
+      runCli(
+        ['init'],
+        {
+          stdout: { write() {} },
+          stderr: { write() {} },
+        },
+      ),
+    /Run guided setup with `vibecompass init --guided`/,
+  );
+});
+
 test('runCli prints hosted next steps when init configures a sync binding', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-hosted-next-steps-'));
   const stdout = [];
@@ -3331,11 +3365,11 @@ test('runCli supports guided init with placement recommendation and first-sessio
     ['Create a starter CLAUDE.md if missing?', ''],
     ['Create a starter AGENTS.md if missing?', 'no'],
     ['Open the first builder session immediately after init?', 'yes'],
-    ['What are you working on?', 'Bootstrap the guided init flow.'],
-    ['Session lane id', 'guided-bootstrap'],
+    ['Work summary for this first session', 'Bootstrap the guided init flow.'],
     ['Should close-session include a Git publish step?', 'yes'],
     ['Git remote for the close-session publish step', ''],
   ]);
+  const laneIdAnswers = ['yes', 'guided-bootstrap'];
 
   try {
     const exitCode = await runCli(
@@ -3356,6 +3390,10 @@ test('runCli supports guided init with placement recommendation and first-sessio
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          if (spec.message === 'Session lane id, short kebab-case slug') {
+            return laneIdAnswers.shift();
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -3368,6 +3406,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
     const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
     const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
     const wip = await readFile(path.join(tempDir, '.compass/sessions/active/guided-bootstrap/wip.md'), 'utf8');
+    const sessionYaml = await readFile(path.join(tempDir, '.compass/sessions/active/guided-bootstrap/session.yaml'), 'utf8');
 
     assert.equal(exitCode, 0);
     assert.doesNotMatch(stderr.join(''), /CLAUDE\.md: warning/);
@@ -3386,12 +3425,13 @@ test('runCli supports guided init with placement recommendation and first-sessio
       'Create a starter CLAUDE.md if missing?',
       'Create a starter AGENTS.md if missing?',
       'Open the first builder session immediately after init?',
-      'What are you working on?',
-      'Session lane id',
+      'Work summary for this first session',
+      'Session lane id, short kebab-case slug',
       'Should close-session include a Git publish step?',
       'Git remote for the close-session publish step',
     ]);
     assert.ok(stdout.join('').includes('Placement: primary-repo'));
+    assert.match(stdout.join(''), /Lane id "yes" is reserved\. Enter a short kebab-case lane id, or press Enter to use "bootstrap-the-guided-init-flow"\./);
     assert.ok(stdout.join('').includes('Started session'));
     assert.match(projectYaml, /placement_pattern: primary-repo/);
     assert.match(projectYaml, /default_branch: main/);
@@ -3399,6 +3439,7 @@ test('runCli supports guided init with placement recommendation and first-sessio
     assert.match(projectYaml, /git_remote: origin/);
     assert.match(claude, /Working on: Bootstrap the guided init flow\./);
     assert.match(wip, /Bootstrap the guided init flow\./);
+    assert.match(sessionYaml, /repos:\n  - "app"/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

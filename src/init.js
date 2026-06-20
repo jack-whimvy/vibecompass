@@ -231,7 +231,9 @@ function normalizeInitOptions(options) {
     : cwd;
 
   if (typeof preparedOptions.name !== 'string' || preparedOptions.name.trim() === '') {
-    throw new Error('init requires a non-empty project name.');
+    throw new Error(
+      'init requires a non-empty project name. Run guided setup with `vibecompass init --guided`, or provide `--name <project-name>`.',
+    );
   }
 
   if (typeof preparedOptions.mode !== 'string' || !VALID_MODES.has(preparedOptions.mode)) {

@@ -10,6 +10,7 @@ import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
 import { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
+import { PACKAGE_VERSION } from './version.js';
 import {
   applyPullExport,
   pullExportProjectMemory,
@@ -22,6 +23,11 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
 
   if (parsed.command === 'help') {
     io.stdout.write(`${usageText()}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'version') {
+    io.stdout.write(`${PACKAGE_VERSION}\n`);
     return 0;
   }
 
@@ -99,6 +105,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         toolingRootDir: initPlan.initOptions.toolingRootDir,
         sessionId: initPlan.sessionPlan.sessionId,
         workingOn: initPlan.sessionPlan.workingOn,
+        repos: initPlan.sessionPlan.repos,
         ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
       });
       io.stdout.write(`Started session ${sessionResult.sessionDate}-${sessionResult.sessionNumber}\n`);
@@ -423,6 +430,10 @@ export function parseCliArgs(argv) {
 
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     return { command: 'help' };
+  }
+
+  if (command === 'version' || command === '--version' || command === '-v') {
+    return { command: 'version' };
   }
 
   if (command !== 'init') {
@@ -1495,6 +1506,8 @@ function splitAssignment(value, flagName) {
 function usageText() {
   return [
     'Usage:',
+    '  vibecompass --version',
+    '  vibecompass version',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
     '  vibecompass connect-hosted [options]',
     '  vibecompass sync-target [<name>] [options]',

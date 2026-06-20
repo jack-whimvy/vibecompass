@@ -104,6 +104,7 @@ export async function resolveInitCliOptions(options, environment = {}) {
       ? {
           sessionId: resolved.sessionId,
           workingOn: resolved.sessionWorkingOn,
+          repos: resolved.repos.map((repo) => repo.id),
         }
       : null,
   };
@@ -608,14 +609,15 @@ async function completeGuidedInitOptions(options, environment) {
     }
 
     if (!resolved.sessionWorkingOn) {
-      resolved.sessionWorkingOn = await askInput(prompter, 'What are you working on?');
+      resolved.sessionWorkingOn = await askInput(prompter, 'Work summary for this first session');
     }
 
     if (!resolved.sessionId) {
-      resolved.sessionId = await askInput(prompter, 'Session lane id', {
-        defaultValue: suggestLaneId(resolved.sessionWorkingOn),
+      const defaultSessionId = suggestLaneId(resolved.sessionWorkingOn);
+      resolved.sessionId = await askInput(prompter, 'Session lane id, short kebab-case slug', {
+        defaultValue: defaultSessionId,
         validate(value) {
-          return validateLaneIdForPrompt(value);
+          return validateLaneIdForPrompt(value, defaultSessionId);
         },
       });
     }
@@ -1245,7 +1247,7 @@ function suggestLaneId(value) {
   return slug.length >= 3 ? slug : 'builder-session';
 }
 
-function validateLaneIdForPrompt(value) {
+function validateLaneIdForPrompt(value, defaultValue) {
   if (!/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/.test(value)) {
     return 'Lane id must be 3-64 lowercase letters, numbers, or hyphens, and must start and end with a letter or number.';
   }
@@ -1268,7 +1270,7 @@ function validateLaneIdForPrompt(value) {
     'wip',
     'yes',
   ].includes(value)) {
-    return `Lane id "${value}" is reserved.`;
+    return `Lane id "${value}" is reserved. Enter a short kebab-case lane id, or press Enter to use "${defaultValue}".`;
   }
 
   return null;
