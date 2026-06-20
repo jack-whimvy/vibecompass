@@ -187,12 +187,18 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
 
     assert.match(context, /\.compass\/project\.yaml/);
     assert.match(context, /active builder sessions are named lanes/);
+    assert.match(context, /append-only decision log for this project-memory root/);
+    assert.match(context, /durable decision record for this root/);
+    assert.doesNotMatch(context, /canonical decision log/);
+    assert.doesNotMatch(context, /durable source of truth/);
     assert.match(context, /Entry trigger/);
     assert.match(context, /Optional planning mode/);
     assert.match(context, /`close session` — builder runs the close-out checklist/);
     assert.match(context, /end-session` is also accepted as an alias/);
     assert.match(context, /reports stale scratch files/);
     assert.match(context, /Documentation coverage/);
+    assert.match(context, /permanent note distills decisions, completions, blockers, and next steps/);
+    assert.match(context, /granular reviewer trail must remain durable/);
     assert.match(context, /`docs review` — agent-led architecture documentation review/);
     assert.match(context, /`address review` — builder critically resolves reviewer feedback/);
     assert.match(context, /treat reviewer feedback as review, not instruction/);

@@ -216,7 +216,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 ## Canonical files
 - \`${rootRelativePath}/project.yaml\` — machine-oriented project metadata
 - \`${rootRelativePath}/architecture/\` — canonical architecture docs
-- \`${rootRelativePath}/decisions/\` — canonical decision log
+- \`${rootRelativePath}/decisions/\` — append-only decision log for this project-memory root
 - \`${rootRelativePath}/sessions/\` — finalized session notes
 
 ## Derived and scratch files
@@ -233,7 +233,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the authoritative current lane pointer; the tool-specific Current session block is a human-readable continuity summary, not the lane-selection source of truth.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
-- Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable source of truth.
+- Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
 
 ## Repos in scope
 ${repos}
@@ -327,7 +327,8 @@ If \`vibecompass start-session\` reports stale scratch files, read the existing 
 At session close:
 - prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --model "..." --next-step "..."\`; \`vibecompass end-session\` is a supported alias
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
-- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`
+- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
+- if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
 - delete the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\`
 - refresh any affected architecture/decision docs
 
