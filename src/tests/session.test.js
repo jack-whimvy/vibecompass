@@ -394,6 +394,52 @@ test('closeProjectSession allows sessions without recorded models', async () => 
   }
 });
 
+test('closeProjectSession degrades gracefully when docs-update planning fails', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-docs-update-degrade-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Session Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'planning-degrade',
+      workingOn: 'Close even when docs-update planning cannot inspect docs.',
+      date: '2026-04-20',
+    });
+
+    const result = await closeProjectSession({
+      cwd: tempDir,
+      rootDir,
+      title: 'Planning Degrade',
+      completed: ['Closed the session even though docs-update planning failed.'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
+      nextSteps: ['Investigate the docs-update planner failure before relying on docs-update output.'],
+      docsUpdatePlanner: async () => {
+        throw new Error('Injected docs-update planner failure.');
+      },
+    });
+
+    assert.equal(result.docsUpdatePlan, null);
+    assert.match(result.warnings.join('\n'), /Docs-update plan skipped: Injected docs-update planner failure\./);
+    assert.match(result.sessionFilePath, /2026-04-20-1-planning-degrade\.md$/);
+    assert.match(await readFile(result.sessionFilePath, 'utf8'), /Closed the session even though docs-update planning failed\./);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('session lanes can run concurrently and switch current lane', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-lanes-'));
   const rootDir = path.join(tempDir, '.compass');

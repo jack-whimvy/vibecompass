@@ -140,6 +140,84 @@ test('runCli prints a targeted docs-update plan', async () => {
   }
 });
 
+test('runCli prints docs-update --json as a typed plan', async () => {
+  const fixture = await createDocsUpdateFixture();
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    const exitCode = await runCli(
+      [
+        'docs-update',
+        '--root',
+        fixture.rootDir,
+        '--session',
+        'auth-flow',
+        '--changed',
+        'app:src/auth/login.ts',
+        '--json',
+      ],
+      {
+        stdout: { write: (chunk) => stdout.push(chunk) },
+        stderr: { write: (chunk) => stderr.push(chunk) },
+      },
+      { cwd: fixture.tempDir },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    const plan = JSON.parse(stdout.join(''));
+    assert.equal(plan.session.id, 'auth-flow');
+    assert.deepEqual(plan.delta.changedFiles, ['app:src/auth/login.ts']);
+    assert.equal(plan.architecture.affected[0].path, 'architecture/product/auth/login.md');
+    assert.deepEqual(plan.packageOwnedChanges, []);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate carries architecture quality warnings from the scanner', async () => {
+  const fixture = await createDocsUpdateFixture();
+
+  try {
+    await writeFile(
+      path.join(fixture.rootDir, 'architecture/product/auth/login.md'),
+      [
+        '---',
+        'domain: Product',
+        'feature: Auth',
+        'component: Login',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Login flow docs.',
+        '',
+        '## Involved files',
+        '- `app:src/auth/login.ts`',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+      changedFiles: ['app:src/auth/login.ts'],
+    });
+
+    const warningCodes = plan.architecture.affected[0].qualityWarnings.map((warning) => warning.code);
+    assert.ok(warningCodes.includes('architecture-missing-section'));
+    assert.ok(warningCodes.includes('architecture-missing-evidence-metadata'));
+    assert.ok(warningCodes.includes('architecture-missing-blindspots-metadata'));
+    assert.match(renderDocsUpdatePlan(plan), /quality warnings:/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test('planDocsUpdate reads git status from declared nested repo folders', async (t) => {
   if (spawnSync('git', ['--version']).status !== 0) {
     t.skip('git is required for nested repo status detection.');
@@ -170,11 +248,117 @@ test('planDocsUpdate reads git status from declared nested repo folders', async 
   }
 });
 
+test('planDocsUpdate unquotes git porcelain paths from declared nested repo folders', async (t) => {
+  if (spawnSync('git', ['--version']).status !== 0) {
+    t.skip('git is required for nested repo status detection.');
+    return;
+  }
+
+  const fixture = await createDocsUpdateFixture({
+    involvedFile: 'app:src/auth/login flow.ts',
+  });
+  const repoDir = path.join(fixture.tempDir, 'app');
+
+  try {
+    await mkdir(path.join(repoDir, 'src/auth'), { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['config', 'core.quotePath', 'true'], { cwd: repoDir }).status, 0);
+    await writeFile(path.join(repoDir, 'src/auth/login flow.ts'), 'export const login = true;\n', 'utf8');
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+    });
+
+    assert.ok(plan.delta.changedFiles.includes('app:src/auth/login flow.ts'));
+    assert.deepEqual(
+      plan.architecture.affected.map((doc) => doc.path),
+      ['architecture/product/auth/login.md'],
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate decodes UTF-8 octal escapes from quoted git porcelain paths', async (t) => {
+  if (spawnSync('git', ['--version']).status !== 0) {
+    t.skip('git is required for nested repo status detection.');
+    return;
+  }
+
+  const fixture = await createDocsUpdateFixture({
+    involvedFile: 'app:src/auth/café.ts',
+  });
+  const repoDir = path.join(fixture.tempDir, 'app');
+
+  try {
+    await mkdir(path.join(repoDir, 'src/auth'), { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['config', 'core.quotePath', 'true'], { cwd: repoDir }).status, 0);
+    await writeFile(path.join(repoDir, 'src/auth/café.ts'), 'export const login = true;\n', 'utf8');
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+    });
+
+    assert.ok(plan.delta.changedFiles.includes('app:src/auth/café.ts'));
+    assert.deepEqual(
+      plan.architecture.affected.map((doc) => doc.path),
+      ['architecture/product/auth/login.md'],
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate uses the destination path for quoted git porcelain renames', async (t) => {
+  if (spawnSync('git', ['--version']).status !== 0) {
+    t.skip('git is required for nested repo status detection.');
+    return;
+  }
+
+  const fixture = await createDocsUpdateFixture({
+    involvedFile: 'app:src/auth/login flow.ts',
+  });
+  const repoDir = path.join(fixture.tempDir, 'app');
+
+  try {
+    await mkdir(path.join(repoDir, 'src/auth'), { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['config', 'core.quotePath', 'true'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['config', 'user.name', 'VibeCompass Test'], { cwd: repoDir }).status, 0);
+    await writeFile(path.join(repoDir, 'src/auth/login -> old.ts'), 'export const login = true;\n', 'utf8');
+    assert.equal(spawnSync('git', ['add', 'src/auth/login -> old.ts'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['commit', '-m', 'Add old login path'], { cwd: repoDir }).status, 0);
+    assert.equal(spawnSync('git', ['mv', 'src/auth/login -> old.ts', 'src/auth/login flow.ts'], { cwd: repoDir }).status, 0);
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+    });
+
+    assert.ok(plan.delta.changedFiles.includes('app:src/auth/login flow.ts'));
+    assert.equal(plan.delta.changedFiles.some((filePath) => filePath.includes('login -> old.ts')), false);
+    assert.deepEqual(
+      plan.architecture.affected.map((doc) => doc.path),
+      ['architecture/product/auth/login.md'],
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 async function createDocsUpdateFixture(options = {}) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-docs-update-'));
   const rootDir = path.join(tempDir, '.compass');
   const features = options.features ?? ['auth'];
   const claims = options.claims ?? ['app:src/auth'];
+  const involvedFile = options.involvedFile ?? 'app:src/auth/login.ts';
 
   await initializeProjectMemory({
     cwd: tempDir,
@@ -204,11 +388,11 @@ async function createDocsUpdateFixture(options = {}) {
       'Login flow docs.',
       '',
       '## Review metadata',
-      '- Evidence: `app:src/auth/login.ts`',
+      `- Evidence: \`${involvedFile}\``,
       '- Blindspots: None identified for this fixture.',
       '',
       '## Details',
-      'The login flow lives under `app:src/auth/login.ts`.',
+      `The login flow lives under \`${involvedFile}\`.`,
       '',
       '## Retrieval guidance',
       '- Use this doc when changing login flow implementation.',
@@ -218,7 +402,7 @@ async function createDocsUpdateFixture(options = {}) {
       '- Keep this doc aligned with login changes.',
       '',
       '## Involved files',
-      '- `app:src/auth/login.ts`',
+      `- \`${involvedFile}\``,
       '',
     ].join('\n'),
     'utf8',

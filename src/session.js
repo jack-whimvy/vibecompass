@@ -193,6 +193,8 @@ export async function closeProjectSession(options) {
     rootDir: normalized.rootDir,
     cwd: normalized.cwd,
     sessionId,
+    // Test injection seam; production callers should let close-session use the default planner.
+    planner: options?.docsUpdatePlanner,
   });
 
   if (!(await fileExists(lanePaths.wipFilePath))) {
@@ -417,8 +419,13 @@ async function refreshStateManifestSafely(rootDir) {
 
 async function planDocsUpdateSafely(options) {
   try {
+    const planner = typeof options.planner === 'function' ? options.planner : planDocsUpdate;
     return {
-      plan: await planDocsUpdate(options),
+      plan: await planner({
+        rootDir: options.rootDir,
+        cwd: options.cwd,
+        sessionId: options.sessionId,
+      }),
       warnings: [],
     };
   } catch (error) {

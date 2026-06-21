@@ -236,9 +236,98 @@ function parseGitStatusPaths(stdout) {
     .filter(Boolean)
     .map((line) => {
       const rawPath = line.slice(3).trim();
-      const renameIndex = rawPath.indexOf(' -> ');
-      return renameIndex >= 0 ? rawPath.slice(renameIndex + 4) : rawPath;
+      const renameIndex = findUnquotedRenameSeparator(rawPath);
+      const pathPart = renameIndex >= 0 ? rawPath.slice(renameIndex + 4).trim() : rawPath;
+      return unquoteGitPorcelainPath(pathPart);
     });
+}
+
+function findUnquotedRenameSeparator(value) {
+  let inQuotes = false;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (inQuotes && char === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    if (!inQuotes && value.startsWith(' -> ', index)) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function unquoteGitPorcelainPath(value) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) {
+    return trimmed;
+  }
+
+  let decoded = '';
+  let octalBytes = [];
+  const flushOctalBytes = () => {
+    if (octalBytes.length === 0) {
+      return;
+    }
+
+    decoded += Buffer.from(octalBytes).toString('utf8');
+    octalBytes = [];
+  };
+
+  for (let index = 1; index < trimmed.length - 1; index += 1) {
+    const char = trimmed[index];
+    if (char !== '\\') {
+      flushOctalBytes();
+      decoded += char;
+      continue;
+    }
+
+    const next = trimmed[index + 1];
+    if (next === undefined) {
+      flushOctalBytes();
+      decoded += '\\';
+      continue;
+    }
+
+    const octalMatch = trimmed.slice(index + 1).match(/^[0-7]{1,3}/);
+    if (octalMatch) {
+      octalBytes.push(Number.parseInt(octalMatch[0], 8));
+      index += octalMatch[0].length;
+      continue;
+    }
+
+    flushOctalBytes();
+    const escapes = {
+      a: '\u0007',
+      b: '\b',
+      f: '\f',
+      n: '\n',
+      r: '\r',
+      t: '\t',
+      v: '\v',
+      '\\': '\\',
+      '"': '"',
+    };
+    decoded += escapes[next] ?? next;
+    index += 1;
+  }
+
+  flushOctalBytes();
+  return decoded;
 }
 
 function normalizeChangedFiles(paths, repos) {
