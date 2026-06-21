@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add `docs-update` as a session-delta documentation maintenance planner that maps changed files, lane claims, session repos/features, new decisions, and package-owned generated/state surfaces to targeted architecture/decision/session follow-up.
+- Print the same docs-update plan during `close-session` / `end-session` before the required document-maintenance checkpoint, while keeping semantic document authorship with the closing agent or human.
+- Breaking: `close-session` / `end-session` and the `closeProjectSession` API now require document-maintenance checkpoint statuses for architecture docs, the decision log, and session handoff/scratch maintenance before a lane can be finalized.
+- Surface shared docs-review architecture quality warnings for missing review metadata, evidence, blindspots, retrieval guidance, and repo scope in scanner/status output.
+- Refresh `state/manifest.json.active_sessions` after session start, switch, and close commands so package-managed roots do not keep stale active-lane summaries.
+
 ## 0.10.5 - 2026-06-20
 
 - Include compact docs-review evidence summaries in hosted review submissions, covering coverage score basis, source-inventory totals, documentation-plan totals, reconciliation deltas, producer stamps, and warning provenance.

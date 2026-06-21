@@ -12,7 +12,8 @@ export const WORKFLOW_REGISTRY = [
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
       { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and appends findings' },
       { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files' },
-      { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>`; `end session` and `vibecompass end-session` are accepted aliases' },
+      { trigger: 'docs update', summary: 'builder runs a targeted session-delta documentation maintenance plan with `vibecompass docs-update --session <lane-id>`' },
+      { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases' },
     ],
   },
   {

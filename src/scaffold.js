@@ -248,7 +248,7 @@ ${repos}
 ${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\`, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` + \`handoff.md\` and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\` plus document-maintenance checkpoint statuses, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is also accepted as an alias for \`vibecompass close-session\`; the canonical command name remains \`close-session\`.
 
 ## Workflow defaults
@@ -257,6 +257,7 @@ ${renderWorkflowDefaults(workflow)}
 ## Documentation coverage
 - The architecture, decision, and session files created by init are an initial scaffold, not a comprehensive codebase review.
 - Before risky implementation work, inspect the relevant code and update the affected architecture docs.
+- Use \`vibecompass docs-update --session <lane-id>\` during a session for a targeted maintenance plan based on changed files, lane claims, session repos/features, and new decisions. This is a session-delta planner, not a broad architecture review.
 - Use the \`docs review\` prompt command when you want the current AI session to run a comprehensive documentation review. It may run \`vibecompass docs-review --guided\` as package mechanics to record marker state and print the canonical review contract.
 
 ## Session startup
@@ -310,10 +311,11 @@ Session lane: <lane-id>
 During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
+- run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
 - use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
-- stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\`
+- stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them
 
 If \`vibecompass start-session\` reports stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
@@ -325,7 +327,9 @@ If \`vibecompass start-session\` reports stale scratch files, read the existing 
 - If planning produces a real architectural decision, append it to \`${rootRelativePath}/decisions/\` before implementing.
 
 At session close:
-- prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --model "..." --next-step "..."\`; \`vibecompass end-session\` is a supported alias
+- prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --architecture-docs updated|not-needed|deferred --decision-log updated|not-needed|deferred --session-maintenance updated|not-needed|deferred --next-step "..."\`; \`vibecompass end-session\` is a supported alias
+- close-session prints the same targeted docs-update plan before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
+- document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
 - if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
@@ -372,6 +376,10 @@ Initial project-memory scaffold for ${projectConfig.name}.
 
 ${projectConfig.description ? `${projectConfig.description}\n` : ''}This document is a starting map, not a comprehensive architecture review.
 
+## Review metadata
+- Evidence: \`project.yaml\`, declared repo descriptors, and the files created by \`vibecompass init\`
+- Blindspots: Runtime architecture, feature flows, persistence, integrations, deployment, observability, and test strategy are not reviewed by the init scaffold.
+
 ## Details
 - Mode: \`${projectConfig.mode}\`
 - Documentation coverage: initial scaffold
@@ -394,6 +402,11 @@ Not yet documented:
 - Feature/domain/component map beyond this placeholder
 
 Before changing any undocumented area, inspect the relevant code and update or add architecture docs.
+
+## Retrieval guidance
+- Use this doc to understand the project-memory root shape, declared repositories, and the fact that the initial coverage is scaffold-only.
+- Do not use this doc as evidence for runtime behavior, feature ownership, data flow, external integrations, or deployment behavior.
+- Prefer more specific domain/feature/component docs once they exist, and run \`vibecompass docs-update --session <lane-id>\` during active work to find targeted maintenance needs.
 
 ## Next steps
 - Use the \`docs review\` prompt command for a comprehensive documentation review.
@@ -488,9 +501,17 @@ architecture/<domain-slug>/<feature-slug>/<component>.md
 
 ## Recommended sections
 - \`## Description\`
+- \`## Review metadata\`
 - \`## Details\`
+- \`## Retrieval guidance\`
 - \`## Next steps\`
 - \`## Involved files\`
+
+## Shared quality bar
+- Review metadata should record concrete evidence sources and blindspots.
+- Retrieval guidance should say when to consult the doc, what it does not cover, and which related docs or decisions matter.
+- Details should distinguish confirmed behavior from known gaps or open follow-up.
+- Involved files should use concrete \`repo:path\` references that match the affected implementation surface.
 
 Each component doc is canonical. This README is only a convenience guide.
 `;
@@ -601,6 +622,7 @@ function buildScaffoldAgentContext(options) {
 function renderWorkflowDefaults(workflow) {
   const lines = [
     `- reviewer handback: ${describeReviewerHandback(workflow)}`,
+    '- close-session: require document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch',
     '- close-session: refresh any relevant architecture docs before finalizing the session',
     '- close-session: refresh any relevant decision files before finalizing the session',
   ];

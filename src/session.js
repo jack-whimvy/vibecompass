@@ -5,11 +5,34 @@ import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { START_MARKER } from './generators/agent-files/markers.js';
+import { planDocsUpdate } from './docs-update.js';
+// This lazy-only cycle is intentional: manifest.js reads lane state from this
+// module, and session command handlers rewrite the derived manifest after
+// lane mutations. Keep both sides free of top-level calls into the other.
+import { writeStateManifest } from './manifest.js';
 
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
 const SESSION_FILENAME_PATTERN = /^(\d{4}-\d{2}-\d{2})-(\d+)-([a-z0-9-]+)\.md$/i;
 const LANE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+const DOCUMENT_MAINTENANCE_STATUSES = new Set(['updated', 'not-needed', 'deferred']);
+const DOCUMENT_MAINTENANCE_FIELDS = [
+  {
+    key: 'architectureDocs',
+    label: 'Architecture docs',
+    flag: '--architecture-docs',
+  },
+  {
+    key: 'decisionLog',
+    label: 'Decision log',
+    flag: '--decision-log',
+  },
+  {
+    key: 'sessionMaintenance',
+    label: 'Session handoff/scratch',
+    flag: '--session-maintenance',
+  },
+];
 const RESERVED_LANE_IDS = new Set([
   'active',
   'current',
@@ -114,6 +137,7 @@ export async function startProjectSession(options) {
     status: 'active',
     workingOn,
   }, { current: sessionId });
+  const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
   const auditWarnings = await buildDocsReviewWarnings(normalized);
   const metadataWarnings = collectLaneMetadataWarnings(existingLanes);
   const agentFileSync = await syncAgentInstructionFilesSafely({
@@ -134,8 +158,10 @@ export async function startProjectSession(options) {
     warnings: [
       ...metadataWarnings,
       ...overlapWarnings,
+      ...manifestRefresh.warnings,
       ...auditWarnings,
     ],
+    manifest: manifestRefresh.manifest,
     agentFileSync,
   };
 }
@@ -162,6 +188,12 @@ export async function closeProjectSession(options) {
   const workflowSettings = await readWorkflowSettings(normalized.projectFilePath);
   const sessionId = await resolveExistingSessionId(normalized, options);
   const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
+  const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
+  const docsUpdate = await planDocsUpdateSafely({
+    rootDir: normalized.rootDir,
+    cwd: normalized.cwd,
+    sessionId,
+  });
 
   if (!(await fileExists(lanePaths.wipFilePath))) {
     throw new Error(
@@ -205,6 +237,7 @@ export async function closeProjectSession(options) {
       completed,
       decisions,
       models: models.length > 0 ? models : ['Not recorded.'],
+      documentMaintenance,
       blockers,
       nextSteps,
     }),
@@ -241,6 +274,7 @@ export async function closeProjectSession(options) {
   );
 
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
+  const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
   const agentFileSync = await syncAgentInstructionFilesSafely({
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
@@ -256,13 +290,60 @@ export async function closeProjectSession(options) {
     sessionRelativePath,
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
+    documentMaintenance,
+    docsUpdatePlan: docsUpdate.plan,
     workflowGuidance: buildCloseSessionGuidance(workflowSettings),
+    warnings: [
+      ...docsUpdate.warnings,
+      ...manifestRefresh.warnings,
+    ],
+    manifest: manifestRefresh.manifest,
     agentFileSync,
     removedScratchFiles: [
       lanePaths.wipFilePath,
       ...(hadHandoff ? [lanePaths.handoffFilePath] : []),
     ],
   };
+}
+
+function normalizeDocumentMaintenanceCheckpoint(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+  const missing = [];
+  const invalid = [];
+  const checkpoint = {};
+
+  for (const field of DOCUMENT_MAINTENANCE_FIELDS) {
+    const normalized = normalizeOptionalString(source[field.key]);
+    if (!normalized) {
+      missing.push(`${field.flag} <updated|not-needed|deferred>`);
+      continue;
+    }
+
+    if (!DOCUMENT_MAINTENANCE_STATUSES.has(normalized)) {
+      invalid.push(`${field.flag}=${normalized}`);
+      continue;
+    }
+
+    checkpoint[field.key] = normalized;
+  }
+
+  if (missing.length > 0 || invalid.length > 0) {
+    const details = [
+      missing.length > 0
+        ? `Missing document-maintenance checkpoint status: ${missing.join(', ')}.`
+        : null,
+      invalid.length > 0
+        ? `Invalid document-maintenance checkpoint status: ${invalid.join(', ')}. Allowed values: updated, not-needed, deferred.`
+        : null,
+      'The package validates the close-session checkpoint, but the closer remains responsible for semantic doc updates.',
+    ].filter(Boolean);
+
+    throw new Error(details.join(' '));
+  }
+
+  return checkpoint;
 }
 
 export async function listProjectSessions(options = {}) {
@@ -300,6 +381,7 @@ export async function switchProjectSession(options = {}) {
     ),
     'utf8',
   );
+  const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
   const agentFileSync = await syncAgentInstructionFilesSafely({
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
@@ -310,8 +392,43 @@ export async function switchProjectSession(options = {}) {
     claudePath: normalized.claudePath,
     current: sessionId,
     lanes,
+    warnings: manifestRefresh.warnings,
+    manifest: manifestRefresh.manifest,
     agentFileSync,
   };
+}
+
+async function refreshStateManifestSafely(rootDir) {
+  try {
+    const manifest = await writeStateManifest(rootDir);
+    return {
+      manifest,
+      warnings: [],
+    };
+  } catch (error) {
+    return {
+      manifest: null,
+      warnings: [
+        `State manifest refresh skipped: ${error instanceof Error ? error.message : String(error)}`,
+      ],
+    };
+  }
+}
+
+async function planDocsUpdateSafely(options) {
+  try {
+    return {
+      plan: await planDocsUpdate(options),
+      warnings: [],
+    };
+  } catch (error) {
+    return {
+      plan: null,
+      warnings: [
+        `Docs-update plan skipped: ${error instanceof Error ? error.message : String(error)}`,
+      ],
+    };
+  }
 }
 
 async function syncAgentInstructionFilesSafely(options) {
@@ -364,6 +481,7 @@ function normalizeSessionPaths(options) {
     : cwd;
 
   return {
+    cwd,
     rootDir,
     toolingRootDir,
     projectFilePath: path.resolve(rootDir, 'project.yaml'),
@@ -918,12 +1036,21 @@ ${renderBulletList(options.decisions, 'No new decisions were logged in this sess
 ## Models used
 ${renderBulletList(options.models)}
 
+## Document maintenance checkpoint
+${renderDocumentMaintenanceCheckpoint(options.documentMaintenance)}
+
 ## Blockers / open questions
 ${renderBulletList(options.blockers, 'No blocker remains.')}
 
 ## Next session should start with
 ${renderOrderedList(options.nextSteps)}
 `;
+}
+
+function renderDocumentMaintenanceCheckpoint(documentMaintenance) {
+  return DOCUMENT_MAINTENANCE_FIELDS
+    .map((field) => `- ${field.label}: ${documentMaintenance[field.key]}`)
+    .join('\n');
 }
 
 function renderBulletList(items, fallback) {

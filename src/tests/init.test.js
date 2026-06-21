@@ -2757,6 +2757,8 @@ test('runCli status reports project health without mutating files', async () => 
     assert.match(stdout.join(''), /VibeCompass status/);
     assert.match(stdout.join(''), /Project: Status Project/);
     assert.match(stdout.join(''), new RegExp(`Root stamp: ${PACKAGE_VERSION.replaceAll('.', '\\.')} \\(current\\)`));
+    assert.match(stdout.join(''), /Project memory:/);
+    assert.match(stdout.join(''), /Architecture warnings: 0/);
     assert.match(stdout.join(''), /Agent files:/);
     assert.equal(await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8'), projectBefore);
     assert.equal(await readFile(initResult.manifestPath, 'utf8'), manifestBefore);
@@ -2818,6 +2820,8 @@ test('runCli status --json returns a redacted typed model', async () => {
     assert.match(status.generatedAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(status.project.sync.credentialEnvVar, 'VIBECOMPASS_SYNC_TOKEN');
     assert.equal(status.compatibility.package.status, 'current');
+    assert.equal(status.projectMemory.status, 'ok');
+    assert.equal(status.projectMemory.architectureWarningCount, 0);
     assert.doesNotMatch(output, /super-secret-token-value/);
     assert.doesNotMatch(output, /preview_secret_token/);
     assert.doesNotMatch(output, /pending_previews/);
@@ -3353,6 +3357,12 @@ test('runCli session lifecycle commands emit shared compatibility warnings', asy
         'Checked session preflight warnings.',
         '--next-step',
         'Continue the package upgrade audit.',
+        '--architecture-docs',
+        'updated',
+        '--decision-log',
+        'updated',
+        '--session-maintenance',
+        'updated',
       ],
       {
         stdout: { write() {} },

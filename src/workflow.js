@@ -78,6 +78,7 @@ export function buildCloseSessionGuidance(workflowSettings) {
   const guidance = [];
 
   guidance.push('Reviewer handback stays in the selected sessions/active/<lane-id>/wip.md and handoff.md before close-session runs.');
+  guidance.push('Close-session requires document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch: updated, not-needed, or deferred.');
 
   if (workflowSettings.closeSession.refreshArchitectureDocs) {
     guidance.push('Refresh any relevant architecture docs before finalizing the session.');

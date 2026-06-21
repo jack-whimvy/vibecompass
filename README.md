@@ -113,6 +113,9 @@ npx -y @vibecompass/vibecompass@latest close-session \
   --session feature-lane \
   --title "Feature Lane" \
   --completed "Shipped the slice" \
+  --architecture-docs updated \
+  --decision-log not-needed \
+  --session-maintenance updated \
   --next-step "Review and publish"
 ```
 
@@ -127,12 +130,14 @@ npx -y @vibecompass/vibecompass@latest status --root .compass
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "Auth flow"
 npx -y @vibecompass/vibecompass@latest list-sessions --root .compass
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
-npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --next-step "Review"
+npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
+npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
 
 # Agent instruction files
 npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 
-# Architecture docs review
+# Targeted and comprehensive architecture docs maintenance
+npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow --changed app:src/auth/login.ts
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided --source-root app=../app
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --apply-output

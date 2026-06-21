@@ -44,8 +44,16 @@ repos:
 ## Description
 Parser implementation details.
 
+## Review metadata
+- Evidence: app:src/project-memory.js, docs:architecture/platform/project-memory/backend.md
+- Blindspots: None identified for this parser fixture.
+
 ## Details
 More detail.
+
+## Retrieval guidance
+- Use this fixture doc for parser manifest tests.
+- It does not describe runtime behavior.
 
 ## Next steps
 - Ship it.
@@ -135,8 +143,16 @@ repo: docs
 ## Description
 Contract.
 
+## Review metadata
+- Evidence: docs:architecture/platform/project-memory/file-schema.md
+- Blindspots: None identified for this manifest fixture.
+
 ## Details
 Details.
+
+## Retrieval guidance
+- Use this fixture doc for manifest generation tests.
+- It does not describe runtime behavior.
 
 ## Next steps
 - None.
@@ -463,8 +479,16 @@ repo: docs
 ## Description
 UI notes.
 
+## Review metadata
+- Evidence: docs:architecture/platform/project-memory/frontend.md
+- Blindspots: None identified for this warning fixture.
+
 ## Details
 Details.
+
+## Retrieval guidance
+- Use this fixture doc for unknown-status scanner tests.
+- It does not describe runtime behavior.
 
 ## Next steps
 - Later.

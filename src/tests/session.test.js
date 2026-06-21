@@ -5,8 +5,21 @@ import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
-import { writeStateManifest } from '../manifest.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from '../session.js';
+
+const DOCUMENT_MAINTENANCE_UPDATED = {
+  architectureDocs: 'updated',
+  decisionLog: 'updated',
+  sessionMaintenance: 'updated',
+};
+const CLI_DOCUMENT_MAINTENANCE_UPDATED = [
+  '--architecture-docs',
+  'updated',
+  '--decision-log',
+  'updated',
+  '--session-maintenance',
+  'updated',
+];
 
 test('startProjectSession creates scratch files and updates CLAUDE.md', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-start-'));
@@ -54,6 +67,11 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
     assert.match(laneMetadata, /id: workflow-parity/);
     assert.match(laneMetadata, /session_number: 1/);
     assert.match(activeIndex, /current: workflow-parity/);
+    assert.equal(result.manifest.manifest.active_sessions.current, 'workflow-parity');
+
+    const startManifest = JSON.parse(await readFile(path.join(rootDir, 'state/manifest.json'), 'utf8'));
+    assert.equal(startManifest.active_sessions.current, 'workflow-parity');
+    assert.deepEqual(startManifest.active_sessions.lanes.map((lane) => lane.id), ['workflow-parity']);
 
     await assert.rejects(
       () =>
@@ -231,6 +249,7 @@ test('closeProjectSession finalizes the session note and removes scratch files',
       ],
       decisions: ['D-161 — `vibecompass` owns explicit session open/close helpers.'],
       models: ['Codex (GPT-5) — implemented the session lifecycle commands and tests.'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
       nextSteps: [
         'Verify the updated package docs and public docs copy.',
         'Decide whether to publish the new workflow slice immediately.',
@@ -246,6 +265,7 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.match(sessionNote, /## Completed\n- Added explicit session open and close helpers\./);
     assert.match(sessionNote, /## Decisions made\n- D-161/);
     assert.match(sessionNote, /## Models used\n- Codex \(GPT-5\) — implemented the session lifecycle commands and tests\./);
+    assert.match(sessionNote, /## Document maintenance checkpoint\n- Architecture docs: updated\n- Decision log: updated\n- Session handoff\/scratch: updated/);
     assert.match(sessionNote, /1\. Verify the updated package docs and public docs copy\./);
     assert.match(claude, /Working on: Session closed\. Ready for the next builder session\./);
     assert.match(claude, /Last thing completed: Closed session 1 and wrote `sessions\/2026-04-20-1-workflow-parity-commands\.md`\./);
@@ -253,9 +273,12 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.ok(result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'));
     assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
     assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
+    assert.equal(result.docsUpdatePlan.session.id, 'workflow-parity');
+    assert.deepEqual(result.docsUpdatePlan.delta.changedFiles, []);
     assert.equal(result.agentFileSync.results.find((item) => item.format === 'claude_md')?.status, 'update');
     assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'update');
     assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Session Project Agent Instructions/);
+    assert.equal(result.manifest.manifest.active_sessions, undefined);
 
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/workflow-parity/wip.md')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/workflow-parity/handoff.md')));
@@ -306,6 +329,7 @@ test('closeProjectSession falls back to default workflow guidance when project.y
         rootDir,
         title: `Workflow Fallback ${scenario}`,
         completed: ['Closed the session even though the workflow file was unavailable.'],
+        documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
         nextSteps: ['Restore or regenerate project.yaml before the next session.'],
       });
 
@@ -359,6 +383,7 @@ test('closeProjectSession allows sessions without recorded models', async () => 
       rootDir,
       title: 'Human Session Close',
       completed: ['Closed a manual session without AI metadata.'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
       nextSteps: ['Start the next session as usual.'],
     });
 
@@ -433,10 +458,10 @@ test('session lanes can run concurrently and switch current lane', async () => {
     const switched = await switchProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-plans' });
     assert.equal(switched.current, 'billing-plans');
 
-    const manifestResult = await writeStateManifest(rootDir);
-    assert.equal(manifestResult.manifest.active_sessions.current, 'billing-plans');
+    const manifestAfterSwitch = JSON.parse(await readFile(path.join(rootDir, 'state/manifest.json'), 'utf8'));
+    assert.equal(manifestAfterSwitch.active_sessions.current, 'billing-plans');
     assert.deepEqual(
-      manifestResult.manifest.active_sessions.lanes.map((lane) => ({
+      manifestAfterSwitch.active_sessions.lanes.map((lane) => ({
         id: lane.id,
         feature_slugs: lane.feature_slugs,
         claimed_paths: lane.claimed_paths,
@@ -535,6 +560,110 @@ test('session lanes can run concurrently and switch current lane', async () => {
   }
 });
 
+test('session lifecycle manifest refresh preserves sync cursor state', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-sync-preserve-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const manifestPath = path.join(rootDir, 'state/manifest.json');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Sync Cursor Project',
+      mode: 'local-primary',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    const syncState = {
+      last_successful_remote_revision: 'rem_dev_001',
+      last_successful_local_root_revision: 'loc_dev_001',
+      last_successful_manifest_hash: 'sha256:dev0000000000000000000000000000000000000000000000000000000000000',
+      last_sync_direction: 'push',
+      last_sync_at: '2026-04-20T10:00:00.000Z',
+      pending_previews: [],
+      targets: {
+        dev: {
+          api_url: 'http://localhost:3000',
+          project_id: 'proj-dev',
+          last_successful_remote_revision: 'rem_dev_001',
+          last_successful_local_root_revision: 'loc_dev_001',
+          last_successful_manifest_hash: 'sha256:dev0000000000000000000000000000000000000000000000000000000000000',
+          last_sync_direction: 'push',
+          last_sync_at: '2026-04-20T10:00:00.000Z',
+          pending_previews: [],
+        },
+        prod: {
+          api_url: 'https://api.vibecompass.example',
+          project_id: 'proj-prod',
+          last_successful_remote_revision: 'rem_prod_001',
+          last_successful_local_root_revision: 'loc_prod_001',
+          last_successful_manifest_hash: 'sha256:prod000000000000000000000000000000000000000000000000000000000000',
+          last_sync_direction: 'pull_export',
+          last_sync_at: '2026-04-20T11:00:00.000Z',
+          pending_previews: [
+            {
+              preview_token: 'preview-prod',
+              base_remote_revision: 'rem_prod_001',
+              target_remote_revision: 'rem_prod_002',
+              local_root_revision: 'loc_prod_001',
+              local_manifest_hash: 'sha256:prod000000000000000000000000000000000000000000000000000000000000',
+              authoritative_change_set_hash: 'sha256:change0000000000000000000000000000000000000000000000000000000000',
+              include_pending_proposals: true,
+              available_proposal_ids: ['proposal-1'],
+              created_at: '2026-04-20T11:05:00.000Z',
+              expires_at: '2026-04-20T11:20:00.000Z',
+            },
+          ],
+        },
+      },
+    };
+    const seededManifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ ...seededManifest, sync: syncState }, null, 2)}\n`,
+      'utf8',
+    );
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'sync-preserve',
+      workingOn: 'Preserve sync cursors after start.',
+      date: '2026-04-20',
+    });
+    assert.deepEqual(JSON.parse(await readFile(manifestPath, 'utf8')).sync, syncState);
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'second-lane',
+      workingOn: 'Keep a second lane open for close.',
+      date: '2026-04-20',
+    });
+    await switchProjectSession({ cwd: tempDir, rootDir, sessionId: 'sync-preserve' });
+    assert.deepEqual(JSON.parse(await readFile(manifestPath, 'utf8')).sync, syncState);
+
+    await closeProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'sync-preserve',
+      title: 'Sync Preserve Lane',
+      completed: ['Closed one lane without losing sync cursors.'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
+      nextSteps: ['Continue the second lane.'],
+    });
+    const manifestAfterClose = JSON.parse(await readFile(manifestPath, 'utf8'));
+    assert.deepEqual(manifestAfterClose.sync, syncState);
+    assert.equal(manifestAfterClose.active_sessions.current, 'second-lane');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('startProjectSession warns and falls back when an existing lane has corrupt metadata', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-corrupt-lane-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -582,6 +711,63 @@ test('startProjectSession warns and falls back when an existing lane has corrupt
   }
 });
 
+test('closeProjectSession requires document-maintenance checkpoint statuses', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-close-checkpoint-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Checkpoint Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'checkpoint-lane',
+      workingOn: 'Verify close-session checkpoint validation.',
+      date: '2026-04-20',
+    });
+
+    await assert.rejects(
+      () =>
+        closeProjectSession({
+          cwd: tempDir,
+          rootDir,
+          title: 'Missing Checkpoint',
+          completed: ['Tried to close without checkpoint statuses.'],
+          nextSteps: ['Add checkpoint statuses.'],
+        }),
+      /Missing document-maintenance checkpoint status/i,
+    );
+    await assert.rejects(
+      () =>
+        closeProjectSession({
+          cwd: tempDir,
+          rootDir,
+          title: 'Invalid Checkpoint',
+          completed: ['Tried to close with an invalid checkpoint status.'],
+          documentMaintenance: {
+            architectureDocs: 'updated',
+            decisionLog: 'skipped',
+            sessionMaintenance: 'not-needed',
+          },
+          nextSteps: ['Use valid checkpoint statuses.'],
+        }),
+      /Invalid document-maintenance checkpoint status/i,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('closeProjectSession requires --session when multiple lanes are active', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-close-multiple-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -621,6 +807,7 @@ test('closeProjectSession requires --session when multiple lanes are active', as
           rootDir,
           title: 'Ambiguous Lane Close',
           completed: ['Tried to close without selecting a lane.'],
+          documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
           nextSteps: ['Pass --session before closing.'],
         }),
       /Multiple active session lanes exist/i,
@@ -665,6 +852,7 @@ test('closeProjectSession still supports legacy root scratch files during migrat
       rootDir,
       title: 'Legacy Scratch Close',
       completed: ['Closed a legacy root-level scratch session.'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
       nextSteps: ['Start a lane-aware session next.'],
     });
 
@@ -728,6 +916,7 @@ test('runCli supports start-session and close-session', async () => {
         'Exercised the CLI start-session path.',
         '--next-step',
         'Run the package test suite.',
+        ...CLI_DOCUMENT_MAINTENANCE_UPDATED,
       ],
       {
         stdout: { write(chunk) { stdout.push(chunk); } },
@@ -744,6 +933,8 @@ test('runCli supports start-session and close-session', async () => {
     assert.ok(stdout.join('').includes('Started session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('Closed session 2026-04-20-1'));
     assert.ok(stdout.join('').includes('2026-04-20-1-cli-session-flow.md'));
+    assert.ok(stdout.join('').includes('Docs update plan:'));
+    assert.ok(stdout.join('').includes('Document maintenance checkpoint:'));
     assert.ok(stdout.join('').includes('Workflow guidance:'));
     assert.ok(stdout.join('').includes('Refresh any relevant architecture docs before finalizing the session.'));
   } finally {
@@ -831,6 +1022,7 @@ test('runCli supports list-sessions, switch-session, and close-session --session
           'Resolve billing provider retries before reopening billing.',
           '--next-step',
           'Continue the marketing lane.',
+          ...CLI_DOCUMENT_MAINTENANCE_UPDATED,
         ],
         io,
         { cwd: tempDir },
@@ -857,6 +1049,10 @@ test('runCli supports list-sessions, switch-session, and close-session --session
     assert.doesNotMatch(claude, /Session closed\. Ready for the next builder session\./);
     assert.doesNotMatch(claude, /Stripe API rate limit belongs to billing only\./);
     assert.doesNotMatch(claude, /Resolve billing provider retries before reopening billing\./);
+
+    const manifestAfterClose = JSON.parse(await readFile(path.join(rootDir, 'state/manifest.json'), 'utf8'));
+    assert.equal(manifestAfterClose.active_sessions.current, 'marketing-copy');
+    assert.deepEqual(manifestAfterClose.active_sessions.lanes.map((lane) => lane.id), ['marketing-copy']);
 
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/wip.md')));
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/billing-plans/session.yaml')));
@@ -903,6 +1099,7 @@ test('runCli supports end-session as a close-session alias', async () => {
         'Closed the session through the end-session alias.',
         '--next-step',
         'Continue with normal start-session flow.',
+        ...CLI_DOCUMENT_MAINTENANCE_UPDATED,
       ],
       {
         stdout: {

@@ -5,6 +5,7 @@ import { sha256Text } from './hash.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { listProjectSessions } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
+import { scanProjectMemory } from './project-memory.js';
 
 export async function getProjectStatus(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
@@ -18,11 +19,12 @@ export async function getProjectStatus(options = {}) {
     cwd,
     ...(options.packageVersion ? { packageVersion: options.packageVersion } : {}),
   });
-  const [project, sessions, docsReview, agentFiles] = await Promise.all([
+  const [project, sessions, docsReview, agentFiles, projectMemory] = await Promise.all([
     readProjectSummary(compatibility.projectFilePath),
     readSessionsStatus(rootDir),
     readDocsReviewStatus(rootDir),
     readAgentFileStatus(rootDir, toolingRootDir),
+    readProjectMemoryStatus(rootDir),
   ]);
 
   return {
@@ -39,12 +41,14 @@ export async function getProjectStatus(options = {}) {
     sessions,
     docsReview,
     agentFiles,
+    projectMemory,
     recommendations: buildRecommendations({
       project,
       compatibility,
       sessions,
       docsReview,
       agentFiles,
+      projectMemory,
     }),
   };
 }
@@ -99,6 +103,9 @@ export function renderStatusText(status) {
       ? [`- Output drift: ${status.docsReview.outputDrift.reasons.join('; ')}`]
       : []),
     '',
+    'Project memory:',
+    ...formatProjectMemoryStatus(status.projectMemory),
+    '',
     'Agent files:',
     ...formatAgentFileStatus(status.agentFiles),
   );
@@ -125,6 +132,7 @@ export function toStatusJson(status) {
     sessions: status.sessions,
     docsReview: status.docsReview,
     agentFiles: status.agentFiles,
+    projectMemory: status.projectMemory,
     recommendations: status.recommendations,
   };
 }
@@ -297,7 +305,48 @@ async function readAgentFileStatus(rootDir, toolingRootDir) {
   }
 }
 
-function buildRecommendations({ project, compatibility, sessions, docsReview, agentFiles }) {
+async function readProjectMemoryStatus(rootDir) {
+  try {
+    const scan = await scanProjectMemory(rootDir);
+    const architectureDocs = scan.documents.filter((document) => document.kind === 'architecture');
+    const architectureWarnings = scan.warnings
+      .filter((warning) => warning.path?.startsWith('architecture/'))
+      .map((warning) => ({
+        path: warning.path,
+        code: warning.code,
+        message: warning.message,
+      }));
+
+    return {
+      status: scan.errors.length > 0 ? 'errors' : 'ok',
+      architectureDocCount: architectureDocs.length,
+      architectureWarningCount: architectureWarnings.length,
+      warningSample: architectureWarnings.slice(0, 10),
+      truncatedWarningCount: Math.max(0, architectureWarnings.length - 10),
+      errorCount: scan.errors.length,
+      errorSample: scan.errors.slice(0, 10).map((error) => ({
+        path: error.path,
+        code: error.code,
+        message: error.message,
+      })),
+      truncatedErrorCount: Math.max(0, scan.errors.length - 10),
+    };
+  } catch (error) {
+    return {
+      status: 'unavailable',
+      architectureDocCount: 0,
+      architectureWarningCount: 0,
+      warningSample: [],
+      truncatedWarningCount: 0,
+      errorCount: 0,
+      errorSample: [],
+      truncatedErrorCount: 0,
+      errorMessage: error instanceof Error ? error.message : 'Unable to scan project memory.',
+    };
+  }
+}
+
+function buildRecommendations({ project, compatibility, sessions, docsReview, agentFiles, projectMemory }) {
   const recommendations = [];
   if (project.status === 'unreadable') {
     recommendations.push('vibecompass init --guided');
@@ -320,6 +369,16 @@ function buildRecommendations({ project, compatibility, sessions, docsReview, ag
     recommendations.push('vibecompass sync-agents --dry-run');
   }
 
+  if (projectMemory.status === 'errors') {
+    recommendations.push('vibecompass status --json');
+  } else if (projectMemory.architectureWarningCount > 0) {
+    recommendations.push(
+      sessions.status === 'ok' && sessions.current
+        ? `vibecompass docs-update --session ${sessions.current}`
+        : 'vibecompass docs-review --guided',
+    );
+  }
+
   if (sessions.status === 'ok' && sessions.lanes.length === 0) {
     recommendations.push('vibecompass start-session --id LANE_ID --working-on "TASK"');
   } else if (sessions.status === 'ok' && sessions.lanes.length >= 2) {
@@ -334,6 +393,8 @@ function hasStatusDrift(status) {
     status.compatibility.warnings.length > 0 ||
     status.docsReview.status !== 'completed' ||
     Boolean(status.docsReview.outputDrift?.hasDrift) ||
+    status.projectMemory.status !== 'ok' ||
+    status.projectMemory.architectureWarningCount > 0 ||
     status.agentFiles.status !== 'ok' ||
     status.agentFiles.results.some((item) => item.changed || item.warning)
   );
@@ -388,6 +449,34 @@ function formatDocsReviewStatus(docsReview) {
     return `Marker unreadable (${docsReview.errorMessage})`;
   }
   return `${docsReview.status}${docsReview.completedAt ? ` at ${docsReview.completedAt}` : ''}`;
+}
+
+function formatProjectMemoryStatus(projectMemory) {
+  if (projectMemory.status === 'unavailable') {
+    return [`- unavailable (${projectMemory.errorMessage})`];
+  }
+
+  const lines = [
+    `- Architecture docs: ${projectMemory.architectureDocCount}`,
+    `- Architecture warnings: ${projectMemory.architectureWarningCount}`,
+  ];
+
+  for (const warning of projectMemory.warningSample) {
+    lines.push(`- ${warning.path}: ${warning.code} — ${warning.message}`);
+  }
+
+  if (projectMemory.truncatedWarningCount > 0) {
+    lines.push(`- ${projectMemory.truncatedWarningCount} more architecture warning(s) omitted; use --json for the full status sample.`);
+  }
+
+  if (projectMemory.errorCount > 0) {
+    lines.push(`- Scan errors: ${projectMemory.errorCount}`);
+    for (const error of projectMemory.errorSample) {
+      lines.push(`- ${error.path}: ${error.code} — ${error.message}`);
+    }
+  }
+
+  return lines;
 }
 
 function formatAgentFileStatus(agentFiles) {

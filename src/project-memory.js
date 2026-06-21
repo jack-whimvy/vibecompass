@@ -11,7 +11,9 @@ const NON_CANONICAL_ARCHITECTURE_FILES = new Set(['README.md']);
 const VALID_MODES = new Set(['local-only', 'local-primary', 'hosted-only']);
 const RECOMMENDED_ARCHITECTURE_SECTIONS = [
   'Description',
+  'Review metadata',
   'Details',
+  'Retrieval guidance',
   'Next steps',
   'Involved files',
 ];
@@ -444,6 +446,31 @@ function parseArchitectureDocument(options) {
           ),
         );
       }
+    }
+
+    if (!/^\s*-\s*Evidence:\s+\S/im.test(frontmatter.body)) {
+      warnings.push(
+        createWarning(
+          'architecture-missing-evidence-metadata',
+          'Architecture doc is missing review metadata "Evidence" with concrete repo:path references.',
+        ),
+      );
+    } else if (/^\s*-\s*Evidence:\s*repo:path references inspected before making implementation claims\s*$/im.test(frontmatter.body)) {
+      warnings.push(
+        createWarning(
+          'architecture-generic-evidence-metadata',
+          'Architecture doc uses generic evidence metadata; list concrete repo:path references instead.',
+        ),
+      );
+    }
+
+    if (!/^\s*-\s*Blindspots:\s+\S/im.test(frontmatter.body)) {
+      warnings.push(
+        createWarning(
+          'architecture-missing-blindspots-metadata',
+          'Architecture doc is missing review metadata "Blindspots".',
+        ),
+      );
     }
 
     if (repoIds.length === 0 && /##\s+Involved files/i.test(frontmatter.body) && /`[^`]+\/[^`]+`/.test(frontmatter.body)) {

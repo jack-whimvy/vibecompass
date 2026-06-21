@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { connectHostedProjectMemory, initializeProjectMemory, setDefaultSyncTarget } from './init.js';
 import { preflightDocsReview } from './docs-review.js';
+import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -205,6 +206,20 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'docs-update') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await planDocsUpdate({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } else {
+      io.stdout.write(renderDocsUpdatePlan(result));
+    }
+    return 0;
+  }
+
   if (parsed.command === 'close-session' || parsed.command === 'end-session') {
     await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await closeProjectSession({
@@ -214,12 +229,17 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
+    if (result.docsUpdatePlan) {
+      io.stdout.write(renderDocsUpdatePlan(result.docsUpdatePlan));
+    }
+    writeDocumentMaintenanceCheckpoint(io, result.documentMaintenance);
     if (result.workflowGuidance.length > 0) {
       io.stdout.write('Workflow guidance:\n');
       for (const item of result.workflowGuidance) {
         io.stdout.write(`- ${item}\n`);
       }
     }
+    writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
   }
@@ -250,6 +270,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     });
     io.stdout.write(`Current session lane: ${result.current}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
+    writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
   }
@@ -455,6 +476,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'refresh-workflow') {
       return parseRefreshWorkflowArgs(rest);
+    }
+
+    if (command === 'docs-update') {
+      return parseDocsUpdateArgs(rest);
     }
 
     if (command === 'close-session' || command === 'end-session') {
@@ -896,6 +921,7 @@ function parseCloseSessionArgs(argv) {
     models: [],
     blockers: [],
     nextSteps: [],
+    documentMaintenance: {},
   };
   // Repeatable CLI flags stay singular for readability, but map to plural arrays in the JS API.
 
@@ -949,6 +975,15 @@ function parseCloseSessionArgs(argv) {
       case '--next-session-should':
         parsed.nextSessionShould = value;
         break;
+      case '--architecture-docs':
+        parsed.documentMaintenance.architectureDocs = value;
+        break;
+      case '--decision-log':
+        parsed.documentMaintenance.decisionLog = value;
+        break;
+      case '--session-maintenance':
+        parsed.documentMaintenance.sessionMaintenance = value;
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -956,6 +991,49 @@ function parseCloseSessionArgs(argv) {
 
   return {
     command: 'close-session',
+    options: parsed,
+  };
+}
+
+function parseDocsUpdateArgs(argv) {
+  const parsed = {
+    changedFiles: [],
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--changed':
+        parsed.changedFiles.push(value);
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'docs-update',
     options: parsed,
   };
 }
@@ -1464,6 +1542,17 @@ function writeRefreshWorkflowResult(io, result) {
   writeAgentFileSyncResult(io, result.agentFileSync);
 }
 
+function writeDocumentMaintenanceCheckpoint(io, documentMaintenance) {
+  if (!documentMaintenance) {
+    return;
+  }
+
+  io.stdout.write('Document maintenance checkpoint:\n');
+  io.stdout.write(`- Architecture docs: ${documentMaintenance.architectureDocs}\n`);
+  io.stdout.write(`- Decision log: ${documentMaintenance.decisionLog}\n`);
+  io.stdout.write(`- Session handoff/scratch: ${documentMaintenance.sessionMaintenance}\n`);
+}
+
 async function writeCompatibilityPreflightWarnings(io, options = {}, runtime = {}) {
   const result = await inspectProjectCompatibility({
     ...options,
@@ -1513,9 +1602,10 @@ function usageText() {
     '  vibecompass sync-target [<name>] [options]',
     '  vibecompass status [options]',
     '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
+    '  vibecompass docs-update [--session <lane-id>] [options]',
     '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
-    '  vibecompass close-session --title <text> --completed <text> --next-step <text> [options]',
-    '  vibecompass end-session --title <text> --completed <text> --next-step <text> [options]  # alias',
+    '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
+    '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
     '  vibecompass list-sessions [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass sync-agents [options]',
@@ -1578,6 +1668,12 @@ function usageText() {
     '  --update-package-stamp               Update an existing project.yaml package_version stamp',
     '  --allow-downgrade-templates          Allow applying templates with a CLI older than the root stamp',
     '',
+    'Docs-update options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --session <lane-id>                  Active session lane to inspect; defaults to current lane',
+    '  --changed <repo:path|path>           Repeatable explicit changed path; defaults to git status when omitted',
+    '  --json                               Print the typed docs-update plan as JSON',
+    '',
     'Start-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
@@ -1602,6 +1698,9 @@ function usageText() {
     '  --model <text>                       Optional repeatable model contribution entry',
     '  --blocker <text>                     Repeatable blocker or open question',
     '  --next-step <text>                   Repeatable next-session step',
+    '  --architecture-docs <status>         Required checkpoint: updated|not-needed|deferred',
+    '  --decision-log <status>              Required checkpoint: updated|not-needed|deferred',
+    '  --session-maintenance <status>       Required checkpoint: updated|not-needed|deferred',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md completed summary',
     '  --next-session-should <text>         Optional override for the CLAUDE.md next-session summary',
     '',
