@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.6 - 2026-06-22
+
 - Add `docs-update` as a session-delta documentation maintenance planner that maps changed files, lane claims, session repos/features, new decisions, and package-owned generated/state surfaces to targeted architecture/decision/session follow-up.
 - Print the same docs-update plan during `close-session` / `end-session` before the required document-maintenance checkpoint, while keeping semantic document authorship with the closing agent or human.
 - Breaking: `close-session` / `end-session` and the `closeProjectSession` API now require document-maintenance checkpoint statuses for architecture docs, the decision log, and session handoff/scratch maintenance before a lane can be finalized.
