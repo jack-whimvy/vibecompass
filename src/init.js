@@ -71,8 +71,13 @@ export async function connectHostedProjectMemory(options) {
     throw error;
   }
 
-  if (!['local-primary', 'hosted-only'].includes(projectConfig.mode)) {
-    throw new Error('connect-hosted requires project.yaml mode to be local-primary or hosted-only.');
+  if (!VALID_MODES.has(projectConfig.mode)) {
+    throw new Error('connect-hosted requires project.yaml mode to be local-only, local-primary, or hosted-only.');
+  }
+
+  const previousMode = projectConfig.mode;
+  if (projectConfig.mode === 'local-only') {
+    projectConfig.mode = 'local-primary';
   }
 
   const targetName = typeof options?.targetName === 'string' && options.targetName.trim() !== ''
@@ -136,6 +141,8 @@ export async function connectHostedProjectMemory(options) {
     rootDir,
     projectFilePath,
     mode: projectConfig.mode,
+    previousMode,
+    modeChanged: previousMode !== projectConfig.mode,
     syncEnvVar: sync.credential_env_var,
     syncTarget,
   };

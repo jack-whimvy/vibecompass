@@ -147,6 +147,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
     });
     io.stdout.write(`Connected hosted VibeCompass for ${result.mode}\n`);
+    if (result.modeChanged) {
+      io.stdout.write(`Project mode: ${result.previousMode} -> ${result.mode}\n`);
+    }
     io.stdout.write(`Updated ${result.projectFilePath}\n`);
     if (result.syncTarget) {
       io.stdout.write(`Sync target: ${result.syncTarget.name} (default: ${result.syncTarget.defaultTarget})\n`);

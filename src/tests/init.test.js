@@ -2679,6 +2679,181 @@ test('runCli connect-hosted adds a hosted sync binding later', async () => {
   }
 });
 
+test('runCli connect-hosted promotes local-only roots to local-primary', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-local-only-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Connect Local Only Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const exitCode = await runCli(
+      [
+        'connect-hosted',
+        '--sync-api-url',
+        'https://vibecompass.dev',
+        '--sync-project-id',
+        'vc_proj_local_only',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(projectYaml, /mode: local-primary/);
+    assert.match(projectYaml, /sync:/);
+    assert.match(projectYaml, /project_id: vc_proj_local_only/);
+    assert.match(projectYaml, /credential_env_var: VIBECOMPASS_SYNC_TOKEN/);
+    assert.match(output, /Connected hosted VibeCompass for local-primary/);
+    assert.match(output, /Project mode: local-only -> local-primary/);
+    assert.match(output, /Then run: vibecompass push/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli connect-hosted leaves hosted-only roots hosted-only', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-hosted-only-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Connect Hosted Only Project',
+      mode: 'hosted-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const exitCode = await runCli(
+      [
+        'connect-hosted',
+        '--sync-api-url',
+        'https://vibecompass.dev',
+        '--sync-project-id',
+        'vc_proj_hosted_only',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(projectYaml, /mode: hosted-only/);
+    assert.match(projectYaml, /sync:/);
+    assert.match(projectYaml, /project_id: vc_proj_hosted_only/);
+    assert.match(output, /Connected hosted VibeCompass for hosted-only/);
+    assert.doesNotMatch(output, /Project mode:/);
+    assert.doesNotMatch(output, /Then run: vibecompass push/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli connect-hosted --target promotes local-only roots and writes named target', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-local-only-target-'));
+  const stdout = [];
+  const stderr = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Connect Local Only Target Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+
+    const exitCode = await runCli(
+      [
+        'connect-hosted',
+        '--target',
+        'dev',
+        '--sync-api-url',
+        'https://dev.vibecompass.test',
+        '--sync-project-id',
+        'vc_proj_dev',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN_DEV',
+      ],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+
+    const output = stdout.join('');
+    const projectYaml = await readFile(path.join(tempDir, '.compass/project.yaml'), 'utf8');
+
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.length, 0);
+    assert.match(projectYaml, /mode: local-primary/);
+    assert.match(projectYaml, /default_target: dev/);
+    assert.match(projectYaml, /project_id: vc_proj_dev/);
+    assert.match(projectYaml, /credential_env_var: VIBECOMPASS_SYNC_TOKEN_DEV/);
+    assert.match(output, /Connected hosted VibeCompass for local-primary/);
+    assert.match(output, /Project mode: local-only -> local-primary/);
+    assert.match(output, /Sync target: dev \(default: dev\)/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('runCli connect-hosted tells users to init first when project.yaml is missing', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-connect-hosted-missing-'));
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.10.7 - 2026-06-25
+
+- Let `connect-hosted` attach hosted sync to existing `local-only` project-memory roots by promoting them to `local-primary`, so local-only users can run the hosted setup command copied from the app without first editing `project.yaml`.
+- Print the mode promotion in CLI output and preserve existing `local-primary` / `hosted-only` behavior.
+- Cover hosted-only passthrough, local-only promotion, and named-target promotion with CLI regression tests.
+
 ## 0.10.6 - 2026-06-22
 
 - Add `docs-update` as a session-delta documentation maintenance planner that maps changed files, lane claims, session repos/features, new decisions, and package-owned generated/state surfaces to targeted architecture/decision/session follow-up.
