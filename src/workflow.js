@@ -1,3 +1,5 @@
+import { resolveSyncBinding } from './sync-binding.js';
+
 export const DEFAULT_REVIEWER_HANDBACK = 'handoff-file';
 export const DEFAULT_GIT_REMOTE = 'origin';
 export const DEFAULT_COMMIT_TEMPLATE = 'docs(session): YYYY-MM-DD-N — <summary>';
@@ -74,8 +76,10 @@ export function buildWorkflowMetadata(existingMetadata, overrides = {}) {
   };
 }
 
-export function buildCloseSessionGuidance(workflowSettings) {
+export function buildCloseSessionGuidance(workflowSettings, options = {}) {
   const guidance = [];
+  const projectConfig = isPlainObject(options.projectConfig) ? options.projectConfig : null;
+  const rootFlag = normalizeOptionalString(options.rootFlag) ?? '--root .compass';
 
   guidance.push('Reviewer handback stays in the selected sessions/active/<lane-id>/wip.md and handoff.md before close-session runs.');
   guidance.push('Close-session requires document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch: updated, not-needed, or deferred.');
@@ -95,7 +99,41 @@ export function buildCloseSessionGuidance(workflowSettings) {
     guidance.push(`Use commit message format: ${workflowSettings.closeSession.commitTemplate}`);
   }
 
+  guidance.push(...buildHostedProjectionGuidance(projectConfig, rootFlag));
+
   return guidance;
+}
+
+function buildHostedProjectionGuidance(projectConfig, rootFlag) {
+  if (!projectConfig) {
+    return [
+      'Hosted projection freshness could not be determined because project.yaml was unavailable; if this root is connected to hosted, push or refresh hosted state explicitly after close-session.',
+    ];
+  }
+
+  if (projectConfig.mode === 'local-primary') {
+    const binding = resolveSyncBinding(projectConfig, null);
+    if (!binding) {
+      return [
+        'Hosted projection freshness: no hosted sync binding is configured for this local-primary root, so no hosted push command is available.',
+      ];
+    }
+
+    const targetFlag = binding.target ? ` --sync-target ${binding.target}` : '';
+    return [
+      `Hosted projection freshness: after local canonical files are finalized, run \`vibecompass push ${rootFlag}${targetFlag}\` when the hosted dashboard should reflect this session.`,
+    ];
+  }
+
+  if (projectConfig.mode === 'hosted-only') {
+    return [
+      'Hosted projection freshness: this root is hosted-only, so there is no authoritative local push; confirm hosted dashboard/proposal/Understanding state was updated or record it as deferred.',
+    ];
+  }
+
+  return [
+    'Hosted projection freshness: local-only mode has no hosted push expectation unless the project is later connected with connect-hosted.',
+  ];
 }
 
 function normalizeReviewerHandback(value) {

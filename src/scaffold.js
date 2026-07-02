@@ -256,7 +256,8 @@ ${renderWorkflowDefaults(workflow)}
 
 ## Documentation coverage
 - The architecture, decision, and session files created by init are an initial scaffold, not a comprehensive codebase review.
-- Before risky implementation work, inspect the relevant code and update the affected architecture docs.
+- Comprehensive \`docs review\` establishes a breadth-first baseline first: inventory the project, propose a coverage plan, create compact accepted docs, and leave deferred/missing areas visible before focused deepening.
+- Before implementation work on a specific feature, inspect the relevant architecture docs, decisions, coverage/documentation-plan state if present, and source files. If the area is missing, partial, or has never been deepened enough for the build, record that gap in the lane scratch and use \`docs update\`, a focused docs-review/deepening pass, or an explicit deferral before close-out.
 - Use \`vibecompass docs-update --session <lane-id>\` during a session for a targeted maintenance plan based on changed files, lane claims, session repos/features, and new decisions. This is a session-delta planner, not a broad architecture review.
 - Use the \`docs review\` prompt command when you want the current AI session to run a comprehensive documentation review. It may run \`vibecompass docs-review --guided\` as package mechanics to record marker state and print the canonical review contract.
 
@@ -312,6 +313,7 @@ During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
+- after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh
 - use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
@@ -335,6 +337,8 @@ At session close:
 - if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
 - delete the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\`
 - refresh any affected architecture/decision docs
+- for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
+- for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred
 
 ## Reviewer workflow
 - use \`review handoff\` when you want the reviewer to run the next review pass

@@ -185,7 +185,8 @@ export async function closeProjectSession(options) {
 
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const claude = await readClaudeFile(normalized.claudePath);
-  const workflowSettings = await readWorkflowSettings(normalized.projectFilePath);
+  const projectConfig = await readProjectConfig(normalized.projectFilePath);
+  const workflowSettings = resolveWorkflowSettings(projectConfig);
   const sessionId = await resolveExistingSessionId(normalized, options);
   const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
   const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
@@ -294,7 +295,10 @@ export async function closeProjectSession(options) {
     sessionNumber: activeSession.sessionNumber,
     documentMaintenance,
     docsUpdatePlan: docsUpdate.plan,
-    workflowGuidance: buildCloseSessionGuidance(workflowSettings),
+    workflowGuidance: buildCloseSessionGuidance(workflowSettings, {
+      projectConfig,
+      rootFlag: buildRootFlagForGuidance(normalized),
+    }),
     warnings: [
       ...docsUpdate.warnings,
       ...manifestRefresh.warnings,
@@ -527,14 +531,17 @@ async function ensureInitializedProjectMemory(rootDir, options = {}) {
   }
 }
 
-async function readWorkflowSettings(projectFilePath) {
+async function readProjectConfig(projectFilePath) {
   try {
     const source = await readFile(projectFilePath, 'utf8');
-    const data = parseSimpleYaml(source, { sourceName: projectFilePath });
-    return resolveWorkflowSettings(data);
+    return parseSimpleYaml(source, { sourceName: projectFilePath });
   } catch {
-    return resolveWorkflowSettings(null);
+    return null;
   }
+}
+
+function buildRootFlagForGuidance(normalized) {
+  return `--root ${toPosix(path.relative(normalized.cwd, normalized.rootDir) || '.')}`;
 }
 
 async function readClaudeFile(claudePath) {

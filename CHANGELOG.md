@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.10.8 - 2026-07-02
+
+- Clarify generated docs-review workflow guidance so first passes establish breadth-first baseline coverage before optional scoped deepening.
+- Add build-session guidance that tells builders to inspect relevant docs, decisions, coverage state, and source before feature work, then record, deepen, or explicitly defer documentation gaps before close-out.
+- Print mode-aware hosted projection guidance during `close-session` / `end-session`: connected `local-primary` roots get an explicit `vibecompass push` reminder, `hosted-only` roots are directed through hosted/dashboard refresh, and `local-only` roots have no hosted push expectation.
+- Expand close-session hosted guidance tests across local-primary with binding, local-primary without binding, hosted-only, and local-only modes.
+
 ## 0.10.7 - 2026-06-25
 
 - Let `connect-hosted` attach hosted sync to existing `local-only` project-memory roots by promoting them to `local-primary`, so local-only users can run the hosted setup command copied from the app without first editing `project.yaml`.

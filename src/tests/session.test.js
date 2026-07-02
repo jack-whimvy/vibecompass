@@ -353,6 +353,78 @@ test('closeProjectSession falls back to default workflow guidance when project.y
   }
 });
 
+test('closeProjectSession prints mode-aware hosted projection guidance', async () => {
+  for (const scenario of [
+    {
+      mode: 'local-primary',
+      sync: {
+        apiUrl: 'https://vibecompass.dev',
+        projectId: 'vc_proj_test',
+        credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
+      },
+      expected: /vibecompass push --root \.compass/,
+    },
+    {
+      mode: 'local-primary',
+      sync: undefined,
+      expected: /no hosted sync binding is configured/,
+    },
+    {
+      mode: 'hosted-only',
+      sync: {
+        apiUrl: 'https://vibecompass.dev',
+        projectId: 'vc_proj_hosted',
+        credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
+      },
+      expected: /there is no authoritative local push/,
+    },
+    {
+      mode: 'local-only',
+      sync: undefined,
+      expected: /no hosted push expectation/,
+    },
+  ]) {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), `vibecompass-session-hosted-${scenario.mode}-`));
+    const rootDir = path.join(tempDir, '.compass');
+
+    try {
+      await initializeProjectMemory({
+        cwd: tempDir,
+        rootDir,
+        name: `Hosted Guidance ${scenario.mode}`,
+        mode: scenario.mode,
+        repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+        sync: scenario.sync,
+        bootstrap: {
+          workflow: true,
+          claude: true,
+        },
+      });
+
+      await startProjectSession({
+        cwd: tempDir,
+        rootDir,
+        sessionId: 'hosted-guidance',
+        workingOn: 'Check hosted projection guidance.',
+        date: '2026-04-20',
+      });
+
+      const result = await closeProjectSession({
+        cwd: tempDir,
+        rootDir,
+        title: 'Hosted Guidance',
+        completed: ['Checked hosted projection guidance.'],
+        documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
+        nextSteps: ['Continue hosted sync testing.'],
+      });
+
+      assert.match(result.workflowGuidance.join('\n'), scenario.expected);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test('closeProjectSession allows sessions without recorded models', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-no-models-'));
   const rootDir = path.join(tempDir, '.compass');

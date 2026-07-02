@@ -180,11 +180,15 @@ After setup, use these phrases inside your AI coding tool:
 - `planning mode`
 - `review handoff`
 - `address review`
+- `docs update`
 - `close session` / `end session`
 - `docs review`
 
 The npm package owns the file mechanics. Your AI session owns reading the
-workflow files, updating handoffs, and applying reviewed changes.
+workflow files, updating handoffs, and applying reviewed changes. Use
+`docs review` for the broad baseline and scoped deepening work; use
+`docs update` / `vibecompass docs-update` for ordinary session-delta
+maintenance tied to the current lane.
 
 ## Hosted Sync
 
@@ -200,6 +204,11 @@ npx -y @vibecompass/vibecompass@latest connect-hosted \
 
 npx -y @vibecompass/vibecompass@latest push --root .compass
 ```
+
+After `close-session`, run `push` again when a connected local-primary root
+changed canonical project-memory files and the hosted dashboard should catch
+up. Hosted-only projects do not use a local authoritative push; update or
+refresh them through the hosted dashboard/proposal flow.
 
 ### Multiple environments
 
