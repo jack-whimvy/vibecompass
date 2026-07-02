@@ -2,6 +2,7 @@ import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { serializeProjectConfig } from './project-yaml.js';
 import { writeStateManifest } from './manifest.js';
+import { withMemoryRootLock } from './serialization.js';
 import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
 import { buildWorkflowMetadata } from './workflow.js';
@@ -57,6 +58,10 @@ export async function initializeProjectMemory(options) {
 export async function connectHostedProjectMemory(options) {
   const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options?.rootDir ?? '.compass');
+  return withMemoryRootLock(rootDir, 'connect-hosted', () => connectHostedProjectMemoryLocked(options, rootDir));
+}
+
+async function connectHostedProjectMemoryLocked(options, rootDir) {
   const projectFilePath = path.join(rootDir, 'project.yaml');
   let projectConfig;
   try {
@@ -171,6 +176,10 @@ async function updateManifestSyncState(rootDir, updater) {
 export async function setDefaultSyncTarget(options) {
   const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options?.rootDir ?? '.compass');
+  return withMemoryRootLock(rootDir, 'sync-target', () => setDefaultSyncTargetLocked(options, rootDir));
+}
+
+async function setDefaultSyncTargetLocked(options, rootDir) {
   const projectFilePath = path.join(rootDir, 'project.yaml');
   const projectConfig = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
     sourceName: projectFilePath,

@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { localRevisionFromManifestHash, stableHash } from './hash.js';
+import { withMemoryRootLock } from './serialization.js';
 import { scanProjectMemory } from './project-memory.js';
 import { listProjectSessions } from './session.js';
 import { PACKAGE_VERSION } from './version.js';
@@ -83,6 +84,10 @@ export async function prepareStateManifest(rootDir, options = {}) {
 }
 
 export async function writeStateManifest(rootDir, options = {}) {
+  return withMemoryRootLock(rootDir, 'state-manifest-refresh', () => writeStateManifestLocked(rootDir, options));
+}
+
+async function writeStateManifestLocked(rootDir, options = {}) {
   const prepared = await prepareStateManifest(rootDir, options);
   const stateDir = path.dirname(prepared.manifestPath);
 

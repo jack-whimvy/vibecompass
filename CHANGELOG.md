@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a per-root serialization lock (mkdir-mutex under `state/` with owner tokens, release-only-own semantics, atomic rename-based reclaim of dead-process locks, and no stealing from live holders) so all package writers of shared project memory — session lifecycle, `refresh-workflow --apply`, docs-review apply paths, `apply-export`, `connect-hosted`, `sync-target`, state-manifest refresh, and managed agent-file sync — run one at a time per project-memory root (D-276).
+- Add `append-decision`: an atomic append path that allocates the next D-number at write time from a staged `### D-NEXT — <title>` entry, plus `next-decision-id` as an advisory preview.
+- Block `close-session` when duplicate decision IDs exist in canonical decision files; duplicates are surfaced for human repair, never auto-renumbered.
+- Add `rebuild-active-index` to regenerate `sessions/active/index.yaml` from active lane directories with an explicit current-lane selection when multiple lanes are active (D-277).
+
 ## 0.10.8 - 2026-07-02
 
 - Clarify generated docs-review workflow guidance so first passes establish breadth-first baseline coverage before optional scoped deepening.

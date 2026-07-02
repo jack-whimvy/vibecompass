@@ -2,6 +2,7 @@ import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
+import { withMemoryRootLock } from './serialization.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import {
   buildSyncStateWithCursor,
@@ -143,6 +144,10 @@ export async function pullExportProjectMemory(options = {}, environment = {}) {
 export async function applyPullExport(options = {}, environment = {}) {
   const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  return withMemoryRootLock(rootDir, 'apply-export', () => applyPullExportLocked(options, rootDir));
+}
+
+async function applyPullExportLocked(options, rootDir) {
   const outputPath = path.resolve(rootDir, options.outputPath ?? DEFAULT_EXPORT_PATH);
   const bundle = await readJsonRequired(outputPath, 'pull-export bundle');
   const operations = Array.isArray(bundle.operations) ? bundle.operations : [];

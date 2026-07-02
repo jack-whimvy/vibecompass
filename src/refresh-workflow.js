@@ -6,11 +6,19 @@ import { serializeProjectConfig } from './project-yaml.js';
 import { buildWorkflowScaffoldFiles } from './scaffold.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
+import { withMemoryRootLock } from './serialization.js';
 import { PACKAGE_VERSION } from './version.js';
 
 export async function refreshWorkflow(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  if (!options.apply) {
+    return refreshWorkflowResolved(options, cwd, rootDir);
+  }
+  return withMemoryRootLock(rootDir, 'refresh-workflow', () => refreshWorkflowResolved(options, cwd, rootDir));
+}
+
+async function refreshWorkflowResolved(options, cwd, rootDir) {
   const toolingRootDir = options.toolingRootDir
     ? path.resolve(cwd, options.toolingRootDir)
     : cwd;

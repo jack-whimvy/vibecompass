@@ -16,6 +16,8 @@ import {
 } from './source-inventory.js';
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
+import { withMemoryRootLock } from './serialization.js';
+import { listDecisionFileNames, readNextDecisionId } from './decisions.js';
 
 const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v7';
 const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v1';
@@ -229,6 +231,10 @@ async function completeDocsReview(options) {
 }
 
 async function applyDocsReviewOutput(options) {
+  return withMemoryRootLock(options.rootDir, 'docs-review-apply-output', () => applyDocsReviewOutputLocked(options));
+}
+
+async function applyDocsReviewOutputLocked(options) {
   const current = await readDocsReviewMarker(options.statePath);
   const outputPath = options.outputPath
     ? path.resolve(options.rootDir, options.outputPath)
@@ -391,6 +397,10 @@ async function applyDocsReviewOutput(options) {
 }
 
 async function applyDecisionArtifact(options) {
+  return withMemoryRootLock(options.rootDir, 'docs-review-apply-decision-artifact', () => applyDecisionArtifactLocked(options));
+}
+
+async function applyDecisionArtifactLocked(options) {
   const current = await readDocsReviewMarker(options.statePath);
   const artifactId = normalizeOptionalString(options.artifactId);
   if (!artifactId) {
@@ -1949,33 +1959,8 @@ async function applyDecisionRecommendations(options) {
   };
 }
 
-async function readNextDecisionId(rootDir) {
-  const decisionsDir = path.join(rootDir, 'decisions');
-  let max = 0;
-
-  for (const fileName of await listDecisionFileNames(decisionsDir)) {
-    const content = await readFile(path.join(decisionsDir, fileName), 'utf8');
-    for (const match of content.matchAll(/^###\s+D-(\d+)\b/gm)) {
-      max = Math.max(max, Number(match[1]));
-    }
-  }
-
-  return max + 1;
-}
-
-async function listDecisionFileNames(decisionsDir) {
-  try {
-    return (await readdir(decisionsDir))
-      .filter((fileName) =>
-        fileName.endsWith('.md') &&
-        !['INDEX.md', 'README.md', 'EXAMPLE.md'].includes(fileName),
-      )
-      .sort((left, right) => left.localeCompare(right));
-  } catch (error) {
-    if (error?.code === 'ENOENT') return [];
-    throw error;
-  }
-}
+// readNextDecisionId and listDecisionFileNames moved to decisions.js so the
+// atomic append path (D-276) and these apply paths share one allocation scan.
 
 function renderDecisionEntry(options) {
   const decisionNumber = `D-${String(options.decisionId).padStart(3, '0')}`;

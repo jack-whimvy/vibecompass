@@ -9,6 +9,7 @@ import { agentsMdFormat } from './agents-md.js';
 import { cursorRulesFormat } from './cursor-rules.js';
 import { copilotInstructionsFormat } from './copilot-instructions.js';
 import { getWorkflowConflictScanPatterns } from '../../workflows/registry.js';
+import { withMemoryRootLock } from '../../serialization.js';
 
 const FORMATS = [
   claudeMdFormat,
@@ -23,6 +24,13 @@ const CONFLICT_SCAN_PATTERNS = getWorkflowConflictScanPatterns();
 export async function syncAgentInstructionFiles(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  if (options.dryRun) {
+    return syncAgentInstructionFilesLocked(options, cwd, rootDir);
+  }
+  return withMemoryRootLock(rootDir, 'sync-agents', () => syncAgentInstructionFilesLocked(options, cwd, rootDir));
+}
+
+async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
   const toolingRootDir = options.toolingRootDir
     ? path.resolve(cwd, options.toolingRootDir)
     : cwd;

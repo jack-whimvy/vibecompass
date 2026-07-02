@@ -6,6 +6,8 @@ import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.j
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { START_MARKER } from './generators/agent-files/markers.js';
 import { planDocsUpdate } from './docs-update.js';
+import { withMemoryRootLock } from './serialization.js';
+import { findDuplicateDecisionIds, formatDecisionId } from './decisions.js';
 // This lazy-only cycle is intentional: manifest.js reads lane state from this
 // module, and session command handlers rewrite the derived manifest after
 // lane mutations. Keep both sides free of top-level calls into the other.
@@ -54,6 +56,10 @@ const RESERVED_LANE_IDS = new Set([
 
 export async function startProjectSession(options) {
   const normalized = normalizeSessionPaths(options);
+  return withMemoryRootLock(normalized.rootDir, 'start-session', () => startProjectSessionLocked(normalized, options));
+}
+
+async function startProjectSessionLocked(normalized, options) {
   const workingOn = requireNonEmptyString(options?.workingOn, 'start-session requires a non-empty workingOn value.');
   const sessionDate = normalizeSessionDate(options?.date);
 
@@ -168,6 +174,10 @@ export async function startProjectSession(options) {
 
 export async function closeProjectSession(options) {
   const normalized = normalizeSessionPaths(options);
+  return withMemoryRootLock(normalized.rootDir, 'close-session', () => closeProjectSessionLocked(normalized, options));
+}
+
+async function closeProjectSessionLocked(normalized, options) {
   const title = requireNonEmptyString(options?.title, 'session close requires a non-empty title.');
   const completed = normalizeStringArray(options?.completed);
   const models = normalizeStringArray(options?.models);
@@ -184,6 +194,16 @@ export async function closeProjectSession(options) {
   }
 
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+
+  const duplicateDecisionIds = await findDuplicateDecisionIds(normalized.rootDir);
+  if (duplicateDecisionIds.length > 0) {
+    throw new Error(
+      `close-session is blocked: duplicate decision IDs detected — ${duplicateDecisionIds
+        .map((duplicate) => `${formatDecisionId(duplicate.id)} (${duplicate.occurrences.join(', ')})`)
+        .join('; ')}. Repair the canonical decision files by hand before closing (D-276); duplicates are never auto-renumbered.`,
+    );
+  }
+
   const claude = await readClaudeFile(normalized.claudePath);
   const projectConfig = await readProjectConfig(normalized.projectFilePath);
   const workflowSettings = resolveWorkflowSettings(projectConfig);
@@ -367,6 +387,10 @@ export async function listProjectSessions(options = {}) {
 
 export async function switchProjectSession(options = {}) {
   const normalized = normalizeSessionPaths(options);
+  return withMemoryRootLock(normalized.rootDir, 'switch-session', () => switchProjectSessionLocked(normalized, options));
+}
+
+async function switchProjectSessionLocked(normalized, options) {
   const sessionId = validateLaneId(requireNonEmptyString(options?.sessionId, 'switch-session requires a session ID.'));
   const lanes = await listActiveSessionLanes(normalized);
   const lane = lanes.find((item) => item.id === sessionId);
@@ -402,6 +426,61 @@ export async function switchProjectSession(options = {}) {
     manifest: manifestRefresh.manifest,
     agentFileSync,
   };
+}
+
+/**
+ * Rebuilds `sessions/active/index.yaml` from the active lane directories plus
+ * an explicit current-lane selection (D-266/D-277 recovery path). The current
+ * pointer is never derived from enumeration alone: an explicit `current` wins,
+ * a still-valid existing pointer is preserved, and only a single surviving
+ * lane may become current implicitly.
+ */
+export async function rebuildActiveSessionIndex(options = {}) {
+  const normalized = normalizeSessionPaths(options);
+  return withMemoryRootLock(normalized.rootDir, 'rebuild-active-index', async () => {
+    await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+    const lanes = await listActiveSessionLanes(normalized);
+    const requested = options?.current == null || options.current === ''
+      ? null
+      : validateLaneId(requireNonEmptyString(options.current, 'rebuild-active-index requires a non-empty --current lane ID when provided.'));
+
+    if (requested && !lanes.some((lane) => lane.id === requested)) {
+      throw new Error(`Active session lane "${requested}" does not exist; cannot set it as the current lane.`);
+    }
+
+    if (lanes.length === 0) {
+      await rm(normalized.activeSessionsIndexPath, { force: true });
+      return {
+        rootDir: normalized.rootDir,
+        indexPath: normalized.activeSessionsIndexPath,
+        current: null,
+        lanes,
+        removed: true,
+      };
+    }
+
+    const existing = await readActiveSessionIndex(normalized);
+    const current =
+      requested ??
+      (lanes.some((lane) => lane.id === existing.current) ? existing.current : null) ??
+      (lanes.length === 1 ? lanes[0].id : null);
+
+    if (!current) {
+      throw new Error(
+        'rebuild-active-index needs an explicit --current <lane-id> because more than one lane is active and the existing pointer is not valid (D-277: the current lane is an explicit selection, not a derived default).',
+      );
+    }
+
+    await mkdir(normalized.activeSessionsDir, { recursive: true });
+    await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, lanes), 'utf8');
+    return {
+      rootDir: normalized.rootDir,
+      indexPath: normalized.activeSessionsIndexPath,
+      current,
+      lanes,
+      removed: false,
+    };
+  });
 }
 
 async function refreshStateManifestSafely(rootDir) {

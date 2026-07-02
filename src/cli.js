@@ -6,7 +6,10 @@ import { connectHostedProjectMemory, initializeProjectMemory, setDefaultSyncTarg
 import { preflightDocsReview } from './docs-review.js';
 import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
-import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from './session.js';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { closeProjectSession, listProjectSessions, rebuildActiveSessionIndex, startProjectSession, switchProjectSession } from './session.js';
+import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
@@ -446,6 +449,54 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'rebuild-active-index') {
+    const result = await rebuildActiveSessionIndex({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (result.removed) {
+      io.stdout.write('No active lanes; removed sessions/active/index.yaml.\n');
+    } else {
+      io.stdout.write(`Rebuilt ${result.indexPath}\n`);
+      io.stdout.write(`Current lane: ${result.current}\n`);
+      for (const lane of result.lanes) {
+        io.stdout.write(`- ${lane.id}${lane.workingOn ? `: ${lane.workingOn}` : ''}\n`);
+      }
+    }
+    return 0;
+  }
+
+  if (parsed.command === 'append-decision') {
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
+    if (!parsed.options.entryPath) {
+      throw new Error('append-decision requires --entry <staged-entry-file>.');
+    }
+    const entryContent = await readFile(path.resolve(cwd, parsed.options.entryPath), 'utf8');
+    const result = await appendDecisionEntry({
+      rootDir,
+      target: parsed.options.target,
+      entryContent,
+    });
+    io.stdout.write(`Appended ${formatDecisionId(result.decisionId)} to ${result.targetPath}\n`);
+    for (const warning of result.warnings) {
+      io.stdout.write(`Warning: ${warning}\n`);
+    }
+    io.stdout.write(`${result.indexReminder}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'next-decision-id') {
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
+    const nextId = await readNextDecisionId(rootDir);
+    io.stdout.write(`Advisory next decision ID: ${formatDecisionId(nextId)}\n`);
+    io.stdout.write(
+      'Allocation happens at write time under the memory-root lock (D-276). Use `vibecompass append-decision`, or re-read the log immediately before appending by hand.\n',
+    );
+    return 0;
+  }
+
   throw new Error(`Unknown command "${parsed.command}".`);
 }
 
@@ -495,6 +546,18 @@ export function parseCliArgs(argv) {
 
     if (command === 'switch-session') {
       return parseSwitchSessionArgs(rest);
+    }
+
+    if (command === 'rebuild-active-index') {
+      return parseRebuildActiveIndexArgs(rest);
+    }
+
+    if (command === 'append-decision') {
+      return parseAppendDecisionArgs(rest);
+    }
+
+    if (command === 'next-decision-id') {
+      return parseNextDecisionIdArgs(rest);
     }
 
     if (command === 'sync-agents') {
@@ -1071,6 +1134,84 @@ function parseListSessionsArgs(argv) {
   };
 }
 
+function parseRebuildActiveIndexArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--current':
+        parsed.current = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return { command: 'rebuild-active-index', options: parsed };
+}
+
+function parseAppendDecisionArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--target':
+        parsed.target = value;
+        break;
+      case '--entry':
+        parsed.entryPath = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return { command: 'append-decision', options: parsed };
+}
+
+function parseNextDecisionIdArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return { command: 'next-decision-id', options: parsed };
+}
+
 function parseSwitchSessionArgs(argv) {
   const parsed = {};
   const positional = [];
@@ -1611,6 +1752,9 @@ function usageText() {
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
     '  vibecompass list-sessions [options]',
     '  vibecompass switch-session <id> [options]',
+    '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
+    '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [options]',
+    '  vibecompass next-decision-id [options]',
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
     '  vibecompass pull-preview [options]',
@@ -1710,6 +1854,15 @@ function usageText() {
     'List/switch-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
+    '',
+    'Rebuild-active-index options:',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --current <lane-id>                  Explicit current-lane selection; required when multiple lanes are active and the existing pointer is invalid',
+    '',
+    'Decision-log options (append-decision / next-decision-id):',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --target <domain.md>                 Decision domain file under decisions/ (e.g. cross-cutting.md); never INDEX.md',
+    '  --entry <path>                       Staged entry file starting with "### D-NEXT — <title>"; the D-number is allocated atomically at write time (D-276)',
     '',
     'Sync-agents options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
