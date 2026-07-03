@@ -2,17 +2,21 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { inspectProjectCompatibility } from './compatibility.js';
 import { sha256Text } from './hash.js';
+import { resolveLaneMarkerContext } from './lane-marker.js';
 import { parseSimpleYaml } from './simple-yaml.js';
-import { listProjectSessions } from './session.js';
+import { inferToolingRootForMemoryRoot, listProjectSessions } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { scanProjectMemory } from './project-memory.js';
 
 export async function getProjectStatus(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
-  const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  const rootContext = await resolveStatusRootContext(cwd, options.rootDir);
+  const rootDir = rootContext.rootDir;
   const toolingRootDir = options.toolingRootDir
     ? path.resolve(cwd, options.toolingRootDir)
-    : cwd;
+    : rootContext.rootSource === 'marker'
+      ? await inferToolingRootForMemoryRoot(rootDir)
+      : cwd;
 
   const compatibility = await inspectProjectCompatibility({
     rootDir,
@@ -36,7 +40,15 @@ export async function getProjectStatus(options = {}) {
       cliPackageVersion: compatibility.cliPackageVersion,
       package: compatibility.package,
       state: compatibility.state,
-      warnings: compatibility.warnings,
+      warnings: [
+        ...(rootContext.markerError
+          ? [{
+              code: 'lane-marker-unreadable',
+              message: `A lane marker near ${cwd} could not be resolved (${rootContext.markerError}); reporting on ${rootDir} instead. Lane-scoped commands will fail closed on it.`,
+            }]
+          : []),
+        ...compatibility.warnings,
+      ],
     },
     sessions,
     docsReview,
@@ -51,6 +63,30 @@ export async function getProjectStatus(options = {}) {
       projectMemory,
     }),
   };
+}
+
+/**
+ * D-280: status adopts the nearest valid marker's memory root when --root is
+ * omitted, matching lane-scoped commands, so `status` from a worktree cwd
+ * reports the bound root instead of a nonexistent `cwd/.compass`. Status is
+ * read-only and must not fail on a corrupt or foreign marker — resolution
+ * failures fall back to the cwd default.
+ */
+async function resolveStatusRootContext(cwd, explicitRootDir) {
+  if (explicitRootDir) {
+    return { rootDir: path.resolve(cwd, explicitRootDir), rootSource: 'flag', markerError: null };
+  }
+
+  try {
+    const context = await resolveLaneMarkerContext({ cwd });
+    return { rootDir: context.rootDir, rootSource: context.rootSource, markerError: null };
+  } catch (error) {
+    return {
+      rootDir: path.resolve(cwd, '.compass'),
+      rootSource: 'default',
+      markerError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export function renderStatusText(status) {

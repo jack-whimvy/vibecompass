@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { resolveLaneMarkerContext } from './lane-marker.js';
 import { STATE_VERSION } from './manifest.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { PACKAGE_VERSION } from './version.js';
@@ -10,11 +11,20 @@ import { PACKAGE_VERSION } from './version.js';
  */
 export async function inspectProjectCompatibility(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
-  const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  const rootResolution = await resolveInspectionRootDir(cwd, options.rootDir);
+  const rootDir = rootResolution.rootDir;
   const cliPackageVersion = normalizePackageVersion(options.packageVersion ?? PACKAGE_VERSION);
   const projectFilePath = path.join(rootDir, 'project.yaml');
   const manifestPath = path.join(rootDir, 'state', 'manifest.json');
   const warnings = [];
+
+  if (rootResolution.markerError) {
+    warnings.push(warning({
+      code: 'lane-marker-unreadable',
+      message: `A lane marker near ${cwd} could not be resolved (${rootResolution.markerError}); inspecting ${rootDir} instead. Lane-scoped commands will fail closed on it.`,
+      errorMessage: rootResolution.markerError,
+    }));
+  }
 
   const project = await readProjectStamp(projectFilePath);
   const manifest = await readManifestState(manifestPath);
@@ -99,6 +109,29 @@ export async function inspectProjectCompatibility(options = {}) {
 
 export function formatCompatibilityWarnings(result) {
   return (result?.warnings ?? []).map((warning) => warning.message);
+}
+
+/**
+ * D-280: read-only inspection adopts the nearest valid marker's memory root
+ * the same way lane-scoped commands do, so a worktree cwd is inspected
+ * against the root it is bound to instead of a nonexistent `cwd/.compass`.
+ * The preflight must never block a command, so marker resolution failures
+ * fall back to the cwd default — the command that follows surfaces the
+ * marker error itself.
+ */
+async function resolveInspectionRootDir(cwd, explicitRootDir) {
+  if (explicitRootDir) {
+    return { rootDir: path.resolve(cwd, explicitRootDir), markerError: null };
+  }
+
+  try {
+    return { rootDir: (await resolveLaneMarkerContext({ cwd })).rootDir, markerError: null };
+  } catch (error) {
+    return {
+      rootDir: path.resolve(cwd, '.compass'),
+      markerError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 async function readProjectStamp(projectFilePath) {

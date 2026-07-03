@@ -133,6 +133,12 @@ npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
 
+# Optional git binding for a lane (D-281): create/reuse a branch in each bound
+# repo; --worktree provisions per-repo worktrees under
+# <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
+# container, so commands run from inside a worktree need no --root/--session.
+npx -y @vibecompass/vibecompass@latest start-session --id auth-flow --working-on "Auth flow" --repo app --branch feature/auth --worktree
+
 # Agent instruction files
 npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 

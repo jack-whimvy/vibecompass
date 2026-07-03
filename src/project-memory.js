@@ -97,7 +97,12 @@ export async function scanProjectMemory(rootDir) {
   const sessionDocuments = await parseMarkdownTree({
     rootDir,
     directoryName: 'sessions',
-    shouldInclude: (filename) => !NON_CANONICAL_SESSION_FILES.has(filename),
+    // D-278: everything under sessions/active/ is local-only lane scratch,
+    // never canonical — a stray lane-local file (e.g. a plan note) must not
+    // fail-close the whole scan as a malformed session note. The filename set
+    // still covers the legacy root-level wip.md/handoff.md.
+    shouldInclude: (filename, relativePath) =>
+      !NON_CANONICAL_SESSION_FILES.has(filename) && !relativePath.startsWith('sessions/active/'),
     parseDocument: (documentPath, relativePath, content) =>
       parseSessionDocument({
         content,

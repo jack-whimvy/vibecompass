@@ -234,6 +234,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
 - Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
+- Optional git binding (D-281): \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
 
@@ -272,7 +273,7 @@ ${renderWorkflowDefaults(workflow)}
 6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
 
 ## Builder workflow
-At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`.
+At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees (D-281).
 If you manage files manually, create \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` and \`${rootRelativePath}/sessions/active/index.yaml\`, then create \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` if it does not exist:
 
 \`\`\`md

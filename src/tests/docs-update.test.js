@@ -425,3 +425,34 @@ async function createDocsUpdateFixture(options = {}) {
     cleanup: () => rm(tempDir, { recursive: true, force: true }),
   };
 }
+
+test('planDocsUpdate resolves declared repo folders against the workspace, not the invoking cwd (S3-0)', async (t) => {
+  if (spawnSync('git', ['--version']).status !== 0) {
+    t.skip('git is required for nested repo status detection.');
+    return;
+  }
+
+  const fixture = await createDocsUpdateFixture();
+  const repoDir = path.join(fixture.tempDir, 'app');
+  const nestedCwd = path.join(fixture.tempDir, 'notes');
+
+  try {
+    await mkdir(path.join(repoDir, 'src/auth'), { recursive: true });
+    await mkdir(nestedCwd, { recursive: true });
+    assert.equal(spawnSync('git', ['init'], { cwd: repoDir }).status, 0);
+    await writeFile(path.join(repoDir, 'src/auth/login.ts'), 'export const login = true;\n', 'utf8');
+
+    // From a nested non-repo cwd the old cwd-relative resolution pointed the
+    // repo scan at <cwd>/app (nonexistent, errors swallowed); the workspace
+    // base (dirname of the memory root) finds the real checkout.
+    const plan = await planDocsUpdate({
+      cwd: nestedCwd,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+    });
+
+    assert.ok(plan.delta.changedFiles.includes('app:src/auth/login.ts'));
+  } finally {
+    await fixture.cleanup();
+  }
+});

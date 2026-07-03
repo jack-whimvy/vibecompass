@@ -41,8 +41,18 @@ export async function planDocsUpdate(options = {}) {
   });
   const changedFiles = await resolveChangedFiles({
     cwd: normalized.cwd,
+    // Repo working copies live as siblings of the memory root (the
+    // workspace), not relative to wherever the command runs — a worktree or
+    // nested cwd previously made every repo dir resolve to a nonexistent
+    // path whose git-status errors were silently swallowed.
+    workspaceDir: path.dirname(normalized.rootDir),
+    // D-281: a git-bound lane's diff lives in its recorded worktrees, not the
+    // source checkouts — scan those for bound repos so the delta carries
+    // correct `repo-id:` prefixes.
+    laneWorktrees: activeSession?.worktrees ?? {},
     explicitChangedFiles: normalized.changedFiles,
     repos: project.repos ?? [],
+    warnings,
   });
   const architectureDocs = scan.documents
     .filter((document) => document.kind === 'architecture')
@@ -188,6 +198,7 @@ async function readActiveSession(rootDir, requestedSessionId, laneContext = {}) 
       repos: normalizeStringArray(data.repos),
       claimedPaths: normalizeStringArray(data.claimed_paths),
       featureSlugs: normalizeStringArray(data.feature_slugs),
+      worktrees: normalizeWorktreeMap(data.worktrees),
       decisionSnapshotHighestId: Number.isInteger(data.decision_snapshot?.highest_decision_id)
         ? data.decision_snapshot.highest_decision_id
         : null,
@@ -199,9 +210,26 @@ async function readActiveSession(rootDir, requestedSessionId, laneContext = {}) 
       repos: [],
       claimedPaths: [],
       featureSlugs: [],
+      worktrees: {},
       decisionSnapshotHighestId: null,
     };
   }
+}
+
+function normalizeWorktreeMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizeOptionalString(entry);
+    if (normalized) {
+      result[key] = path.resolve(normalized);
+    }
+  }
+
+  return result;
 }
 
 async function listActiveLaneDirIds(activeRoot) {
@@ -222,14 +250,40 @@ async function resolveChangedFiles(options) {
   }
 
   const changedPaths = new Set();
-  for (const filePath of await readGitStatusPaths(options.cwd)) {
-    changedPaths.add(filePath);
+  const laneWorktrees = options.laneWorktrees ?? {};
+  // A cwd equal to or inside a recorded worktree is fully covered by that
+  // worktree's prefixed scan below; running the unprefixed cwd scan too would
+  // report the same files twice, once without a repo prefix.
+  const cwdInsideRecordedWorktree = Object.values(laneWorktrees).some((worktreePath) =>
+    isPathEqualOrInside(options.cwd, worktreePath));
+  if (!cwdInsideRecordedWorktree) {
+    for (const filePath of await readGitStatusPaths(options.cwd)) {
+      changedPaths.add(filePath);
+    }
   }
 
   const repoStatusResults = await Promise.all(
     options.repos.map(async (repo) => {
-      const repoDir = resolveRepoWorkingDirectory(options.cwd, repo);
-      if (!repo?.id || !repoDir || repoDir === options.cwd) {
+      if (!repo?.id) {
+        return [];
+      }
+
+      let laneWorktree = laneWorktrees[repo.id] ?? null;
+      if (laneWorktree && !(await directoryExists(laneWorktree))) {
+        // Recorded-but-missing is benign crash residue (D-281); fall back to
+        // the source checkout rather than silently zeroing this repo's delta.
+        options.warnings?.push(
+          `Recorded worktree ${laneWorktree} for repo "${repo.id}" does not exist; scanning the source checkout instead.`,
+        );
+        laneWorktree = null;
+      }
+      const repoDir = laneWorktree ?? resolveRepoWorkingDirectory(options.workspaceDir, repo);
+      // The cwd containment skip applies only to source dirs: a cwd at or
+      // inside an unbound repo's checkout is already covered by the
+      // unprefixed scan (git status paths are toplevel-relative, so a
+      // prefixed scan would double-report every file). A recorded worktree
+      // is scanned prefixed even when it is the cwd.
+      if (!repoDir || (!laneWorktree && isPathEqualOrInside(options.cwd, repoDir))) {
         return [];
       }
 
@@ -256,16 +310,30 @@ async function readGitStatusPaths(cwd) {
   }
 }
 
-function resolveRepoWorkingDirectory(cwd, repo) {
+function isPathEqualOrInside(candidate, parentDir) {
+  const relative = path.relative(path.resolve(parentDir), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function directoryExists(target) {
+  try {
+    await readdir(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveRepoWorkingDirectory(workspaceDir, repo) {
   if (!repo?.id) {
     return null;
   }
 
   if (repo.path) {
-    return path.resolve(cwd, repo.path);
+    return path.resolve(workspaceDir, repo.path);
   }
 
-  return path.resolve(cwd, repo.id);
+  return path.resolve(workspaceDir, repo.id);
 }
 
 function parseGitStatusPaths(stdout) {

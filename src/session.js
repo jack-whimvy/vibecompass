@@ -7,6 +7,13 @@ import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.j
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { START_MARKER } from './generators/agent-files/markers.js';
 import { planDocsUpdate } from './docs-update.js';
+import {
+  captureBaseRevisions,
+  normalizeBranchName,
+  preflightGitBinding,
+  provisionGitBinding,
+  rollbackGitBinding,
+} from './git-binding.js';
 import { withMemoryRootLock } from './serialization.js';
 import { findDuplicateDecisionIds, formatDecisionId } from './decisions.js';
 import {
@@ -114,8 +121,10 @@ async function inferToolingRootDirForContext(options, markerContext) {
  * Prefer whichever directory actually holds a CLAUDE.md, falling back to the
  * parent (the actionable readClaudeFile error and --tooling-root remain the
  * escape hatch for layouts with no CLAUDE.md at either).
+ * Exported for read-only surfaces (status) that adopt a marker-supplied root
+ * and must follow the same placement rule for the tooling root.
  */
-async function inferToolingRootForMemoryRoot(rootDir) {
+export async function inferToolingRootForMemoryRoot(rootDir) {
   if (await fileExists(path.join(rootDir, 'CLAUDE.md'))) {
     return rootDir;
   }
@@ -143,6 +152,53 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     existingLanes,
   });
   const highestDecisionId = await readHighestDecisionId(normalized.rootDir);
+  const projectConfig = await readProjectConfig(normalized.projectFilePath);
+  const baseRevisionCapture = await captureBaseRevisions({
+    workspaceDir: path.dirname(normalized.rootDir),
+    repoIds: repos,
+    projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
+  });
+
+  // D-281 opt-in git binding: normalize + preflight before the first write so
+  // a refused binding leaves the root untouched.
+  if (options?.worktree && !options?.branch) {
+    throw new Error('--worktree requires --branch; a worktree checks out the lane branch.');
+  }
+  let gitBinding = null;
+  if (options?.branch) {
+    const branch = await normalizeBranchName(options.branch);
+    const workspaceDir = path.dirname(normalized.rootDir);
+    const containerDir = path.join(workspaceDir, 'worktrees', sessionId);
+    const useWorktree = options.worktree === true;
+    const preflight = await preflightGitBinding({
+      workspaceDir,
+      rootDir: normalized.rootDir,
+      branch,
+      worktree: useWorktree,
+      repoIds: repos,
+      projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
+      existingLanes,
+      containerDir,
+    });
+    gitBinding = {
+      branch,
+      containerDir: useWorktree ? containerDir : null,
+      repoPlans: preflight.repoPlans,
+      warnings: preflight.warnings,
+      marker: useWorktree
+        ? {
+            path: path.join(containerDir, LANE_MARKER_FILENAME),
+            token: randomUUID(),
+            createdAt: formatLocalDateTime(new Date()),
+          }
+        : null,
+    };
+    // Bound repos base on what the binding checks out (create: start point;
+    // reuse: existing branch tip), overriding the plain HEAD capture.
+    for (const plan of preflight.repoPlans) {
+      baseRevisionCapture.baseRevisions[plan.repoId] = plan.baseRevision;
+    }
+  }
 
   const nextSessionNumber = await getNextSessionNumber(normalized.sessionsDir, sessionDate);
   const currentSession = parseCurrentSessionBlock(claude.content, { optional: true });
@@ -184,6 +240,24 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       features,
       repos,
       claims,
+      baseRevisions: baseRevisionCapture.baseRevisions,
+      // Record-before-create (D-281): the full binding plan — including the
+      // marker path/token — is in session.yaml before any git artifact or
+      // marker file exists, so a crash leaves only benign recorded-but-missing
+      // entries.
+      ...(gitBinding
+        ? {
+            branch: gitBinding.branch,
+            worktreeContainer: gitBinding.containerDir,
+            worktrees: gitBinding.containerDir
+              ? Object.fromEntries(gitBinding.repoPlans.map((plan) => [plan.repoId, plan.worktreePath]))
+              : null,
+            worktreeSources: gitBinding.containerDir
+              ? Object.fromEntries(gitBinding.repoPlans.map((plan) => [plan.repoId, plan.sourceDir]))
+              : null,
+            laneMarker: gitBinding.marker,
+          }
+        : {}),
       highestDecisionId,
     }),
     'utf8',
@@ -208,11 +282,55 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     }),
     'utf8',
   );
+  const priorIndexContent = await readFile(normalized.activeSessionsIndexPath, 'utf8').catch(() => null);
   await upsertActiveSessionIndex(normalized, {
     id: sessionId,
     status: 'active',
     workingOn,
   }, { current: sessionId });
+
+  if (gitBinding) {
+    const progress = { worktrees: [], createdBranches: [] };
+    try {
+      if (gitBinding.containerDir) {
+        await mkdir(gitBinding.containerDir, { recursive: true });
+        await writeFile(
+          gitBinding.marker.path,
+          renderLaneMarker({
+            laneId: sessionId,
+            memoryRoot: normalized.rootDir,
+            token: gitBinding.marker.token,
+            createdAt: gitBinding.marker.createdAt,
+            createdBy: PACKAGE_VERSION,
+          }),
+          'utf8',
+        );
+      }
+      await provisionGitBinding({ branch: gitBinding.branch, repoPlans: gitBinding.repoPlans }, progress);
+    } catch (error) {
+      // D-281: start-session is atomic — unwind git artifacts created this
+      // call, then the lane files, CLAUDE.md, and index this call wrote.
+      const rollbackNotes = await rollbackGitBinding(progress, gitBinding.branch);
+      if (gitBinding.containerDir) {
+        await rm(gitBinding.containerDir, { recursive: true, force: true }).catch(() => {});
+      }
+      await rm(lanePaths.laneDir, { recursive: true, force: true }).catch(() => {});
+      await writeFile(normalized.claudePath, claude.content, 'utf8').catch(() => {});
+      if (priorIndexContent === null) {
+        await rm(normalized.activeSessionsIndexPath, { force: true }).catch(() => {});
+      } else {
+        await writeFile(normalized.activeSessionsIndexPath, priorIndexContent, 'utf8').catch(() => {});
+      }
+      await refreshStateManifestSafely(normalized.rootDir);
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `${message}\nGit binding failed; start-session was rolled back and lane "${sessionId}" was not created.` +
+          (rollbackNotes.length > 0 ? `\nRollback notes: ${rollbackNotes.join('; ')}` : '') +
+          '\nIf a crash interrupts this rollback, run `vibecompass rebuild-active-index` and close the lane normally.',
+      );
+    }
+  }
+
   const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
   const auditWarnings = await buildDocsReviewWarnings(normalized);
   const metadataWarnings = collectLaneMetadataWarnings(existingLanes);
@@ -235,9 +353,26 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       ...markerContext.warnings,
       ...metadataWarnings,
       ...overlapWarnings,
+      ...baseRevisionCapture.warnings,
+      ...(gitBinding?.warnings ?? []),
       ...manifestRefresh.warnings,
       ...auditWarnings,
     ],
+    ...(gitBinding
+      ? {
+          gitBinding: {
+            branch: gitBinding.branch,
+            worktreeContainer: gitBinding.containerDir,
+            markerPath: gitBinding.marker?.path ?? null,
+            repos: gitBinding.repoPlans.map((plan) => ({
+              repoId: plan.repoId,
+              mode: plan.mode,
+              baseRevision: plan.baseRevision,
+              worktreePath: plan.worktreePath,
+            })),
+          },
+        }
+      : {}),
     manifest: manifestRefresh.manifest,
     agentFileSync,
   };
@@ -283,6 +418,34 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const sessionId = laneSelection.sessionId;
   const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
   const closingLaneMetadata = sessionId ? await readLaneMetadata(lanePaths.sessionFilePath) : null;
+  // Interim S3-2 guard (D-281): the close-side guarded worktree removal is
+  // S3-3 work, and closing a lane whose recorded worktrees still exist would
+  // token-delete the container marker and destroy session.yaml — the only
+  // records the removal guard depends on — while the worktrees (and any
+  // uncommitted work in them) survive unmanaged. Refuse before any
+  // irreversible write; recorded-but-missing worktrees are benign crash
+  // residue and do not block the close.
+  if (closingLaneMetadata) {
+    const survivingWorktrees = [];
+    for (const [repoId, worktreePath] of Object.entries(closingLaneMetadata.worktrees ?? {})) {
+      if (await fileExists(worktreePath)) {
+        survivingWorktrees.push({ repoId, worktreePath });
+      }
+    }
+    if (survivingWorktrees.length > 0) {
+      const cleanupCommands = survivingWorktrees
+        .map(({ repoId, worktreePath }) => {
+          const sourceDir = closingLaneMetadata.worktreeSources?.[repoId];
+          return `git -C ${sourceDir ?? '<source repo>'} worktree remove ${worktreePath}`;
+        })
+        .join('\n  ');
+      throw new Error(
+        `Lane "${sessionId}" still has provisioned worktrees on disk:\n  ${survivingWorktrees.map((entry) => entry.worktreePath).join('\n  ')}\n` +
+          'close-session cannot yet remove worktrees (D-281 close-side removal is unimplemented); closing now would destroy the records the removal guard needs while the worktrees survive. ' +
+          `Commit or discard their work, remove them manually:\n  ${cleanupCommands}\nthen rerun close-session.`,
+      );
+    }
+  }
   const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
   const docsUpdate = await planDocsUpdateSafely({
     rootDir: normalized.rootDir,
@@ -681,6 +844,22 @@ async function writeLaneMarkerForSessionLocked(normalized, options, markerContex
   }
 
   const laneMetadata = await readLaneMetadata(lanePaths.sessionFilePath);
+  // Fail closed when the lane metadata is unreadable: a null-degraded parse
+  // would hide a recorded worktree container and let a rebind orphan the
+  // removal guard (D-281).
+  if (laneMetadata.warnings.length > 0) {
+    throw new Error(
+      `Lane "${sessionId}"'s session.yaml could not be parsed (${laneMetadata.warnings[0]}); refusing to rebind its marker — a provisioned worktree container would be undetectable (D-281). Repair the lane metadata first.`,
+    );
+  }
+  // D-281: a provisioned lane's container marker is what authorizes guarded
+  // worktree removal at close; rebinding would token-delete it and orphan
+  // the worktrees permanently.
+  if (laneMetadata.worktreeContainer) {
+    throw new Error(
+      `Lane "${sessionId}" has a provisioned worktree container at ${laneMetadata.worktreeContainer}; its marker is managed by start/close-session and rebinding it would orphan the worktree-removal guard (D-281). Close the lane to remove the worktrees instead.`,
+    );
+  }
   if (laneMetadata.laneMarker?.path && path.resolve(laneMetadata.laneMarker.path) !== markerPath) {
     const cleanup = await removeRecordedLaneMarker(laneMetadata.laneMarker);
     warnings.push(...cleanup.warnings);
@@ -1097,6 +1276,11 @@ async function listActiveSessionLanes(normalized) {
         claims: metadata.claims,
         startedAt: metadata.startedAt,
         decisionSnapshot: metadata.decisionSnapshot,
+        branch: metadata.branch ?? null,
+        worktreeContainer: metadata.worktreeContainer ?? null,
+        worktrees: metadata.worktrees ?? {},
+        worktreeSources: metadata.worktreeSources ?? {},
+        baseRevisions: metadata.baseRevisions ?? {},
         warnings: metadata.warnings,
         sessionDate: metadata.sessionDate ?? wipSession?.sessionDate ?? null,
         sessionNumber: metadata.sessionNumber ?? wipSession?.sessionNumber ?? 0,
@@ -1142,6 +1326,11 @@ async function readLaneMetadata(sessionFilePath) {
             createdAt: normalizeOptionalString(data.lane_marker.created_at),
           }
         : null,
+      branch: normalizeOptionalString(data.branch),
+      worktreeContainer: normalizeOptionalString(data.worktree_container),
+      worktrees: normalizeStringMap(data.worktrees),
+      worktreeSources: normalizeStringMap(data.worktree_sources),
+      baseRevisions: normalizeStringMap(data.base_revisions),
       sessionDate: normalizeOptionalString(data.session_date),
       sessionNumber: typeof data.session_number === 'number' ? data.session_number : Number(data.session_number) || null,
       warnings: [],
@@ -1158,6 +1347,11 @@ async function readLaneMetadata(sessionFilePath) {
         highestDecisionId: null,
       },
       laneMarker: null,
+      branch: null,
+      worktreeContainer: null,
+      worktrees: {},
+      worktreeSources: {},
+      baseRevisions: {},
       sessionDate: null,
       sessionNumber: null,
       warnings: [
@@ -1165,6 +1359,27 @@ async function readLaneMetadata(sessionFilePath) {
       ],
     };
   }
+}
+
+/**
+ * One-level block map of string values (worktrees, worktree_sources,
+ * base_revisions). Unquoted all-digit values come back numerically coerced
+ * from parseScalar — normalize them back to strings.
+ */
+function normalizeStringMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizeOptionalString(typeof entry === 'number' ? String(entry) : entry);
+    if (normalized) {
+      result[key] = normalized;
+    }
+  }
+
+  return result;
 }
 
 async function readActiveSessionIndex(normalized) {
@@ -1385,10 +1600,40 @@ function renderLaneMetadata(options) {
     renderYamlArray('repos', options.repos),
     renderYamlArray('claimed_paths', options.claims),
     `started_at: ${formatLocalDateTime(new Date())}`,
+    ...(options.branch ? [`branch: ${quoteYamlString(options.branch)}`] : []),
+    ...(options.worktreeContainer ? [`worktree_container: ${quoteYamlString(options.worktreeContainer)}`] : []),
+    ...renderYamlBlockMapLines('worktrees', options.worktrees),
+    ...renderYamlBlockMapLines('worktree_sources', options.worktreeSources),
+    ...renderYamlBlockMapLines('base_revisions', options.baseRevisions),
+    ...(options.laneMarker
+      ? [
+          'lane_marker:',
+          `  path: ${quoteYamlString(options.laneMarker.path)}`,
+          `  token: ${quoteYamlString(options.laneMarker.token)}`,
+          `  created_at: ${options.laneMarker.createdAt}`,
+        ]
+      : []),
     'decision_snapshot:',
     `  highest_decision_id: ${options.highestDecisionId ?? 'null'}`,
     '',
   ].join('\n');
+}
+
+/**
+ * One-level block map of id keys to quoted string values, omitted entirely
+ * when empty. Writers validate keys with isSimpleYamlKeySafe before recording
+ * them — an unparseable key would null-degrade the whole lane for readers.
+ */
+function renderYamlBlockMapLines(key, map) {
+  const entries = map ? Object.entries(map).filter(([, value]) => value !== null && value !== undefined) : [];
+  if (entries.length === 0) {
+    return [];
+  }
+
+  return [
+    `${key}:`,
+    ...entries.map(([mapKey, value]) => `  ${mapKey}: ${quoteYamlString(String(value))}`),
+  ];
 }
 
 function renderActiveSessionIndex(current, lanes) {

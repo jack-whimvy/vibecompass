@@ -126,6 +126,10 @@ async function readActiveSessionsForManifest(rootDir) {
       repos: lane.repos ?? [],
       claimed_paths: lane.claims ?? [],
       started_at: lane.startedAt ?? null,
+      // D-281/D-278: git-binding presence projection — omitted for unbound
+      // lanes so pre-S3 manifest shapes are unchanged.
+      ...(lane.branch ? { branch: lane.branch } : {}),
+      ...(lane.worktreeContainer ? { worktree_container: lane.worktreeContainer } : {}),
       ...(lane.decisionSnapshot
         ? {
           decision_snapshot: {

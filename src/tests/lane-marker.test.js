@@ -14,6 +14,8 @@ import {
   writeLaneMarkerForSession,
 } from '../session.js';
 import { planDocsUpdate } from '../docs-update.js';
+import { inspectProjectCompatibility } from '../compatibility.js';
+import { getProjectStatus } from '../status.js';
 import { writeStateManifest } from '../manifest.js';
 import { LANE_MARKER_FILENAME, readLaneMarker } from '../lane-marker.js';
 
@@ -672,6 +674,65 @@ test('close-session at 2+ lanes without a selection names both escape hatches', 
         return true;
       },
     );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('compatibility preflight and status adopt a marker-supplied root (D-280, S3-0)', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-inspect-');
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    const boundDir = path.join(tempDir, 'bound');
+    await mkdir(boundDir, { recursive: true });
+    await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: boundDir });
+
+    const compatibility = await inspectProjectCompatibility({ cwd: boundDir });
+    assert.equal(compatibility.rootDir, rootDir);
+    assert.ok(!compatibility.warnings.some((warning) => warning.code === 'project-yaml-unreadable'));
+
+    const status = await getProjectStatus({ cwd: boundDir });
+    assert.equal(status.rootDir, rootDir);
+    // Root has no CLAUDE.md inside, so tooling root follows the
+    // `<owner>/.compass` placement: the memory root's parent.
+    assert.equal(status.toolingRootDir, tempDir);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('compatibility preflight falls back to cwd/.compass on a corrupt marker instead of failing', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-marker-corrupt-inspect-'));
+
+  try {
+    await writeFile(path.join(tempDir, LANE_MARKER_FILENAME), 'format_version: 99\n', 'utf8');
+
+    const compatibility = await inspectProjectCompatibility({ cwd: tempDir });
+    assert.equal(compatibility.rootDir, path.join(tempDir, '.compass'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('CLI compatibility preflight emits no spurious root warnings from a marker-bound cwd', async () => {
+  const { tempDir } = await createInitializedRoot('vibecompass-marker-preflight-cli-');
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    const boundDir = path.join(tempDir, 'bound');
+    await mkdir(boundDir, { recursive: true });
+    await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: boundDir });
+
+    const stdout = [];
+    const stderr = [];
+    const io = {
+      stdout: { write(chunk) { stdout.push(chunk); } },
+      stderr: { write(chunk) { stderr.push(chunk); } },
+    };
+    await runCli(['list-sessions'], io, { cwd: boundDir });
+    assert.ok(!stderr.join('').includes('project.yaml is unreadable'));
+    assert.match(stdout.join(''), /lane-a/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

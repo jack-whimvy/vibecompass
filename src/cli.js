@@ -133,6 +133,20 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Created ${result.wipFilePath}\n`);
     io.stdout.write(`Created ${result.handoffFilePath}\n`);
+    if (result.gitBinding) {
+      io.stdout.write(`Git binding: branch "${result.gitBinding.branch}"\n`);
+      for (const repo of result.gitBinding.repos) {
+        const location = repo.worktreePath ? ` at ${repo.worktreePath}` : '';
+        io.stdout.write(`- ${repo.repoId}: ${repo.mode === 'reuse' ? 'reused existing branch' : 'created branch'}${location} (base ${repo.baseRevision.slice(0, 12)})\n`);
+      }
+      if (result.gitBinding.markerPath) {
+        io.stdout.write(`Lane marker: ${result.gitBinding.markerPath}\n`);
+        const firstWorktree = result.gitBinding.repos.find((repo) => repo.worktreePath);
+        if (firstWorktree) {
+          io.stdout.write(`Next: cd ${firstWorktree.worktreePath} — commands run from inside a worktree need no --root or --session (lane marker).\n`);
+        }
+      }
+    }
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
@@ -791,6 +805,16 @@ function parseStartSessionArgs(argv) {
       throw new Error(`Unexpected argument "${token}".`);
     }
 
+    // Boolean flags first (D-281): --worktree takes no value — the container
+    // location is fixed to <workspace>/worktrees/<lane-id> per D-279.
+    if (token === '--worktree') {
+      parsed.worktree = true;
+      continue;
+    }
+    if (token.startsWith('--worktree=')) {
+      throw new Error('Flag "--worktree" takes no value; the worktree container is fixed to <workspace>/worktrees/<lane-id> (D-279).');
+    }
+
     const value = argv[index + 1];
     if (value === undefined) {
       throw new Error(`Flag "${token}" requires a value.`);
@@ -818,6 +842,9 @@ function parseStartSessionArgs(argv) {
         break;
       case '--claim':
         parsed.claims = [...(parsed.claims ?? []), value];
+        break;
+      case '--branch':
+        parsed.branch = value;
         break;
       case '--date':
         parsed.date = value;
@@ -1797,7 +1824,7 @@ function usageText() {
     '  vibecompass status [options]',
     '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
     '  vibecompass docs-update [--session <lane-id>] [options]',
-    '  vibecompass start-session --id <lane-id> --working-on <text> [options]',
+    '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
     '  vibecompass list-sessions [options]',
@@ -1880,6 +1907,8 @@ function usageText() {
     '  --feature <slug>                     Repeatable feature slug for the lane',
     '  --repo <id>                          Repeatable repo ID for the lane',
     '  --claim <path>                       Repeatable path claim for overlap warnings',
+    '  --branch <name>                      Opt-in git binding (D-281): create or reuse this branch in every bound --repo; requires at least one --repo',
+    '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> (D-279) and write the lane marker into the container',
     '  --date <YYYY-MM-DD>                  Optional explicit session date',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',

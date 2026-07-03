@@ -1,4 +1,15 @@
 const KEY_VALUE_PATTERN = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:(?:\s+(.*)|\s*)$/;
+const SAFE_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+
+/**
+ * Whether a value can appear as a block-map key in this subset. Writers that
+ * derive map keys from user-supplied identifiers (e.g. repo ids in lane
+ * metadata) must check this and fail closed instead of emitting a key the
+ * parser will reject — a parse throw degrades the whole document for readers.
+ */
+export function isSimpleYamlKeySafe(value) {
+  return typeof value === 'string' && SAFE_KEY_PATTERN.test(value);
+}
 
 export function parseSimpleYaml(source, options = {}) {
   // This intentionally supports only the YAML subset used by project.yaml and
@@ -208,10 +219,19 @@ function parseScalar(rawValue) {
     return Number(rawValue);
   }
 
-  if (
-    (rawValue.startsWith('"') && rawValue.endsWith('"')) ||
-    (rawValue.startsWith("'") && rawValue.endsWith("'"))
-  ) {
+  if (rawValue.startsWith('"') && rawValue.endsWith('"')) {
+    // Writers quote free-text values with JSON.stringify; parse the token
+    // back symmetrically so escaped quotes and backslashes (e.g. Windows
+    // paths) round-trip. Hand-authored quoting that is not valid JSON keeps
+    // the historical naive slice so legacy files stay readable.
+    try {
+      return JSON.parse(rawValue);
+    } catch {
+      return rawValue.slice(1, -1);
+    }
+  }
+
+  if (rawValue.startsWith("'") && rawValue.endsWith("'")) {
     return rawValue.slice(1, -1);
   }
 

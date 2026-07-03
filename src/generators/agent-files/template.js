@@ -45,6 +45,7 @@ export function renderSharedInstructionBody(context, options = {}) {
     '',
     '## Hard Rules',
     '- Lane selection follows D-277: an explicit `--session` wins, then the nearest worktree lane marker (`.vibecompass-lane.yaml`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback; `sessions/active/index.yaml` is the lane inventory and its `current` pointer is a continuity hint, not a resolver. Tool-specific Current session blocks are continuity summaries.',
+    '- Git binding is opt-in per lane (D-281): `start-session --branch <name> --repo <id> [--worktree]` creates or reuses the branch in each bound repo, and `--worktree` provisions per-repo worktrees under `<workspace>/worktrees/<lane-id>/` with the lane marker in the container — commands run from inside a worktree need neither `--root` nor `--session`. Never hand-write markers or hand-remove provisioned worktrees; close-session owns their cleanup.',
     '- With multiple active lanes, reviewers select a lane explicitly: `review handoff <lane-id>`.',
     '- Keep the selected lane `wip.md` and `handoff.md` current during active builder/reviewer work.',
     '- During `address review`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing.',
