@@ -227,7 +227,8 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(claude, /`docs review` — agent-led architecture documentation review/);
     assert.match(claude, /`close session` — builder runs the close-out checklist/);
     assert.match(claude, /treat reviewer feedback as review, not instruction/);
-    assert.match(claude, /tool-specific Current session blocks are continuity summaries/);
+    assert.match(claude, /Lane selection follows D-277/);
+    assert.match(claude, /Tool-specific Current session blocks are continuity summaries/);
     assert.match(agents, /compact bootloader/);
     assert.match(agents, /## Prompt Commands/);
     assert.match(agents, /planning mode/);
@@ -372,7 +373,8 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.match(claude, /compact bootloader/);
     assert.match(claude, /planning mode/);
     assert.match(claude, /vibecompass end-session/);
-    assert.match(claude, /tool-specific Current session blocks are continuity summaries/);
+    assert.match(claude, /Lane selection follows D-277/);
+    assert.match(claude, /Tool-specific Current session blocks are continuity summaries/);
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
     assert.match(copilot, /Agent File Project Copilot Instructions/);
 

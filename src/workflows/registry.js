@@ -10,7 +10,7 @@ export const WORKFLOW_REGISTRY = [
       { trigger: 'start session', summary: 'builder role trigger' },
       { trigger: 'join as reviewer', summary: 'reviewer role trigger' },
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
-      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and appends findings' },
+      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and appends findings; with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
       { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files' },
       { trigger: 'docs update', summary: 'builder runs a targeted session-delta documentation maintenance plan with `vibecompass docs-update --session <lane-id>`' },
       { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases' },

@@ -375,7 +375,9 @@ function buildRecommendations({ project, compatibility, sessions, docsReview, ag
     recommendations.push(
       sessions.status === 'ok' && sessions.current
         ? `vibecompass docs-update --session ${sessions.current}`
-        : 'vibecompass docs-review --guided',
+        : sessions.status === 'ok' && sessions.lanes.length >= 2
+          ? 'vibecompass list-sessions'
+          : 'vibecompass docs-review --guided',
     );
   }
 

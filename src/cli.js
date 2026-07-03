@@ -8,7 +8,7 @@ import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { closeProjectSession, listProjectSessions, rebuildActiveSessionIndex, startProjectSession, switchProjectSession } from './session.js';
+import { closeProjectSession, listProjectSessions, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
@@ -466,6 +466,18 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'write-lane-marker') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await writeLaneMarkerForSession({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    io.stdout.write(`Wrote lane marker for "${result.sessionId}" at ${result.markerPath}\n`);
+    io.stdout.write(`Recorded the marker in the lane's session.yaml (token-matched removal at close-session).\n`);
+    writeWarnings(io, result.warnings);
+    return 0;
+  }
+
   if (parsed.command === 'append-decision') {
     const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
     const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
@@ -550,6 +562,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'rebuild-active-index') {
       return parseRebuildActiveIndexArgs(rest);
+    }
+
+    if (command === 'write-lane-marker') {
+      return parseWriteLaneMarkerArgs(rest);
     }
 
     if (command === 'append-decision') {
@@ -1160,6 +1176,40 @@ function parseRebuildActiveIndexArgs(argv) {
   return { command: 'rebuild-active-index', options: parsed };
 }
 
+function parseWriteLaneMarkerArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--dir':
+        parsed.dir = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return { command: 'write-lane-marker', options: parsed };
+}
+
 function parseAppendDecisionArgs(argv) {
   const parsed = {};
 
@@ -1753,6 +1803,7 @@ function usageText() {
     '  vibecompass list-sessions [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
+    '  vibecompass write-lane-marker --session <lane-id> [--dir <path>] [options]',
     '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [options]',
     '  vibecompass next-decision-id [options]',
     '  vibecompass sync-agents [options]',
@@ -1816,14 +1867,14 @@ function usageText() {
     '  --allow-downgrade-templates          Allow applying templates with a CLI older than the root stamp',
     '',
     'Docs-update options:',
-    '  --root <path>                        Project-memory root. Defaults to .compass',
-    '  --session <lane-id>                  Active session lane to inspect; defaults to current lane',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --session <lane-id>                  Active session lane to inspect. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
     '  --changed <repo:path|path>           Repeatable explicit changed path; defaults to git status when omitted',
     '  --json                               Print the typed docs-update plan as JSON',
     '',
     'Start-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
-    '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
+    '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --working-on <text>                  Required active-session summary',
     '  --id <lane-id>                       Required active session lane ID',
     '  --feature <slug>                     Repeatable feature slug for the lane',
@@ -1836,10 +1887,10 @@ function usageText() {
     '',
     'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
-    '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd',
+    '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --title <text>                       Required display title for the finalized session note',
     '  --worked-on <text>                   Optional override for "What we worked on"',
-    '  --session <lane-id>                  Active session lane to close',
+    '  --session <lane-id>                  Active session lane to close. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
     '  --completed <text>                   Repeatable completed item',
     '  --decision <text>                    Repeatable decision reference or summary',
     '  --model <text>                       Optional repeatable model contribution entry',
@@ -1858,6 +1909,11 @@ function usageText() {
     'Rebuild-active-index options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --current <lane-id>                  Explicit current-lane selection; required when multiple lanes are active and the existing pointer is invalid',
+    '',
+    'Write-lane-marker options (D-280):',
+    '  --session <lane-id>                  Required active lane the marker binds to',
+    '  --dir <path>                         Marker target directory; defaults to cwd. Must be path-disjoint from the memory root',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',

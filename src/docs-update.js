@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parseFrontmatter } from './frontmatter.js';
+import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
@@ -19,9 +20,25 @@ const PACKAGE_OWNED_PATH_PATTERNS = [
 
 export async function planDocsUpdate(options = {}) {
   const normalized = normalizeDocsUpdateOptions(options);
+  // D-280: docs-update shares the same context resolution as session
+  // commands — explicit --root wins, else the nearest valid marker's
+  // memory_root, else cwd/.compass — and the same D-277 lane selection.
+  const markerContext = await resolveLaneMarkerContext({
+    cwd: normalized.cwd,
+    explicitRootDir: options.rootDir ?? null,
+    explicitSessionId: normalized.sessionId,
+  });
+  normalized.rootDir = markerContext.rootDir;
+  // suppressLaneWarnings marks the embedded close-session plan, which already
+  // carries the same marker-context warnings on the close result itself.
+  const warnings = options.suppressLaneWarnings === true ? [] : [...markerContext.warnings];
   const scan = await scanProjectMemory(normalized.rootDir);
   const project = scan.project?.extracted ?? {};
-  const activeSession = await readActiveSession(normalized.rootDir, normalized.sessionId);
+  const activeSession = await readActiveSession(normalized.rootDir, normalized.sessionId, {
+    markerContext,
+    warnings,
+    suppressLaneWarnings: options.suppressLaneWarnings === true,
+  });
   const changedFiles = await resolveChangedFiles({
     cwd: normalized.cwd,
     explicitChangedFiles: normalized.changedFiles,
@@ -72,6 +89,7 @@ export async function planDocsUpdate(options = {}) {
     decisions: decisionStatus,
     packageOwnedChanges,
     recommendations,
+    warnings,
   };
 }
 
@@ -121,6 +139,10 @@ export function renderDocsUpdatePlan(plan) {
     lines.push(`- ${recommendation}`);
   }
 
+  for (const warning of plan.warnings ?? []) {
+    lines.push(`Warning: ${warning}`);
+  }
+
   return `${lines.join('\n')}\n`;
 }
 
@@ -134,20 +156,25 @@ function normalizeDocsUpdateOptions(options) {
   };
 }
 
-async function readActiveSession(rootDir, requestedSessionId) {
+async function readActiveSession(rootDir, requestedSessionId, laneContext = {}) {
   const activeRoot = path.join(rootDir, 'sessions', 'active');
-  const indexPath = path.join(activeRoot, 'index.yaml');
-  let sessionId = normalizeOptionalString(requestedSessionId);
-
-  if (!sessionId) {
-    try {
-      const indexData = parseSimpleYaml(await readFile(indexPath, 'utf8'), { sourceName: indexPath });
-      sessionId = normalizeOptionalString(indexData.current);
-    } catch {
-      sessionId = null;
-    }
+  // D-277 lane selection via the shared resolver: explicit --session wins,
+  // then the worktree marker (stale markers fail closed), then the single
+  // active lane; with 2+ lanes and no selection this throws instead of
+  // silently trusting the root-global index pointer.
+  const selection = resolveLaneSelection({
+    explicitSessionId: normalizeOptionalString(requestedSessionId),
+    marker: laneContext.markerContext?.marker ?? null,
+    laneIds: await listActiveLaneDirIds(activeRoot),
+    rootDir,
+    purpose: 'plan docs updates for',
+    suppressLaneWarnings: laneContext.suppressLaneWarnings === true,
+  });
+  if (Array.isArray(laneContext.warnings)) {
+    laneContext.warnings.push(...selection.warnings);
   }
 
+  const sessionId = selection.sessionId;
   if (!sessionId) {
     return null;
   }
@@ -174,6 +201,18 @@ async function readActiveSession(rootDir, requestedSessionId) {
       featureSlugs: [],
       decisionSnapshotHighestId: null,
     };
+  }
+}
+
+async function listActiveLaneDirIds(activeRoot) {
+  try {
+    const entries = await readdir(activeRoot, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
   }
 }
 

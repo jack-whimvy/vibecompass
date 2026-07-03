@@ -222,16 +222,18 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 ## Derived and scratch files
 - \`${rootRelativePath}/context.md\` — generated AI-facing workflow context
 - \`${rootRelativePath}/state/manifest.json\` — machine-owned local state; do not hand-edit
-- \`${rootRelativePath}/sessions/active/index.yaml\` — active session lane index and current lane pointer
-- \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` — lane metadata
+- \`${rootRelativePath}/sessions/active/index.yaml\` — active session lane inventory and continuity pointer
+- \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` — lane metadata (including the recorded \`lane_marker\` when one exists)
 - \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` — lane-local builder scratchpad
 - \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` — lane-local builder/reviewer relay
+- \`.vibecompass-lane.yaml\` — worktree-local lane marker (D-280); lives outside the memory root, written only by \`vibecompass write-lane-marker\` or worktree provisioning, never synced
 
 ## Session model
 - VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
 - \`vibecompass start-session\` requires \`--id <lane-id>\` so each active lane has a meaningful feature or workstream name.
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
-- \`${rootRelativePath}/sessions/active/index.yaml\` is the authoritative current lane pointer; the tool-specific Current session block is a human-readable continuity summary, not the lane-selection source of truth.
+- Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
+- \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
 
@@ -264,7 +266,7 @@ ${renderWorkflowDefaults(workflow)}
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
 2. Read the latest finalized session note in \`${rootRelativePath}/sessions/\`.
-3. If present, read \`${rootRelativePath}/sessions/active/index.yaml\` and choose the selected or current lane.
+3. If present, read \`${rootRelativePath}/sessions/active/index.yaml\` for the lane inventory; select the lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane (D-277).
 4. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
 5. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
 6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
@@ -563,8 +565,8 @@ Finalized session notes for ${projectConfig.name} live here.
 - \`## Next session should start with\`
 
 ## Active-session scratch files
-- \`active/index.yaml\` — active lane index and current lane pointer
-- \`active/<lane-id>/session.yaml\` — lane metadata
+- \`active/index.yaml\` — active lane inventory and continuity pointer (not a resolver with 2+ lanes; D-277)
+- \`active/<lane-id>/session.yaml\` — lane metadata, including the recorded \`lane_marker\` when one exists
 - \`active/<lane-id>/wip.md\` — builder scratchpad during an active lane
 - \`active/<lane-id>/handoff.md\` — reviewer/builder baton-pass during an active lane
 

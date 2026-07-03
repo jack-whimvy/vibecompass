@@ -1,4 +1,5 @@
-import { access, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -8,6 +9,17 @@ import { START_MARKER } from './generators/agent-files/markers.js';
 import { planDocsUpdate } from './docs-update.js';
 import { withMemoryRootLock } from './serialization.js';
 import { findDuplicateDecisionIds, formatDecisionId } from './decisions.js';
+import {
+  LANE_MARKER_FILENAME,
+  assertMarkerTargetDisjoint,
+  findEnclosingGitDir,
+  readLaneMarker,
+  renderLaneMarker,
+  resolveLaneMarkerContext,
+  resolveLaneSelection,
+  validateLaneId,
+} from './lane-marker.js';
+import { PACKAGE_VERSION } from './version.js';
 // This lazy-only cycle is intentional: manifest.js reads lane state from this
 // module, and session command handlers rewrite the derived manifest after
 // lane mutations. Keep both sides free of top-level calls into the other.
@@ -16,7 +28,6 @@ import { writeStateManifest } from './manifest.js';
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
 const SESSION_FILENAME_PATTERN = /^(\d{4}-\d{2}-\d{2})-(\d+)-([a-z0-9-]+)\.md$/i;
-const LANE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
 const DOCUMENT_MAINTENANCE_STATUSES = new Set(['updated', 'not-needed', 'deferred']);
 const DOCUMENT_MAINTENANCE_FIELDS = [
   {
@@ -35,31 +46,84 @@ const DOCUMENT_MAINTENANCE_FIELDS = [
     flag: '--session-maintenance',
   },
 ];
-const RESERVED_LANE_IDS = new Set([
-  'active',
-  'current',
-  'default',
-  'false',
-  'handoff',
-  'index',
-  'new',
-  'no',
-  'null',
-  'off',
-  'on',
-  'sessions',
-  'state',
-  'true',
-  'wip',
-  'yes',
-]);
-
 export async function startProjectSession(options) {
-  const normalized = normalizeSessionPaths(options);
-  return withMemoryRootLock(normalized.rootDir, 'start-session', () => startProjectSessionLocked(normalized, options));
+  const { normalized, markerContext } = await resolveSessionCommandContext(options);
+  return withMemoryRootLock(normalized.rootDir, 'start-session', () =>
+    startProjectSessionLocked(normalized, options, markerContext));
 }
 
-async function startProjectSessionLocked(normalized, options) {
+/**
+ * Pre-lock command context (D-280): an explicit --root always wins; otherwise
+ * lane-scoped commands adopt the nearest valid worktree lane marker's
+ * memory_root, and only when no marker resolves does the `cwd/.compass`
+ * default apply. Commands that never resolve a lane from the marker skip the
+ * marker walk entirely when --root is explicit, so internal callers that
+ * always pass rootDir (manifest/status refresh) keep their existing behavior.
+ */
+async function resolveSessionCommandContext(options, { needMarkerForLane = false } = {}) {
+  let markerContext;
+  if (options?.rootDir && !needMarkerForLane) {
+    const cwd = options?.cwd ? path.resolve(options.cwd) : process.cwd();
+    markerContext = { cwd, rootDir: path.resolve(cwd, options.rootDir), rootSource: 'flag', marker: null, warnings: [] };
+  } else {
+    markerContext = await resolveLaneMarkerContext({
+      cwd: options?.cwd,
+      explicitRootDir: options?.rootDir ?? null,
+      explicitSessionId: normalizeOptionalString(options?.sessionId),
+    });
+  }
+
+  const inferredToolingRootDir = await inferToolingRootDirForContext(options, markerContext);
+  const normalized = normalizeSessionPaths({
+    ...options,
+    cwd: markerContext.cwd,
+    rootDir: markerContext.rootDir,
+    ...(inferredToolingRootDir ? { toolingRootDir: inferredToolingRootDir } : {}),
+  });
+  return { normalized, markerContext };
+}
+
+/**
+ * The tooling root (CLAUDE.md home) defaults to cwd, but follows the memory
+ * root's placement in two cases: when the marker supplied the root (a
+ * worktree cwd must update the real Current-session block), and when an
+ * explicit --root is used from a cwd with no CLAUDE.md (e.g. the corrupt-
+ * marker bypass run from a worktree) — a case where the cwd default could
+ * only fail at readClaudeFile, so inferring is strictly recovery, never a
+ * behavior change for working flows.
+ */
+async function inferToolingRootDirForContext(options, markerContext) {
+  if (options?.toolingRootDir) {
+    return undefined;
+  }
+
+  if (markerContext.rootSource === 'marker') {
+    return inferToolingRootForMemoryRoot(markerContext.rootDir);
+  }
+
+  if (markerContext.rootSource === 'flag' && !(await fileExists(path.join(markerContext.cwd, 'CLAUDE.md')))) {
+    return inferToolingRootForMemoryRoot(markerContext.rootDir);
+  }
+
+  return undefined;
+}
+
+/**
+ * The `<owner>/.compass` placement keeps CLAUDE.md one level above the memory
+ * root; the dedicated-memory-repo placement keeps it inside the root itself.
+ * Prefer whichever directory actually holds a CLAUDE.md, falling back to the
+ * parent (the actionable readClaudeFile error and --tooling-root remain the
+ * escape hatch for layouts with no CLAUDE.md at either).
+ */
+async function inferToolingRootForMemoryRoot(rootDir) {
+  if (await fileExists(path.join(rootDir, 'CLAUDE.md'))) {
+    return rootDir;
+  }
+
+  return path.dirname(rootDir);
+}
+
+async function startProjectSessionLocked(normalized, options, markerContext) {
   const workingOn = requireNonEmptyString(options?.workingOn, 'start-session requires a non-empty workingOn value.');
   const sessionDate = normalizeSessionDate(options?.date);
 
@@ -93,6 +157,12 @@ async function startProjectSessionLocked(normalized, options) {
     nextSessionShould:
       normalizeOptionalString(options?.nextSessionShould) ??
       'Finish the active session and close it with a finalized session note.',
+  }, {
+    lanes: [
+      ...existingLanes.map((lane) => ({ id: lane.id, workingOn: lane.workingOn })),
+      { id: sessionId, workingOn },
+    ],
+    selectedId: sessionId,
   });
 
   await mkdir(normalized.activeSessionsDir, { recursive: true });
@@ -162,6 +232,7 @@ async function startProjectSessionLocked(normalized, options) {
     sessionDate,
     sessionNumber: nextSessionNumber,
     warnings: [
+      ...markerContext.warnings,
       ...metadataWarnings,
       ...overlapWarnings,
       ...manifestRefresh.warnings,
@@ -173,11 +244,12 @@ async function startProjectSessionLocked(normalized, options) {
 }
 
 export async function closeProjectSession(options) {
-  const normalized = normalizeSessionPaths(options);
-  return withMemoryRootLock(normalized.rootDir, 'close-session', () => closeProjectSessionLocked(normalized, options));
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  return withMemoryRootLock(normalized.rootDir, 'close-session', () =>
+    closeProjectSessionLocked(normalized, options, markerContext));
 }
 
-async function closeProjectSessionLocked(normalized, options) {
+async function closeProjectSessionLocked(normalized, options, markerContext) {
   const title = requireNonEmptyString(options?.title, 'session close requires a non-empty title.');
   const completed = normalizeStringArray(options?.completed);
   const models = normalizeStringArray(options?.models);
@@ -207,13 +279,18 @@ async function closeProjectSessionLocked(normalized, options) {
   const claude = await readClaudeFile(normalized.claudePath);
   const projectConfig = await readProjectConfig(normalized.projectFilePath);
   const workflowSettings = resolveWorkflowSettings(projectConfig);
-  const sessionId = await resolveExistingSessionId(normalized, options);
+  const laneSelection = await resolveExistingSessionId(normalized, options, markerContext, 'close');
+  const sessionId = laneSelection.sessionId;
   const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
+  const closingLaneMetadata = sessionId ? await readLaneMetadata(lanePaths.sessionFilePath) : null;
   const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
   const docsUpdate = await planDocsUpdateSafely({
     rootDir: normalized.rootDir,
     cwd: normalized.cwd,
     sessionId,
+    // close-session already resolved (and warned about) the lane selection;
+    // the embedded plan must not repeat the flag-vs-marker warning.
+    suppressLaneWarnings: true,
     // Test injection seam; production callers should let close-session use the default planner.
     planner: options?.docsUpdatePlanner,
   });
@@ -268,8 +345,13 @@ async function closeProjectSessionLocked(normalized, options) {
   );
 
   const hadHandoff = await fileExists(lanePaths.handoffFilePath);
+  const markerCleanupWarnings = [];
   let activeSessionIndex = null;
   if (sessionId) {
+    if (closingLaneMetadata?.laneMarker?.path) {
+      const cleanup = await removeRecordedLaneMarker(closingLaneMetadata.laneMarker);
+      markerCleanupWarnings.push(...cleanup.warnings);
+    }
     await rm(lanePaths.laneDir, { recursive: true, force: true });
     activeSessionIndex = await removeActiveSessionFromIndex(normalized, sessionId);
   } else {
@@ -280,20 +362,34 @@ async function closeProjectSessionLocked(normalized, options) {
   }
 
   const closedSummary = `Closed session ${activeSession.sessionNumber} and wrote \`${sessionRelativePath}\`.`;
+  const survivingLanes = activeSessionIndex?.lanes ?? [];
+  const survivorListing = { lanes: survivingLanes.map((lane) => ({ id: lane.id, workingOn: lane.workingOn })), selectedId: activeSessionIndex?.current ?? null };
   const updatedClaude = replaceCurrentSessionBlock(
     claude.content,
     activeSessionIndex?.current
-      ? buildCurrentSessionFieldsForLane(activeSessionIndex.lanes.find((lane) => lane.id === activeSessionIndex.current), {
+      ? buildCurrentSessionFieldsForLane(survivingLanes.find((lane) => lane.id === activeSessionIndex.current), {
           lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
         })
-      : {
-          date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
-          workingOn: 'Session closed. Ready for the next builder session.',
-          lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
-          blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
-          nextSessionShould:
-            normalizeOptionalString(options?.nextSessionShould) ?? summarizeOrderedList(nextSteps),
-        },
+      : survivingLanes.length >= 2
+        ? {
+            date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
+            workingOn:
+              'Multiple lanes remain active. Select one explicitly with `vibecompass switch-session <lane-id>`, --session, or a worktree lane marker.',
+            lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
+            blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
+            nextSessionShould:
+              normalizeOptionalString(options?.nextSessionShould) ??
+              'Pick the next lane explicitly (D-277: no implicit current-lane fallback while multiple lanes are active).',
+          }
+        : {
+            date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
+            workingOn: 'Session closed. Ready for the next builder session.',
+            lastThingCompleted: normalizeOptionalString(options?.lastThingCompleted) ?? closedSummary,
+            blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
+            nextSessionShould:
+              normalizeOptionalString(options?.nextSessionShould) ?? summarizeOrderedList(nextSteps),
+          },
+    survivorListing,
   );
 
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
@@ -320,6 +416,9 @@ async function closeProjectSessionLocked(normalized, options) {
       rootFlag: buildRootFlagForGuidance(normalized),
     }),
     warnings: [
+      ...markerContext.warnings,
+      ...laneSelection.warnings,
+      ...markerCleanupWarnings,
       ...docsUpdate.warnings,
       ...manifestRefresh.warnings,
     ],
@@ -373,24 +472,39 @@ function normalizeDocumentMaintenanceCheckpoint(value) {
 }
 
 export async function listProjectSessions(options = {}) {
-  const normalized = normalizeSessionPaths(options);
+  const { normalized } = await resolveSessionCommandContext(options);
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const index = await readActiveSessionIndex(normalized);
   const lanes = await listActiveSessionLanes(normalized);
 
   return {
     rootDir: normalized.rootDir,
-    current: index.current ?? lanes[0]?.id ?? null,
+    current: resolveValidatedCurrentLane(index.current, lanes),
     lanes,
   };
 }
 
-export async function switchProjectSession(options = {}) {
-  const normalized = normalizeSessionPaths(options);
-  return withMemoryRootLock(normalized.rootDir, 'switch-session', () => switchProjectSessionLocked(normalized, options));
+/**
+ * D-277: the index pointer is only reported as current when it names an
+ * existing active lane; a single active lane may be current implicitly, but
+ * with two or more lanes an invalid/missing pointer is never repaired by
+ * picking one — current becomes null until an explicit selection.
+ */
+function resolveValidatedCurrentLane(pointer, lanes) {
+  if (pointer && lanes.some((lane) => lane.id === pointer)) {
+    return pointer;
+  }
+
+  return lanes.length === 1 ? lanes[0].id : null;
 }
 
-async function switchProjectSessionLocked(normalized, options) {
+export async function switchProjectSession(options = {}) {
+  const { normalized, markerContext } = await resolveSessionCommandContext(options);
+  return withMemoryRootLock(normalized.rootDir, 'switch-session', () =>
+    switchProjectSessionLocked(normalized, options, markerContext));
+}
+
+async function switchProjectSessionLocked(normalized, options, markerContext) {
   const sessionId = validateLaneId(requireNonEmptyString(options?.sessionId, 'switch-session requires a session ID.'));
   const lanes = await listActiveSessionLanes(normalized);
   const lane = lanes.find((item) => item.id === sessionId);
@@ -398,6 +512,16 @@ async function switchProjectSessionLocked(normalized, options) {
   if (!lane) {
     throw new Error(`Active session lane "${sessionId}" does not exist.`);
   }
+
+  // D-280 disagreement warning: switching to a lane other than the one the
+  // enclosing marker binds proceeds, but names both lanes.
+  const selection = resolveLaneSelection({
+    explicitSessionId: sessionId,
+    marker: markerContext?.marker ?? null,
+    laneIds: lanes.map((item) => item.id),
+    rootDir: normalized.rootDir,
+    purpose: 'switch to',
+  });
 
   await upsertActiveSessionIndex(normalized, null, { current: sessionId });
   const claude = await readClaudeFile(normalized.claudePath);
@@ -408,6 +532,7 @@ async function switchProjectSessionLocked(normalized, options) {
       buildCurrentSessionFieldsForLane(lane, {
         lastThingCompleted: `Switched current lane to ${sessionId}.`,
       }),
+      { lanes: lanes.map((item) => ({ id: item.id, workingOn: item.workingOn })), selectedId: sessionId },
     ),
     'utf8',
   );
@@ -422,7 +547,7 @@ async function switchProjectSessionLocked(normalized, options) {
     claudePath: normalized.claudePath,
     current: sessionId,
     lanes,
-    warnings: manifestRefresh.warnings,
+    warnings: [...markerContext.warnings, ...selection.warnings, ...manifestRefresh.warnings],
     manifest: manifestRefresh.manifest,
     agentFileSync,
   };
@@ -436,7 +561,7 @@ async function switchProjectSessionLocked(normalized, options) {
  * lane may become current implicitly.
  */
 export async function rebuildActiveSessionIndex(options = {}) {
-  const normalized = normalizeSessionPaths(options);
+  const { normalized } = await resolveSessionCommandContext(options);
   return withMemoryRootLock(normalized.rootDir, 'rebuild-active-index', async () => {
     await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
     const lanes = await listActiveSessionLanes(normalized);
@@ -483,6 +608,167 @@ export async function rebuildActiveSessionIndex(options = {}) {
   });
 }
 
+/**
+ * Writes the worktree lane marker for an active lane (D-280). Markers are
+ * never written implicitly: this explicit command and S3 worktree
+ * provisioning are the only producers. The target must be path-disjoint from
+ * the memory root, and the lane's session.yaml records the marker under a
+ * `lane_marker:` block map so close-session and S3 removal can token-match.
+ */
+export async function writeLaneMarkerForSession(options) {
+  // needMarkerForLane: the enclosing marker is consulted even under an
+  // explicit --root so the D-280 flag-vs-marker disagreement warning fires
+  // when this command binds a different lane than the invoking context.
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  return withMemoryRootLock(normalized.rootDir, 'write-lane-marker', () =>
+    writeLaneMarkerForSessionLocked(normalized, options, markerContext));
+}
+
+async function writeLaneMarkerForSessionLocked(normalized, options, markerContext) {
+  const sessionId = validateLaneId(
+    requireNonEmptyString(options?.sessionId, 'write-lane-marker requires --session <lane-id> so the marker binds to an explicit lane.'),
+  );
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const warnings = [...markerContext.warnings];
+  const lanes = await listActiveSessionLanes(normalized);
+  // Shared D-277/D-280 selection: validates the explicit lane is active and
+  // emits the disagreement warning when an enclosing marker names another lane.
+  const selection = resolveLaneSelection({
+    explicitSessionId: sessionId,
+    marker: markerContext.marker,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose: 'bind the marker to',
+  });
+  warnings.push(...selection.warnings);
+
+  const lanePaths = getLanePaths(normalized, sessionId);
+  if (!(await fileExists(lanePaths.sessionFilePath))) {
+    throw new Error(
+      `Lane "${sessionId}" has no session.yaml at ${lanePaths.sessionFilePath}; the marker cannot be recorded. Repair the lane (rebuild-active-index) before writing a marker.`,
+    );
+  }
+
+  const targetDir = path.resolve(normalized.cwd, options?.dir ?? '.');
+  const targetStat = await stat(targetDir).catch(() => null);
+  if (!targetStat) {
+    throw new Error(
+      `write-lane-marker target directory ${targetDir} does not exist. Create it first; markers are never provisioned implicitly (D-280).`,
+    );
+  }
+  if (!targetStat.isDirectory()) {
+    throw new Error(`write-lane-marker target ${targetDir} is not a directory.`);
+  }
+
+  await assertMarkerTargetDisjoint(targetDir, normalized.rootDir);
+  const gitDir = await findEnclosingGitDir(targetDir);
+  if (gitDir) {
+    warnings.push(
+      `Marker target ${targetDir} sits inside a git work tree (${gitDir}); lane markers are local-only (D-278) — make sure ${LANE_MARKER_FILENAME} is git-ignored there.`,
+    );
+  }
+
+  const markerPath = path.join(targetDir, LANE_MARKER_FILENAME);
+  if (await fileExists(markerPath)) {
+    try {
+      const existing = await readLaneMarker(markerPath);
+      if (existing.laneId !== sessionId) {
+        warnings.push(`Replaced the marker at ${markerPath} previously bound to lane "${existing.laneId}".`);
+      }
+    } catch {
+      warnings.push(`Replaced an unreadable marker at ${markerPath}.`);
+    }
+  }
+
+  const laneMetadata = await readLaneMetadata(lanePaths.sessionFilePath);
+  if (laneMetadata.laneMarker?.path && path.resolve(laneMetadata.laneMarker.path) !== markerPath) {
+    const cleanup = await removeRecordedLaneMarker(laneMetadata.laneMarker);
+    warnings.push(...cleanup.warnings);
+  }
+
+  const token = randomUUID();
+  const createdAt = formatLocalDateTime(new Date());
+  const sessionYaml = await readFile(lanePaths.sessionFilePath, 'utf8');
+  // Record before writing the marker file: a crash between the two leaves the
+  // benign recorded-but-missing state (cleanup is a no-op) instead of an
+  // unrecorded on-disk marker that nothing can remove or report.
+  await writeFile(
+    lanePaths.sessionFilePath,
+    upsertLaneMarkerBlock(sessionYaml, { path: markerPath, token, createdAt }),
+    'utf8',
+  );
+  await writeFile(
+    markerPath,
+    renderLaneMarker({
+      laneId: sessionId,
+      memoryRoot: normalized.rootDir,
+      token,
+      createdAt,
+      createdBy: PACKAGE_VERSION,
+    }),
+    'utf8',
+  );
+
+  return {
+    rootDir: normalized.rootDir,
+    sessionId,
+    markerPath,
+    token,
+    warnings,
+  };
+}
+
+/**
+ * Removes a lane's recorded marker file only when the on-disk token still
+ * matches the recorded token (D-280 guarded removal); anything else is
+ * reported and left in place.
+ */
+async function removeRecordedLaneMarker(recorded) {
+  const warnings = [];
+  if (!recorded?.path) {
+    return { removed: false, warnings };
+  }
+
+  if (!(await fileExists(recorded.path))) {
+    return { removed: false, warnings };
+  }
+
+  try {
+    const marker = await readLaneMarker(recorded.path);
+    if (recorded.token && marker.token === recorded.token) {
+      await rm(recorded.path, { force: true });
+      return { removed: true, warnings };
+    }
+
+    warnings.push(
+      `Lane marker at ${recorded.path} left in place: its token does not match the lane's recorded marker (D-280: only token-matched markers are removed).`,
+    );
+  } catch (error) {
+    warnings.push(
+      `Lane marker at ${recorded.path} left in place: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  return { removed: false, warnings };
+}
+
+/** Replaces (or appends) the `lane_marker:` block map in a session.yaml body. */
+function upsertLaneMarkerBlock(content, marker) {
+  // CRLF-tolerant to match parseSimpleYaml's /\r?\n/ splitting; a missed
+  // strip here would append a duplicate key and void the whole lane metadata.
+  const stripped = content.replace(/^lane_marker:\r?\n(?:[ \t]+.*\r?\n?)*/m, '');
+  const base = stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  const block = [
+    'lane_marker:',
+    `  path: ${quoteYamlString(marker.path)}`,
+    `  token: ${quoteYamlString(marker.token)}`,
+    `  created_at: ${marker.createdAt}`,
+    '',
+  ].join('\n');
+
+  return `${base}${block}`;
+}
+
 async function refreshStateManifestSafely(rootDir) {
   try {
     const manifest = await writeStateManifest(rootDir);
@@ -508,6 +794,7 @@ async function planDocsUpdateSafely(options) {
         rootDir: options.rootDir,
         cwd: options.cwd,
         sessionId: options.sessionId,
+        suppressLaneWarnings: options.suppressLaneWarnings === true,
       }),
       warnings: [],
     };
@@ -667,9 +954,9 @@ function parseCurrentSessionBlock(content, options = {}) {
   };
 }
 
-function replaceCurrentSessionBlock(content, fields) {
+function replaceCurrentSessionBlock(content, fields, laneListing = null) {
   const sessionFence = findCurrentSessionFence(content);
-  const blockBody = renderCurrentSessionBlockBody(fields);
+  const blockBody = renderCurrentSessionBlockBody(fields, laneListing);
 
   if (!sessionFence) {
     return insertCurrentSessionBlock(content, blockBody);
@@ -678,14 +965,32 @@ function replaceCurrentSessionBlock(content, fields) {
   return `${content.slice(0, sessionFence.bodyStart)}${blockBody}${content.slice(sessionFence.bodyEnd)}`;
 }
 
-function renderCurrentSessionBlockBody(fields) {
-  return [
-    `Date: ${fields.date}`,
+/**
+ * D-277: with two or more active lanes the block becomes a derived multi-lane
+ * listing (one line per active lane plus the selected lane); with at most one
+ * lane it keeps the exact legacy five-field shape. The five field labels stay
+ * present in both shapes so parseCurrentSessionBlock/findCurrentSessionFence
+ * keep working on either.
+ */
+function renderCurrentSessionBlockBody(fields, laneListing = null) {
+  const lines = [`Date: ${fields.date}`];
+
+  if (laneListing && Array.isArray(laneListing.lanes) && laneListing.lanes.length >= 2) {
+    lines.push('Active lanes:');
+    for (const lane of [...laneListing.lanes].sort((left, right) => left.id.localeCompare(right.id))) {
+      const selectedSuffix = laneListing.selectedId === lane.id ? ' [selected]' : '';
+      lines.push(`- ${lane.id} — ${lane.workingOn ?? 'No summary recorded'}${selectedSuffix}`);
+    }
+  }
+
+  lines.push(
     `Working on: ${fields.workingOn}`,
     `Last thing completed: ${fields.lastThingCompleted}`,
     `Blockers: ${fields.blockers}`,
     `Next session should: ${fields.nextSessionShould}`,
-  ].join('\n');
+  );
+
+  return lines.join('\n');
 }
 
 function insertCurrentSessionBlock(content, blockBody) {
@@ -757,22 +1062,17 @@ async function resolveStartSessionId(normalized, options) {
   throw new Error('start-session requires --id <lane-id> so each active lane has a meaningful name.');
 }
 
-async function resolveExistingSessionId(normalized, options) {
+async function resolveExistingSessionId(normalized, options, markerContext, purpose) {
   const explicitId = normalizeOptionalString(options?.sessionId);
-  if (explicitId) {
-    return validateLaneId(explicitId);
-  }
-
   const lanes = await listActiveSessionLanes(normalized);
-  if (lanes.length === 1) {
-    return lanes[0].id;
-  }
 
-  if (lanes.length > 1) {
-    throw new Error('Multiple active session lanes exist. Pass --session to choose which lane to close.');
-  }
-
-  return null;
+  return resolveLaneSelection({
+    explicitSessionId: explicitId ? validateLaneId(explicitId) : null,
+    marker: markerContext?.marker ?? null,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose,
+  });
 }
 
 async function listActiveSessionLanes(normalized) {
@@ -835,6 +1135,13 @@ async function readLaneMetadata(sessionFilePath) {
       decisionSnapshot: {
         highestDecisionId: parseNullableNumber(data.decision_snapshot?.highest_decision_id),
       },
+      laneMarker: data.lane_marker && typeof data.lane_marker === 'object'
+        ? {
+            path: normalizeOptionalString(data.lane_marker.path),
+            token: normalizeOptionalString(data.lane_marker.token),
+            createdAt: normalizeOptionalString(data.lane_marker.created_at),
+          }
+        : null,
       sessionDate: normalizeOptionalString(data.session_date),
       sessionNumber: typeof data.session_number === 'number' ? data.session_number : Number(data.session_number) || null,
       warnings: [],
@@ -850,6 +1157,7 @@ async function readLaneMetadata(sessionFilePath) {
       decisionSnapshot: {
         highestDecisionId: null,
       },
+      laneMarker: null,
       sessionDate: null,
       sessionNumber: null,
       warnings: [
@@ -875,7 +1183,12 @@ async function readActiveSessionIndex(normalized) {
 }
 
 async function upsertActiveSessionIndex(normalized, lane, options = {}) {
-  const currentIndex = await readActiveSessionIndex(normalized);
+  // D-277: callers must select `current` explicitly; the upsert never derives
+  // a current lane from the lane being written or a stale existing pointer.
+  if (!('current' in options)) {
+    throw new Error('upsertActiveSessionIndex requires an explicit current-lane selection.');
+  }
+
   const lanes = await listActiveSessionLanes(normalized);
   const laneMap = new Map(lanes.map((item) => [item.id, item]));
   if (lane) {
@@ -886,9 +1199,8 @@ async function upsertActiveSessionIndex(normalized, lane, options = {}) {
     });
   }
 
-  const current = options.current ?? currentIndex.current ?? lane?.id ?? null;
   await mkdir(normalized.activeSessionsDir, { recursive: true });
-  await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(current, [...laneMap.values()]), 'utf8');
+  await writeFile(normalized.activeSessionsIndexPath, renderActiveSessionIndex(options.current, [...laneMap.values()]), 'utf8');
 }
 
 /**
@@ -899,7 +1211,15 @@ async function upsertActiveSessionIndex(normalized, lane, options = {}) {
 async function removeActiveSessionFromIndex(normalized, sessionId) {
   const index = await readActiveSessionIndex(normalized);
   const lanes = (await listActiveSessionLanes(normalized)).filter((lane) => lane.id !== sessionId);
-  const current = index.current === sessionId ? lanes[0]?.id ?? null : index.current;
+  // D-277: a surviving pointer is kept only when it names a surviving lane; a
+  // sole survivor may become current implicitly, but with 2+ survivors the
+  // pointer goes null until an explicit switch-session / marker selection.
+  // This also repairs stale pointers that named an already-missing lane.
+  const keptPointer =
+    index.current && index.current !== sessionId && lanes.some((lane) => lane.id === index.current)
+      ? index.current
+      : null;
+  const current = keptPointer ?? (lanes.length === 1 ? lanes[0].id : null);
   if (lanes.length === 0) {
     await rm(normalized.activeSessionsIndexPath, { force: true });
     return {
@@ -953,19 +1273,6 @@ function parseActiveSession(wipContent, wipFilePath = 'sessions/active/<lane-id>
     sessionDate: match[1],
     sessionNumber: Number(match[2]),
   };
-}
-
-function validateLaneId(value) {
-  const normalized = value.trim();
-  if (!LANE_ID_PATTERN.test(normalized)) {
-    throw new Error('Session lane ID must be a lowercase slug 3-64 characters long using letters, numbers, and hyphens.');
-  }
-
-  if (RESERVED_LANE_IDS.has(normalized)) {
-    throw new Error(`Session lane ID "${normalized}" is reserved.`);
-  }
-
-  return normalized;
 }
 
 function extractSectionBody(content, sectionTitle) {
