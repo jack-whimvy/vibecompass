@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -12,6 +12,7 @@ import {
   normalizeBranchName,
   preflightGitBinding,
   provisionGitBinding,
+  removeLaneWorktreesAtClose,
   rollbackGitBinding,
 } from './git-binding.js';
 import { withMemoryRootLock } from './serialization.js';
@@ -418,33 +419,16 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const sessionId = laneSelection.sessionId;
   const lanePaths = sessionId ? getLanePaths(normalized, sessionId) : normalized;
   const closingLaneMetadata = sessionId ? await readLaneMetadata(lanePaths.sessionFilePath) : null;
-  // Interim S3-2 guard (D-281): the close-side guarded worktree removal is
-  // S3-3 work, and closing a lane whose recorded worktrees still exist would
-  // token-delete the container marker and destroy session.yaml — the only
-  // records the removal guard depends on — while the worktrees (and any
-  // uncommitted work in them) survive unmanaged. Refuse before any
-  // irreversible write; recorded-but-missing worktrees are benign crash
-  // residue and do not block the close.
-  if (closingLaneMetadata) {
-    const survivingWorktrees = [];
-    for (const [repoId, worktreePath] of Object.entries(closingLaneMetadata.worktrees ?? {})) {
-      if (await fileExists(worktreePath)) {
-        survivingWorktrees.push({ repoId, worktreePath });
-      }
-    }
-    if (survivingWorktrees.length > 0) {
-      const cleanupCommands = survivingWorktrees
-        .map(({ repoId, worktreePath }) => {
-          const sourceDir = closingLaneMetadata.worktreeSources?.[repoId];
-          return `git -C ${sourceDir ?? '<source repo>'} worktree remove ${worktreePath}`;
-        })
-        .join('\n  ');
-      throw new Error(
-        `Lane "${sessionId}" still has provisioned worktrees on disk:\n  ${survivingWorktrees.map((entry) => entry.worktreePath).join('\n  ')}\n` +
-          'close-session cannot yet remove worktrees (D-281 close-side removal is unimplemented); closing now would destroy the records the removal guard needs while the worktrees survive. ' +
-          `Commit or discard their work, remove them manually:\n  ${cleanupCommands}\nthen rerun close-session.`,
-      );
-    }
+  // Fail closed on a null-degraded lane parse, mirroring the write-lane-marker
+  // rebind guard: a degraded parse reads as "no worktrees recorded", so
+  // closing would destroy session.yaml — the only record of the worktree
+  // paths, sources, container, and marker token — while the worktrees (and
+  // any uncommitted work in them) survive unmanaged behind a permanently
+  // stale marker (D-281).
+  if (closingLaneMetadata && closingLaneMetadata.warnings.length > 0) {
+    throw new Error(
+      `Lane "${sessionId}"'s session.yaml could not be parsed (${closingLaneMetadata.warnings[0]}); refusing to close — a null-degraded parse would hide recorded worktrees and closing would destroy the removal-guard records while the worktrees survive (D-281). Repair the lane metadata first, then rerun close-session.`,
+    );
   }
   const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
   const docsUpdate = await planDocsUpdateSafely({
@@ -487,7 +471,9 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const sessionFilePath = path.join(normalized.rootDir, sessionRelativePath);
 
   if (await fileExists(sessionFilePath)) {
-    throw new Error(`Session note already exists at ${sessionFilePath}.`);
+    throw new Error(
+      `Session note already exists at ${sessionFilePath}. If a previous close-session was interrupted after writing the note (for example during worktree removal), move or delete that file and rerun close-session — recorded-but-missing worktrees from the interrupted run are benign.`,
+    );
   }
 
   await writeFile(
@@ -510,11 +496,67 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const hadHandoff = await fileExists(lanePaths.handoffFilePath);
   const markerCleanupWarnings = [];
   let activeSessionIndex = null;
+  let worktreeCleanup = null;
   if (sessionId) {
-    if (closingLaneMetadata?.laneMarker?.path) {
-      const cleanup = await removeRecordedLaneMarker(closingLaneMetadata.laneMarker);
-      markerCleanupWarnings.push(...cleanup.warnings);
+    // D-281 close-side guarded removal (S3-3): runs after the session note is
+    // written (a failed note write leaves everything intact) and before the
+    // lane records are destroyed. A crash between removal and the lane-dir
+    // delete leaves only benign recorded-but-missing entries.
+    const removal = closingLaneMetadata
+      ? await removeLaneWorktreesAtClose({
+          laneId: sessionId,
+          worktrees: closingLaneMetadata.worktrees,
+          worktreeSources: closingLaneMetadata.worktreeSources,
+          worktreeContainer: closingLaneMetadata.worktreeContainer,
+          recordedMarker: closingLaneMetadata.laneMarker,
+          cwd: normalized.cwd,
+        })
+      : { attempted: false, removed: [], surviving: [], warnings: [] };
+    markerCleanupWarnings.push(...removal.warnings);
+
+    let markerRemoved = false;
+    let markerKept = false;
+    let containerRemoved = false;
+    if (removal.surviving.length > 0) {
+      // D-281: keep the marker while any recorded worktree survives, so the
+      // leftover worktrees keep an actionable fail-closed breadcrumb instead
+      // of a silent wrong-root fallback. Only claim the marker "was kept"
+      // when it actually exists — removal may have been refused precisely
+      // because the marker is missing.
+      if (closingLaneMetadata?.laneMarker?.path && (await fileExists(closingLaneMetadata.laneMarker.path))) {
+        markerKept = true;
+        markerCleanupWarnings.push(
+          `Lane "${sessionId}" closed with ${removal.surviving.length} surviving worktree(s); the container marker at ${closingLaneMetadata.laneMarker.path} was kept as a breadcrumb (D-281). After removing the worktrees, delete the marker and the container directory manually.`,
+        );
+      }
+    } else {
+      if (closingLaneMetadata?.laneMarker?.path) {
+        const cleanup = await removeRecordedLaneMarker(closingLaneMetadata.laneMarker);
+        markerRemoved = cleanup.removed;
+        markerCleanupWarnings.push(...cleanup.warnings);
+      }
+      if (removal.attempted && closingLaneMetadata?.worktreeContainer) {
+        // rmdir-if-empty: never recursive — a stray user file in the
+        // container keeps it in place with a note rather than being deleted.
+        const containerCleanup = await removeEmptyWorktreeContainer(closingLaneMetadata.worktreeContainer, normalized.cwd);
+        containerRemoved = containerCleanup.removed;
+        markerCleanupWarnings.push(...containerCleanup.warnings);
+      }
     }
+    if (removal.attempted) {
+      worktreeCleanup = {
+        branch: closingLaneMetadata?.branch ?? null,
+        removed: removal.removed,
+        surviving: removal.surviving,
+        markerRemoved,
+        // Explicit kept status (reviewer pass): "kept" requires the marker
+        // file to exist — surviving worktrees with a missing marker must not
+        // render a phantom breadcrumb line.
+        markerKept,
+        containerRemoved,
+      };
+    }
+
     await rm(lanePaths.laneDir, { recursive: true, force: true });
     activeSessionIndex = await removeActiveSessionFromIndex(normalized, sessionId);
   } else {
@@ -578,10 +620,15 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       projectConfig,
       rootFlag: buildRootFlagForGuidance(normalized),
     }),
+    worktreeCleanup,
     warnings: [
       ...markerContext.warnings,
       ...laneSelection.warnings,
       ...markerCleanupWarnings,
+      // A:192 (D-281): the pre-close staleness set computed by docs-update is
+      // re-emitted at close as warnings, so the closer sees it even when the
+      // embedded plan scrolls past.
+      ...collectStalenessWarnings(docsUpdate.plan),
       ...docsUpdate.warnings,
       ...manifestRefresh.warnings,
     ],
@@ -592,6 +639,62 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       ...(hadHandoff ? [lanePaths.handoffFilePath] : []),
     ],
   };
+}
+
+/**
+ * D-281 rmdir-if-empty: after the worktrees and the container marker are
+ * gone, an empty container is removed non-recursively. Anything left inside
+ * (stray user files) keeps the container in place with a note — close-out
+ * never deletes content it did not create. The D-281 cwd clause applies here
+ * too: POSIX happily rmdirs the invoking process's own working directory,
+ * which would strand the caller's shell in a deleted path.
+ */
+async function removeEmptyWorktreeContainer(containerDir, cwd) {
+  const realContainer = await canonicalizePathBestEffort(containerDir);
+  const realCwd = await canonicalizePathBestEffort(cwd ?? process.cwd());
+  const cwdRelative = path.relative(realContainer, realCwd);
+  if (cwdRelative === '' || (!cwdRelative.startsWith('..') && !path.isAbsolute(cwdRelative))) {
+    return {
+      removed: false,
+      warnings: [
+        `Worktree container ${containerDir} was left in place: the current working directory is inside it (D-281). cd out of the container, then delete it manually.`,
+      ],
+    };
+  }
+
+  try {
+    await rmdir(containerDir);
+    return { removed: true, warnings: [] };
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return { removed: false, warnings: [] };
+    }
+
+    return {
+      removed: false,
+      warnings: [
+        `Worktree container ${containerDir} was left in place: it is not empty (close-session only removes an empty container; D-281). Inspect and delete it manually.`,
+      ],
+    };
+  }
+}
+
+async function canonicalizePathBestEffort(value) {
+  try {
+    return await realpath(value);
+  } catch {
+    return path.resolve(value);
+  }
+}
+
+/** Flattens the docs-update pre-close staleness set into close warnings (A:192 re-emission). */
+function collectStalenessWarnings(plan) {
+  const staleness = plan?.staleness;
+  if (!staleness) {
+    return [];
+  }
+
+  return (staleness.entries ?? []).map((entry) => `Pre-close staleness: ${entry}`);
 }
 
 function normalizeDocumentMaintenanceCheckpoint(value) {

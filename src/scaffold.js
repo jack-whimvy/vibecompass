@@ -235,6 +235,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
 - Optional git binding (D-281): \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
+- At close, \`close-session\` removes a bound lane's recorded clean worktrees (guarded and never forced: dirty, in-use, or unverifiable worktrees survive with guidance, the lane marker is kept while any worktree survives, and branches are never deleted). Do not hand-remove provisioned worktrees; follow the printed guidance instead.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
 
@@ -333,12 +334,12 @@ If \`vibecompass start-session\` reports stale scratch files, read the existing 
 
 At session close:
 - prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --architecture-docs updated|not-needed|deferred --decision-log updated|not-needed|deferred --session-maintenance updated|not-needed|deferred --next-step "..."\`; \`vibecompass end-session\` is a supported alias
-- close-session prints the same targeted docs-update plan before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
+- close-session prints the same targeted docs-update plan — including the pre-close staleness set (new decisions since lane start, stale base revisions, newer finalized notes touching this lane's scope, claim overlap with other active lanes) — before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
 - document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
 - if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
-- delete the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\`
+- close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, and the container when they are safely removable; leftover pieces come with printed guidance
 - refresh any affected architecture/decision docs
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
 - for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred

@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { realpath, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { assertMarkerTargetDisjoint, findEnclosingGitDir } from './lane-marker.js';
+import { assertMarkerTargetDisjoint, findEnclosingGitDir, readLaneMarker } from './lane-marker.js';
 import { isSimpleYamlKeySafe } from './simple-yaml.js';
 
 const execFileAsync = promisify(execFile);
@@ -61,6 +61,24 @@ export async function captureBaseRevisions(options) {
   }
 
   return { baseRevisions, warnings };
+}
+
+/**
+ * S3-4 base-revision staleness probe: the current HEAD of a repo source
+ * checkout, with the same repository-root-only semantics as
+ * captureBaseRevisions (a nested directory would report the outer repo's
+ * HEAD). Returns null for missing/non-git/nested/unborn sources — the
+ * caller names unreadable heads for repos that recorded a base (unevaluable
+ * staleness pieces are named, not skipped).
+ */
+export async function readCurrentRepoHead(repoDir) {
+  const toplevel = await readGitToplevel(repoDir);
+  if (!toplevel || !(await isSameDirectoryReal(toplevel, repoDir))) {
+    return null;
+  }
+
+  const head = await readGitHeadRevision(repoDir);
+  return head.status === 'ok' ? head.revision : null;
 }
 
 /**
@@ -368,6 +386,174 @@ export async function rollbackGitBinding(progress, branch) {
   }
 
   return notes;
+}
+
+/**
+ * D-281 close-side guarded removal (S3-3). Recorded clean worktrees are
+ * removed by default; everything else survives with actionable guidance.
+ * The destructive path is strictly narrower than the creative one:
+ * - only paths recorded in session.yaml AND contained in the lane's recorded
+ *   container AND covered by a token-matched container marker are removable
+ *   (D-279/D-280 guards — arbitrary path removal is refused)
+ * - removal is never forced; a status failure counts as unknown, not clean
+ * - removal is skipped with guidance when the process cwd sits inside the
+ *   target
+ * - branches are never deleted at close
+ * Recorded-but-missing worktrees are benign crash residue and never block or
+ * warn. Returns { attempted, removed, surviving, warnings }; the caller keeps
+ * the container marker while any recorded worktree survives.
+ */
+export async function removeLaneWorktreesAtClose(options) {
+  const removed = [];
+  const surviving = [];
+  const warnings = [];
+  const recordedEntries = Object.entries(options.worktrees ?? {});
+  if (recordedEntries.length === 0) {
+    return { attempted: false, removed, surviving, warnings };
+  }
+
+  const manualCommand = ({ repoId, worktreePath }) => {
+    const sourceDir = options.worktreeSources?.[repoId];
+    return sourceDir
+      ? `git -C ${sourceDir} worktree remove ${worktreePath}`
+      : `git worktree remove ${worktreePath} (run from repo "${repoId}"'s source checkout)`;
+  };
+  const keep = (entry, reason, detail) => {
+    surviving.push({ repoId: entry.repoId, worktreePath: entry.worktreePath, reason });
+    warnings.push(
+      `Worktree ${entry.worktreePath} for repo "${entry.repoId}" was left in place: ${detail} Remove it manually: ${manualCommand(entry)}`,
+    );
+  };
+
+  const existingEntries = [];
+  for (const [repoId, worktreePath] of recordedEntries) {
+    // A relative recorded path is refused before any probe: the guards here
+    // resolve it against the process cwd while `git -C <source>` would
+    // resolve it against the source repo, so the validated path and the
+    // removed path could differ (D-279: arbitrary path removal is refused).
+    if (!path.isAbsolute(worktreePath)) {
+      keep({ repoId, worktreePath }, 'not-absolute', 'its recorded path is not absolute, so the guards and the removal command could resolve to different locations (D-279: arbitrary path removal is refused).');
+      continue;
+    }
+    if (await pathExists(worktreePath)) {
+      existingEntries.push({ repoId, worktreePath });
+    }
+  }
+  if (existingEntries.length === 0) {
+    return { attempted: true, removed, surviving, warnings };
+  }
+
+  // Container-level guard, checked once: removal is licensed by the recorded
+  // container plus a token-matched container marker (D-280). Any failure here
+  // keeps every surviving worktree — an unverifiable container may belong to
+  // someone else.
+  const containerGuardFailure = await describeContainerGuardFailure(options);
+  if (containerGuardFailure) {
+    for (const entry of existingEntries) {
+      keep(entry, 'container-unverified', `${containerGuardFailure} (D-280/D-281: only marker-verified container contents are removable).`);
+    }
+    return { attempted: true, removed, surviving, warnings };
+  }
+
+  const realContainer = await canonicalizePathReal(options.worktreeContainer);
+  const realCwd = await canonicalizePathReal(options.cwd ?? process.cwd());
+  for (const entry of existingEntries) {
+    const realWorktree = await canonicalizePathReal(entry.worktreePath);
+    if (realWorktree === realContainer || !isPathEqualOrInsideReal(realWorktree, realContainer)) {
+      keep(entry, 'outside-container', `its recorded path sits outside the lane's worktree container ${options.worktreeContainer} (D-279: arbitrary path removal is refused).`);
+      continue;
+    }
+    if (isPathEqualOrInsideReal(realCwd, realWorktree)) {
+      keep(entry, 'cwd-inside', 'the current working directory is inside it (D-281). cd out of the worktree first.');
+      continue;
+    }
+
+    const cleanliness = await readWorktreeCleanliness(entry.worktreePath);
+    if (cleanliness === 'dirty') {
+      keep(entry, 'dirty', 'it has uncommitted changes and close-session never forces removal (D-281). Commit or discard them first.');
+      continue;
+    }
+    if (cleanliness === 'unknown') {
+      keep(entry, 'status-unknown', 'its cleanliness could not be determined — a status failure counts as unknown, not clean (D-281). Inspect it first.');
+      continue;
+    }
+
+    const sourceDir = options.worktreeSources?.[entry.repoId];
+    if (!sourceDir) {
+      keep(entry, 'no-source-recorded', 'the lane recorded no source repository for it, so the removal command cannot be constructed safely.');
+      continue;
+    }
+    try {
+      await execFileAsync(
+        'git',
+        ['-C', sourceDir, 'worktree', 'remove', entry.worktreePath],
+        { timeout: WORKTREE_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+      );
+      removed.push({ repoId: entry.repoId, worktreePath: entry.worktreePath, sourceDir });
+    } catch (error) {
+      keep(entry, 'git-refused', `git refused the removal: ${describeGitError(error)}. Resolve that first.`);
+    }
+  }
+
+  return { attempted: true, removed, surviving, warnings };
+}
+
+/**
+ * Returns a human-readable reason when the D-280 container guard cannot
+ * license removal, or null when the container marker verifies. The marker
+ * must live directly in the recorded container and match the lane's recorded
+ * token and lane id — a mismatch means the container may not be ours.
+ */
+async function describeContainerGuardFailure(options) {
+  if (!options.worktreeContainer) {
+    return 'the lane recorded no worktree container';
+  }
+  if (!options.recordedMarker?.path || !options.recordedMarker?.token) {
+    return 'the lane recorded no container marker to verify ownership against';
+  }
+
+  const realContainer = await canonicalizePathReal(options.worktreeContainer);
+  const recordedMarkerDir = await canonicalizePathReal(path.dirname(path.resolve(options.recordedMarker.path)));
+  if (recordedMarkerDir !== realContainer) {
+    return `the recorded marker path ${options.recordedMarker.path} does not sit in the recorded container ${options.worktreeContainer}`;
+  }
+
+  let marker;
+  try {
+    marker = await readLaneMarker(options.recordedMarker.path);
+  } catch (error) {
+    return `the container marker could not be verified: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (marker.token !== options.recordedMarker.token) {
+    return `the container marker at ${options.recordedMarker.path} does not match the lane's recorded token`;
+  }
+  if (options.laneId && marker.laneId !== options.laneId) {
+    return `the container marker at ${options.recordedMarker.path} belongs to lane "${marker.laneId}", not "${options.laneId}"`;
+  }
+
+  return null;
+}
+
+/**
+ * Close-side cleanliness probe. Unlike the start-side dirty warning (which
+ * fails open — a probe failure only skips a warning), removal must fail
+ * closed: an unreadable status is 'unknown' and the worktree survives.
+ * Gitignored files intentionally do NOT count as dirty, matching git's own
+ * unforced `worktree remove` semantics — ignored local files (.env, caches)
+ * are deleted with the worktree, and treating them as dirty would make
+ * every real worktree (node_modules etc.) survive by default.
+ */
+async function readWorktreeCleanliness(worktreePath) {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', worktreePath, 'status', '--porcelain=v1', '--untracked-files=all'],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    return stdout.trim() === '' ? 'clean' : 'dirty';
+  } catch {
+    return 'unknown';
+  }
 }
 
 async function runProvisioningGit(args, description) {

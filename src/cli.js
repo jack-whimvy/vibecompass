@@ -249,6 +249,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
+    writeWorktreeCleanupResult(io, result.worktreeCleanup);
     if (result.docsUpdatePlan) {
       io.stdout.write(renderDocsUpdatePlan(result.docsUpdatePlan));
     }
@@ -1763,6 +1764,45 @@ function writeRefreshWorkflowResult(io, result) {
   writeAgentFileSyncResult(io, result.agentFileSync);
 }
 
+// D-281 close-side worktree cleanup summary. Status lines stay on stdout;
+// the actionable per-worktree guidance travels on result.warnings (stderr).
+const SURVIVING_WORKTREE_REASON_LABELS = {
+  'container-unverified': 'container marker unverified',
+  'outside-container': 'outside the lane container',
+  'cwd-inside': 'current working directory is inside it',
+  'not-absolute': 'recorded path not absolute',
+  dirty: 'uncommitted changes',
+  'status-unknown': 'cleanliness unknown',
+  'no-source-recorded': 'no recorded source repo',
+  'git-refused': 'git refused the removal',
+};
+
+function writeWorktreeCleanupResult(io, worktreeCleanup) {
+  if (!worktreeCleanup) {
+    return;
+  }
+
+  io.stdout.write('Worktree cleanup:\n');
+  for (const removed of worktreeCleanup.removed) {
+    io.stdout.write(`- ${removed.repoId}: removed ${removed.worktreePath}\n`);
+  }
+  for (const surviving of worktreeCleanup.surviving) {
+    const label = SURVIVING_WORKTREE_REASON_LABELS[surviving.reason] ?? surviving.reason;
+    io.stdout.write(`- ${surviving.repoId}: kept ${surviving.worktreePath} (${label})\n`);
+  }
+  if (worktreeCleanup.markerRemoved) {
+    io.stdout.write('- lane marker removed (token-matched)\n');
+  } else if (worktreeCleanup.markerKept) {
+    io.stdout.write('- lane marker kept while worktrees survive (D-281)\n');
+  }
+  if (worktreeCleanup.containerRemoved) {
+    io.stdout.write('- container removed (empty)\n');
+  }
+  if (worktreeCleanup.branch) {
+    io.stdout.write(`- branch "${worktreeCleanup.branch}" left in place (close-session never deletes branches; D-281)\n`);
+  }
+}
+
 function writeDocumentMaintenanceCheckpoint(io, documentMaintenance) {
   if (!documentMaintenance) {
     return;
@@ -1915,7 +1955,7 @@ function usageText() {
     '  --next-session-should <text>         Optional current-session handoff summary',
     '',
     'Close-session options (also accepted by end-session):',
-    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --title <text>                       Required display title for the finalized session note',
     '  --worked-on <text>                   Optional override for "What we worked on"',

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,8 +12,11 @@ import {
   normalizeBranchName,
   preflightGitBinding,
   provisionGitBinding,
+  removeLaneWorktreesAtClose,
   rollbackGitBinding,
 } from '../git-binding.js';
+import { renderLaneMarker } from '../lane-marker.js';
+import { PACKAGE_VERSION } from '../version.js';
 import { inspectProjectCompatibility } from '../compatibility.js';
 import { getProjectStatus } from '../status.js';
 import { writeStateManifest } from '../manifest.js';
@@ -686,42 +689,320 @@ test('CLI: --worktree parses as boolean, --worktree= is rejected, init refuses -
 
 // ---------- Fleet-finding regression tests ----------
 
-test('close-session refuses while provisioned worktrees survive, then closes cleanly after manual removal (D-281 interim guard)', async (t) => {
+// ---------- S3-3: close-side guarded worktree removal (D-281) ----------
+
+async function startBoundLane(tempDir, laneId = 'lane-a', branch = 'feat') {
+  await startProjectSession({
+    cwd: tempDir,
+    sessionId: laneId,
+    workingOn: 'Bound work',
+    repos: ['app'],
+    branch,
+    worktree: true,
+  });
+  const container = path.join(tempDir, 'worktrees', laneId);
+  return {
+    container,
+    markerPath: path.join(container, '.vibecompass-lane.yaml'),
+    worktreePath: path.join(container, 'app'),
+  };
+}
+
+test('close-session removes recorded clean worktrees, the marker, and the empty container; branches survive (D-281 S3-3)', async (t) => {
   if (!hasGit()) {
     t.skip('git is required.');
     return;
   }
 
-  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-guard-');
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-clean-');
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.sessionId, 'lane-a');
+    assert.deepEqual(result.worktreeCleanup.removed, [{ repoId: 'app', worktreePath, sourceDir: appDir }]);
+    assert.deepEqual(result.worktreeCleanup.surviving, []);
+    assert.equal(result.worktreeCleanup.markerRemoved, true);
+    assert.equal(result.worktreeCleanup.containerRemoved, true);
+    assert.equal(result.worktreeCleanup.branch, 'feat');
+
+    assert.equal(existsSync(worktreePath), false, 'worktree removed at close');
+    assert.equal(existsSync(markerPath), false, 'marker removed token-matched at close');
+    assert.equal(existsSync(container), false, 'empty container removed at close');
+    assert.equal(git(appDir, ['rev-parse', '--verify', '--quiet', 'refs/heads/feat']).length > 0, true, 'branch is never deleted at close');
+    assert.equal(git(appDir, ['worktree', 'list', '--porcelain']).split('worktree ').filter(Boolean).length, 1, 'no lingering worktree registration');
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session CLI renders the worktree cleanup summary (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-cli-');
 
   try {
     await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { worktreePath } = await startBoundLane(tempDir);
+
+    const stdout = [];
+    const io = { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write() {} } };
+    const exitCode = await runCli([
+      'close-session', '--root', rootDir, '--session', 'lane-a',
+      '--title', 'Lane Close', '--completed', 'Did the work', '--next-step', 'Continue',
+      '--architecture-docs', 'updated', '--decision-log', 'updated', '--session-maintenance', 'updated',
+    ], io, { cwd: tempDir });
+    assert.equal(exitCode, 0);
+    const output = stdout.join('');
+    assert.match(output, /Worktree cleanup:/);
+    assert.ok(output.includes(`- app: removed ${worktreePath}`));
+    assert.match(output, /- lane marker removed \(token-matched\)/);
+    assert.match(output, /- container removed \(empty\)/);
+    assert.match(output, /- branch "feat" left in place \(close-session never deletes branches; D-281\)/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session keeps dirty worktrees, the marker, and the container, with guidance (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-dirty-');
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+    await writeFile(path.join(worktreePath, 'uncommitted.txt'), 'work in progress\n', 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.sessionId, 'lane-a', 'close completes; removal is conservative, not blocking');
+    assert.deepEqual(result.worktreeCleanup.removed, []);
+    assert.equal(result.worktreeCleanup.surviving.length, 1);
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'dirty');
+    assert.equal(result.worktreeCleanup.markerRemoved, false);
+    assert.equal(result.worktreeCleanup.containerRemoved, false);
+
+    assert.equal(existsSync(worktreePath), true, 'dirty worktree survives — removal is never forced');
+    assert.equal(existsSync(path.join(worktreePath, 'uncommitted.txt')), true, 'uncommitted work survives');
+    assert.equal(existsSync(markerPath), true, 'marker kept while a recorded worktree survives');
+    assert.equal(existsSync(container), true);
+    assert.ok(result.warnings.some((warning) => /uncommitted changes/.test(warning) && warning.includes(`git -C ${appDir} worktree remove ${worktreePath}`)));
+    assert.ok(result.warnings.some((warning) => /kept as a breadcrumb \(D-281\)/.test(warning)));
+    assert.equal(existsSync(path.join(rootDir, 'sessions/active/lane-a')), false, 'lane scratch is still finalized');
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session skips removal with guidance when the cwd sits inside the target worktree (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-cwd-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+
+    const result = await closeProjectSession({ cwd: worktreePath, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.sessionId, 'lane-a');
+    assert.equal(result.worktreeCleanup.surviving.length, 1);
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'cwd-inside');
+    assert.equal(existsSync(worktreePath), true, 'the worktree the cwd sits in survives');
+    assert.equal(existsSync(markerPath), true, 'marker kept while a recorded worktree survives');
+    assert.ok(result.warnings.some((warning) => /current working directory is inside it/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session treats recorded-but-missing worktrees as benign and still cleans marker + container (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-missing-');
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+    git(appDir, ['worktree', 'remove', worktreePath]);
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.sessionId, 'lane-a');
+    assert.deepEqual(result.worktreeCleanup.removed, []);
+    assert.deepEqual(result.worktreeCleanup.surviving, []);
+    assert.equal(result.worktreeCleanup.markerRemoved, true);
+    assert.equal(result.worktreeCleanup.containerRemoved, true);
+    assert.equal(existsSync(markerPath), false);
+    assert.equal(existsSync(container), false);
+    assert.ok(!result.warnings.some((warning) => /worktree/i.test(warning)), 'recorded-but-missing produces no worktree warning');
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses removal when the container marker token does not match (D-280/D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-token-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    const originalMarker = await readFile(markerPath, 'utf8');
+    await writeFile(markerPath, originalMarker.replace(/^token: ".*"$/m, 'token: "00000000-0000-0000-0000-000000000000"'), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving.length, 1);
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'container-unverified');
+    assert.equal(existsSync(worktreePath), true, 'an unverified container is never touched');
+    assert.equal(existsSync(markerPath), true);
+    assert.ok(result.warnings.some((warning) => /does not match the lane's recorded token/.test(warning)));
+    assert.equal(git(path.join(tempDir, 'app'), ['rev-parse', '--verify', '--quiet', 'refs/heads/feat']).length > 0, true);
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses removal of a recorded path outside the lane container (D-279 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-outside-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const externalDir = path.join(tempDir, 'external-target');
+    await createGitRepoWithCommit(externalDir);
+    const { worktreePath, markerPath } = await startBoundLane(tempDir);
+
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    await writeFile(sessionFilePath, sessionYaml.replace(JSON.stringify(worktreePath), JSON.stringify(externalDir)), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving.length, 1);
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'outside-container');
+    assert.equal(existsSync(externalDir), true, 'arbitrary path removal is refused');
+    assert.equal(existsSync(markerPath), true, 'marker kept while a recorded worktree survives');
+    assert.ok(result.warnings.some((warning) => /arbitrary path removal is refused/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session leaves a non-empty container in place with a note (D-281 S3-3 rmdir-if-empty)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-stray-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+    await writeFile(path.join(container, 'stray-notes.txt'), 'user file\n', 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.deepEqual(result.worktreeCleanup.surviving, []);
+    assert.equal(result.worktreeCleanup.markerRemoved, true);
+    assert.equal(result.worktreeCleanup.containerRemoved, false);
+    assert.equal(existsSync(worktreePath), false, 'clean worktree removed');
+    assert.equal(existsSync(markerPath), false, 'marker removed');
+    assert.equal(existsSync(container), true, 'non-empty container survives');
+    assert.equal(existsSync(path.join(container, 'stray-notes.txt')), true, 'stray user file survives');
+    assert.ok(result.warnings.some((warning) => /it is not empty/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session counts a failed cleanliness probe as unknown, not clean (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-unknown-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    // Breaking the worktree's gitdir link makes `git status` fail there.
+    await rm(path.join(worktreePath, '.git'), { force: true });
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving.length, 1);
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'status-unknown');
+    assert.equal(existsSync(worktreePath), true);
+    assert.equal(existsSync(markerPath), true);
+    assert.ok(result.warnings.some((warning) => /could not be determined/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session removes clean worktrees while keeping dirty ones in a multi-repo lane (D-281 S3-3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-partial-', [
+    { id: 'app', remote: 'https://github.com/example/app.git' },
+    { id: 'lib', remote: 'https://github.com/example/lib.git' },
+  ]);
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    const libDir = path.join(tempDir, 'lib');
+    await createGitRepoWithCommit(appDir);
+    await createGitRepoWithCommit(libDir);
     await startProjectSession({
       cwd: tempDir,
       sessionId: 'lane-a',
       workingOn: 'Bound work',
-      repos: ['app'],
+      repos: ['app', 'lib'],
       branch: 'feat',
       worktree: true,
     });
     const container = path.join(tempDir, 'worktrees', 'lane-a');
     const markerPath = path.join(container, '.vibecompass-lane.yaml');
+    await writeFile(path.join(container, 'lib', 'uncommitted.txt'), 'wip\n', 'utf8');
 
-    // Refusal lists the worktree and the manual cleanup command; nothing is
-    // destroyed (marker + lane records intact).
-    await assert.rejects(
-      closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS }),
-      /still has provisioned worktrees on disk[\s\S]*git -C .* worktree remove/,
-    );
-    assert.equal(existsSync(markerPath), true, 'marker must survive a refused close');
-    assert.equal(existsSync(path.join(rootDir, 'sessions/active/lane-a/session.yaml')), true);
-
-    // After manual worktree removal, recorded-but-missing is benign and the
-    // close proceeds, removing the container marker token-matched.
-    git(path.join(tempDir, 'app'), ['worktree', 'remove', path.join(container, 'app')]);
     const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
-    assert.equal(result.sessionId, 'lane-a');
-    assert.equal(existsSync(markerPath), false, 'marker removed token-matched at close');
+    assert.deepEqual(result.worktreeCleanup.removed.map((entry) => entry.repoId), ['app']);
+    assert.deepEqual(result.worktreeCleanup.surviving.map((entry) => entry.repoId), ['lib']);
+    assert.equal(existsSync(path.join(container, 'app')), false);
+    assert.equal(existsSync(path.join(container, 'lib')), true);
+    assert.equal(existsSync(markerPath), true, 'marker kept while any recorded worktree survives');
+    assert.equal(git(appDir, ['rev-parse', '--verify', '--quiet', 'refs/heads/feat']).length > 0, true);
+    assert.equal(git(libDir, ['rev-parse', '--verify', '--quiet', 'refs/heads/feat']).length > 0, true);
     assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -1085,6 +1366,575 @@ test('two concurrent git-bound starts on disjoint repos serialize cleanly under 
     assert.deepEqual(sessions.lanes.map((lane) => lane.id).sort(), ['lane-x', 'lane-y']);
     assert.equal(git(path.join(tempDir, 'worktrees', 'lane-x', 'appa'), ['symbolic-ref', 'HEAD']), 'refs/heads/feat-x');
     assert.equal(git(path.join(tempDir, 'worktrees', 'lane-y', 'appb'), ['symbolic-ref', 'HEAD']), 'refs/heads/feat-y');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// ---------- S3-4: pre-close staleness set (A:192, D-281) ----------
+
+test('docs-update surfaces the pre-close staleness set and close-session re-emits it (A:192 S3-4)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-staleness-', [
+    { id: 'app', remote: 'https://github.com/example/app.git' },
+    { id: 'lib', remote: 'https://github.com/example/lib.git' },
+  ]);
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    await writeFile(
+      path.join(rootDir, 'decisions', 'cross-cutting.md'),
+      [
+        '# Cross-cutting decisions',
+        '',
+        '### D-001 — Seed decision',
+        '**Timestamp:** 2026-01-01 09:00 PST',
+        '**Decision:** Seed.',
+        '**Rationale:** Seed.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-a',
+      workingOn: 'Staleness lane',
+      repos: ['app'],
+      claims: ['src/feature.js'],
+    });
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-b',
+      workingOn: 'Overlapping lane',
+      repos: ['app'],
+      claims: ['src/'],
+    });
+    // Shares repo `app` with lane-a, but its claim is explicitly scoped to
+    // `lib` while lane-a's unprefixed claim scopes to lane-a's repos ({app})
+    // — disjoint scopes must NOT cross-flag (fleet F8).
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-c',
+      workingOn: 'Disjoint-scope lane',
+      repos: ['app', 'lib'],
+      claims: ['lib:src/feature.js'],
+    });
+
+    // 1. A canonical decision appended after lane-a's snapshot.
+    await appendFile(
+      path.join(rootDir, 'decisions', 'cross-cutting.md'),
+      [
+        '### D-002 — Later decision',
+        '**Timestamp:** 2026-01-02 09:00 PST',
+        '**Decision:** Later.',
+        '**Rationale:** Later.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    // 2. The source repo head moves past the lane's captured base revision.
+    await writeFile(path.join(appDir, 'later.txt'), 'later\n', 'utf8');
+    git(appDir, ['add', '.']);
+    git(appDir, ['commit', '-m', 'later']);
+
+    // 3. Finalized notes: one materialized after lane start that mentions the
+    //    lane's claim, one backdated before lane start (must not flag).
+    const now = Date.now();
+    const newNotePath = path.join(rootDir, 'sessions', '2026-01-02-1-overlapping-work.md');
+    await writeFile(newNotePath, '# Session — 2026-01-02-1 — Overlapping Work\n\nTouched `src/feature.js` heavily.\n', 'utf8');
+    await utimes(newNotePath, new Date(now + 60_000), new Date(now + 60_000));
+    const oldNotePath = path.join(rootDir, 'sessions', '2026-01-01-1-old-work.md');
+    await writeFile(oldNotePath, '# Session — 2026-01-01-1 — Old Work\n\nAlso touched `src/feature.js` back then.\n', 'utf8');
+    await utimes(oldNotePath, new Date(now - 3_600_000), new Date(now - 3_600_000));
+
+    const plan = await planDocsUpdate({ cwd: tempDir, sessionId: 'lane-a' });
+    assert.ok(plan.staleness, 'a selected lane gets a staleness set');
+    assert.ok(plan.staleness.newDecisions.some((decision) => decision.id === 2 && decision.path === 'decisions/cross-cutting.md'));
+    assert.equal(plan.staleness.staleBaseRevisions.length, 1);
+    assert.equal(plan.staleness.staleBaseRevisions[0].repoId, 'app');
+    assert.deepEqual(plan.staleness.newSessionNotes.map((note) => note.path), ['sessions/2026-01-02-1-overlapping-work.md']);
+    assert.ok(plan.staleness.newSessionNotes[0].reasons.some((reason) => reason.includes('src/feature.js')));
+    assert.deepEqual(plan.staleness.laneOverlaps.map((overlap) => overlap.laneId), ['lane-b']);
+    assert.ok(plan.staleness.entries.length >= 4);
+
+    // CLI docs-update renders the section.
+    const stdout = [];
+    const io = { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write() {} } };
+    assert.equal(await runCli(['docs-update', '--root', rootDir, '--session', 'lane-a'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /Pre-close staleness set:\n- New decision D-2 since lane start/);
+
+    // close-session re-emits every staleness entry as a warning (A:192).
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.ok(result.warnings.some((warning) => /^Pre-close staleness: New decision D-2 since lane start \(decisions\/cross-cutting\.md\)/.test(warning)));
+    assert.ok(result.warnings.some((warning) => /^Pre-close staleness: Base revision for repo "app" is stale/.test(warning)));
+    assert.ok(result.warnings.some((warning) => /^Pre-close staleness: Finalized session note sessions\/2026-01-02-1-overlapping-work\.md/.test(warning)));
+    assert.ok(result.warnings.some((warning) => /^Pre-close staleness: Active lane "lane-b" overlaps/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a fresh lane reports an empty staleness set and close-session emits no staleness warnings (S3-4)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-staleness-none-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-a',
+      workingOn: 'Quiet lane',
+      repos: ['app'],
+      claims: ['src/feature.js'],
+    });
+
+    const plan = await planDocsUpdate({ cwd: tempDir, sessionId: 'lane-a' });
+    assert.deepEqual(plan.staleness.entries, []);
+
+    const stdout = [];
+    const io = { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write() {} } };
+    assert.equal(await runCli(['docs-update', '--root', rootDir, '--session', 'lane-a'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /Pre-close staleness set:\n- none detected/);
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.ok(!result.warnings.some((warning) => warning.startsWith('Pre-close staleness:')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// ---------- Deferred S3 start-side test follow-ups ----------
+
+test('provisioned container markers are byte-identical to write-lane-marker output for the same fields (D-280/D-281)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-parity-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath } = await startBoundLane(tempDir);
+
+    // The provisioned container marker must be exactly renderLaneMarker
+    // output for the recorded fields — the same renderer write-lane-marker
+    // uses (D-280's two producers share one format).
+    const laneYaml = parseSimpleYaml(
+      await readFile(path.join(rootDir, 'sessions/active/lane-a/session.yaml'), 'utf8'),
+      { sourceName: 'session.yaml' },
+    );
+    const provisionedMarker = await readFile(markerPath, 'utf8');
+    assert.equal(provisionedMarker, renderLaneMarker({
+      laneId: 'lane-a',
+      memoryRoot: rootDir,
+      token: laneYaml.lane_marker.token,
+      createdAt: laneYaml.lane_marker.created_at,
+      createdBy: PACKAGE_VERSION,
+    }));
+
+    // And the explicit write-lane-marker producer emits the identical shape.
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-b', workingOn: 'Unbound lane' });
+    const manualDir = path.join(tempDir, 'manual-marker-target');
+    await mkdir(manualDir, { recursive: true });
+    const manualResult = await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-b', dir: manualDir });
+    const manualYaml = parseSimpleYaml(
+      await readFile(path.join(rootDir, 'sessions/active/lane-b/session.yaml'), 'utf8'),
+      { sourceName: 'session.yaml' },
+    );
+    assert.equal(await readFile(manualResult.markerPath, 'utf8'), renderLaneMarker({
+      laneId: 'lane-b',
+      memoryRoot: rootDir,
+      token: manualYaml.lane_marker.token,
+      createdAt: manualYaml.lane_marker.created_at,
+      createdBy: PACKAGE_VERSION,
+    }));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('rollback falls back to rm when a worktree registration refuses removal (D-281 rm+prune fallback)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-rollback-fallback-', [
+    { id: 'app', remote: 'https://github.com/example/app.git' },
+    { id: 'lib', remote: 'https://github.com/example/lib.git' },
+  ]);
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    const libDir = path.join(tempDir, 'lib');
+    await createGitRepoWithCommit(appDir);
+    await createGitRepoWithCommit(libDir);
+
+    // app's checkout succeeds but locks its own worktree, so the rollback's
+    // `worktree remove --force` fails (a locked worktree needs -f -f) and the
+    // rm fallback must delete the directory; lib's checkout fails to trigger
+    // the rollback.
+    const appHookPath = path.join(appDir, '.git', 'hooks', 'post-checkout');
+    await writeFile(appHookPath, '#!/bin/sh\ngit worktree lock "$PWD"\nexit 0\n', 'utf8');
+    await chmod(appHookPath, 0o755);
+    const libHookPath = path.join(libDir, '.git', 'hooks', 'post-checkout');
+    await writeFile(libHookPath, '#!/bin/sh\nexit 1\n', 'utf8');
+    await chmod(libHookPath, 0o755);
+
+    await assert.rejects(
+      startProjectSession({
+        cwd: tempDir,
+        sessionId: 'lane-a',
+        workingOn: 'Bound work',
+        repos: ['app', 'lib'],
+        branch: 'feat',
+        worktree: true,
+      }),
+      /rolled back and lane "lane-a" was not created/,
+    );
+
+    const worktreePath = path.join(tempDir, 'worktrees', 'lane-a', 'app');
+    assert.equal(existsSync(worktreePath), false, 'the rm fallback deleted the locked worktree directory');
+    assert.equal(existsSync(path.join(tempDir, 'worktrees', 'lane-a')), false, 'the container rollback removed the container');
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, [], 'the lane was not created');
+    // The locked registration survives the prune (locks exist to protect
+    // registrations), which in turn protects the branch from deletion — the
+    // conservative degradation D-281 accepts for a broken registration.
+    const registrations = git(appDir, ['worktree', 'list', '--porcelain']).split('worktree ').filter(Boolean);
+    assert.equal(registrations.length, 2, 'the locked registration survives — proof the git removal failed and rm ran');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('two bound lanes on one repo warn about divergence at start and close independently (D-281 cross-lane wiring)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-cross-lane-');
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-a',
+      workingOn: 'First bound lane',
+      repos: ['app'],
+      branch: 'feat-a',
+      worktree: true,
+    });
+    const second = await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-b',
+      workingOn: 'Second bound lane',
+      repos: ['app'],
+      branch: 'feat-b',
+      worktree: true,
+    });
+    assert.ok(second.warnings.some((warning) => /binds branch "feat-a" in shared repo\(s\) app/.test(warning)));
+
+    const laneAWorktree = path.join(tempDir, 'worktrees', 'lane-a', 'app');
+    const laneBWorktree = path.join(tempDir, 'worktrees', 'lane-b', 'app');
+    assert.equal(git(laneAWorktree, ['symbolic-ref', 'HEAD']), 'refs/heads/feat-a');
+    assert.equal(git(laneBWorktree, ['symbolic-ref', 'HEAD']), 'refs/heads/feat-b');
+
+    const firstClose = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.deepEqual(firstClose.worktreeCleanup.removed.map((entry) => entry.repoId), ['app']);
+    assert.equal(existsSync(laneAWorktree), false, 'lane-a cleanup removed only its own worktree');
+    assert.equal(existsSync(laneBWorktree), true, 'lane-b worktree is untouched by lane-a close');
+    assert.equal(existsSync(path.join(tempDir, 'worktrees', 'lane-b', '.vibecompass-lane.yaml')), true);
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes.map((lane) => lane.id), ['lane-b']);
+
+    const secondClose = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-b', ...CLOSE_DEFAULTS });
+    assert.deepEqual(secondClose.worktreeCleanup.removed.map((entry) => entry.repoId), ['app']);
+    assert.equal(existsSync(path.join(tempDir, 'worktrees', 'lane-b')), false);
+    assert.equal(git(appDir, ['rev-parse', '--verify', '--quiet', 'refs/heads/feat-a']).length > 0, true, 'branches survive every close');
+    assert.equal(git(appDir, ['rev-parse', '--verify', '--quiet', 'refs/heads/feat-b']).length > 0, true);
+    assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// ---------- Review-fleet regression tests (S3 close side) ----------
+
+test('close-session fails closed when the lane session.yaml is unparseable (D-281 fleet F1)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-corrupt-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    await writeFile(sessionFilePath, '\tbroken: yaml\n', 'utf8');
+
+    // A null-degraded parse reads as "no worktrees recorded"; closing would
+    // destroy the removal-guard records while the worktrees survive.
+    await assert.rejects(
+      closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS }),
+      /could not be parsed[\s\S]*refusing to close[\s\S]*removal-guard records/,
+    );
+    assert.equal(existsSync(worktreePath), true, 'worktree untouched by the refused close');
+    assert.equal(existsSync(markerPath), true, 'marker untouched by the refused close');
+    assert.equal(existsSync(sessionFilePath), true, 'lane records untouched by the refused close');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session never rmdirs a container the cwd sits inside (D-281 fleet F2)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-cwd-container-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+
+    const result = await closeProjectSession({ cwd: container, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.deepEqual(result.worktreeCleanup.surviving, []);
+    assert.equal(result.worktreeCleanup.markerRemoved, true);
+    assert.equal(result.worktreeCleanup.containerRemoved, false, 'the cwd container is never rmdirred');
+    assert.equal(existsSync(worktreePath), false, 'clean worktree still removed');
+    assert.equal(existsSync(markerPath), false, 'marker still removed token-matched');
+    assert.equal(existsSync(container), true, 'container survives while it is the cwd');
+    assert.ok(result.warnings.some((warning) => /container .* left in place: the current working directory is inside it/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses removal when the container marker names a different lane (D-281 fleet F13)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-laneid-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    const marker = await readFile(markerPath, 'utf8');
+    await writeFile(markerPath, marker.replace(/^lane_id: .*$/m, 'lane_id: lane-zz'), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'container-unverified');
+    assert.equal(existsSync(worktreePath), true);
+    assert.ok(result.warnings.some((warning) => /belongs to lane "lane-zz", not "lane-a"/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses removal when the container marker file is missing, without a phantom breadcrumb warning (D-281 fleet F13/F12)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-marker-gone-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    await rm(markerPath, { force: true });
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'container-unverified');
+    assert.equal(existsSync(worktreePath), true, 'an unverifiable container is never touched');
+    assert.ok(result.warnings.some((warning) => /could not be verified/.test(warning)));
+    assert.ok(!result.warnings.some((warning) => /kept as a breadcrumb/.test(warning)), 'no breadcrumb claim for a marker that does not exist');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses removal when the recorded marker path sits outside the container (D-281 fleet F13)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-marker-outside-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    const foreignMarkerPath = path.join(tempDir, 'elsewhere', '.vibecompass-lane.yaml');
+    await writeFile(sessionFilePath, sessionYaml.replace(JSON.stringify(markerPath), JSON.stringify(foreignMarkerPath)), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'container-unverified');
+    assert.equal(existsSync(worktreePath), true);
+    assert.ok(result.warnings.some((warning) => /does not sit in the recorded container/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session keeps a worktree whose lane recorded no source repo (D-281 fleet F13)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-no-source-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { worktreePath, markerPath } = await startBoundLane(tempDir);
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    await writeFile(sessionFilePath, sessionYaml.replace(/^worktree_sources:\r?\n(?: {2}.*\r?\n?)*/m, ''), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'no-source-recorded');
+    assert.equal(existsSync(worktreePath), true);
+    assert.equal(existsSync(markerPath), true, 'marker kept while the worktree survives');
+    assert.ok(result.warnings.some((warning) => /recorded no source repository/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session refuses a relative recorded worktree path outright (D-279 fleet F6)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-relative-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { worktreePath, markerPath } = await startBoundLane(tempDir);
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    await writeFile(sessionFilePath, sessionYaml.replace(JSON.stringify(worktreePath), '"relative-target"'), 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.worktreeCleanup.surviving[0].reason, 'not-absolute');
+    assert.equal(existsSync(markerPath), true, 'marker kept while a recorded entry survives');
+    assert.ok(result.warnings.some((warning) => /is not absolute/.test(warning)));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session CLI renders surviving worktree entries and the kept marker (D-281 fleet F14)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-cli-kept-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { worktreePath } = await startBoundLane(tempDir);
+    await writeFile(path.join(worktreePath, 'uncommitted.txt'), 'wip\n', 'utf8');
+
+    const stdout = [];
+    const io = { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write() {} } };
+    const exitCode = await runCli([
+      'close-session', '--root', rootDir, '--session', 'lane-a',
+      '--title', 'Lane Close', '--completed', 'Did the work', '--next-step', 'Continue',
+      '--architecture-docs', 'updated', '--decision-log', 'updated', '--session-maintenance', 'updated',
+    ], io, { cwd: tempDir });
+    assert.equal(exitCode, 0);
+    const output = stdout.join('');
+    assert.ok(output.includes(`- app: kept ${worktreePath} (uncommitted changes)`));
+    assert.match(output, /- lane marker kept while worktrees survive \(D-281\)/);
+    assert.match(output, /- branch "feat" left in place/);
+    assert.doesNotMatch(output, /container removed/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// ---------- Reviewer-pass regression tests (S3 close side) ----------
+
+test('close-session CLI prints no marker line at all when the marker file is missing (reviewer pass)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-close-cli-no-marker-');
+
+  try {
+    await createGitRepoWithCommit(path.join(tempDir, 'app'));
+    const { markerPath, worktreePath } = await startBoundLane(tempDir);
+    await rm(markerPath, { force: true });
+
+    const stdout = [];
+    const io = { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write() {} } };
+    const exitCode = await runCli([
+      'close-session', '--root', rootDir, '--session', 'lane-a',
+      '--title', 'Lane Close', '--completed', 'Did the work', '--next-step', 'Continue',
+      '--architecture-docs', 'updated', '--decision-log', 'updated', '--session-maintenance', 'updated',
+    ], io, { cwd: tempDir });
+    assert.equal(exitCode, 0);
+    const output = stdout.join('');
+    assert.ok(output.includes(`- app: kept ${worktreePath} (container marker unverified)`));
+    assert.doesNotMatch(output, /lane marker kept/, 'no phantom kept-marker line for a missing marker');
+    assert.doesNotMatch(output, /lane marker removed/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('pre-close staleness names a recorded base revision whose current head is unreadable (reviewer pass)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-staleness-unreadable-');
+
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createGitRepoWithCommit(appDir);
+    await startProjectSession({
+      cwd: tempDir,
+      sessionId: 'lane-a',
+      workingOn: 'Unreadable head lane',
+      repos: ['app'],
+      claims: ['src/feature.js'],
+    });
+    // The lane recorded a base revision for app at start; the source
+    // disappearing afterwards must be named, not silently skipped.
+    await rm(appDir, { recursive: true, force: true });
+
+    const plan = await planDocsUpdate({ cwd: tempDir, sessionId: 'lane-a' });
+    assert.deepEqual(plan.staleness.staleBaseRevisions, []);
+    assert.ok(plan.staleness.notEvaluated.some((entry) =>
+      entry.includes('base-revision staleness for repo "app"') && entry.includes('could not be read')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

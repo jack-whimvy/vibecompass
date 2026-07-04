@@ -137,6 +137,14 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # repo; --worktree provisions per-repo worktrees under
 # <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
 # container, so commands run from inside a worktree need no --root/--session.
+# At close, close-session removes the recorded worktrees when they are clean
+# (guarded, never forced; branches are never deleted); dirty or in-use
+# worktrees survive with guidance and the lane marker stays as a breadcrumb.
+# Gitignored files (e.g. .env) do not count as dirty and are deleted with a
+# clean worktree — copy ignored local files out before closing.
+# close-session and docs-update also print a pre-close staleness set: new
+# decisions since lane start, stale base revisions, newer finalized notes
+# that mention the lane's scope, and claim overlap with other active lanes.
 npx -y @vibecompass/vibecompass@latest start-session --id auth-flow --working-on "Auth flow" --repo app --branch feature/auth --worktree
 
 # Agent instruction files

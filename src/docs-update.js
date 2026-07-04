@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parseFrontmatter } from './frontmatter.js';
+import { readCurrentRepoHead, resolveRepoSourceDir } from './git-binding.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -68,6 +69,19 @@ export async function planDocsUpdate(options = {}) {
     .filter((file) => isPackageOwnedPath(file.normalizedPath))
     .map((file) => file.raw);
   const decisionStatus = summarizeDecisionStatus(scan, activeSession);
+  // A:192 (D-281): the pre-close staleness set is computed on every
+  // docs-update run for the selected lane and re-emitted by close-session, so
+  // mid-session and close-out see the same target set.
+  const staleness = activeSession
+    ? await buildPreCloseStaleness({
+        rootDir: normalized.rootDir,
+        workspaceDir: path.dirname(normalized.rootDir),
+        activeSession,
+        otherLanes: await listOtherActiveLanes(path.join(normalized.rootDir, 'sessions', 'active'), activeSession.id),
+        decisionStatus,
+        projectRepos: project.repos ?? [],
+      })
+    : null;
   const recommendations = buildRecommendations({
     changedFiles,
     affectedArchitectureDocs,
@@ -97,6 +111,7 @@ export async function planDocsUpdate(options = {}) {
       needsNewDoc: changedFiles.some((file) => isImplementationLikePath(file.normalizedPath)) && affectedArchitectureDocs.length === 0,
     },
     decisions: decisionStatus,
+    staleness,
     packageOwnedChanges,
     recommendations,
     warnings,
@@ -135,6 +150,20 @@ export function renderDocsUpdatePlan(plan) {
     lines.push('- No lane decision snapshot available.');
   } else {
     lines.push('- No new decisions detected since lane start.');
+  }
+
+  if (plan.staleness) {
+    lines.push('Pre-close staleness set:');
+    if (plan.staleness.entries.length === 0) {
+      lines.push('- none detected');
+    } else {
+      for (const entry of plan.staleness.entries) {
+        lines.push(`- ${entry}`);
+      }
+    }
+    for (const skipped of plan.staleness.notEvaluated) {
+      lines.push(`- (not evaluated) ${skipped}`);
+    }
   }
 
   if (plan.packageOwnedChanges.length > 0) {
@@ -198,7 +227,10 @@ async function readActiveSession(rootDir, requestedSessionId, laneContext = {}) 
       repos: normalizeStringArray(data.repos),
       claimedPaths: normalizeStringArray(data.claimed_paths),
       featureSlugs: normalizeStringArray(data.feature_slugs),
+      startedAt: normalizeOptionalString(data.started_at),
       worktrees: normalizeWorktreeMap(data.worktrees),
+      worktreeSources: normalizeWorktreeMap(data.worktree_sources),
+      baseRevisions: normalizeStringValueMap(data.base_revisions),
       decisionSnapshotHighestId: Number.isInteger(data.decision_snapshot?.highest_decision_id)
         ? data.decision_snapshot.highest_decision_id
         : null,
@@ -210,10 +242,38 @@ async function readActiveSession(rootDir, requestedSessionId, laneContext = {}) 
       repos: [],
       claimedPaths: [],
       featureSlugs: [],
+      startedAt: null,
       worktrees: {},
+      worktreeSources: {},
+      baseRevisions: {},
       decisionSnapshotHighestId: null,
     };
   }
+}
+
+/** Other active lanes' scope fields, for the pre-close claim-overlap check. */
+async function listOtherActiveLanes(activeRoot, selectedId) {
+  const lanes = [];
+  for (const laneId of await listActiveLaneDirIds(activeRoot)) {
+    if (laneId === selectedId) {
+      continue;
+    }
+
+    try {
+      const sessionPath = path.join(activeRoot, laneId, 'session.yaml');
+      const data = parseSimpleYaml(await readFile(sessionPath, 'utf8'), { sourceName: sessionPath });
+      lanes.push({
+        id: laneId,
+        repos: normalizeStringArray(data.repos),
+        claimedPaths: normalizeStringArray(data.claimed_paths),
+      });
+    } catch {
+      // An unreadable sibling lane cannot contribute overlap detail; the lane
+      // lifecycle commands own reporting corrupt lane metadata.
+    }
+  }
+
+  return lanes;
 }
 
 function normalizeWorktreeMap(value) {
@@ -230,6 +290,268 @@ function normalizeWorktreeMap(value) {
   }
 
   return result;
+}
+
+/** Plain string map (base_revisions) — values are revisions, not paths. */
+function normalizeStringValueMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = entry === null || entry === undefined ? null : String(entry).trim();
+    if (normalized) {
+      result[key] = normalized;
+    }
+  }
+
+  return result;
+}
+
+const SESSION_NOTE_FILENAME_PATTERN = /^\d{4}-\d{2}-\d{2}-\d+-[a-z0-9-]+\.md$/i;
+
+/**
+ * A:192 (D-281): the pre-close staleness set. Everything here is a warning
+ * surface — actionable and non-destructive; the closer chooses whether to
+ * reconcile, close anyway, or keep the lane active. Pieces that cannot be
+ * evaluated (no started_at, no decision snapshot) are named instead of being
+ * silently skipped.
+ */
+async function buildPreCloseStaleness(options) {
+  const activeSession = options.activeSession;
+  const entries = [];
+  const notEvaluated = [];
+
+  // 1. New canonical decisions appended after the lane's frozen start-of-lane
+  //    snapshot (D-266). Elevated from the informational decision-log summary:
+  //    the closer confirms each one is either this lane's own append or does
+  //    not change this lane's contracts.
+  const newDecisions = options.decisionStatus.newDecisions ?? [];
+  if (options.decisionStatus.decisionSnapshotHighestId === null) {
+    notEvaluated.push('decision staleness: the lane has no decision snapshot.');
+  } else {
+    for (const decision of newDecisions) {
+      entries.push(
+        `New decision D-${decision.id} since lane start (${decision.path}) — confirm it is this lane's own append or does not change this lane's contracts.`,
+      );
+    }
+  }
+
+  // 2. Base revisions stale relative to the current source repo heads. Bound
+  //    repos compare against the recorded source checkout, not the lane
+  //    worktree — the lane's own commits are not staleness. A repo that
+  //    RECORDED a base but whose current head is unreadable is named in
+  //    notEvaluated (something changed since capture); repos that never
+  //    captured a base (non-git sources) stay silent by design — git is
+  //    never required for lanes (D-265/D-279).
+  const staleBaseRevisions = [];
+  for (const [repoId, baseRevision] of Object.entries(activeSession.baseRevisions ?? {})) {
+    const sourceDir = activeSession.worktreeSources?.[repoId]
+      ?? resolveRepoSourceDir(options.workspaceDir, repoId, options.projectRepos);
+    const head = await readCurrentRepoHead(sourceDir);
+    if (head === null) {
+      notEvaluated.push(
+        `base-revision staleness for repo "${repoId}": the current head of ${sourceDir} could not be read (missing, non-git, nested, or unborn) even though the lane recorded base ${baseRevision.slice(0, 12)} there at start.`,
+      );
+      continue;
+    }
+    if (head !== baseRevision) {
+      staleBaseRevisions.push({ repoId, baseRevision, headRevision: head });
+      entries.push(
+        `Base revision for repo "${repoId}" is stale: lane base ${baseRevision.slice(0, 12)}, current source head ${head.slice(0, 12)} — review what landed since lane start.`,
+      );
+    }
+  }
+
+  // 3. Finalized session notes materialized after this lane started that
+  //    mention the lane's declared scope. mtime ordering is intentional: a
+  //    note that arrives in this root after lane start (local close, pull,
+  //    apply-export) is new to this lane regardless of its filename date.
+  const newSessionNotes = [];
+  const startedAtMs = activeSession.startedAt ? Date.parse(activeSession.startedAt) : Number.NaN;
+  if (Number.isNaN(startedAtMs)) {
+    notEvaluated.push('session-note staleness: the lane has no parseable started_at.');
+  } else {
+    for (const note of await listFinalizedSessionNotesSince(options.rootDir, startedAtMs)) {
+      const reasons = describeNoteScopeOverlap(note.content, activeSession);
+      if (reasons.length > 0) {
+        newSessionNotes.push({ path: note.relativePath, reasons });
+        entries.push(
+          `Finalized session note ${note.relativePath} was written after this lane started (${reasons.join('; ')}) — check it for overlap with this lane's scope.`,
+        );
+      }
+    }
+  }
+
+  // 4. Claimed-path overlap with other active lanes (recently closed lanes
+  //    surface through the finalized-note check above). Claims only overlap
+  //    when their repo scopes can intersect: an explicit `repo:` prefix pins
+  //    a claim to that repo, an unprefixed claim can live in any repo its
+  //    lane declares — `app:src/x` vs `lib:src/x` never cross-flag.
+  const laneOverlaps = [];
+  for (const lane of options.otherLanes ?? []) {
+    const sharedRepos = lane.repos.filter((repoId) => (activeSession.repos ?? []).includes(repoId));
+    if (sharedRepos.length === 0) {
+      continue;
+    }
+
+    const overlappingPaths = [];
+    for (const claim of activeSession.claimedPaths ?? []) {
+      const claimScope = claimRepoScope(claim, activeSession.repos ?? []);
+      for (const otherClaim of lane.claimedPaths) {
+        if (!repoScopesIntersect(claimScope, claimRepoScope(otherClaim, lane.repos))) {
+          continue;
+        }
+        if (pathsOverlap(normalizeClaimPath(claim), normalizeClaimPath(otherClaim))) {
+          overlappingPaths.push(normalizeClaimPath(claim));
+        }
+      }
+    }
+    if (overlappingPaths.length > 0) {
+      const uniquePaths = Array.from(new Set(overlappingPaths));
+      laneOverlaps.push({ laneId: lane.id, sharedRepos, overlappingPaths: uniquePaths });
+      entries.push(
+        `Active lane "${lane.id}" overlaps this lane's claimed path(s) ${uniquePaths.join(', ')} in shared repo(s) ${sharedRepos.join(', ')} — coordinate before closing.`,
+      );
+    }
+  }
+
+  return {
+    newDecisions,
+    staleBaseRevisions,
+    newSessionNotes,
+    laneOverlaps,
+    notEvaluated,
+    entries,
+  };
+}
+
+/**
+ * Notes newer than the lane start, stat-first: mature roots accumulate
+ * finalized notes forever, so content is read only for the (normally tiny)
+ * set that passes the mtime filter.
+ */
+async function listFinalizedSessionNotesSince(rootDir, sinceMs) {
+  const sessionsDir = path.join(rootDir, 'sessions');
+  let names;
+  try {
+    names = await readdir(sessionsDir);
+  } catch {
+    return [];
+  }
+
+  const candidates = await Promise.all(
+    names
+      .filter((name) => SESSION_NOTE_FILENAME_PATTERN.test(name))
+      .map(async (name) => {
+        const filePath = path.join(sessionsDir, name);
+        try {
+          const fileStat = await stat(filePath);
+          return fileStat.mtimeMs > sinceMs ? { name, filePath, mtimeMs: fileStat.mtimeMs } : null;
+        } catch {
+          return null;
+        }
+      }),
+  );
+
+  const notes = [];
+  for (const candidate of candidates.filter(Boolean).sort((left, right) => left.name.localeCompare(right.name))) {
+    try {
+      notes.push({
+        relativePath: `sessions/${candidate.name}`,
+        mtimeMs: candidate.mtimeMs,
+        content: await readFile(candidate.filePath, 'utf8'),
+      });
+    } catch {
+      // A note that disappears mid-scan is not staleness.
+    }
+  }
+
+  return notes;
+}
+
+/**
+ * Scope-overlap heuristics between a finalized note and the lane. Claimed
+ * paths match only against backticked path-like tokens in the note (session
+ * notes reference files in backticks by convention) with repo scoping — an
+ * unanchored substring scan would make directory claims like `src/` match
+ * virtually every note. Feature slugs match by mention; repos only via
+ * backticked `repo:path` references (a bare repo id matches too much prose
+ * to be a signal).
+ */
+function describeNoteScopeOverlap(content, activeSession) {
+  const reasons = [];
+  const lowerContent = content.toLowerCase();
+  const noteTokens = Array.from(content.matchAll(/`([^`\n]+)`/g))
+    .map((match) => match[1].trim())
+    .filter((token) => token.includes('/') || token.includes(':'));
+
+  for (const claim of activeSession.claimedPaths ?? []) {
+    const claimPath = normalizeClaimPath(claim);
+    if (!claimPath) {
+      continue;
+    }
+    const claimScope = claimRepoScope(claim, activeSession.repos ?? []);
+    const matched = noteTokens.some((token) => {
+      const tokenRepoMatch = token.match(/^([^:/\s]+):(.+)$/);
+      if (tokenRepoMatch && claimScope && !claimScope.includes(tokenRepoMatch[1])) {
+        return false;
+      }
+      const tokenPath = normalizePath(tokenRepoMatch ? tokenRepoMatch[2] : token).replace(/\/+$/, '');
+      return tokenPath !== '' && pathsOverlap(claimPath, tokenPath);
+    });
+    if (matched) {
+      reasons.push(`mentions claimed path ${claimPath}`);
+    }
+  }
+
+  for (const feature of activeSession.featureSlugs ?? []) {
+    if (feature && lowerContent.includes(feature.toLowerCase())) {
+      reasons.push(`mentions lane feature "${feature}"`);
+    }
+  }
+
+  for (const repoId of activeSession.repos ?? []) {
+    const referencePattern = new RegExp(`\`${escapeRegExp(repoId)}:[^\`\\n]+\``);
+    if (referencePattern.test(content)) {
+      reasons.push(`references repo "${repoId}" files`);
+    }
+  }
+
+  return reasons;
+}
+
+/**
+ * A claim's possible repo scope: an explicit `repo:` prefix pins it, an
+ * unprefixed claim can live in any repo its lane declares. null means the
+ * scope is unknowable and intersects everything (conservative for a warning
+ * surface).
+ */
+function claimRepoScope(claim, laneRepos) {
+  const match = String(claim).match(/^([^:/\s]+):/);
+  if (match) {
+    return [match[1]];
+  }
+
+  return Array.isArray(laneRepos) && laneRepos.length > 0 ? laneRepos : null;
+}
+
+function repoScopesIntersect(left, right) {
+  if (!left || !right) {
+    return true;
+  }
+
+  return left.some((repoId) => right.includes(repoId));
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Claims may carry a repo prefix and a trailing slash; neither survives into prefix matching. */
+function normalizeClaimPath(claim) {
+  return stripRepoPrefix(claim).replace(/\/+$/, '');
 }
 
 async function listActiveLaneDirIds(activeRoot) {
@@ -560,17 +882,23 @@ function pathsOverlap(left, right) {
 }
 
 function summarizeDecisionStatus(scan, activeSession) {
-  const decisionIds = scan.documents
+  const decisionEntries = scan.documents
     .filter((document) => document.kind === 'decision')
-    .flatMap((document) => document.extracted?.decision_ids ?? [])
-    .sort((left, right) => left - right);
+    .flatMap((document) => (document.extracted?.decision_ids ?? []).map((id) => ({ id, path: document.path })))
+    .sort((left, right) => left.id - right.id);
+  const decisionIds = decisionEntries.map((entry) => entry.id);
   const highestDecisionId = decisionIds.length > 0 ? decisionIds[decisionIds.length - 1] : null;
   const snapshot = activeSession?.decisionSnapshotHighestId ?? null;
+  // A:192 staleness elevation: keep the id-with-source-file detail so the
+  // pre-close staleness set can name the domain file each new decision
+  // landed in.
+  const newDecisions = snapshot === null ? [] : decisionEntries.filter((entry) => entry.id > snapshot);
 
   return {
     highestDecisionId,
     decisionSnapshotHighestId: snapshot,
-    newDecisionIds: snapshot === null ? [] : decisionIds.filter((id) => id > snapshot),
+    newDecisionIds: newDecisions.map((entry) => entry.id),
+    newDecisions,
   };
 }
 
