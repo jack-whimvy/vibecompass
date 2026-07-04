@@ -227,6 +227,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` — lane-local builder scratchpad
 - \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` — lane-local builder/reviewer relay
 - \`.vibecompass-lane.yaml\` — worktree-local lane marker (D-280); lives outside the memory root, written only by \`vibecompass write-lane-marker\` or worktree provisioning, never synced
+- \`${rootRelativePath}/decisions/INDEX.md\` — derived grouped decision index; refresh with \`vibecompass refresh-decision-index\` (D-283, structure-preserving) instead of hand-editing rows
 
 ## Session model
 - VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
@@ -236,6 +237,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
 - Optional git binding (D-281): \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
 - At close, \`close-session\` removes a bound lane's recorded clean worktrees (guarded and never forced: dirty, in-use, or unverifiable worktrees survive with guidance, the lane marker is kept while any worktree survives, and branches are never deleted). Do not hand-remove provisioned worktrees; follow the printed guidance instead.
+- Every lane gets a per-lane runtime assignment at start (D-282): a lane port and temp dir recorded in \`session.yaml\` and exported with \`eval "$(vibecompass lane-env)"\` (includes conventional \`PORT\`/\`TMPDIR\` aliases), so parallel lanes never fight over dev-server ports or temp paths. Defaults are configurable under \`project.yaml\` \`runtime:\`; \`close-session\` removes the lane temp dir under guards.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
 
@@ -316,13 +318,14 @@ Session lane: <lane-id>
 During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
+- run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used (D-282); do not hardcode ports in lane work
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
 - after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh
 - use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
-- record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them
+- record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them; \`vibecompass append-decision\` allocates the D-number at write time and refreshes the grouped \`decisions/INDEX.md\` when the lane context is resolvable (D-283); run \`vibecompass refresh-decision-index\` after hand-appends
 
 If \`vibecompass start-session\` reports stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
 
@@ -339,7 +342,7 @@ At session close:
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
 - if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
-- close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, and the container when they are safely removable; leftover pieces come with printed guidance
+- close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, the container, and the lane temp dir when they are safely removable; leftover pieces come with printed guidance
 - refresh any affected architecture/decision docs
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
 - for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred
@@ -533,8 +536,9 @@ Append-only decision log for ${projectConfig.name}.
 ## Conventions
 - store canonical decision entries in domain-grouped files such as \`cross-cutting.md\`
 - never edit or delete prior decision entries
-- use headings in the form \`### D-<number> — Title\`
+- use headings in the form \`### D-<number> — Title\` (em-dash; hyphen-only headings cannot be indexed)
 - include \`**Timestamp:**\`, \`**Decision:**\`, and \`**Rationale:**\`
+- \`INDEX.md\` is a derived grouped index: refresh it with \`vibecompass refresh-decision-index\` (structure-preserving, D-283) rather than hand-editing rows; \`vibecompass append-decision\` refreshes it automatically when it can label the session group
 
 ## Example
 

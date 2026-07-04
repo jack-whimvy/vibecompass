@@ -130,6 +130,16 @@ async function readActiveSessionsForManifest(rootDir) {
       // lanes so pre-S3 manifest shapes are unchanged.
       ...(lane.branch ? { branch: lane.branch } : {}),
       ...(lane.worktreeContainer ? { worktree_container: lane.worktreeContainer } : {}),
+      // D-282: runtime assignment presence projection — omitted for pre-S4
+      // lanes so their manifest shapes are unchanged.
+      ...(lane.runtime && (Number.isInteger(lane.runtime.port) || lane.runtime.tmpDir)
+        ? {
+          runtime: {
+            ...(Number.isInteger(lane.runtime.port) ? { port: lane.runtime.port } : {}),
+            ...(lane.runtime.tmpDir ? { tmp_dir: lane.runtime.tmpDir } : {}),
+          },
+        }
+        : {}),
       ...(lane.decisionSnapshot
         ? {
           decision_snapshot: {

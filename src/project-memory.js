@@ -34,8 +34,12 @@ const KNOWN_PROJECT_FIELDS = new Set([
   'repos',
   'default_branch',
   'sync',
+  'runtime',
   'metadata',
 ]);
+// D-282 runtime-isolation settings; deep value validation (ranges, absolute
+// paths) lives at the consumption point in lane-runtime.js.
+const KNOWN_RUNTIME_FIELDS = new Set(['port_base', 'port_step', 'tmp_base']);
 const KNOWN_REPO_FIELDS = new Set(['id', 'source', 'remote', 'path', 'default_branch']);
 const KNOWN_SYNC_FIELDS = new Set([
   'provider',
@@ -337,6 +341,23 @@ function validateProjectData(data, relativePath) {
             'sync.credential_source "env" requires sync.credential_env_var.',
           ),
         );
+      }
+    }
+  }
+
+  if (data.runtime !== undefined) {
+    if (!isPlainObject(data.runtime)) {
+      warnings.push(
+        createWarning(
+          'project-runtime-invalid',
+          'project.yaml "runtime" must be a mapping of runtime-isolation settings (D-282); the defaults apply.',
+        ),
+      );
+    } else {
+      for (const key of Object.keys(data.runtime)) {
+        if (!KNOWN_RUNTIME_FIELDS.has(key)) {
+          warnings.push(createWarning('project-runtime-unknown-field', `Unknown project.yaml runtime field "${key}".`));
+        }
       }
     }
   }

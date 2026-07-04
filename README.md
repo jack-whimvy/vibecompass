@@ -147,8 +147,26 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # that mention the lane's scope, and claim overlap with other active lanes.
 npx -y @vibecompass/vibecompass@latest start-session --id auth-flow --working-on "Auth flow" --repo app --branch feature/auth --worktree
 
+# Per-lane runtime isolation (D-282): every lane gets its own port and temp
+# dir at start (recorded in the lane's session.yaml; defaults configurable
+# under project.yaml runtime: port_base/port_step/tmp_base). Export them into
+# a shell — includes conventional PORT/TMPDIR aliases so unmodified dev
+# servers pick them up — before running dev servers or build tools, so
+# parallel lanes never fight over ports or temp paths. close-session removes
+# the lane temp dir (guarded; the port record vanishes with the lane).
+eval "$(npx -y @vibecompass/vibecompass@latest lane-env)"
+
 # Agent instruction files
 npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
+
+# Decision log maintenance: append-decision allocates the D-number at write
+# time and refreshes the grouped decisions/INDEX.md when it can label the
+# group from the lane context (D-283, structure-preserving — hand-authored
+# session group headings are preserved verbatim; unparseable structure fails
+# closed). refresh-decision-index --check validates the index against the
+# canonical decision files without writing.
+npx -y @vibecompass/vibecompass@latest append-decision --root .compass --target cross-cutting.md --entry staged-entry.md
+npx -y @vibecompass/vibecompass@latest refresh-decision-index --root .compass --check
 
 # Targeted and comprehensive architecture docs maintenance
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow --changed app:src/auth/login.ts

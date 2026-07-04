@@ -18,6 +18,13 @@ import {
 import { withMemoryRootLock } from './serialization.js';
 import { findDuplicateDecisionIds, formatDecisionId } from './decisions.js';
 import {
+  assignLanePort,
+  buildLaneTmpDir,
+  computeLaneTmpRootKey,
+  removeLaneTmpDirAtClose,
+  resolveRuntimeSettings,
+} from './lane-runtime.js';
+import {
   LANE_MARKER_FILENAME,
   assertMarkerTargetDisjoint,
   findEnclosingGitDir,
@@ -160,6 +167,24 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
   });
 
+  // D-282 per-lane runtime assignment, computed in preflight inside the
+  // memory-root lock so sibling lanes' recorded ports are stable while the
+  // lowest free slot is picked. Assignment is lane coordination on this root,
+  // not an OS-level reservation — no port is probed or bound here.
+  const runtimeSettings = resolveRuntimeSettings(projectConfig);
+  const laneRuntime = {
+    port: assignLanePort({
+      existingLanes,
+      portBase: runtimeSettings.portBase,
+      portStep: runtimeSettings.portStep,
+    }),
+    tmpDir: buildLaneTmpDir({
+      tmpBase: runtimeSettings.tmpBase,
+      rootKey: await computeLaneTmpRootKey(normalized.rootDir),
+      laneId: sessionId,
+    }),
+  };
+
   // D-281 opt-in git binding: normalize + preflight before the first write so
   // a refused binding leaves the root untouched.
   if (options?.worktree && !options?.branch) {
@@ -222,6 +247,15 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     selectedId: sessionId,
   });
 
+  // D-282: the lane temp dir is created before the first root write, so a
+  // creation failure aborts start-session with the root untouched (empty
+  // parent namespace dirs left behind by a failure are benign).
+  await mkdir(laneRuntime.tmpDir, { recursive: true }).catch((error) => {
+    throw new Error(
+      `Could not create the lane temp directory ${laneRuntime.tmpDir}: ${error instanceof Error ? error.message : String(error)} (D-282). Configure project.yaml runtime.tmp_base if the default namespace is not writable.`,
+    );
+  });
+
   await mkdir(normalized.activeSessionsDir, { recursive: true });
   await mkdir(lanePaths.laneDir, { recursive: false }).catch((error) => {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
@@ -242,6 +276,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       repos,
       claims,
       baseRevisions: baseRevisionCapture.baseRevisions,
+      runtime: laneRuntime,
       // Record-before-create (D-281): the full binding plan — including the
       // marker path/token — is in session.yaml before any git artifact or
       // marker file exists, so a crash leaves only benign recorded-but-missing
@@ -316,6 +351,8 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
         await rm(gitBinding.containerDir, { recursive: true, force: true }).catch(() => {});
       }
       await rm(lanePaths.laneDir, { recursive: true, force: true }).catch(() => {});
+      // D-282: the lane temp dir was created this call; unwind it with the rest.
+      await rm(laneRuntime.tmpDir, { recursive: true, force: true }).catch(() => {});
       await writeFile(normalized.claudePath, claude.content, 'utf8').catch(() => {});
       if (priorIndexContent === null) {
         await rm(normalized.activeSessionsIndexPath, { force: true }).catch(() => {});
@@ -350,11 +387,13 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     handoffFilePath: lanePaths.handoffFilePath,
     sessionDate,
     sessionNumber: nextSessionNumber,
+    runtime: laneRuntime,
     warnings: [
       ...markerContext.warnings,
       ...metadataWarnings,
       ...overlapWarnings,
       ...baseRevisionCapture.warnings,
+      ...runtimeSettings.warnings,
       ...(gitBinding?.warnings ?? []),
       ...manifestRefresh.warnings,
       ...auditWarnings,
@@ -497,6 +536,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const markerCleanupWarnings = [];
   let activeSessionIndex = null;
   let worktreeCleanup = null;
+  let runtimeCleanup = null;
   if (sessionId) {
     // D-281 close-side guarded removal (S3-3): runs after the session note is
     // written (a failed note write leaves everything intact) and before the
@@ -555,6 +595,20 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
         markerKept,
         containerRemoved,
       };
+    }
+
+    // D-282 guarded lane temp-dir removal: runs before the lane record —
+    // the only pointer to the temp dir — is destroyed. Lanes without a
+    // recorded runtime block (pre-S4) close exactly as before.
+    if (closingLaneMetadata?.runtime?.tmpDir) {
+      const runtimeSettings = resolveRuntimeSettings(projectConfig);
+      runtimeCleanup = await removeLaneTmpDirAtClose({
+        recordedTmpDir: closingLaneMetadata.runtime.tmpDir,
+        laneId: sessionId,
+        namespaceDir: path.join(runtimeSettings.tmpBase, await computeLaneTmpRootKey(normalized.rootDir)),
+        cwd: normalized.cwd,
+      });
+      markerCleanupWarnings.push(...runtimeCleanup.warnings);
     }
 
     await rm(lanePaths.laneDir, { recursive: true, force: true });
@@ -621,6 +675,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       rootFlag: buildRootFlagForGuidance(normalized),
     }),
     worktreeCleanup,
+    runtimeCleanup,
     warnings: [
       ...markerContext.warnings,
       ...laneSelection.warnings,
@@ -735,6 +790,66 @@ function normalizeDocumentMaintenanceCheckpoint(value) {
   }
 
   return checkpoint;
+}
+
+/**
+ * Read-only lane runtime export (D-282): resolves the lane per D-277/D-280
+ * (explicit --session, else nearest worktree marker, else single active lane)
+ * and returns the recorded runtime assignment plus a ready-to-export env map.
+ * The conventional PORT/TMPDIR aliases let unmodified dev servers and tools
+ * pick the assignment up; pass conventionalAliases: false to omit them.
+ */
+export async function readLaneEnvironment(options = {}) {
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const lanes = await listActiveSessionLanes(normalized);
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  const selection = resolveLaneSelection({
+    explicitSessionId: explicitId ? validateLaneId(explicitId) : null,
+    marker: markerContext.marker,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose: 'export runtime env for',
+  });
+
+  if (!selection.sessionId) {
+    throw new Error('No active session lane exists. Run `vibecompass start-session` first (D-282: runtime assignments are per-lane).');
+  }
+
+  const lane = lanes.find((item) => item.id === selection.sessionId);
+  if (lane.warnings.length > 0) {
+    throw new Error(
+      `Lane "${selection.sessionId}"'s session.yaml could not be parsed (${lane.warnings[0]}); repair the lane metadata before exporting its runtime env.`,
+    );
+  }
+
+  if (!lane.runtime || !Number.isInteger(lane.runtime.port) || !lane.runtime.tmpDir) {
+    throw new Error(
+      `Lane "${selection.sessionId}" has no recorded runtime assignment (lanes started before D-282 have none). Close and re-open the lane to assign one.`,
+    );
+  }
+
+  const conventionalAliases = options.conventionalAliases !== false;
+  const env = {
+    VIBECOMPASS_LANE_ID: selection.sessionId,
+    VIBECOMPASS_LANE_PORT: String(lane.runtime.port),
+    VIBECOMPASS_LANE_TMPDIR: lane.runtime.tmpDir,
+    ...(conventionalAliases
+      ? {
+          PORT: String(lane.runtime.port),
+          TMPDIR: lane.runtime.tmpDir,
+        }
+      : {}),
+  };
+
+  return {
+    rootDir: normalized.rootDir,
+    sessionId: selection.sessionId,
+    port: lane.runtime.port,
+    tmpDir: lane.runtime.tmpDir,
+    env,
+    warnings: [...markerContext.warnings, ...selection.warnings],
+  };
 }
 
 export async function listProjectSessions(options = {}) {
@@ -1384,6 +1499,7 @@ async function listActiveSessionLanes(normalized) {
         worktrees: metadata.worktrees ?? {},
         worktreeSources: metadata.worktreeSources ?? {},
         baseRevisions: metadata.baseRevisions ?? {},
+        runtime: metadata.runtime ?? null,
         warnings: metadata.warnings,
         sessionDate: metadata.sessionDate ?? wipSession?.sessionDate ?? null,
         sessionNumber: metadata.sessionNumber ?? wipSession?.sessionNumber ?? 0,
@@ -1434,6 +1550,12 @@ async function readLaneMetadata(sessionFilePath) {
       worktrees: normalizeStringMap(data.worktrees),
       worktreeSources: normalizeStringMap(data.worktree_sources),
       baseRevisions: normalizeStringMap(data.base_revisions),
+      runtime: data.runtime && typeof data.runtime === 'object' && !Array.isArray(data.runtime)
+        ? {
+            port: parseNullableNumber(data.runtime.port),
+            tmpDir: normalizeOptionalString(data.runtime.tmp_dir),
+          }
+        : null,
       sessionDate: normalizeOptionalString(data.session_date),
       sessionNumber: typeof data.session_number === 'number' ? data.session_number : Number(data.session_number) || null,
       warnings: [],
@@ -1455,6 +1577,7 @@ async function readLaneMetadata(sessionFilePath) {
       worktrees: {},
       worktreeSources: {},
       baseRevisions: {},
+      runtime: null,
       sessionDate: null,
       sessionNumber: null,
       warnings: [
@@ -1703,6 +1826,15 @@ function renderLaneMetadata(options) {
     renderYamlArray('repos', options.repos),
     renderYamlArray('claimed_paths', options.claims),
     `started_at: ${formatLocalDateTime(new Date())}`,
+    // D-282: the runtime assignment travels with the lane record (local-only
+    // per D-278) so lane-env and close-time cleanup read it back.
+    ...(options.runtime
+      ? [
+          'runtime:',
+          `  port: ${options.runtime.port}`,
+          `  tmp_dir: ${quoteYamlString(options.runtime.tmpDir)}`,
+        ]
+      : []),
     ...(options.branch ? [`branch: ${quoteYamlString(options.branch)}`] : []),
     ...(options.worktreeContainer ? [`worktree_container: ${quoteYamlString(options.worktreeContainer)}`] : []),
     ...renderYamlBlockMapLines('worktrees', options.worktrees),

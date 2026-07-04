@@ -8,8 +8,9 @@ import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { closeProjectSession, listProjectSessions, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
+import { closeProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
+import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
@@ -147,8 +148,35 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         }
       }
     }
+    if (result.runtime) {
+      io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
+      io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (D-282; pass --session <lane-id> when multiple lanes are active).\n');
+    }
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
+    return 0;
+  }
+
+  if (parsed.command === 'lane-env') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await readLaneEnvironment({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({
+        root_dir: result.rootDir,
+        lane_id: result.sessionId,
+        port: result.port,
+        tmp_dir: result.tmpDir,
+        env: result.env,
+      }, null, 2)}\n`);
+    } else {
+      for (const [name, value] of Object.entries(result.env)) {
+        io.stdout.write(`export ${name}=${shellQuoteSingle(value)}\n`);
+      }
+    }
+    writeWarnings(io, result.warnings);
     return 0;
   }
 
@@ -250,6 +278,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
     writeWorktreeCleanupResult(io, result.worktreeCleanup);
+    writeRuntimeCleanupResult(io, result.runtimeCleanup);
     if (result.docsUpdatePlan) {
       io.stdout.write(renderDocsUpdatePlan(result.docsUpdatePlan));
     }
@@ -500,16 +529,72 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       throw new Error('append-decision requires --entry <staged-entry-file>.');
     }
     const entryContent = await readFile(path.resolve(cwd, parsed.options.entryPath), 'utf8');
+    // D-283: refresh the grouped index when a group label is determinable —
+    // explicit --group wins, else the resolvable lane context labels the
+    // group. With neither, the append keeps the hand-refresh reminder.
+    const groupLabel = parsed.options.groupLabel ?? (await resolveIndexGroupLabelSafely(rootDir, cwd));
     const result = await appendDecisionEntry({
       rootDir,
       target: parsed.options.target,
       entryContent,
+      ...(groupLabel
+        ? { indexRefresher: () => refreshGroupedDecisionIndex({ rootDir, groupLabel }) }
+        : {}),
     });
     io.stdout.write(`Appended ${formatDecisionId(result.decisionId)} to ${result.targetPath}\n`);
     for (const warning of result.warnings) {
       io.stdout.write(`Warning: ${warning}\n`);
     }
     io.stdout.write(`${result.indexReminder}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'refresh-decision-index') {
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
+
+    if (parsed.options.check) {
+      const result = await checkGroupedDecisionIndex({ rootDir });
+      if (result.ok) {
+        io.stdout.write(
+          `Grouped decision index check: clean (${result.stats.rowCount} rows in ${result.stats.groupCount} groups; ${result.stats.decisionCount} canonical decisions)\n`,
+        );
+        return 0;
+      }
+      io.stderr.write(`Grouped decision index check failed for ${result.indexPath}:\n`);
+      for (const problem of result.problems) {
+        io.stderr.write(`- ${problem}\n`);
+      }
+      return 1;
+    }
+
+    let groupLabel = parsed.options.groupLabel ?? null;
+    let labelWarnings = [];
+    if (!groupLabel) {
+      const resolved = await resolveDefaultIndexGroupLabel({ rootDir, cwd, sessionId: parsed.options.sessionId ?? null });
+      if (resolved) {
+        groupLabel = resolved.label;
+        labelWarnings = resolved.warnings;
+      }
+    }
+    const result = await refreshGroupedDecisionIndex({ rootDir, groupLabel });
+    writeWarnings(io, [...labelWarnings, ...result.warnings]);
+    if (result.problems.length > 0) {
+      io.stderr.write(`Grouped decision index refresh refused for ${result.indexPath} (D-283 fail-closed):\n`);
+      for (const problem of result.problems) {
+        io.stderr.write(`- ${problem}\n`);
+      }
+      return 1;
+    }
+    if (result.upToDate) {
+      io.stdout.write(`decisions/INDEX.md is up to date (nothing missing).\n`);
+    } else {
+      io.stdout.write(`Refreshed ${result.indexPath} (structure-preserving, D-283)\n`);
+      io.stdout.write(`Added under "## ${result.groupLabel}":\n`);
+      for (const decision of result.added) {
+        io.stdout.write(`- ${formatDecisionId(decision.id)} | ${decision.title} | ${decision.domain}.md\n`);
+      }
+    }
     return 0;
   }
 
@@ -583,8 +668,16 @@ export function parseCliArgs(argv) {
       return parseWriteLaneMarkerArgs(rest);
     }
 
+    if (command === 'lane-env') {
+      return parseLaneEnvArgs(rest);
+    }
+
     if (command === 'append-decision') {
       return parseAppendDecisionArgs(rest);
+    }
+
+    if (command === 'refresh-decision-index') {
+      return parseRefreshDecisionIndexArgs(rest);
     }
 
     if (command === 'next-decision-id') {
@@ -866,6 +959,50 @@ function parseStartSessionArgs(argv) {
 
   return {
     command: 'start-session',
+    options: parsed,
+  };
+}
+
+function parseLaneEnvArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    if (token === '--no-conventional') {
+      parsed.conventionalAliases = false;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'lane-env',
     options: parsed,
   };
 }
@@ -1259,12 +1396,68 @@ function parseAppendDecisionArgs(argv) {
       case '--entry':
         parsed.entryPath = value;
         break;
+      case '--group':
+        parsed.groupLabel = value;
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
   }
 
   return { command: 'append-decision', options: parsed };
+}
+
+function parseRefreshDecisionIndexArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--check') {
+      parsed.check = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--group':
+        parsed.groupLabel = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return { command: 'refresh-decision-index', options: parsed };
+}
+
+/**
+ * D-283 auto-labeling for append-decision: any lane-resolution failure (2+
+ * lanes with no marker, stale marker, no lanes) degrades to "no label" so the
+ * canonical append proceeds with the hand-refresh reminder.
+ */
+async function resolveIndexGroupLabelSafely(rootDir, cwd) {
+  try {
+    const resolved = await resolveDefaultIndexGroupLabel({ rootDir, cwd });
+    return resolved?.label ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function parseNextDecisionIdArgs(argv) {
@@ -1803,6 +1996,40 @@ function writeWorktreeCleanupResult(io, worktreeCleanup) {
   }
 }
 
+// D-282 close-side lane temp-dir cleanup summary. A missing recorded dir is
+// benign crash residue and prints nothing, matching recorded-but-missing
+// worktrees; guard refusals print the kept path with a short label while the
+// actionable guidance travels on result.warnings (stderr).
+const KEPT_LANE_TMP_REASON_LABELS = {
+  'not-absolute': 'recorded path not absolute',
+  'outside-namespace': 'outside the lane temp namespace',
+  'lane-id-mismatch': "does not end in the lane's id",
+  'cwd-inside': 'current working directory is inside it',
+  'remove-failed': 'removal failed',
+};
+
+function writeRuntimeCleanupResult(io, runtimeCleanup) {
+  if (!runtimeCleanup) {
+    return;
+  }
+
+  if (runtimeCleanup.removed) {
+    io.stdout.write(`Lane temp dir: removed ${runtimeCleanup.tmpDir}\n`);
+    return;
+  }
+
+  if (runtimeCleanup.reason === 'missing') {
+    return;
+  }
+
+  const label = KEPT_LANE_TMP_REASON_LABELS[runtimeCleanup.reason] ?? runtimeCleanup.reason;
+  io.stdout.write(`Lane temp dir: kept ${runtimeCleanup.tmpDir} (${label})\n`);
+}
+
+function shellQuoteSingle(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 function writeDocumentMaintenanceCheckpoint(io, documentMaintenance) {
   if (!documentMaintenance) {
     return;
@@ -1871,7 +2098,9 @@ function usageText() {
     '  vibecompass switch-session <id> [options]',
     '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
     '  vibecompass write-lane-marker --session <lane-id> [--dir <path>] [options]',
-    '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [options]',
+    '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
+    '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [--group <label>] [options]',
+    '  vibecompass refresh-decision-index [--check] [--session <lane-id>] [--group <label>] [options]',
     '  vibecompass next-decision-id [options]',
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
@@ -1984,10 +2213,25 @@ function usageText() {
     '  --dir <path>                         Marker target directory; defaults to cwd. Must be path-disjoint from the memory root',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '',
+    'Lane-env options (D-282):',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --session <lane-id>                  Lane to export. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --json                               Print the runtime assignment as JSON instead of shell export lines',
+    '  --no-conventional                    Omit the conventional PORT/TMPDIR alias exports',
+    '                                        Consume with: eval "$(vibecompass lane-env)"; defaults come from project.yaml runtime.{port_base,port_step,tmp_base}',
+    '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --target <domain.md>                 Decision domain file under decisions/ (e.g. cross-cutting.md); never INDEX.md',
     '  --entry <path>                       Staged entry file starting with "### D-NEXT — <title>"; the D-number is allocated atomically at write time (D-276)',
+    '  --group <label>                      Grouped index group label for the D-283 refresh (e.g. "2026-07-03 — Session 3 (lane-x lane)"); defaults to the resolvable lane context',
+    '',
+    'Refresh-decision-index options (D-283):',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --check                              Validate the grouped index against canonical decision entries without writing',
+    '  --session <lane-id>                  Lane whose date/session/id labels a new group; defaults to the D-277 lane resolution',
+    '  --group <label>                      Explicit group label for appended rows; wins over the lane-derived label',
+    '                                        Structure-preserving: existing groups/rows are kept verbatim; unparseable structure fails closed',
     '',
     'Sync-agents options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

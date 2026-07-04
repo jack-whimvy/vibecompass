@@ -130,13 +130,35 @@ export async function appendDecisionEntry(options) {
       );
     }
 
+    // D-283: when the caller supplies a structure-preserving index refresher
+    // (a group label was determinable), the derived index is refreshed inside
+    // this same lock (D-276 — reentrant for the holder). The canonical append
+    // never fails because of the index: a refusal degrades to a warning plus
+    // the hand-refresh reminder.
+    let indexReminder =
+      'decisions/INDEX.md is derived; add the grouped index row for this entry by hand (or run `vibecompass refresh-decision-index`).';
+    if (typeof options.indexRefresher === 'function') {
+      const refresh = await options.indexRefresher({ decisionId });
+      warnings.push(...(refresh?.warnings ?? []));
+      if (refresh?.refreshed) {
+        indexReminder = `decisions/INDEX.md refreshed (structure-preserving, D-283): added ${refresh.added
+          .map((decision) => formatDecisionId(decision.id))
+          .join(', ')} under "## ${refresh.groupLabel}".`;
+      } else if (refresh?.upToDate) {
+        indexReminder = 'decisions/INDEX.md already lists this entry (structure-preserving refresh found nothing missing).';
+      } else if (refresh) {
+        warnings.push(
+          `decisions/INDEX.md was not refreshed (D-283 fail-closed): ${refresh.problems[0] ?? 'unknown refusal'}`,
+        );
+      }
+    }
+
     return {
       decisionId,
       target: targetName,
       targetPath,
       warnings,
-      indexReminder:
-        'decisions/INDEX.md is derived; add the grouped index row for this entry by hand until the structure-preserving generator lands (S4).',
+      indexReminder,
     };
   });
 }

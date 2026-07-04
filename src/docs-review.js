@@ -18,6 +18,7 @@ import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
 import { PACKAGE_VERSION } from './version.js';
 import { withMemoryRootLock } from './serialization.js';
 import { listDecisionFileNames, readNextDecisionId } from './decisions.js';
+import { looksLikeGroupedDecisionIndex } from './decision-index.js';
 
 const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v7';
 const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v1';
@@ -2007,6 +2008,20 @@ async function refreshDecisionIndex(rootDir) {
   const indexPath = path.join(decisionsDir, 'INDEX.md');
   const warnings = [];
   const rows = [];
+
+  // D-283/D-255 quarantine: the flat generator must never be pointed at a
+  // grouped index — a wholesale rewrite would destroy the hand-authored
+  // session group headings. Any "## " heading counts as grouped-shaped, so a
+  // malformed grouped index survives too.
+  const existingIndex = await readFile(indexPath, 'utf8').catch(() => null);
+  if (existingIndex !== null && looksLikeGroupedDecisionIndex(existingIndex)) {
+    return {
+      refreshed: false,
+      warnings: [
+        'decisions/INDEX.md uses the grouped session shape; --refresh-index (the flat D-209 generator) refuses to overwrite it. Use `vibecompass refresh-decision-index` (D-283) instead.',
+      ],
+    };
+  }
 
   for (const fileName of await listDecisionFileNames(decisionsDir)) {
     const relativePath = `decisions/${fileName}`;
