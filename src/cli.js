@@ -11,7 +11,7 @@ import path from 'node:path';
 import { closeProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
-import { resolveLaneMarkerContext } from './lane-marker.js';
+import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
@@ -551,7 +551,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         : {}),
     });
     io.stdout.write(`Appended ${formatDecisionId(result.decisionId)} to ${result.targetPath}\n`);
-    for (const warning of [...markerContext.warnings, ...labelResult.warnings, ...result.warnings]) {
+    for (const warning of uniqueStrings([...markerContext.warnings, ...labelResult.warnings, ...result.warnings])) {
       io.stdout.write(`Warning: ${warning}\n`);
     }
     io.stdout.write(`${result.indexReminder}\n`);
@@ -590,7 +590,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       ? { label: parsed.options.groupLabel, warnings: [] }
       : await resolveIndexGroupLabelSafely({ rootDir, cwd, sessionId: parsed.options.sessionId ?? null, marker: markerContext.marker });
     const result = await refreshGroupedDecisionIndex({ rootDir, groupLabel: labelResult.label });
-    writeWarnings(io, [...markerContext.warnings, ...labelResult.warnings, ...result.warnings]);
+    writeWarnings(io, uniqueStrings([...markerContext.warnings, ...labelResult.warnings, ...result.warnings]));
     if (result.problems.length > 0) {
       io.stderr.write(`Grouped decision index refresh refused for ${result.indexPath} (D-283 fail-closed):\n`);
       for (const problem of result.problems) {
@@ -1473,7 +1473,29 @@ async function resolveDecisionCommandContext(cwd, options) {
     explicitRootDir: options.rootDir ?? null,
     explicitSessionId: options.sessionId ?? null,
   });
-  return { rootDir: markerContext.rootDir, marker: markerContext.marker, warnings: markerContext.warnings };
+  const rootDir = markerContext.rootDir;
+  const warnings = [...markerContext.warnings];
+
+  // D-277/D-280: validate an explicit selection signal up front, before the
+  // command decides whether it needs a group label. A `--session` naming a
+  // non-active lane, or a resolved worktree marker that is stale (names a
+  // non-active lane), must fail the command closed even when an explicit
+  // `--group` skips label resolution and even for read-only `--check`. The
+  // 2+-lane no-selection ambiguity carries no explicit signal and is left for
+  // tolerant label handling (a no-op refresh must still succeed there).
+  if (options.sessionId || markerContext.marker) {
+    const sessions = await listProjectSessions({ rootDir, cwd });
+    const selection = resolveLaneSelection({
+      explicitSessionId: options.sessionId ?? null,
+      marker: markerContext.marker,
+      laneIds: sessions.lanes.map((lane) => lane.id),
+      rootDir,
+      purpose: 'run this decision-log command in',
+    });
+    warnings.push(...selection.warnings);
+  }
+
+  return { rootDir, marker: markerContext.marker, warnings };
 }
 
 /**
@@ -2072,6 +2094,12 @@ function writeRuntimeCleanupResult(io, runtimeCleanup) {
 
 function shellQuoteSingle(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+/** Preserves order, drops duplicate warning strings (D-283 eager validation
+ * can surface the same selection warning twice). */
+function uniqueStrings(items) {
+  return [...new Set(items)];
 }
 
 function writeDocumentMaintenanceCheckpoint(io, documentMaintenance) {

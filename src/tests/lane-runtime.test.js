@@ -310,8 +310,11 @@ test('close-session removes the lane temp dir even after runtime.tmp_base change
     );
     await writeFile(projectFilePath, rewritten, 'utf8');
 
+    // D-284: the close guard keys off the recorded <root-key>/<lane-id> tail,
+    // not tmp_base, so a tmp_base reconfiguration mid-lane does not strand the
+    // dir — it is still identified as this root's lane temp dir and removed.
     const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
-    assert.equal(result.runtimeCleanup.removed, true, 'temp dir removed despite the tmp_base change');
+    assert.equal(result.runtimeCleanup.removed, true, 'temp dir removed despite the tmp_base change (D-284)');
     assert.equal(existsSync(started.runtime.tmpDir), false);
   } finally {
     await rm(tempDir, { recursive: true, force: true });

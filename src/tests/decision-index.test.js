@@ -483,6 +483,77 @@ test('decision-log commands fail closed on a stale worktree marker; 2+-lane no-o
   }
 });
 
+test('explicit --group does not bypass stale-marker / --session fail-closed (D-280/D-277)', async () => {
+  const { tempDir, rootDir, indexPath } = await createIndexedRoot();
+
+  try {
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-a', workingOn: 'A' });
+    const before = await readFile(indexPath, 'utf8');
+
+    // Stale hand-written marker (names a non-active lane) in the cwd.
+    const markerDir = path.join(tempDir, 'stale-cwd');
+    await mkdir(markerDir, { recursive: true });
+    await writeFile(
+      path.join(markerDir, LANE_MARKER_FILENAME),
+      renderLaneMarker({
+        laneId: 'ghost-lane',
+        memoryRoot: rootDir,
+        token: '22222222-2222-2222-2222-222222222222',
+        createdAt: '2026-07-03T00:00:00-07:00',
+        createdBy: '0.11.0',
+      }),
+      'utf8',
+    );
+    const label = '2026-07-03 — Session 9 (manual lane)';
+
+    // refresh-decision-index --group from the stale-marker cwd must fail closed.
+    await assert.rejects(
+      runCli(['refresh-decision-index', '--group', label], { stdout: { write() {} }, stderr: { write() {} } }, { cwd: markerDir }),
+      /not an active lane/,
+    );
+    // and --check too (the marker is adopted for the root either way).
+    await assert.rejects(
+      runCli(['refresh-decision-index', '--check'], { stdout: { write() {} }, stderr: { write() {} } }, { cwd: markerDir }),
+      /not an active lane/,
+    );
+
+    // append-decision --group from the stale-marker cwd must fail closed and append nothing.
+    const stagedPath = path.join(tempDir, 'staged.md');
+    await writeFile(
+      stagedPath,
+      ['### D-NEXT — Should not land', '**Timestamp:** 2026-07-03 00:00 PDT', '**Decision:** x.', '**Rationale:** y.', ''].join('\n'),
+      'utf8',
+    );
+    const crossBefore = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    await assert.rejects(
+      runCli(['append-decision', '--target', 'cross-cutting.md', '--entry', stagedPath, '--group', label], { stdout: { write() {} }, stderr: { write() {} } }, { cwd: markerDir }),
+      /not an active lane/,
+    );
+    assert.equal(await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8'), crossBefore, 'stale marker + --group appended nothing');
+    assert.equal(await readFile(indexPath, 'utf8'), before, 'index untouched');
+
+    // An explicit --session typo with --group also fails closed (label present, selection still validated).
+    await assert.rejects(
+      runCli(['append-decision', '--root', rootDir, '--target', 'cross-cutting.md', '--entry', stagedPath, '--group', label, '--session', 'typo-lane'], { stdout: { write() {} }, stderr: { write() {} } }, { cwd: tempDir }),
+      /not an active lane/,
+    );
+    assert.equal(await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8'), crossBefore, '--session typo + --group appended nothing');
+
+    // Control: a VALID explicit --group from the workspace cwd (no marker, single lane) still works.
+    await writeFile(
+      path.join(rootDir, 'decisions/platform.md'),
+      ['# Platform decisions', '', decisionEntry(4, 'Platform decision'), '---', '', decisionEntry(5, 'Fifth decision')].join('\n'),
+      'utf8',
+    );
+    const { io, stdout } = createCaptureIo();
+    const exit = await runCli(['refresh-decision-index', '--root', rootDir, '--group', label], io, { cwd: tempDir });
+    assert.equal(exit, 0, stdout.join(''));
+    assert.match(stdout.join(''), /Refreshed/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('the flat --refresh-index generator refuses a grouped index (D-283/D-255 quarantine)', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-flat-refusal-'));
   const rootDir = path.join(tempDir, '.compass');
