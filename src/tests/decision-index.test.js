@@ -6,7 +6,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
-import { startProjectSession } from '../session.js';
+import { appendDecisionEntry } from '../decisions.js';
+import { startProjectSession, writeLaneMarkerForSession } from '../session.js';
 import {
   checkGroupedDecisionIndex,
   collectCanonicalDecisions,
@@ -327,6 +328,89 @@ test('append-decision keeps the hand reminder when no group label is determinabl
     await runCli(['append-decision', '--root', rootDir, '--target', 'cross-cutting.md', '--entry', stagedPath], io, { cwd: tempDir });
     assert.match(stdout.join(''), /add the grouped index row for this entry by hand/);
     assert.equal(await readFile(indexPath, 'utf8'), GROUPED_INDEX, 'index untouched without a label');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('append-decision degrades a thrown index refresh to a warning without failing the canonical append (D-283)', async () => {
+  const { tempDir, rootDir, indexPath } = await createIndexedRoot();
+
+  try {
+    const before = await readFile(indexPath, 'utf8');
+    let called = 0;
+    const result = await appendDecisionEntry({
+      rootDir,
+      target: 'cross-cutting.md',
+      entryContent: ['### D-NEXT — Fifth decision', '**Timestamp:** 2026-07-03 00:00 PDT', '**Decision:** x.', '**Rationale:** y.', ''].join('\n'),
+      indexRefresher: () => {
+        called += 1;
+        throw new Error('EACCES: permission denied, open INDEX.md');
+      },
+    });
+    assert.equal(called, 1);
+    assert.equal(result.decisionId, 5, 'the canonical entry was appended and allocated its D-number');
+    assert.ok(result.warnings.some((warning) => warning.includes('EACCES') && warning.includes('do not re-run append-decision')));
+    const decisions = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    assert.equal(decisions.match(/^### D-005 —/gm).length, 1, 'entry appended exactly once');
+    assert.equal(await readFile(indexPath, 'utf8'), before, 'the failed refresh left the index untouched');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('refresh-decision-index adopts the worktree marker root and no-ops from a marker cwd (D-283/D-280)', async () => {
+  const { tempDir, rootDir, indexPath } = await createIndexedRoot();
+
+  try {
+    await startProjectSession({ cwd: tempDir, sessionId: 'gamma', workingOn: 'Gamma work' });
+    const markerDir = path.join(tempDir, 'worktree-cwd');
+    await mkdir(markerDir, { recursive: true });
+    await writeLaneMarkerForSession({ rootDir, cwd: tempDir, sessionId: 'gamma', dir: markerDir });
+
+    // From the marker cwd with NO --root, both --check and refresh resolve the
+    // marker-supplied root and succeed on the already-up-to-date index.
+    const { io: checkIo, stdout: checkStdout } = createCaptureIo();
+    const checkExit = await runCli(['refresh-decision-index', '--check'], checkIo, { cwd: markerDir });
+    assert.equal(checkExit, 0, checkStdout.join(''));
+    assert.match(checkStdout.join(''), /check: clean/);
+
+    const { io, stdout } = createCaptureIo();
+    const exit = await runCli(['refresh-decision-index'], io, { cwd: markerDir });
+    assert.equal(exit, 0);
+    assert.match(stdout.join(''), /up to date/);
+    assert.equal(await readFile(indexPath, 'utf8'), GROUPED_INDEX, 'byte-idempotent no-op');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('refresh-decision-index no-ops on a 2+ lane root with no marker instead of failing (D-283/D-277)', async () => {
+  const { tempDir, rootDir, indexPath } = await createIndexedRoot();
+
+  try {
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-a', workingOn: 'A' });
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-b', workingOn: 'B' });
+
+    // Nothing missing → the eager label resolution must not turn a no-op into
+    // a multi-lane selection error.
+    const { io, stdout } = createCaptureIo();
+    const exit = await runCli(['refresh-decision-index', '--root', rootDir], io, { cwd: tempDir });
+    assert.equal(exit, 0, stdout.join(''));
+    assert.match(stdout.join(''), /up to date/);
+    assert.equal(await readFile(indexPath, 'utf8'), GROUPED_INDEX);
+
+    // But a refresh that actually needs to append rows still fails closed,
+    // asking for an explicit --group / --session (label is load-bearing here).
+    await writeFile(
+      path.join(rootDir, 'decisions/platform.md'),
+      ['# Platform decisions', '', decisionEntry(4, 'Platform decision'), '---', '', decisionEntry(5, 'Fifth decision')].join('\n'),
+      'utf8',
+    );
+    const { io: missingIo, stderr } = createCaptureIo();
+    const missingExit = await runCli(['refresh-decision-index', '--root', rootDir], missingIo, { cwd: tempDir });
+    assert.equal(missingExit, 1);
+    assert.match(stderr.join(''), /no group label/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

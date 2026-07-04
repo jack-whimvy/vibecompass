@@ -11,6 +11,7 @@ import path from 'node:path';
 import { closeProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
+import { resolveLaneMarkerContext } from './lane-marker.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
@@ -524,15 +525,23 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
 
   if (parsed.command === 'append-decision') {
     const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
-    const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
     if (!parsed.options.entryPath) {
       throw new Error('append-decision requires --entry <staged-entry-file>.');
     }
+    // D-280 marker-aware root: an explicit --root wins, else the nearest
+    // worktree lane marker supplies the root, so a builder appending a
+    // decision mid-lane from inside a worktree needs neither --root nor
+    // --session (matching lane-env / close-session).
+    const markerContext = await resolveDecisionCommandContext(cwd, parsed.options);
+    const rootDir = markerContext.rootDir;
     const entryContent = await readFile(path.resolve(cwd, parsed.options.entryPath), 'utf8');
     // D-283: refresh the grouped index when a group label is determinable —
     // explicit --group wins, else the resolvable lane context labels the
     // group. With neither, the append keeps the hand-refresh reminder.
-    const groupLabel = parsed.options.groupLabel ?? (await resolveIndexGroupLabelSafely(rootDir, cwd));
+    const labelResult = parsed.options.groupLabel
+      ? { label: parsed.options.groupLabel, warnings: [] }
+      : await resolveIndexGroupLabelSafely({ rootDir, cwd, sessionId: parsed.options.sessionId ?? null, marker: markerContext.marker });
+    const groupLabel = labelResult.label;
     const result = await appendDecisionEntry({
       rootDir,
       target: parsed.options.target,
@@ -542,7 +551,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
         : {}),
     });
     io.stdout.write(`Appended ${formatDecisionId(result.decisionId)} to ${result.targetPath}\n`);
-    for (const warning of result.warnings) {
+    for (const warning of [...markerContext.warnings, ...labelResult.warnings, ...result.warnings]) {
       io.stdout.write(`Warning: ${warning}\n`);
     }
     io.stdout.write(`${result.indexReminder}\n`);
@@ -551,10 +560,14 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
 
   if (parsed.command === 'refresh-decision-index') {
     const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
-    const rootDir = path.resolve(cwd, parsed.options.rootDir ?? '.compass');
+    // D-280 marker-aware root, matching lane-env / close-session, so the
+    // command works from inside a provisioned worktree with no flags.
+    const markerContext = await resolveDecisionCommandContext(cwd, parsed.options);
+    const rootDir = markerContext.rootDir;
 
     if (parsed.options.check) {
       const result = await checkGroupedDecisionIndex({ rootDir });
+      writeWarnings(io, markerContext.warnings);
       if (result.ok) {
         io.stdout.write(
           `Grouped decision index check: clean (${result.stats.rowCount} rows in ${result.stats.groupCount} groups; ${result.stats.decisionCount} canonical decisions)\n`,
@@ -568,17 +581,16 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       return 1;
     }
 
-    let groupLabel = parsed.options.groupLabel ?? null;
-    let labelWarnings = [];
-    if (!groupLabel) {
-      const resolved = await resolveDefaultIndexGroupLabel({ rootDir, cwd, sessionId: parsed.options.sessionId ?? null });
-      if (resolved) {
-        groupLabel = resolved.label;
-        labelWarnings = resolved.warnings;
-      }
-    }
-    const result = await refreshGroupedDecisionIndex({ rootDir, groupLabel });
-    writeWarnings(io, [...labelWarnings, ...result.warnings]);
+    // Resolve the group label tolerantly: a no-op refresh (nothing missing)
+    // must not fail just because 2+ lanes are active with no marker/--session.
+    // The label is only load-bearing when rows are actually missing, and
+    // refreshGroupedDecisionIndex raises the actionable "pass --group" problem
+    // in exactly that case.
+    const labelResult = parsed.options.groupLabel
+      ? { label: parsed.options.groupLabel, warnings: [] }
+      : await resolveIndexGroupLabelSafely({ rootDir, cwd, sessionId: parsed.options.sessionId ?? null, marker: markerContext.marker });
+    const result = await refreshGroupedDecisionIndex({ rootDir, groupLabel: labelResult.label });
+    writeWarnings(io, [...markerContext.warnings, ...labelResult.warnings, ...result.warnings]);
     if (result.problems.length > 0) {
       io.stderr.write(`Grouped decision index refresh refused for ${result.indexPath} (D-283 fail-closed):\n`);
       for (const problem of result.problems) {
@@ -1399,6 +1411,9 @@ function parseAppendDecisionArgs(argv) {
       case '--group':
         parsed.groupLabel = value;
         break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -1447,16 +1462,35 @@ function parseRefreshDecisionIndexArgs(argv) {
 }
 
 /**
- * D-283 auto-labeling for append-decision: any lane-resolution failure (2+
- * lanes with no marker, stale marker, no lanes) degrades to "no label" so the
- * canonical append proceeds with the hand-refresh reminder.
+ * D-280 marker-aware root resolution for the decision-log commands
+ * (append-decision, refresh-decision-index): an explicit --root wins, else the
+ * nearest worktree lane marker supplies the memory root, else cwd/.compass.
+ * Returns the resolved root plus any marker warnings.
  */
-async function resolveIndexGroupLabelSafely(rootDir, cwd) {
+async function resolveDecisionCommandContext(cwd, options) {
+  const markerContext = await resolveLaneMarkerContext({
+    cwd,
+    explicitRootDir: options.rootDir ?? null,
+    explicitSessionId: options.sessionId ?? null,
+  });
+  return { rootDir: markerContext.rootDir, marker: markerContext.marker, warnings: markerContext.warnings };
+}
+
+/**
+ * D-283 auto-labeling for the decision-log commands: any lane-resolution
+ * failure (2+ lanes with no marker/--session, stale marker) degrades to "no
+ * label" so a refresh with nothing missing still succeeds and an append still
+ * lands with the hand-refresh reminder. The label is only load-bearing when
+ * rows are actually missing, where the library raises the actionable
+ * "pass --group" problem. Marker warnings are surfaced by the caller;
+ * selection warnings are returned here so they are no longer discarded.
+ */
+async function resolveIndexGroupLabelSafely(options) {
   try {
-    const resolved = await resolveDefaultIndexGroupLabel({ rootDir, cwd });
-    return resolved?.label ?? null;
+    const resolved = await resolveDefaultIndexGroupLabel(options);
+    return { label: resolved?.label ?? null, warnings: resolved?.warnings ?? [] };
   } catch {
-    return null;
+    return { label: null, warnings: [] };
   }
 }
 

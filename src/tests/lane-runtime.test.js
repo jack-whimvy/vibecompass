@@ -13,6 +13,7 @@ import {
   assignLanePort,
   computeLaneTmpRootKey,
   defaultLaneTmpBase,
+  removeLaneTmpDirAtClose,
   resolveRuntimeSettings,
 } from '../lane-runtime.js';
 
@@ -237,6 +238,66 @@ test('close-session keeps a recorded temp dir outside the lane namespace (D-282 
     assert.equal(result.runtimeCleanup.reason, 'outside-namespace');
     assert.equal(existsSync(path.join(decoyDir, 'precious.txt')), true, 'decoy dir untouched');
     assert.ok(result.warnings.some((warning) => warning.includes('lane temp namespace')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session removes the lane temp dir even after runtime.tmp_base changed (D-282 env/tmp_base independence)', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lane-runtime-');
+  const startBase = path.join(tempDir, 'lane-tmp-a');
+  await appendRuntimeConfig(rootDir, { tmp_base: JSON.stringify(startBase) });
+
+  try {
+    const started = await startProjectSession({ cwd: tempDir, sessionId: 'lane-a', workingOn: 'A' });
+    assert.equal(started.runtime.tmpDir.startsWith(startBase), true);
+    // Reconfigure tmp_base after the lane recorded its path. The close-time
+    // guard must key off the recorded <root-key>/<lane-id> tail, not a
+    // recomputed <tmp_base>/<root-key> — otherwise the dir would be stranded.
+    const projectFilePath = path.join(rootDir, 'project.yaml');
+    const rewritten = (await readFile(projectFilePath, 'utf8')).replace(
+      new RegExp(`  tmp_base: .*`),
+      `  tmp_base: ${JSON.stringify(path.join(tempDir, 'lane-tmp-b'))}`,
+    );
+    await writeFile(projectFilePath, rewritten, 'utf8');
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(result.runtimeCleanup.removed, true, 'temp dir removed despite the tmp_base change');
+    assert.equal(existsSync(started.runtime.tmpDir), false);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('removeLaneTmpDirAtClose keys off the recorded root-key/lane-id tail (D-282 unit)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-tmp-guard-'));
+  try {
+    const rootKey = 'abc123def456';
+    const good = path.join(tempDir, 'anywhere', rootKey, 'lane-a');
+    await mkdir(good, { recursive: true });
+    // Correct tail removes regardless of where the namespace physically lives.
+    const removed = await removeLaneTmpDirAtClose({ recordedTmpDir: good, laneId: 'lane-a', rootKey, cwd: tempDir });
+    assert.equal(removed.removed, true);
+    assert.equal(existsSync(good), false);
+
+    // Wrong root key (different root) is refused.
+    const foreignRoot = path.join(tempDir, 'x', 'ffffffffffff', 'lane-a');
+    await mkdir(foreignRoot, { recursive: true });
+    const keptRoot = await removeLaneTmpDirAtClose({ recordedTmpDir: foreignRoot, laneId: 'lane-a', rootKey, cwd: tempDir });
+    assert.equal(keptRoot.removed, false);
+    assert.equal(keptRoot.reason, 'outside-namespace');
+    assert.equal(existsSync(foreignRoot), true);
+
+    // Wrong lane id is refused.
+    const wrongLane = path.join(tempDir, 'y', rootKey, 'lane-b');
+    await mkdir(wrongLane, { recursive: true });
+    const keptLane = await removeLaneTmpDirAtClose({ recordedTmpDir: wrongLane, laneId: 'lane-a', rootKey, cwd: tempDir });
+    assert.equal(keptLane.removed, false);
+    assert.equal(keptLane.reason, 'lane-id-mismatch');
+
+    // Relative path and missing path.
+    assert.equal((await removeLaneTmpDirAtClose({ recordedTmpDir: 'rel/lane-a', laneId: 'lane-a', rootKey, cwd: tempDir })).reason, 'not-absolute');
+    assert.equal((await removeLaneTmpDirAtClose({ recordedTmpDir: path.join(tempDir, 'gone', rootKey, 'lane-a'), laneId: 'lane-a', rootKey, cwd: tempDir })).reason, 'missing');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

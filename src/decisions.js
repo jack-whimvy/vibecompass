@@ -138,7 +138,20 @@ export async function appendDecisionEntry(options) {
     let indexReminder =
       'decisions/INDEX.md is derived; add the grouped index row for this entry by hand (or run `vibecompass refresh-decision-index`).';
     if (typeof options.indexRefresher === 'function') {
-      const refresh = await options.indexRefresher({ decisionId });
+      // The canonical entry is already written above; the derived-index
+      // refresh must never make append-decision report failure. A structural
+      // refusal returns problems (degraded below); an fs error (EACCES,
+      // ENOSPC, an unreadable domain file) would otherwise throw here after
+      // the append landed and make a retry duplicate the entry, so wrap it and
+      // degrade the throw to the same named warning (D-283).
+      let refresh = null;
+      try {
+        refresh = await options.indexRefresher({ decisionId });
+      } catch (error) {
+        warnings.push(
+          `decisions/INDEX.md was not refreshed (D-283): the grouped index refresh failed after the canonical entry was appended — ${error instanceof Error ? error.message : String(error)}. The decision was recorded; do not re-run append-decision — refresh the index by hand with \`vibecompass refresh-decision-index\`.`,
+        );
+      }
       warnings.push(...(refresh?.warnings ?? []));
       if (refresh?.refreshed) {
         indexReminder = `decisions/INDEX.md refreshed (structure-preserving, D-283): added ${refresh.added

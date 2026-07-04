@@ -121,13 +121,24 @@ export function buildLaneTmpDir(options) {
 
 /**
  * D-282 guarded recursive removal at close, mirroring D-279/D-281
- * conservatism: the recorded path must be absolute, resolve strictly inside
- * the package-owned namespace for this root, end in the closing lane's id,
- * and not contain the process cwd. Any guard failure keeps the directory with
- * guidance; a missing directory is benign crash residue.
+ * conservatism: the recorded path must be absolute, its parent segment must be
+ * this root's `rootKey` (the package-owned lane temp namespace for this root),
+ * its final segment must be the closing lane's id, and the process cwd must
+ * not sit inside it. Any guard failure keeps the directory with guidance; a
+ * missing directory is benign crash residue.
+ *
+ * The namespace is verified from the recorded path's own `<root-key>/<lane-id>`
+ * tail rather than a close-time recomputation of `<tmp_base>/<root-key>`: the
+ * default `tmp_base` is `os.tmpdir()`, which reads `TMPDIR` at call time, and
+ * D-282's own documented consumption path (`eval "$(vibecompass lane-env)"`)
+ * exports `TMPDIR=<laneTmpDir>`. Recomputing the namespace from live env would
+ * falsely reject the lane's own recorded dir whenever close runs in a lane-env
+ * shell (or after `runtime.tmp_base` changed), stranding the temp dir.
+ * `rootKey` is the SHA of the memory root's realpath and is env-independent,
+ * so the recorded tail is a stable package signature.
  */
 export async function removeLaneTmpDirAtClose(options) {
-  const { recordedTmpDir, laneId, namespaceDir, cwd } = options;
+  const { recordedTmpDir, laneId, rootKey, cwd } = options;
   const base = { tmpDir: recordedTmpDir, removed: false };
 
   if (!path.isAbsolute(recordedTmpDir)) {
@@ -146,14 +157,12 @@ export async function removeLaneTmpDirAtClose(options) {
   }
 
   const realTmp = await canonicalizePathBestEffort(recordedTmpDir);
-  const realNamespace = await canonicalizePathBestEffort(namespaceDir);
-  const namespaceRelative = path.relative(realNamespace, realTmp);
-  if (namespaceRelative === '' || namespaceRelative.startsWith('..') || path.isAbsolute(namespaceRelative)) {
+  if (path.basename(path.dirname(realTmp)) !== rootKey) {
     return {
       ...base,
       reason: 'outside-namespace',
       warnings: [
-        `Lane temp dir ${recordedTmpDir} was left in place: it does not sit inside the lane temp namespace ${namespaceDir} (D-282 guarded removal; a changed runtime.tmp_base can cause this). Inspect and delete it manually.`,
+        `Lane temp dir ${recordedTmpDir} was left in place: it is not inside this root's lane temp namespace (its parent segment is not the root key ${rootKey}) (D-282 guarded removal). Inspect and delete it manually.`,
       ],
     };
   }

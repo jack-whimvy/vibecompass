@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { formatDecisionId, listDecisionFileNames } from './decisions.js';
-import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
+import { resolveLaneSelection } from './lane-marker.js';
 import { listProjectSessions } from './session.js';
 import { withMemoryRootLock } from './serialization.js';
 
@@ -320,19 +320,18 @@ async function refreshGroupedDecisionIndexLocked(rootDir, options) {
  * Default group label per D-283: `<session_date> — Session <N> (<lane-id>
  * lane)` for the lane resolved by the shared D-277/D-280 selection order.
  * Returns null when the resolved lane cannot supply a date/number; callers
- * that need a label anyway surface the refresh problem.
+ * that need a label anyway surface the refresh problem. The marker is passed
+ * in from the caller's already-resolved command context (so a worktree
+ * marker's root has already been adopted); this function only selects the
+ * lane and does not re-resolve the root — re-resolving with the defaulted
+ * root would null a valid marker as a root mismatch (D-280).
  */
 export async function resolveDefaultIndexGroupLabel(options) {
   const rootDir = requireRootDir(options);
-  const markerContext = await resolveLaneMarkerContext({
-    cwd: options.cwd,
-    explicitRootDir: rootDir,
-    explicitSessionId: options.sessionId ?? null,
-  });
   const sessions = await listProjectSessions({ rootDir, cwd: options.cwd });
   const selection = resolveLaneSelection({
     explicitSessionId: options.sessionId ?? null,
-    marker: markerContext.marker,
+    marker: options.marker ?? null,
     laneIds: sessions.lanes.map((lane) => lane.id),
     rootDir,
     purpose: 'label the decision index group for',
@@ -350,7 +349,7 @@ export async function resolveDefaultIndexGroupLabel(options) {
   return {
     label: `${lane.sessionDate} — Session ${lane.sessionNumber} (${lane.id} lane)`,
     sessionId: selection.sessionId,
-    warnings: [...markerContext.warnings, ...selection.warnings],
+    warnings: [...selection.warnings],
   };
 }
 

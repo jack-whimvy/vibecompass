@@ -598,14 +598,16 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     }
 
     // D-282 guarded lane temp-dir removal: runs before the lane record —
-    // the only pointer to the temp dir — is destroyed. Lanes without a
+    // the only pointer to the temp dir — is destroyed. The namespace is
+    // verified from the recorded path's own <root-key>/<lane-id> tail against
+    // the env-independent rootKey, never a close-time recompute of tmp_base
+    // (os.tmpdir() reads TMPDIR, which lane-env pollutes). Lanes without a
     // recorded runtime block (pre-S4) close exactly as before.
     if (closingLaneMetadata?.runtime?.tmpDir) {
-      const runtimeSettings = resolveRuntimeSettings(projectConfig);
       runtimeCleanup = await removeLaneTmpDirAtClose({
         recordedTmpDir: closingLaneMetadata.runtime.tmpDir,
         laneId: sessionId,
-        namespaceDir: path.join(runtimeSettings.tmpBase, await computeLaneTmpRootKey(normalized.rootDir)),
+        rootKey: await computeLaneTmpRootKey(normalized.rootDir),
         cwd: normalized.cwd,
       });
       markerCleanupWarnings.push(...runtimeCleanup.warnings);
