@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Complete the remaining Phase 8 start-session overlap warnings: lanes can now
+  declare expected architecture doc paths with `--architecture-doc` and
+  decision domain files with `--decision-domain-file` / `--decision-domain`;
+  active-lane overlap warnings compare normalized path spellings for those
+  fields, and same-repo ownership ambiguity now covers one-sided or
+  unparseable path claims while treating single-repo unprefixed claims and
+  disjoint feature slugs as real non-overlapping ownership.
+- Harden S2 lane-marker follow-ups: mutating session commands revalidate a
+  pre-lock marker snapshot after acquiring the memory-root lock, close-session
+  reports unrecorded cwd markers that name the closing lane, and marker parsing
+  round-trips Windows absolute `memory_root` values with backslashes.
+
 ## 0.11.0 - 2026-07-03
 
 Phase 8 concurrent multi-session lanes (stages S1–S4). Highlights: a per-root

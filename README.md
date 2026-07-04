@@ -145,7 +145,15 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # close-session and docs-update also print a pre-close staleness set: new
 # decisions since lane start, stale base revisions, newer finalized notes
 # that mention the lane's scope, and claim overlap with other active lanes.
-npx -y @vibecompass/vibecompass@latest start-session --id auth-flow --working-on "Auth flow" --repo app --branch feature/auth --worktree
+npx -y @vibecompass/vibecompass@latest start-session \
+  --id auth-flow \
+  --working-on "Auth flow" \
+  --repo app \
+  --claim src/app/auth \
+  --architecture-doc architecture/product/auth/login.md \
+  --decision-domain-file cross-cutting.md \
+  --branch feature/auth \
+  --worktree
 
 # Per-lane runtime isolation (D-282): every lane gets its own port and temp
 # dir at start (recorded in the lane's session.yaml; defaults configurable

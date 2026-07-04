@@ -678,6 +678,388 @@ test('session lanes can run concurrently and switch current lane', async () => {
   }
 });
 
+test('start-session warns on architecture doc and decision domain file overlap', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-doc-overlap-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    const cliStdout = [];
+    const cliStderr = [];
+    const startExitCode = await runCli(
+      [
+        'start-session',
+        '--root',
+        rootDir,
+        '--id',
+        'auth-docs',
+        '--working-on',
+        'Update auth architecture.',
+        '--repo',
+        'app',
+        '--architecture-doc',
+        './architecture//product/auth/./login.md',
+        '--decision-domain-file',
+        './decisions/./cross-cutting.md',
+        '--date',
+        '2026-04-20',
+      ],
+      {
+        stdout: { write(chunk) { cliStdout.push(chunk); } },
+        stderr: { write(chunk) { cliStderr.push(chunk); } },
+      },
+      {
+        cwd: tempDir,
+      },
+    );
+    assert.equal(startExitCode, 0);
+    assert.match(cliStdout.join(''), /Started session 2026-04-20-1/);
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-decisions',
+      workingOn: 'Update auth decision docs.',
+      repos: ['app'],
+      architectureDocs: ['architecture/product/auth/login.md'],
+      decisionDomainFiles: ['decisions/cross-cutting.md'],
+      date: '2026-04-20',
+    });
+
+    assert.match(
+      result.warnings.join('\n'),
+      /overlaps "auth-docs" on architecture doc\(s\): architecture\/product\/auth\/login\.md/,
+    );
+    assert.match(
+      result.warnings.join('\n'),
+      /overlaps "auth-docs" on decision domain file\(s\): decisions\/cross-cutting\.md/,
+    );
+
+    const metadata = await readFile(path.join(rootDir, 'sessions/active/auth-docs/session.yaml'), 'utf8');
+    assert.match(metadata, /architecture_docs:\n  - "architecture\/product\/auth\/login\.md"/);
+    assert.match(metadata, /decision_domain_files:\n  - "decisions\/cross-cutting\.md"/);
+    assert.doesNotMatch(metadata, /\/\.\//);
+    assert.doesNotMatch(metadata, /decisions\/\.\/decisions/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session warns when same-repo path ownership is ambiguous', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-unknown-owner-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'repo-wide',
+      workingOn: 'Touch app repo broadly.',
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-path',
+      workingOn: 'Touch billing path.',
+      repos: ['app'],
+      claims: ['src/app/billing'],
+      date: '2026-04-20',
+    });
+
+    assert.match(result.warnings.join('\n'), /ownership is ambiguous/);
+    assert.match(result.warnings.join('\n'), /Add --claim paths or --feature slugs to both lanes/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session treats disjoint feature slugs as same-repo ownership disambiguation', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-feature-owner-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-feature',
+      workingOn: 'Touch auth broadly.',
+      features: ['auth'],
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-feature',
+      workingOn: 'Touch billing broadly.',
+      features: ['billing'],
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+
+    assert.doesNotMatch(result.warnings.join('\n'), /ownership is ambiguous/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session does not let overlapping feature slugs suppress ambiguous ownership', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-shared-feature-owner-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-one',
+      workingOn: 'Touch auth broadly.',
+      features: ['auth'],
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-two',
+      workingOn: 'Touch auth again.',
+      features: ['auth'],
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+
+    assert.match(result.warnings.join('\n'), /overlaps "auth-one" on feature\(s\): auth/);
+    assert.match(result.warnings.join('\n'), /ownership is ambiguous/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session treats unprefixed single-repo claims as non-overlapping ownership', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-unprefixed-claim-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-path',
+      workingOn: 'Touch auth path.',
+      repos: ['app'],
+      claims: ['src/app/auth'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-path',
+      workingOn: 'Touch billing path.',
+      repos: ['app'],
+      claims: ['src/app/billing'],
+      date: '2026-04-20',
+    });
+
+    assert.doesNotMatch(result.warnings.join('\n'), /ownership is ambiguous/);
+    assert.doesNotMatch(result.warnings.join('\n'), /overlaps "auth-path" on claimed path/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session warns when multi-repo claims only disambiguate part of the shared repo set', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-partial-claim-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [
+        { id: 'app', remote: 'https://github.com/example/app.git' },
+        { id: 'docs', remote: 'https://github.com/example/docs.git' },
+      ],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'auth-app',
+      workingOn: 'Touch auth app paths.',
+      repos: ['app', 'docs'],
+      claims: ['app:src/app/auth'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-app',
+      workingOn: 'Touch billing app paths.',
+      repos: ['app', 'docs'],
+      claims: ['app:src/app/billing'],
+      date: '2026-04-20',
+    });
+
+    assert.match(result.warnings.join('\n'), /shares repo\(s\) app, docs with "auth-app"/);
+    assert.match(result.warnings.join('\n'), /ownership is ambiguous/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session treats Windows drive-letter claims as unprefixed paths', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-windows-claim-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'windows-claim',
+      workingOn: 'Touch a Windows-looking path.',
+      repos: ['app'],
+      claims: ['C:\\Users\\dev\\project\\auth'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-path',
+      workingOn: 'Touch billing path.',
+      repos: ['app'],
+      claims: ['src/app/billing'],
+      date: '2026-04-20',
+    });
+
+    assert.doesNotMatch(result.warnings.join('\n'), /ownership is ambiguous/);
+    assert.doesNotMatch(result.warnings.join('\n'), /overlaps "windows-claim" on claimed path/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session treats declared single-letter repo prefixes as repo claims', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-single-letter-repo-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Lane Project',
+      mode: 'local-only',
+      repos: [
+        { id: 'a', remote: 'https://github.com/example/a.git' },
+        { id: 'b', remote: 'https://github.com/example/b.git' },
+      ],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'repo-a',
+      workingOn: 'Touch repo a.',
+      repos: ['a', 'b'],
+      claims: ['a:/src/auth'],
+      date: '2026-04-20',
+    });
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'repo-b',
+      workingOn: 'Touch repo b.',
+      repos: ['a', 'b'],
+      claims: ['b:/src/billing'],
+      date: '2026-04-20',
+    });
+
+    assert.match(result.warnings.join('\n'), /ownership is ambiguous/);
+    assert.doesNotMatch(result.warnings.join('\n'), /overlaps "repo-a" on claimed path/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('session lifecycle manifest refresh preserves sync cursor state', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-sync-preserve-'));
   const rootDir = path.join(tempDir, '.compass');

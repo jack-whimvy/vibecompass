@@ -949,6 +949,13 @@ function parseStartSessionArgs(argv) {
       case '--claim':
         parsed.claims = [...(parsed.claims ?? []), value];
         break;
+      case '--architecture-doc':
+        parsed.architectureDocs = [...(parsed.architectureDocs ?? []), value];
+        break;
+      case '--decision-domain':
+      case '--decision-domain-file':
+        parsed.decisionDomainFiles = [...(parsed.decisionDomainFiles ?? []), value];
+        break;
       case '--branch':
         parsed.branch = value;
         break;
@@ -2248,6 +2255,8 @@ function usageText() {
     '  --feature <slug>                     Repeatable feature slug for the lane',
     '  --repo <id>                          Repeatable repo ID for the lane',
     '  --claim <path>                       Repeatable path claim for overlap warnings',
+    '  --architecture-doc <path>            Repeatable architecture doc path the lane expects to edit',
+    '  --decision-domain-file <domain.md>   Repeatable decision domain file the lane expects to edit (alias: --decision-domain)',
     '  --branch <name>                      Opt-in git binding (D-281): create or reuse this branch in every bound --repo; requires at least one --repo',
     '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> (D-279) and write the lane marker into the container',
     '  --date <YYYY-MM-DD>                  Optional explicit session date',

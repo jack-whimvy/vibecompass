@@ -17,7 +17,8 @@ import { planDocsUpdate } from '../docs-update.js';
 import { inspectProjectCompatibility } from '../compatibility.js';
 import { getProjectStatus } from '../status.js';
 import { writeStateManifest } from '../manifest.js';
-import { LANE_MARKER_FILENAME, readLaneMarker } from '../lane-marker.js';
+import { LANE_MARKER_FILENAME, assertLaneMarkerSnapshotCurrent, readLaneMarker } from '../lane-marker.js';
+import { withMemoryRootLock } from '../serialization.js';
 
 const DOCUMENT_MAINTENANCE_UPDATED = {
   architectureDocs: 'updated',
@@ -70,6 +71,12 @@ async function handWriteMarker(dir, fields) {
   return markerPath;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 test('write-lane-marker + close-session resolve root and lane from a worktree cwd with no --root or --session', async () => {
   const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-infer-');
 
@@ -98,6 +105,10 @@ test('write-lane-marker + close-session resolve root and lane from a worktree cw
     });
     assert.equal(result.sessionId, 'lane-a');
     assert.equal(result.rootDir, rootDir);
+    assert.ok(
+      !result.warnings.some((warning) => /was not recorded in session\.yaml/.test(warning)),
+      'recorded markers must not be reported as unrecorded at close',
+    );
 
     const remaining = await listProjectSessions({ rootDir });
     assert.deepEqual(remaining.lanes.map((lane) => lane.id), ['lane-b']);
@@ -162,6 +173,46 @@ test('a stale marker fails closed even when a single-lane fallback would have su
   }
 });
 
+test('marker snapshot revalidation fails closed when a marker changes before a locked write', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-revalidate-');
+
+  try {
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    const markerPath = await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'token-one' });
+    const snapshot = await readLaneMarker(markerPath);
+
+    await assertLaneMarkerSnapshotCurrent({ marker: snapshot });
+
+    await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'token-two' });
+    await assert.rejects(
+      assertLaneMarkerSnapshotCurrent({ marker: snapshot }),
+      /changed while waiting for the project-memory lock/,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('marker snapshot revalidation fails closed when a marker is deleted before a locked write', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-revalidate-delete-');
+
+  try {
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    const markerPath = await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'token-one' });
+    const snapshot = await readLaneMarker(markerPath);
+
+    await rm(markerPath, { force: true });
+    await assert.rejects(
+      assertLaneMarkerSnapshotCurrent({ marker: snapshot }),
+      /changed while waiting for the project-memory lock/,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('a marker bound to a different memory root is ignored with a warning under an explicit --root', async () => {
   const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-mismatch-');
 
@@ -187,6 +238,31 @@ test('a marker bound to a different memory root is ignored with a warning under 
   }
 });
 
+test('close-session reports an unrecorded cwd marker for the closed lane', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-unrecorded-close-');
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    const markerPath = await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'manual-token' });
+
+    const result = await closeProjectSession({
+      cwd: wtDir,
+      ...CLOSE_DEFAULTS,
+    });
+
+    assert.equal(result.sessionId, 'lane-a');
+    assert.equal(existsSync(markerPath), true, 'unrecorded marker must survive close');
+    assert.ok(
+      result.warnings.some((warning) => /was not recorded in session\.yaml/.test(warning)),
+      'expected an unrecorded-marker cleanup warning',
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('an explicit --session overrides a resolvable marker with a warning naming both lanes', async () => {
   const { tempDir, rootDir } = await createInitializedRoot('vibecompass-marker-override-');
 
@@ -207,6 +283,11 @@ test('an explicit --session overrides a resolvable marker with a warning naming 
     assert.ok(overrideWarning, 'expected a flag-vs-marker warning');
     assert.match(overrideWarning, /lane-b/);
     assert.match(overrideWarning, /marker lane: lane-a/);
+    assert.equal(
+      result.warnings.filter((warning) => /overrides the lane marker/.test(warning)).length,
+      1,
+      'close-session should suppress duplicate lane warnings from its embedded docs-update plan',
+    );
 
     const remaining = await listProjectSessions({ rootDir });
     assert.deepEqual(remaining.lanes.map((lane) => lane.id), ['lane-a']);
@@ -337,6 +418,28 @@ test('docs-update refuses the root-global pointer with 2+ lanes and resolves via
     const plan = await planDocsUpdate({ cwd: wtDir });
     assert.equal(plan.session?.id, 'lane-b');
     assert.equal(plan.rootDir, rootDir);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-update fails closed on a stale marker through its own lane resolver', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-docs-update-stale-marker-');
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    const markerPath = await handWriteMarker(wtDir, { laneId: 'ghost-lane', memoryRoot: rootDir });
+
+    await assert.rejects(
+      planDocsUpdate({ cwd: wtDir }),
+      (error) => {
+        assert.match(error.message, /names lane "ghost-lane"/);
+        assert.ok(error.message.includes(markerPath), 'stale-marker error must name the marker path');
+        return true;
+      },
+    );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -538,12 +641,36 @@ test('readLaneMarker rejects unsupported format_version, relative memory_root, a
     markerPath = await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: 'relative/.compass' });
     await assert.rejects(readLaneMarker(markerPath), /memory_root as an absolute path/);
 
+    markerPath = await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: '\\not-absolute' });
+    await assert.rejects(readLaneMarker(markerPath), /memory_root as an absolute path/);
+
     await writeFile(
       markerPath,
       `format_version: 1\nlane_id: lane-a\nmemory_root: ${JSON.stringify(rootDir)}\n`,
       'utf8',
     );
     await assert.rejects(readLaneMarker(markerPath), /missing its token/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('readLaneMarker round-trips a Windows absolute memory_root with backslashes', async () => {
+  const { tempDir } = await createInitializedRoot('vibecompass-marker-windows-path-');
+
+  try {
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    const windowsRoot = 'C:\\Users\\dev\\project\\.compass';
+    const markerPath = await handWriteMarker(wtDir, {
+      laneId: 'lane-a',
+      memoryRoot: windowsRoot,
+      token: 'windows-token',
+    });
+
+    const marker = await readLaneMarker(markerPath);
+    assert.equal(marker.memoryRoot, windowsRoot);
+    assert.equal(marker.token, 'windows-token');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -622,6 +749,77 @@ test('switch-session warns when the enclosing marker binds a different lane', as
     assert.ok(warning, 'expected the switch-session disagreement warning');
     assert.match(warning, /marker lane: lane-a/);
   } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('switch-session revalidates the marker snapshot after waiting for the memory-root lock', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-switch-marker-revalidate-');
+  let releaseLock;
+  let holdLock;
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    await startLane(tempDir, 'lane-b');
+    const wtDir = path.join(tempDir, 'wt');
+    await mkdir(wtDir, { recursive: true });
+    await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: wtDir });
+
+    holdLock = withMemoryRootLock(rootDir, 'test-hold-switch', async () =>
+      new Promise((resolve) => {
+        releaseLock = resolve;
+      }));
+    while (!releaseLock) {
+      await delay(5);
+    }
+
+    const switched = switchProjectSession({ cwd: wtDir, sessionId: 'lane-b' });
+    await delay(100);
+    await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'changed-token' });
+    releaseLock();
+    await assert.rejects(switched, /changed while waiting for the project-memory lock/);
+    await holdLock;
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+    await holdLock?.catch(() => {});
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('write-lane-marker revalidates the marker snapshot after waiting for the memory-root lock', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-write-marker-revalidate-');
+  let releaseLock;
+  let holdLock;
+
+  try {
+    await startLane(tempDir, 'lane-a');
+    const wtDir = path.join(tempDir, 'wt');
+    const targetDir = path.join(tempDir, 'target');
+    await mkdir(wtDir, { recursive: true });
+    await mkdir(targetDir, { recursive: true });
+    await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: wtDir });
+
+    holdLock = withMemoryRootLock(rootDir, 'test-hold-write-marker', async () =>
+      new Promise((resolve) => {
+        releaseLock = resolve;
+      }));
+    while (!releaseLock) {
+      await delay(5);
+    }
+
+    const writeMarker = writeLaneMarkerForSession({ cwd: wtDir, sessionId: 'lane-a', dir: targetDir });
+    await delay(100);
+    await handWriteMarker(wtDir, { laneId: 'lane-a', memoryRoot: rootDir, token: 'changed-token' });
+    releaseLock();
+    await assert.rejects(writeMarker, /changed while waiting for the project-memory lock/);
+    await holdLock;
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+    await holdLock?.catch(() => {});
     await rm(tempDir, { recursive: true, force: true });
   }
 });

@@ -26,6 +26,7 @@ import {
 } from './lane-runtime.js';
 import {
   LANE_MARKER_FILENAME,
+  assertLaneMarkerSnapshotCurrent,
   assertMarkerTargetDisjoint,
   findEnclosingGitDir,
   readLaneMarker,
@@ -141,6 +142,7 @@ export async function inferToolingRootForMemoryRoot(rootDir) {
 }
 
 async function startProjectSessionLocked(normalized, options, markerContext) {
+  await assertLaneMarkerSnapshotCurrent(markerContext);
   const workingOn = requireNonEmptyString(options?.workingOn, 'start-session requires a non-empty workingOn value.');
   const sessionDate = normalizeSessionDate(options?.date);
 
@@ -151,12 +153,17 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
   const features = normalizeStringArray(options?.features);
   const repos = normalizeStringArray(options?.repos);
   const claims = normalizeStringArray(options?.claims);
+  const architectureDocs = normalizeStringArray(options?.architectureDocs).map(normalizeArchitectureDocPath);
+  const decisionDomainFiles = normalizeStringArray(options?.decisionDomainFiles ?? options?.decisionDomains)
+    .map(normalizeDecisionDomainFile);
   const existingLanes = await listActiveSessionLanes(normalized);
   const overlapWarnings = buildOverlapWarnings({
     sessionId,
     features,
     repos,
     claims,
+    architectureDocs,
+    decisionDomainFiles,
     existingLanes,
   });
   const highestDecisionId = await readHighestDecisionId(normalized.rootDir);
@@ -275,6 +282,8 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       features,
       repos,
       claims,
+      architectureDocs,
+      decisionDomainFiles,
       baseRevisions: baseRevisionCapture.baseRevisions,
       runtime: laneRuntime,
       // Record-before-create (D-281): the full binding plan — including the
@@ -425,6 +434,7 @@ export async function closeProjectSession(options) {
 }
 
 async function closeProjectSessionLocked(normalized, options, markerContext) {
+  await assertLaneMarkerSnapshotCurrent(markerContext);
   const title = requireNonEmptyString(options?.title, 'session close requires a non-empty title.');
   const completed = normalizeStringArray(options?.completed);
   const models = normalizeStringArray(options?.models);
@@ -581,6 +591,17 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
         const containerCleanup = await removeEmptyWorktreeContainer(closingLaneMetadata.worktreeContainer, normalized.cwd);
         containerRemoved = containerCleanup.removed;
         markerCleanupWarnings.push(...containerCleanup.warnings);
+      }
+    }
+    if (markerContext.marker?.laneId === sessionId) {
+      const contextMarkerPath = path.resolve(markerContext.marker.markerPath);
+      const recordedMarkerPath = closingLaneMetadata?.laneMarker?.path
+        ? path.resolve(closingLaneMetadata.laneMarker.path)
+        : null;
+      if (contextMarkerPath !== recordedMarkerPath && (await fileExists(contextMarkerPath))) {
+        markerCleanupWarnings.push(
+          `Lane marker at ${contextMarkerPath} names the closed lane "${sessionId}" but was not recorded in session.yaml; close-session left it in place. Remove it manually or recreate it with \`vibecompass write-lane-marker\` before reusing that directory.`,
+        );
       }
     }
     if (removal.attempted) {
@@ -888,6 +909,7 @@ export async function switchProjectSession(options = {}) {
 }
 
 async function switchProjectSessionLocked(normalized, options, markerContext) {
+  await assertLaneMarkerSnapshotCurrent(markerContext);
   const sessionId = validateLaneId(requireNonEmptyString(options?.sessionId, 'switch-session requires a session ID.'));
   const lanes = await listActiveSessionLanes(normalized);
   const lane = lanes.find((item) => item.id === sessionId);
@@ -1008,6 +1030,7 @@ export async function writeLaneMarkerForSession(options) {
 }
 
 async function writeLaneMarkerForSessionLocked(normalized, options, markerContext) {
+  await assertLaneMarkerSnapshotCurrent(markerContext);
   const sessionId = validateLaneId(
     requireNonEmptyString(options?.sessionId, 'write-lane-marker requires --session <lane-id> so the marker binds to an explicit lane.'),
   );
@@ -1494,6 +1517,8 @@ async function listActiveSessionLanes(normalized) {
         features: metadata.features,
         repos: metadata.repos,
         claims: metadata.claims,
+        architectureDocs: metadata.architectureDocs,
+        decisionDomainFiles: metadata.decisionDomainFiles,
         startedAt: metadata.startedAt,
         decisionSnapshot: metadata.decisionSnapshot,
         branch: metadata.branch ?? null,
@@ -1536,6 +1561,8 @@ async function readLaneMetadata(sessionFilePath) {
       features: normalizeStringArray(data.feature_slugs),
       repos: normalizeStringArray(data.repos),
       claims: normalizeStringArray(data.claimed_paths),
+      architectureDocs: normalizeStringArray(data.architecture_docs).map(normalizeArchitectureDocPath),
+      decisionDomainFiles: normalizeStringArray(data.decision_domain_files).map(normalizeDecisionDomainFile),
       startedAt: normalizeOptionalString(data.started_at),
       decisionSnapshot: {
         highestDecisionId: parseNullableNumber(data.decision_snapshot?.highest_decision_id),
@@ -1569,6 +1596,8 @@ async function readLaneMetadata(sessionFilePath) {
       features: [],
       repos: [],
       claims: [],
+      architectureDocs: [],
+      decisionDomainFiles: [],
       startedAt: null,
       decisionSnapshot: {
         highestDecisionId: null,
@@ -1827,6 +1856,8 @@ function renderLaneMetadata(options) {
     renderYamlArray('feature_slugs', options.features),
     renderYamlArray('repos', options.repos),
     renderYamlArray('claimed_paths', options.claims),
+    renderYamlArray('architecture_docs', options.architectureDocs),
+    renderYamlArray('decision_domain_files', options.decisionDomainFiles),
     `started_at: ${formatLocalDateTime(new Date())}`,
     // D-282: the runtime assignment travels with the lane record (local-only
     // per D-278) so lane-env and close-time cleanup read it back.
@@ -2009,17 +2040,52 @@ function buildOverlapWarnings(options) {
       );
     }
 
-    const claimOverlaps = findClaimOverlaps(options.claims, lane.claims ?? []);
+    const claimOverlaps = findClaimOverlaps(
+      options.claims,
+      options.repos,
+      lane.claims ?? [],
+      lane.repos ?? [],
+    );
     for (const overlap of claimOverlaps) {
       warnings.push(
         `Active session lane "${options.sessionId}" overlaps "${lane.id}" on claimed path ${overlap.repo}:${overlap.path}.`,
       );
     }
 
-    const sharedRepos = intersect(options.repos, lane.repos ?? []);
-    if (sharedRepos.length > 0 && options.claims.length === 0 && (lane.claims ?? []).length === 0) {
+    const sharedArchitectureDocs = intersect(options.architectureDocs ?? [], lane.architectureDocs ?? []);
+    if (sharedArchitectureDocs.length > 0) {
       warnings.push(
-        `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with "${lane.id}" without path claims; add --claim values to clarify ownership.`,
+        `Active session lane "${options.sessionId}" overlaps "${lane.id}" on architecture doc(s): ${sharedArchitectureDocs.join(', ')}.`,
+      );
+    }
+
+    const sharedDecisionDomainFiles = intersect(options.decisionDomainFiles ?? [], lane.decisionDomainFiles ?? []);
+    if (sharedDecisionDomainFiles.length > 0) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" overlaps "${lane.id}" on decision domain file(s): ${sharedDecisionDomainFiles.join(', ')}.`,
+      );
+    }
+
+    const sharedRepos = intersect(options.repos, lane.repos ?? []);
+    const disambiguatedByFeatures =
+      options.features.length > 0 &&
+      (lane.features ?? []).length > 0 &&
+      sharedFeatures.length === 0;
+    const disambiguatedByClaims = hasNarrowNonOverlappingClaims({
+      sharedRepos,
+      leftClaims: options.claims,
+      leftRepos: options.repos,
+      rightClaims: lane.claims ?? [],
+      rightRepos: lane.repos ?? [],
+    });
+    if (
+      sharedRepos.length > 0 &&
+      claimOverlaps.length === 0 &&
+      !disambiguatedByFeatures &&
+      !disambiguatedByClaims
+    ) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with "${lane.id}" without narrower non-overlapping ownership; ownership is ambiguous. Add --claim paths or --feature slugs to both lanes to clarify ownership.`,
       );
     }
   }
@@ -2036,10 +2102,10 @@ function intersect(left, right) {
   return left.filter((item) => rightSet.has(item));
 }
 
-function findClaimOverlaps(leftClaims, rightClaims) {
+function findClaimOverlaps(leftClaims, leftRepos, rightClaims, rightRepos) {
   const overlaps = [];
-  for (const left of leftClaims.map(parseClaim).filter(Boolean)) {
-    for (const right of rightClaims.map(parseClaim).filter(Boolean)) {
+  for (const left of expandClaims(leftClaims, leftRepos)) {
+    for (const right of expandClaims(rightClaims, rightRepos)) {
       if (left.repo !== right.repo) {
         continue;
       }
@@ -2056,20 +2122,94 @@ function findClaimOverlaps(leftClaims, rightClaims) {
   return overlaps;
 }
 
-function parseClaim(value) {
-  const separatorIndex = value.indexOf(':');
-  if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
-    return null;
+function hasNarrowNonOverlappingClaims(options) {
+  if (options.sharedRepos.length === 0) {
+    return false;
   }
 
-  return {
-    repo: value.slice(0, separatorIndex),
-    path: normalizeClaimPath(value.slice(separatorIndex + 1)),
-  };
+  const leftClaims = expandClaims(options.leftClaims, options.leftRepos);
+  const rightClaims = expandClaims(options.rightClaims, options.rightRepos);
+  return options.sharedRepos.every((repo) => {
+    const leftForRepo = leftClaims.filter((claim) => claim.repo === repo);
+    const rightForRepo = rightClaims.filter((claim) => claim.repo === repo);
+    if (leftForRepo.length === 0 || rightForRepo.length === 0) {
+      return false;
+    }
+
+    return leftForRepo.every((left) =>
+      rightForRepo.every((right) => !pathPrefixesOverlap(left.path, right.path)));
+  });
+}
+
+function expandClaims(claims, repos) {
+  const normalizedRepos = normalizeStringArray(repos);
+  return normalizeStringArray(claims)
+    .flatMap((claim) => parseClaim(claim, normalizedRepos))
+    .filter(Boolean);
+}
+
+function parseClaim(value, repos = []) {
+  const source = String(value ?? '').trim();
+  if (!source) {
+    return [];
+  }
+
+  const normalizedRepos = normalizeStringArray(repos);
+  const separatorIndex = source.indexOf(':');
+  const repoId = separatorIndex > 0 ? source.slice(0, separatorIndex) : '';
+  const rawClaimPath = separatorIndex > 0 ? source.slice(separatorIndex + 1) : '';
+  if (separatorIndex > 0 && !rawClaimPath) {
+    return [];
+  }
+
+  if (
+    separatorIndex > 0 &&
+    rawClaimPath &&
+    (!isWindowsDrivePath(source) || (normalizedRepos.includes(repoId) && rawClaimPath.startsWith('/')))
+  ) {
+    const normalizedPath = normalizeClaimPath(rawClaimPath);
+    if (!normalizedPath) {
+      return [];
+    }
+
+    return [{
+      repo: repoId,
+      path: normalizedPath,
+    }];
+  }
+
+  const normalized = normalizeClaimPath(source);
+  if (!normalized) {
+    return [];
+  }
+
+  return normalizedRepos.map((repo) => ({
+    repo,
+    path: normalized,
+  }));
 }
 
 function normalizeClaimPath(value) {
-  return value.replace(/^\/+/, '').replace(/\/+$/, '');
+  return String(value ?? '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .split('/')
+    .filter((segment) => segment !== '' && segment !== '.')
+    .join('/');
+}
+
+function normalizeArchitectureDocPath(value) {
+  return normalizeClaimPath(value);
+}
+
+function normalizeDecisionDomainFile(value) {
+  const normalized = normalizeClaimPath(value);
+  return normalized.startsWith('decisions/') ? normalized : `decisions/${normalized}`;
+}
+
+function isWindowsDrivePath(value) {
+  return /^[A-Za-z]:[\\/]/.test(String(value ?? ''));
 }
 
 function pathPrefixesOverlap(left, right) {

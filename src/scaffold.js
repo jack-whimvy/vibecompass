@@ -276,7 +276,7 @@ ${renderWorkflowDefaults(workflow)}
 6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
 
 ## Builder workflow
-At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees (D-281).
+At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--feature\`, \`--repo\`, \`--claim\`, \`--architecture-doc\`, and \`--decision-domain-file\` values when the lane's scope is known so overlap warnings can be precise. Add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees (D-281).
 If you manage files manually, create \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` and \`${rootRelativePath}/sessions/active/index.yaml\`, then create \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` if it does not exist:
 
 \`\`\`md

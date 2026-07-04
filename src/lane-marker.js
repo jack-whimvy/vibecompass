@@ -108,7 +108,7 @@ export async function readLaneMarker(markerPath) {
   }
 
   const memoryRoot = typeof data.memory_root === 'string' ? data.memory_root.trim() : '';
-  if (!memoryRoot || !path.isAbsolute(memoryRoot)) {
+  if (!memoryRoot || !isAbsolutePathForAnySupportedPlatform(memoryRoot)) {
     throw new Error(
       `Lane marker at ${markerPath} must record memory_root as an absolute path (found ${JSON.stringify(data.memory_root ?? null)}). ` +
         'Recreate the marker with `vibecompass write-lane-marker`, or pass both --root and --session to bypass it.',
@@ -186,6 +186,40 @@ export async function resolveLaneMarkerContext(options) {
     marker,
     warnings,
   };
+}
+
+/**
+ * In-lock revalidation for a marker snapshot captured before waiting on the
+ * memory-root lock. If the marker changed while the command waited, fail
+ * closed instead of using stale lane/root context for a mutating operation.
+ */
+export async function assertLaneMarkerSnapshotCurrent(markerContext) {
+  const snapshot = markerContext?.marker;
+  if (!snapshot) {
+    return;
+  }
+
+  let current;
+  try {
+    current = await readLaneMarker(snapshot.markerPath);
+  } catch (error) {
+    throw new Error(
+      `Lane marker at ${snapshot.markerPath} changed while waiting for the project-memory lock. ` +
+        `Could not re-read the original marker (${error instanceof Error ? error.message : String(error)}). ` +
+        'Rerun the command so lane selection and root inference are based on the current marker.',
+    );
+  }
+
+  if (
+    current.laneId !== snapshot.laneId ||
+    current.memoryRoot !== snapshot.memoryRoot ||
+    current.token !== snapshot.token
+  ) {
+    throw new Error(
+      `Lane marker at ${snapshot.markerPath} changed while waiting for the project-memory lock. ` +
+        'Rerun the command so lane selection and root inference are based on the current marker.',
+    );
+  }
 }
 
 /**
@@ -327,6 +361,10 @@ async function canonicalizePath(value) {
   } catch {
     return path.resolve(value);
   }
+}
+
+function isAbsolutePathForAnySupportedPlatform(value) {
+  return path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
 }
 
 async function fileExists(filePath) {
