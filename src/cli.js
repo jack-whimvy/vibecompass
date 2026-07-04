@@ -1477,19 +1477,29 @@ async function resolveDecisionCommandContext(cwd, options) {
 }
 
 /**
- * D-283 auto-labeling for the decision-log commands: any lane-resolution
- * failure (2+ lanes with no marker/--session, stale marker) degrades to "no
- * label" so a refresh with nothing missing still succeeds and an append still
- * lands with the hand-refresh reminder. The label is only load-bearing when
- * rows are actually missing, where the library raises the actionable
- * "pass --group" problem. Marker warnings are surfaced by the caller;
- * selection warnings are returned here so they are no longer discarded.
+ * D-283 auto-labeling for the decision-log commands. Tolerance is narrow: only
+ * the "2+ active lanes with no explicit selection" ambiguity degrades to "no
+ * label" (so a no-op refresh still succeeds and an append still lands with the
+ * hand-refresh reminder). An *explicit* selection signal — a `--session` value
+ * or a resolved worktree marker — must still fail closed on a bad selection
+ * (a `--session` typo naming a non-active lane, or a stale marker) per
+ * D-277/D-280; swallowing those would let `append-decision --session <typo>`
+ * silently append a canonical decision against the wrong/no lane. Selection
+ * warnings are returned so they are no longer discarded.
  */
 async function resolveIndexGroupLabelSafely(options) {
+  const hasExplicitSelection = Boolean(options.sessionId) || Boolean(options.marker);
+  if (hasExplicitSelection) {
+    // Let a bad explicit selection propagate and fail the command closed.
+    const resolved = await resolveDefaultIndexGroupLabel(options);
+    return { label: resolved?.label ?? null, warnings: resolved?.warnings ?? [] };
+  }
+
   try {
     const resolved = await resolveDefaultIndexGroupLabel(options);
     return { label: resolved?.label ?? null, warnings: resolved?.warnings ?? [] };
   } catch {
+    // Only the 2+-lane no-selection ambiguity reaches here.
     return { label: null, warnings: [] };
   }
 }

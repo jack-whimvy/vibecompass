@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
 import { appendDecisionEntry } from '../decisions.js';
+import { LANE_MARKER_FILENAME, renderLaneMarker } from '../lane-marker.js';
 import { startProjectSession, writeLaneMarkerForSession } from '../session.js';
 import {
   checkGroupedDecisionIndex,
@@ -411,6 +412,72 @@ test('refresh-decision-index no-ops on a 2+ lane root with no marker instead of 
     const missingExit = await runCli(['refresh-decision-index', '--root', rootDir], missingIo, { cwd: tempDir });
     assert.equal(missingExit, 1);
     assert.match(stderr.join(''), /no group label/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('append-decision fails closed on an explicit --session typo instead of appending (D-277/D-283)', async () => {
+  const { tempDir, rootDir } = await createIndexedRoot();
+
+  try {
+    await startProjectSession({ cwd: tempDir, sessionId: 'gamma', workingOn: 'Gamma work' });
+    const stagedPath = path.join(tempDir, 'staged.md');
+    await writeFile(
+      stagedPath,
+      ['### D-NEXT — Should not land', '**Timestamp:** 2026-07-03 00:00 PDT', '**Decision:** x.', '**Rationale:** y.', ''].join('\n'),
+      'utf8',
+    );
+    const before = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+
+    await assert.rejects(
+      runCli(
+        ['append-decision', '--root', rootDir, '--target', 'cross-cutting.md', '--entry', stagedPath, '--session', 'nonexistent-lane'],
+        { stdout: { write() {} }, stderr: { write() {} } },
+        { cwd: tempDir },
+      ),
+      /not an active lane/,
+    );
+    assert.equal(await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8'), before, 'no decision was appended on the typo');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('decision-log commands fail closed on a stale worktree marker; 2+-lane no-op still tolerated (D-280/D-283)', async () => {
+  const { tempDir, rootDir } = await createIndexedRoot();
+
+  try {
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-a', workingOn: 'A' });
+    await startProjectSession({ cwd: tempDir, sessionId: 'lane-b', workingOn: 'B' });
+
+    // A hand-written marker binding a lane that is NOT active (stale, D-280).
+    const markerDir = path.join(tempDir, 'stale-cwd');
+    await mkdir(markerDir, { recursive: true });
+    await writeFile(
+      path.join(markerDir, LANE_MARKER_FILENAME),
+      renderLaneMarker({
+        laneId: 'ghost-lane',
+        memoryRoot: rootDir,
+        token: '11111111-1111-1111-1111-111111111111',
+        createdAt: '2026-07-03T00:00:00-07:00',
+        createdBy: '0.11.0',
+      }),
+      'utf8',
+    );
+
+    // Stale marker must fail the command closed, not silently proceed.
+    await assert.rejects(
+      runCli(['refresh-decision-index'], { stdout: { write() {} }, stderr: { write() {} } }, { cwd: markerDir }),
+      /not an active lane/,
+    );
+
+    // But the 2+-lane no-marker no-op refresh is still tolerated (Finding-2 fix
+    // must not over-correct and break the F3 behavior).
+    const { io, stdout } = createCaptureIo();
+    const exit = await runCli(['refresh-decision-index', '--root', rootDir], io, { cwd: tempDir });
+    assert.equal(exit, 0, stdout.join(''));
+    assert.match(stdout.join(''), /up to date/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

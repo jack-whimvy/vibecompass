@@ -15,6 +15,7 @@ import {
   defaultLaneTmpBase,
   removeLaneTmpDirAtClose,
   resolveRuntimeSettings,
+  stripLaneTmpNamespace,
 } from '../lane-runtime.js';
 
 const DOCUMENT_MAINTENANCE_UPDATED = {
@@ -139,6 +140,54 @@ test('sibling lanes get distinct ports and temp dirs; a freed port is reused (D-
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test('a lane started from a lane-env-polluted shell is a sibling, not nested; closing one keeps the other (D-284)', async () => {
+  // Default tmp_base (unconfigured) so os.tmpdir()/TMPDIR drives placement.
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lane-runtime-');
+  const originalTmpdir = process.env.TMPDIR;
+  let laneNamespace;
+
+  try {
+    const laneA = await startProjectSession({ cwd: tempDir, sessionId: 'lane-a', workingOn: 'A' });
+    laneNamespace = path.dirname(laneA.runtime.tmpDir); // <realTmp>/vibecompass-lanes/<rootKey>
+
+    // Simulate `eval "$(vibecompass lane-env)"` for lane A, then start lane B.
+    process.env.TMPDIR = laneA.runtime.tmpDir;
+    const laneB = await startProjectSession({ cwd: tempDir, sessionId: 'lane-b', workingOn: 'B' });
+
+    assert.equal(
+      laneB.runtime.tmpDir.startsWith(`${laneA.runtime.tmpDir}${path.sep}`),
+      false,
+      'lane B must NOT be nested inside lane A',
+    );
+    assert.equal(path.dirname(laneB.runtime.tmpDir), laneNamespace, 'lane B is a sibling under the same namespace');
+    assert.equal(existsSync(laneB.runtime.tmpDir), true);
+    assert.ok(
+      laneB.warnings.some((warning) => warning.includes('lane-env` shell')),
+      'a warning surfaces the un-nesting',
+    );
+
+    // Close lane A from a normal shell; lane B's active temp dir must survive.
+    process.env.TMPDIR = originalTmpdir;
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.equal(existsSync(laneA.runtime.tmpDir), false, 'lane A temp dir removed');
+    assert.equal(existsSync(laneB.runtime.tmpDir), true, 'closing lane A did NOT remove lane B');
+  } finally {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    if (laneNamespace) await rm(laneNamespace, { recursive: true, force: true });
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('stripLaneTmpNamespace un-nests a polluted temp root (D-284 unit)', () => {
+  const real = path.join(path.sep, 'T');
+  const polluted = path.join(real, 'vibecompass-lanes', 'abc123def456', 'lane-a');
+  assert.equal(stripLaneTmpNamespace(polluted), real);
+  assert.equal(stripLaneTmpNamespace(real), real, 'a clean temp root is unchanged');
+  assert.equal(defaultLaneTmpBase().endsWith(path.join('vibecompass-lanes')), true);
 });
 
 test('project.yaml runtime overrides port_base, port_step, and tmp_base (D-282)', async () => {

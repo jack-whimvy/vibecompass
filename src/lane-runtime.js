@@ -19,8 +19,30 @@ export const LANE_PORT_MIN = 1024;
 export const LANE_PORT_MAX = 65535;
 const LANE_TMP_NAMESPACE = 'vibecompass-lanes';
 
+/**
+ * The default lane temp base is `<os.tmpdir()>/vibecompass-lanes`, but
+ * `os.tmpdir()` reads `TMPDIR` at call time and D-282's own `lane-env` export
+ * sets `TMPDIR=<laneTmpDir>` (the conventional alias). Starting a new lane from
+ * inside a `lane-env` shell would therefore place it *nested inside* the
+ * exporting lane's temp dir — a dangerous layout, because closing the outer
+ * lane recursively removes the inner lane's active temp dir. Strip any
+ * `vibecompass-lanes` segment out of the resolved temp root first, so a lane
+ * started from a `lane-env` shell is a sibling of the exporting lane under the
+ * real OS temp root, never nested (D-284).
+ */
+export function stripLaneTmpNamespace(dir) {
+  const segments = dir.split(path.sep);
+  const index = segments.indexOf(LANE_TMP_NAMESPACE);
+  if (index === -1) {
+    return dir;
+  }
+
+  const rootSegments = segments.slice(0, index);
+  return rootSegments.join(path.sep) || path.sep;
+}
+
 export function defaultLaneTmpBase() {
-  return path.join(os.tmpdir(), LANE_TMP_NAMESPACE);
+  return path.join(stripLaneTmpNamespace(os.tmpdir()), LANE_TMP_NAMESPACE);
 }
 
 /**
@@ -70,6 +92,13 @@ export function resolveRuntimeSettings(projectConfig) {
     } else {
       warnings.push('project.yaml runtime.tmp_base must be an absolute path; using the OS temp namespace default.');
     }
+  } else if (stripLaneTmpNamespace(os.tmpdir()) !== os.tmpdir()) {
+    // A lane-env-polluted TMPDIR was detected and un-nested (D-284). Surface it
+    // so the user knows this lane's temp dir sits beside — not inside — the
+    // lane whose lane-env they evaluated, and that it needs its own lane-env.
+    warnings.push(
+      'Detected a VibeCompass lane temp dir in TMPDIR (you are likely in a `lane-env` shell); placing this lane\'s temp dir as a sibling under the real OS temp root, not nested. Run `eval "$(vibecompass lane-env)"` for the new lane before using it.',
+    );
   }
 
   return { portBase, portStep, tmpBase, warnings };
