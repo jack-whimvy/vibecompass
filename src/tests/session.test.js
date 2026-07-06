@@ -786,6 +786,51 @@ test('worktree-bound same-repo lanes suppress shared-checkout warnings', async (
   }
 });
 
+test('worktree-bound same-repo lanes without claims warn once for missing ownership', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-bound-unclaimed-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Bound Checkout Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-a',
+      workingOn: 'A.',
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+    await appendWorktreeContainer(rootDir, 'lane-a', path.join(tempDir, 'worktrees/lane-a'));
+
+    const laneB = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-b',
+      workingOn: 'B.',
+      repos: ['app'],
+      date: '2026-04-20',
+    });
+    const warnings = laneB.warnings.join('\n');
+
+    assert.match(warnings, /without path claims/);
+    assert.doesNotMatch(warnings, /ownership is ambiguous/);
+    assert.doesNotMatch(warnings, /same checkout/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('start-session warns on architecture doc and decision domain file overlap', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-doc-overlap-'));
   const rootDir = path.join(tempDir, '.compass');
