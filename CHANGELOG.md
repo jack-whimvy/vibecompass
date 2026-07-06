@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.2 - 2026-07-06
+
 - Complete the remaining Phase 8 start-session overlap warnings: lanes can now
   declare expected architecture doc paths with `--architecture-doc` and
   decision domain files with `--decision-domain-file` / `--decision-domain`;
