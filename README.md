@@ -250,6 +250,17 @@ changed canonical project-memory files and the hosted dashboard should catch
 up. Hosted-only projects do not use a local authoritative push; update or
 refresh them through the hosted dashboard/proposal flow.
 
+The sync token is read from the environment variable you bind (for example
+`VIBECOMPASS_SYNC_TOKEN`). One-off `export`s do not survive new terminals —
+persist the token in your shell profile (`~/.zshenv` or `~/.bashrc`):
+
+```bash
+echo 'export VIBECOMPASS_SYNC_TOKEN="<your sync token>"' >> ~/.zshenv
+```
+
+If the token is lost, rotate it on the hosted dashboard under Setup -> Hosted
+sync and export the new value.
+
 ### Multiple environments
 
 One project can have named sync targets (for example a local dev server and

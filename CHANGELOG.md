@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The missing-sync-token error now explains how to recover: re-export the bound
+  env var, persist it in a shell profile, or rotate the token from the hosted
+  dashboard (previously a bare "requires VIBECOMPASS_SYNC_TOKEN" with no
+  guidance). README documents the persistence recipe.
+- AGENTS.md gains a release checklist, including verifying that
+  `vibecompass-mcp`'s dependency range still spans the new version so core
+  releases stop stranding the MCP package (its `^0.1.0` pin had drifted 27
+  releases behind).
+
 ## 0.11.2 - 2026-07-06
 
 - Complete the remaining Phase 8 start-session overlap warnings: lanes can now

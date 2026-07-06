@@ -220,7 +220,11 @@ async function loadSyncContext(options, environment) {
 
   const credential = normalizeOptionalString((environment.env ?? process.env)[binding.credentialEnvVar]);
   if (!credential) {
-    throw new Error(`Hosted sync command requires ${binding.credentialEnvVar}.`);
+    throw new Error(
+      `Hosted sync command requires ${binding.credentialEnvVar}. New terminals do not inherit one-off exports: `
+      + `re-export it (export ${binding.credentialEnvVar}="<sync token>") or persist it in your shell profile (~/.zshenv or ~/.bashrc). `
+      + 'Lost the token? Rotate it on the hosted dashboard under Setup -> Hosted sync, then export the new value.',
+    );
   }
 
   const fetchImpl = environment.runtime?.fetch ?? globalThis.fetch;
