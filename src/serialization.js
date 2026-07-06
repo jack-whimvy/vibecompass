@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 /**
@@ -47,9 +47,9 @@ export function memoryRootLockPath(rootDir) {
  * a nested call from inside the lock holder runs immediately.
  */
 export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
-  const key = path.resolve(rootDir);
+  const key = await canonicalizeMemoryRootKey(rootDir);
   const held = heldRoots.getStore();
-  if (held?.has(key)) {
+  if (await findHeldMemoryRootKey(held, key)) {
     return fn();
   }
 
@@ -75,6 +75,45 @@ export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
     if (processQueues.get(key) === queueSlot) {
       processQueues.delete(key);
     }
+  }
+}
+
+async function canonicalizeMemoryRootKey(rootDir) {
+  const resolved = path.resolve(rootDir);
+  try {
+    return await realpath(resolved);
+  } catch {
+    try {
+      return path.join(await realpath(path.dirname(resolved)), path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+async function findHeldMemoryRootKey(held, key) {
+  if (!held) {
+    return null;
+  }
+
+  if (held.has(key)) {
+    return key;
+  }
+
+  for (const heldKey of held) {
+    if (await memoryRootKeysReferToSamePath(heldKey, key)) {
+      return heldKey;
+    }
+  }
+
+  return null;
+}
+
+async function memoryRootKeysReferToSamePath(left, right) {
+  try {
+    return (await realpath(left)) === (await realpath(right));
+  } catch {
+    return false;
   }
 }
 

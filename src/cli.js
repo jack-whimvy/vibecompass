@@ -151,7 +151,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     if (result.runtime) {
       io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
-      io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (D-282; pass --session <lane-id> when multiple lanes are active).\n');
+      io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (D-282; pass --session <lane-id> when multiple lanes are active; use --worktree for independently runnable same-repo lanes).\n');
     }
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
@@ -2299,7 +2299,7 @@ function usageText() {
     '  --session <lane-id>                  Lane to export. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
     '  --json                               Print the runtime assignment as JSON instead of shell export lines',
     '  --no-conventional                    Omit the conventional PORT/TMPDIR alias exports',
-    '                                        Consume with: eval "$(vibecompass lane-env)"; defaults come from project.yaml runtime.{port_base,port_step,tmp_base}',
+    '                                        Consume with: eval "$(vibecompass lane-env)"; defaults come from project.yaml runtime.{port_base,port_step,tmp_base}; use --worktree for independent same-repo dev servers',
     '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',

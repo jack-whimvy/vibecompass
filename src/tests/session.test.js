@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
-import { closeProjectSession, listProjectSessions, startProjectSession, switchProjectSession } from '../session.js';
+import { closeProjectSession, listProjectSessions, readLaneEnvironment, startProjectSession, switchProjectSession } from '../session.js';
 
 const DOCUMENT_MAINTENANCE_UPDATED = {
   architectureDocs: 'updated',
@@ -20,6 +20,12 @@ const CLI_DOCUMENT_MAINTENANCE_UPDATED = [
   '--session-maintenance',
   'updated',
 ];
+
+async function appendWorktreeContainer(rootDir, laneId, containerDir) {
+  const sessionFilePath = path.join(rootDir, 'sessions/active', laneId, 'session.yaml');
+  const content = await readFile(sessionFilePath, 'utf8');
+  await writeFile(sessionFilePath, `${content}worktree_container: ${JSON.stringify(containerDir)}\n`, 'utf8');
+}
 
 test('startProjectSession creates scratch files and updates CLAUDE.md', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-start-'));
@@ -678,6 +684,108 @@ test('session lanes can run concurrently and switch current lane', async () => {
   }
 });
 
+test('unbound same-repo lanes warn that worktrees are the runnable isolation boundary', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-shared-checkout-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Shared Checkout Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-a',
+      workingOn: 'A.',
+      repos: ['app'],
+      claims: ['app:src/a'],
+      date: '2026-04-20',
+    });
+    const laneB = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-b',
+      workingOn: 'B.',
+      repos: ['app'],
+      claims: ['app:src/b'],
+      date: '2026-04-20',
+    });
+
+    assert.match(laneB.warnings.join('\n'), /--worktree/);
+    assert.match(laneB.warnings.join('\n'), /independent files or dev servers/);
+    assert.doesNotMatch(laneB.warnings.join('\n'), /without path claims/);
+
+    const env = await readLaneEnvironment({ cwd: tempDir, rootDir, sessionId: 'lane-b' });
+    assert.match(env.warnings.join('\n'), /exported PORT is a runtime assignment/);
+    assert.match(env.warnings.join('\n'), /worktrees are the isolation boundary/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('worktree-bound same-repo lanes suppress shared-checkout warnings', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-bound-checkout-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Bound Checkout Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-a',
+      workingOn: 'A.',
+      repos: ['app'],
+      claims: ['app:src/a'],
+      date: '2026-04-20',
+    });
+    await appendWorktreeContainer(rootDir, 'lane-a', path.join(tempDir, 'worktrees/lane-a'));
+
+    const laneB = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'lane-b',
+      workingOn: 'B.',
+      repos: ['app'],
+      claims: ['app:src/b'],
+      date: '2026-04-20',
+    });
+
+    assert.doesNotMatch(laneB.warnings.join('\n'), /--worktree/);
+    assert.doesNotMatch(laneB.warnings.join('\n'), /same checkout/);
+
+    const unboundEnv = await readLaneEnvironment({ cwd: tempDir, rootDir, sessionId: 'lane-b' });
+    assert.doesNotMatch(unboundEnv.warnings.join('\n'), /exported PORT is a runtime assignment/);
+    assert.doesNotMatch(unboundEnv.warnings.join('\n'), /same checkout/);
+
+    await appendWorktreeContainer(rootDir, 'lane-b', path.join(tempDir, 'worktrees/lane-b'));
+    const boundEnv = await readLaneEnvironment({ cwd: tempDir, rootDir, sessionId: 'lane-b' });
+    assert.doesNotMatch(boundEnv.warnings.join('\n'), /--worktree/);
+    assert.doesNotMatch(boundEnv.warnings.join('\n'), /worktrees are the isolation boundary/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('start-session warns on architecture doc and decision domain file overlap', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-doc-overlap-'));
   const rootDir = path.join(tempDir, '.compass');
@@ -834,6 +942,8 @@ test('start-session treats disjoint feature slugs as same-repo ownership disambi
     });
 
     assert.doesNotMatch(result.warnings.join('\n'), /ownership is ambiguous/);
+    assert.match(result.warnings.join('\n'), /--worktree/);
+    assert.match(result.warnings.join('\n'), /worktrees are the isolation boundary/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -920,6 +1030,8 @@ test('start-session treats unprefixed single-repo claims as non-overlapping owne
 
     assert.doesNotMatch(result.warnings.join('\n'), /ownership is ambiguous/);
     assert.doesNotMatch(result.warnings.join('\n'), /overlaps "auth-path" on claimed path/);
+    assert.match(result.warnings.join('\n'), /--worktree/);
+    assert.match(result.warnings.join('\n'), /worktrees are the isolation boundary/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

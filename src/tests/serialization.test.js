@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -82,6 +82,73 @@ test('withMemoryRootLock is reentrant for nested calls', async () => {
       withMemoryRootLock(rootDir, 'inner', async () => 'nested-ok'),
     );
     assert.equal(result, 'nested-ok');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('withMemoryRootLock serializes concurrent symlinked root spellings', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-alias-flat-');
+  const aliasRoot = path.join(tempDir, 'alias-compass');
+
+  try {
+    await symlink(rootDir, aliasRoot);
+    const order = [];
+    await Promise.all([
+      withMemoryRootLock(rootDir, 'real-root', async () => {
+        order.push('real-start');
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        order.push('real-end');
+      }),
+      withMemoryRootLock(aliasRoot, 'alias-root', async () => {
+        order.push('alias-start');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        order.push('alias-end');
+      }),
+    ]);
+
+    for (let index = 0; index < order.length; index += 2) {
+      const prefix = order[index].split('-')[0];
+      assert.equal(order[index], `${prefix}-start`);
+      assert.equal(order[index + 1], `${prefix}-end`, 'critical sections must not interleave across root spellings');
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('withMemoryRootLock re-enters across symlinked root spellings', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-alias-reentrant-');
+  const aliasRoot = path.join(tempDir, 'alias-compass');
+
+  try {
+    await symlink(rootDir, aliasRoot);
+    const result = await withMemoryRootLock(rootDir, 'outer-real', () =>
+      withMemoryRootLock(aliasRoot, 'inner-alias', async () => 'alias-reentered', { attempts: 2, staleMs: 60_000 }),
+    );
+    assert.equal(result, 'alias-reentered');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('withMemoryRootLock re-enters when an absent alias root is created by the outer lock', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-alias-created-'));
+  const realParent = path.join(tempDir, 'real-parent');
+  const aliasParent = path.join(tempDir, 'alias-parent');
+  const realRoot = path.join(realParent, '.compass');
+  const aliasRoot = path.join(aliasParent, '.compass');
+
+  try {
+    await mkdir(realParent);
+    await symlink(realParent, aliasParent);
+    const result = await withMemoryRootLock(aliasRoot, 'outer-absent-alias', () =>
+      withMemoryRootLock(realRoot, 'inner-created-real', async () => 'created-root-reentered', {
+        attempts: 2,
+        staleMs: 60_000,
+      }),
+    );
+    assert.equal(result, 'created-root-reentered');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

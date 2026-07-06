@@ -165,6 +165,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     architectureDocs,
     decisionDomainFiles,
     existingLanes,
+    hasWorktree: options?.worktree === true,
   });
   const highestDecisionId = await readHighestDecisionId(normalized.rootDir);
   const projectConfig = await readProjectConfig(normalized.projectFilePath);
@@ -871,7 +872,18 @@ export async function readLaneEnvironment(options = {}) {
     port: lane.runtime.port,
     tmpDir: lane.runtime.tmpDir,
     env,
-    warnings: [...markerContext.warnings, ...selection.warnings],
+    warnings: [
+      ...markerContext.warnings,
+      ...selection.warnings,
+      ...buildSharedCheckoutWarnings({
+        sessionId: selection.sessionId,
+        repos: lane.repos ?? [],
+        claims: lane.claims ?? [],
+        existingLanes: lanes.filter((item) => item.id !== selection.sessionId),
+        hasWorktree: Boolean(lane.worktreeContainer),
+        context: 'lane-env',
+      }),
+    ],
   };
 }
 
@@ -2067,6 +2079,27 @@ function buildOverlapWarnings(options) {
     }
 
     const sharedRepos = intersect(options.repos, lane.repos ?? []);
+    warnings.push(...buildSharedCheckoutWarnings({
+      sessionId: options.sessionId,
+      repos: options.repos,
+      claims: options.claims,
+      existingLanes: [lane],
+      hasWorktree: options.hasWorktree,
+      context: 'start-session',
+    }));
+
+    const bothLackClaims = options.claims.length === 0 && (lane.claims ?? []).length === 0;
+    if (
+      sharedRepos.length > 0 &&
+      (options.hasWorktree || lane.worktreeContainer) &&
+      bothLackClaims
+    ) {
+      warnings.push(
+        `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with "${lane.id}" without path claims; add --claim values to clarify ownership.`,
+      );
+      continue;
+    }
+
     const disambiguatedByFeatures =
       options.features.length > 0 &&
       (lane.features ?? []).length > 0 &&
@@ -2088,6 +2121,37 @@ function buildOverlapWarnings(options) {
         `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with "${lane.id}" without narrower non-overlapping ownership; ownership is ambiguous. Add --claim paths or --feature slugs to both lanes to clarify ownership.`,
       );
     }
+  }
+
+  return warnings;
+}
+
+function buildSharedCheckoutWarnings(options) {
+  if (options.hasWorktree) {
+    return [];
+  }
+
+  const warnings = [];
+  for (const lane of options.existingLanes) {
+    if (lane.worktreeContainer) {
+      continue;
+    }
+
+    const sharedRepos = intersect(options.repos, lane.repos ?? []);
+    if (sharedRepos.length === 0) {
+      continue;
+    }
+
+    const ownershipHint = options.claims.length === 0 && (lane.claims ?? []).length === 0
+      ? ' Add --claim values when shared-checkout work is intentional so ownership is reviewable.'
+      : '';
+    const runtimeHint = options.context === 'lane-env'
+      ? ' The exported PORT is a runtime assignment, not an independently runnable dev server for a shared checkout.'
+      : '';
+    warnings.push(
+      `Active session lane "${options.sessionId}" shares repo(s) ${sharedRepos.join(', ')} with unbound lane "${lane.id}" in the same checkout. ` +
+        `Use --branch <name> --worktree when lanes need independent files or dev servers; worktrees are the isolation boundary.${runtimeHint}${ownershipHint}`,
+    );
   }
 
   return warnings;
