@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1 - 2026-07-06
+
+- Harden the per-root serialization lock for symlink-aliased memory roots: root keys now canonicalize through existing parent directories when the memory root itself does not yet exist, and nested lock holders compare held/requested roots by `realpath` before reacquiring the disk lock. This preserves reentrancy when an outer lock creates the root and an inner call reaches it through another spelling.
+- Make shared-checkout lane warnings honest about runnable isolation: unbound same-repo lanes now recommend `--branch <name> --worktree` for independent files or dev servers, including at `lane-env` where `PORT` is exported, while keeping `--claim` as the ownership-review fallback.
+- Suppress shared-checkout warnings when either the selected lane or the sibling lane is already worktree-bound, and add regression coverage for the symlink-root reentrancy and worktree-bound warning paths.
+
 ## 0.11.0 - 2026-07-03
 
 Phase 8 concurrent multi-session lanes (stages S1–S4). Highlights: a per-root
