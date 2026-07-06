@@ -387,17 +387,29 @@ async function bootstrapFromBundleLocked(options, rootDir, bundlePath) {
       const binding = resolveSyncBinding(project, options.syncTarget ?? null);
       if (binding) {
         const manifestResult = await writeStateManifest(rootDir);
-        sync = buildSyncStateWithCursor(manifestResult.manifest.sync, binding, {
-          last_successful_remote_revision: serverHead.remote_revision_id,
-          last_successful_local_root_revision:
-            manifestResult.manifest.canonical.local_root_revision,
-          last_successful_manifest_hash:
-            manifestResult.manifest.canonical.manifest_hash,
-          last_sync_direction: 'bootstrap',
-          last_sync_at: new Date().toISOString(),
-          pending_previews: [],
-        });
-        cursorSeeded = true;
+        // Fail closed on cursor seeding: the cursor claims "this root's
+        // content IS the server head" — only true when the materialized
+        // manifest hash matches the head hash captured in the bundle. A
+        // mismatched bundle still materializes (files are hash-verified
+        // individually) but must not claim the head as its baseline.
+        const localHash = manifestResult.manifest.canonical.manifest_hash;
+        if (serverHead.manifest_hash && localHash !== serverHead.manifest_hash) {
+          warnings.push(
+            `Sync cursor NOT seeded: the materialized root's manifest hash (${localHash}) does not match the bundle's server head (${serverHead.manifest_hash}). `
+            + 'The files are intact, but run vibecompass sync-adopt (after reviewing divergence) before pushing.',
+          );
+        } else {
+          sync = buildSyncStateWithCursor(manifestResult.manifest.sync, binding, {
+            last_successful_remote_revision: serverHead.remote_revision_id,
+            last_successful_local_root_revision:
+              manifestResult.manifest.canonical.local_root_revision,
+            last_successful_manifest_hash: localHash,
+            last_sync_direction: 'bootstrap',
+            last_sync_at: new Date().toISOString(),
+            pending_previews: [],
+          });
+          cursorSeeded = true;
+        }
       } else {
         warnings.push(
           'No sync binding found in the bundled project.yaml; run connect-hosted before pushing.',
@@ -414,7 +426,8 @@ async function bootstrapFromBundleLocked(options, rootDir, bundlePath) {
 
   if (projectMode === 'hosted-only') {
     warnings.push(
-      'This is a hosted-only project: the root is fully usable offline, but hosted sync rejects local push until the project is demoted to local-primary.',
+      'This is a hosted-only project: the root is fully usable offline, but hosted sync rejects local push until the project is demoted. '
+      + 'To make this root canonical: run vibecompass connect-hosted (with the API URL, project id, and token env var from the hosted Setup page) to add the sync binding, then vibecompass demote-hosted.',
     );
   }
 

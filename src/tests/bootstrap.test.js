@@ -5,6 +5,7 @@ import path from 'node:path';
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { runCli } from '../cli.js';
 import { initializeProjectMemory } from '../init.js';
+import { writeStateManifest } from '../manifest.js';
 import { sha256Text } from '../hash.js';
 import { parseSimpleYaml } from '../simple-yaml.js';
 
@@ -51,7 +52,7 @@ async function collectCanonicalDocuments(rootDir) {
   return documents;
 }
 
-function buildBundle(documents, { mode, remoteRevisionId }) {
+function buildBundle(documents, { mode, remoteRevisionId, manifestHash }) {
   return {
     bundle_kind: 'bootstrap_export',
     format_version: 1,
@@ -61,7 +62,7 @@ function buildBundle(documents, { mode, remoteRevisionId }) {
     server_head: {
       remote_revision_id: remoteRevisionId,
       remote_revision: 'rr-test-1',
-      manifest_hash: 'sha256:test-server-manifest',
+      manifest_hash: manifestHash ?? 'sha256:test-server-manifest',
     },
     documents: documents.map((document) => ({
       op: 'write',
@@ -109,11 +110,23 @@ test('bootstrap materializes a local-primary root and seeds the sync cursor from
 
     const documents = await collectCanonicalDocuments(path.join(sourceDir, '.compass'));
     assert.ok(documents.length >= 1);
+    // Regenerate the source manifest after connect-hosted so its hash covers
+    // the bundled project.yaml (with the sync section), matching what the
+    // server would have recorded at the last push of this content.
+    const sourceManifest = (
+      await writeStateManifest(path.join(sourceDir, '.compass'))
+    ).manifest;
     const bundlePath = path.join(targetDir, 'bundle.json');
     await writeFile(
       bundlePath,
       JSON.stringify(
-        buildBundle(documents, { mode: 'local-primary', remoteRevisionId: REMOTE_REVISION_ID }),
+        buildBundle(documents, {
+          mode: 'local-primary',
+          remoteRevisionId: REMOTE_REVISION_ID,
+          // Verbatim materialization reproduces the manifest hash — the
+          // cursor is seeded only when this matches (fail closed).
+          manifestHash: sourceManifest.canonical.manifest_hash,
+        }),
         null,
         2,
       ),
@@ -246,6 +259,77 @@ test('bootstrap of a hosted-only bundle warns about sync and does not seed a cur
     const output = stdout.join('');
     assert.match(output, /hosted-only project/);
     assert.doesNotMatch(output, /seeded the sync cursor/);
+  } finally {
+    await rm(sourceDir, { recursive: true, force: true });
+    await rm(targetDir, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap refuses to seed the cursor when the bundle head hash does not match the materialized root', async () => {
+  const sourceDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-bootstrap-src-'));
+  const targetDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-bootstrap-dst-'));
+
+  try {
+    await initializeProjectMemory({
+      cwd: sourceDir,
+      rootDir: '.compass',
+      name: 'Bootstrap Hash Mismatch Fixture',
+      mode: 'local-primary',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    const connectExit = await runCli(
+      [
+        'connect-hosted',
+        '--root',
+        path.join(sourceDir, '.compass'),
+        '--sync-api-url',
+        'https://vibecompass.example',
+        '--sync-project-id',
+        'proj-mismatch',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      createIo([], []),
+      { cwd: sourceDir, env: {} },
+    );
+    assert.equal(connectExit, 0);
+
+    const documents = await collectCanonicalDocuments(path.join(sourceDir, '.compass'));
+    const bundlePath = path.join(targetDir, 'bundle.json');
+    await writeFile(
+      bundlePath,
+      JSON.stringify(
+        buildBundle(documents, {
+          mode: 'local-primary',
+          remoteRevisionId: REMOTE_REVISION_ID,
+          manifestHash: 'sha256:not-the-real-head',
+        }),
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const stdout = [];
+    const exitCode = await runCli(
+      ['bootstrap', '--bundle', bundlePath, '--root', '.compass'],
+      createIo(stdout, []),
+      { cwd: targetDir, env: {} },
+    );
+    assert.equal(exitCode, 0);
+    const output = stdout.join('');
+    // Files materialize, but the cursor must not claim a head we cannot prove.
+    assert.doesNotMatch(output, /seeded the sync cursor/);
+    assert.match(output, /Sync cursor NOT seeded/);
+    assert.match(output, /sync-adopt/);
+
+    const manifest = JSON.parse(
+      await readFile(path.join(targetDir, '.compass/state/manifest.json'), 'utf8'),
+    );
+    const cursor = manifest.sync?.targets
+      ? Object.values(manifest.sync.targets)[0]
+      : manifest.sync;
+    assert.notEqual(cursor?.last_successful_remote_revision, REMOTE_REVISION_ID);
   } finally {
     await rm(sourceDir, { recursive: true, force: true });
     await rm(targetDir, { recursive: true, force: true });

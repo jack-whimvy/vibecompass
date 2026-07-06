@@ -30,6 +30,17 @@ async function promoteHostedLocked(options, environment, rootDir) {
   const notes = [];
 
   if (options.abort === true) {
+    // A confirmed promotion cannot be aborted: the server is already
+    // hosted-only, and rewriting only the local record would create exactly
+    // the split-brain the two-phase flow exists to prevent. Reversing a
+    // finished cutover is demote-hosted's job.
+    if (server.mode === 'hosted-only' && !server.pending_mode_transition) {
+      throw new Error(
+        'This promotion was already confirmed — the hosted project is hosted-only. '
+        + 'Aborting now would only rewrite the local record and split the two mode records. '
+        + 'Use vibecompass demote-hosted to reverse the cutover on both sides.',
+      );
+    }
     await postJson(context, 'mode-transition', { action: 'abort' });
     if (localMode === 'hosted-only') {
       await writeProjectMode(rootDir, 'local-primary');

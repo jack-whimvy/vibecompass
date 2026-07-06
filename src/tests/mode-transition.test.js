@@ -239,3 +239,116 @@ test('promote-hosted --abort restores both sides after an interrupted cutover', 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('promote-hosted --abort refuses after the server has confirmed (no split-brain rewrite)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cutover-late-abort-'));
+  const rootDir = path.join(tempDir, '.compass');
+  try {
+    await createConnectedRoot(tempDir);
+    const mock = hostedMock('local-primary');
+    const env = { VIBECOMPASS_SYNC_TOKEN: 'token' };
+
+    const exitCode = await runCli(
+      ['promote-hosted', '--root', rootDir],
+      createIo(),
+      { cwd: tempDir, env, fetch: mock.fetch },
+    );
+    assert.equal(exitCode, 0);
+    assert.equal(mock.state.mode, 'hosted-only');
+
+    // The cutover is confirmed: abort must refuse instead of rewriting only
+    // the local record back to local-primary.
+    await assert.rejects(
+      () =>
+        runCli(
+          ['promote-hosted', '--abort', '--root', rootDir],
+          createIo(),
+          { cwd: tempDir, env, fetch: mock.fetch },
+        ),
+      /already confirmed[\s\S]*demote-hosted/,
+    );
+    const projectYaml = await readFile(path.join(rootDir, 'project.yaml'), 'utf8');
+    assert.match(projectYaml, /^mode: hosted-only$/m);
+    await access(path.join(rootDir, 'state', 'promoted-root.json'));
+    assert.equal(mock.state.mode, 'hosted-only');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('hosted-only exported root: connect-hosted then demote-hosted is the executable documented sequence', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cutover-demote-path-'));
+  const rootDir = path.join(tempDir, '.compass');
+  try {
+    // Simulate a bootstrap-restored hosted-only root: no sync binding yet
+    // (dashboard-created project.yaml stubs carry none).
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Exported Hosted Fixture',
+      mode: 'hosted-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+    });
+    const mock = hostedMock('hosted-only');
+    const env = { VIBECOMPASS_SYNC_TOKEN: 'token' };
+
+    // Without a binding, demote names the missing step instead of a dead end.
+    await assert.rejects(
+      () =>
+        runCli(['demote-hosted', '--root', rootDir], createIo(), {
+          cwd: tempDir,
+          env,
+          fetch: mock.fetch,
+        }),
+      /connect-hosted/,
+    );
+
+    // Step 1 of the documented sequence: bind the root to the hosted project.
+    const connectExit = await runCli(
+      [
+        'connect-hosted',
+        '--root',
+        rootDir,
+        '--sync-api-url',
+        'https://vibecompass.example',
+        '--sync-project-id',
+        'proj-demote',
+        '--sync-credential-env-var',
+        'VIBECOMPASS_SYNC_TOKEN',
+      ],
+      createIo(),
+      { cwd: tempDir, env: {} },
+    );
+    assert.equal(connectExit, 0);
+    // connect-hosted must not change hosted-only mode (passthrough).
+    assert.match(
+      await readFile(path.join(rootDir, 'project.yaml'), 'utf8'),
+      /^mode: hosted-only$/m,
+    );
+
+    // Step 2: demote flips both records and adopts the head cursor.
+    const stdout = [];
+    const demoteExit = await runCli(
+      ['demote-hosted', '--root', rootDir],
+      createIo(stdout),
+      { cwd: tempDir, env, fetch: mock.fetch },
+    );
+    assert.equal(demoteExit, 0);
+    assert.match(stdout.join(''), /Mode transition: demoted/);
+    assert.match(
+      await readFile(path.join(rootDir, 'project.yaml'), 'utf8'),
+      /^mode: local-primary$/m,
+    );
+    assert.equal(mock.state.mode, 'local-primary');
+
+    const manifest = JSON.parse(
+      await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'),
+    );
+    const cursor = manifest.sync?.targets
+      ? Object.values(manifest.sync.targets)[0]
+      : manifest.sync;
+    assert.equal(cursor?.last_successful_remote_revision, HEAD_ID);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
