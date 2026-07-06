@@ -6,6 +6,7 @@ export { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 export { initializeProjectMemory } from './init.js';
 export { preflightDocsReview } from './docs-review.js';
 export { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
+export { demoteHosted, promoteHosted } from './mode-transition.js';
 export {
   adoptRemoteHead,
   applyPullExport,

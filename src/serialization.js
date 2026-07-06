@@ -46,7 +46,33 @@ export function memoryRootLockPath(rootDir) {
  * Runs `fn` while holding the serialization lock for `rootDir`. Reentrant:
  * a nested call from inside the lock holder runs immediately.
  */
+// Commands that stay allowed on a promoted root: the transition flows
+// themselves, plus recovery tooling that must be able to repair state.
+const PROMOTED_ROOT_ALLOWED_COMMANDS = new Set([
+  'promote-hosted',
+  'demote-hosted',
+  'bootstrap',
+]);
+
+async function assertNotPromotedRoot(rootDir, label) {
+  if (PROMOTED_ROOT_ALLOWED_COMMANDS.has(label)) return;
+  if (process.env.VIBECOMPASS_ALLOW_PROMOTED_ROOT_WRITES === '1') return;
+  const markerPath = path.join(rootDir, 'state', 'promoted-root.json');
+  let marker;
+  try {
+    marker = JSON.parse(await readFile(markerPath, 'utf8'));
+  } catch {
+    return;
+  }
+  throw new Error(
+    `This root was promoted to hosted-only${marker?.promoted_at ? ` on ${marker.promoted_at}` : ''}: the hosted app is canonical and local writes here can never sync back (D-288). `
+    + 'Make changes on the hosted dashboard, run vibecompass demote-hosted to make this root canonical again, '
+    + 'or set VIBECOMPASS_ALLOW_PROMOTED_ROOT_WRITES=1 to override deliberately.',
+  );
+}
+
 export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
+  await assertNotPromotedRoot(rootDir, label);
   const key = await canonicalizeMemoryRootKey(rootDir);
   const held = heldRoots.getStore();
   if (await findHeldMemoryRootKey(held, key)) {

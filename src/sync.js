@@ -440,7 +440,11 @@ async function loadSyncContext(options, environment) {
   });
 
   if (project.mode !== 'local-primary') {
-    throw new Error('Hosted sync commands require project.yaml mode: local-primary.');
+    throw new Error(
+      `Hosted sync commands require project.yaml mode: local-primary (this root says "${project.mode}"). `
+      + 'Mode is recorded twice — locally in project.yaml and on the hosted project — and they must agree. '
+      + 'Run vibecompass status to compare both records; use promote-hosted/demote-hosted to change modes on both sides together instead of hand-editing.',
+    );
   }
 
   const binding = resolveSyncBinding(project, options.syncTarget ?? null);
