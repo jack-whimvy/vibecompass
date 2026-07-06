@@ -8,6 +8,7 @@ export { preflightDocsReview } from './docs-review.js';
 export { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 export {
   applyPullExport,
+  bootstrapFromBundle,
   pullExportProjectMemory,
   pullPreviewProjectMemory,
   pushProjectMemory,

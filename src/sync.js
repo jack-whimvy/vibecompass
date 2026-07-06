@@ -200,6 +200,143 @@ async function applyPullExportLocked(options, rootDir) {
   };
 }
 
+/**
+ * Materializes a complete local memory root from a hosted bootstrap bundle
+ * (D-289): the escape hatch, disaster-recovery, and second-device path. All
+ * document hashes are verified before anything is written (fail closed). For
+ * local-primary bundles with a resolvable sync binding, the bundle's server
+ * head is seeded as the sync cursor so the first push has the correct parent;
+ * hosted-only bundles materialize a fully usable offline root (the server
+ * rejects hosted-only push until the project is demoted).
+ */
+export async function bootstrapFromBundle(options = {}, environment = {}) {
+  const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
+  const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  if (!options.bundlePath) {
+    throw new Error('bootstrap requires --bundle <file> (download it from the hosted Setup page).');
+  }
+  const bundlePath = path.resolve(cwd, options.bundlePath);
+  return withMemoryRootLock(rootDir, 'bootstrap', () =>
+    bootstrapFromBundleLocked(options, rootDir, bundlePath),
+  );
+}
+
+async function bootstrapFromBundleLocked(options, rootDir, bundlePath) {
+  const bundle = await readJsonRequired(bundlePath, 'bootstrap bundle');
+  if (bundle.bundle_kind !== 'bootstrap_export') {
+    throw new Error(
+      `File at ${bundlePath} is not a bootstrap bundle (bundle_kind: ${bundle.bundle_kind ?? 'missing'}).`,
+    );
+  }
+  const documents = Array.isArray(bundle.documents) ? bundle.documents : [];
+  if (documents.length === 0) {
+    throw new Error(`Bootstrap bundle at ${bundlePath} has no documents.`);
+  }
+
+  const projectFilePath = path.join(rootDir, 'project.yaml');
+  let existingProjectFile = false;
+  try {
+    await readFile(projectFilePath, 'utf8');
+    existingProjectFile = true;
+  } catch {
+    existingProjectFile = false;
+  }
+  if (existingProjectFile) {
+    throw new Error(
+      `${rootDir} already contains project.yaml. Bootstrap only materializes fresh roots — pick an empty --root or move the existing one aside.`,
+    );
+  }
+
+  // Fail closed BEFORE writing anything: verify every document's hash and
+  // path, and require the bundle to carry project.yaml.
+  let hasProjectFile = false;
+  const validated = documents.map((document) => {
+    const relativePath = normalizeCanonicalPath(document.path);
+    if (document.op !== 'write' || typeof document.raw_text !== 'string') {
+      throw new Error(`Unsupported bootstrap operation for ${relativePath}.`);
+    }
+    const hash = sha256Text(document.raw_text);
+    if (hash !== document.after_content_hash) {
+      throw new Error(
+        `Bootstrap bundle content hash does not match raw_text for ${relativePath}. The bundle is corrupt — download it again.`,
+      );
+    }
+    if (relativePath === 'project.yaml') hasProjectFile = true;
+    return { relativePath, rawText: document.raw_text };
+  });
+  if (!hasProjectFile) {
+    throw new Error('Bootstrap bundle does not include project.yaml.');
+  }
+
+  // Content is written verbatim (no newline normalization) so the local root
+  // byte-matches the hosted head the bundle's cursor points at.
+  const written = [];
+  for (const document of validated) {
+    const targetPath = path.join(rootDir, document.relativePath);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, document.rawText, 'utf8');
+    written.push(document.relativePath);
+  }
+
+  const warnings = [];
+  let manifestPath = null;
+  let cursorSeeded = false;
+  let projectMode = null;
+  try {
+    const project = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+      sourceName: projectFilePath,
+    });
+    projectMode = typeof project.mode === 'string' ? project.mode : null;
+
+    let sync;
+    const serverHead = bundle.server_head ?? null;
+    if (projectMode === 'local-primary' && serverHead?.remote_revision_id) {
+      const binding = resolveSyncBinding(project, options.syncTarget ?? null);
+      if (binding) {
+        const manifestResult = await writeStateManifest(rootDir);
+        sync = buildSyncStateWithCursor(manifestResult.manifest.sync, binding, {
+          last_successful_remote_revision: serverHead.remote_revision_id,
+          last_successful_local_root_revision:
+            manifestResult.manifest.canonical.local_root_revision,
+          last_successful_manifest_hash:
+            manifestResult.manifest.canonical.manifest_hash,
+          last_sync_direction: 'bootstrap',
+          last_sync_at: new Date().toISOString(),
+          pending_previews: [],
+        });
+        cursorSeeded = true;
+      } else {
+        warnings.push(
+          'No sync binding found in the bundled project.yaml; run connect-hosted before pushing.',
+        );
+      }
+    }
+    const manifestResult = await writeStateManifest(rootDir, sync ? { sync } : undefined);
+    manifestPath = manifestResult.manifestPath;
+  } catch (error) {
+    warnings.push(
+      `Documents were written, but the state manifest could not be generated: ${error.message}`,
+    );
+  }
+
+  if (projectMode === 'hosted-only') {
+    warnings.push(
+      'This is a hosted-only project: the root is fully usable offline, but hosted sync rejects local push until the project is demoted to local-primary.',
+    );
+  }
+
+  return {
+    status: 'bootstrapped',
+    rootDir,
+    manifestPath,
+    documentCount: written.length,
+    mode: projectMode,
+    cursorSeeded,
+    warnings,
+    message: `Materialized ${written.length} document${written.length === 1 ? '' : 's'} into ${rootDir}${cursorSeeded ? ' and seeded the sync cursor from the bundle head' : ''}.`,
+  };
+}
+
 async function loadSyncContext(options, environment) {
   const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
