@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- New `vibecompass bootstrap --bundle <file>` materializes a complete local
+  root from a hosted bootstrap-export bundle (fail-closed hash validation,
+  verbatim writes, sync-cursor seeding for local-primary bundles).
+- New `vibecompass sync-adopt [--accept-divergence]` re-baselines a root's
+  sync cursor onto the hosted head after a divergence preview (D-215) — the
+  recovery path for fresh clones and second devices.
+- New `vibecompass promote-hosted [--resume|--abort]` and
+  `vibecompass demote-hosted [--accept-divergence]` run the D-288 two-phase
+  hosting-mode cutover: fresh verified baseline, server-side transition
+  intent with a completeness report, local flip + promoted-root marker, and
+  confirm — resumable after any crash and fully reversible.
+- Promoted roots hard-refuse canonical write commands (override with
+  VIBECOMPASS_ALLOW_PROMOTED_ROOT_WRITES=1); `vibecompass status` now checks
+  the hosted mode and warns on local/hosted mode mismatches.
+- `apply-export` pre-validates every operation before writing and treats
+  already-applied operations as converged, so retries after partial failure
+  succeed. `docs-review --apply-decision-artifact` is idempotent and
+  crash-safe (provenance Source line, marker repair, post-write verification,
+  code-enforced append-only) and warns on hosted-only roots.
+
 - The missing-sync-token error now explains how to recover: re-export the bound
   env var, persist it in a shell profile, or rotate the token from the hosted
   dashboard (previously a bare "requires VIBECOMPASS_SYNC_TOKEN" with no
