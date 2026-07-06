@@ -155,21 +155,28 @@ async function applyPullExportLocked(options, rootDir) {
     throw new Error(`Pull-export bundle at ${outputPath} has no operations.`);
   }
 
-  const applied = [];
+  // Pre-validate EVERY operation before writing anything, and classify
+  // operations whose target already matches the after-state as
+  // already-applied. This makes a retry after a partial failure converge
+  // instead of failing forever on the ops that succeeded last time.
+  const plan = [];
   for (const operation of operations) {
     const relativePath = normalizeCanonicalPath(operation.path);
     const targetPath = path.join(rootDir, relativePath);
     const currentHash = await readCurrentHash(targetPath);
     const expectedBefore = operation.before_content_hash ?? null;
-    if (currentHash !== expectedBefore) {
-      throw new Error(
-        `Cannot apply ${relativePath}: local content hash ${currentHash ?? 'missing'} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
-      );
-    }
 
     if (operation.op === 'delete') {
-      await unlink(targetPath);
-      applied.push({ path: relativePath, status: 'deleted' });
+      if (currentHash === null) {
+        plan.push({ relativePath, targetPath, action: 'skip', status: 'already-deleted' });
+        continue;
+      }
+      if (currentHash !== expectedBefore) {
+        throw new Error(
+          `Cannot apply ${relativePath}: local content hash ${currentHash} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
+        );
+      }
+      plan.push({ relativePath, targetPath, action: 'delete' });
       continue;
     }
 
@@ -180,10 +187,32 @@ async function applyPullExportLocked(options, rootDir) {
     if (afterHash !== operation.after_content_hash) {
       throw new Error(`Exported content hash does not match raw_text for ${relativePath}.`);
     }
+    if (currentHash === afterHash) {
+      plan.push({ relativePath, targetPath, action: 'skip', status: 'already-applied' });
+      continue;
+    }
+    if (currentHash !== expectedBefore) {
+      throw new Error(
+        `Cannot apply ${relativePath}: local content hash ${currentHash ?? 'missing'} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
+      );
+    }
+    plan.push({ relativePath, targetPath, action: 'write', rawText: operation.raw_text });
+  }
 
-    await mkdir(path.dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, ensureTrailingNewline(operation.raw_text), 'utf8');
-    applied.push({ path: relativePath, status: 'written' });
+  const applied = [];
+  for (const step of plan) {
+    if (step.action === 'skip') {
+      applied.push({ path: step.relativePath, status: step.status });
+      continue;
+    }
+    if (step.action === 'delete') {
+      await unlink(step.targetPath);
+      applied.push({ path: step.relativePath, status: 'deleted' });
+      continue;
+    }
+    await mkdir(path.dirname(step.targetPath), { recursive: true });
+    await writeFile(step.targetPath, ensureTrailingNewline(step.rawText), 'utf8');
+    applied.push({ path: step.relativePath, status: 'written' });
   }
 
   bundle.applied_at = new Date().toISOString();
@@ -197,6 +226,70 @@ async function applyPullExportLocked(options, rootDir) {
     applied,
     proposalIds: bundle.proposal_ids ?? [],
     message: `Applied ${applied.length} exported proposal operation${applied.length === 1 ? '' : 's'}. Run vibecompass push to confirm applied proposals.`,
+  };
+}
+
+/**
+ * Re-baselines this root's sync cursor onto the hosted head (D-287 sync
+ * trust): the recovery path for a fresh clone or second device whose
+ * gitignored cursor is missing, which previously hit a permanent 409
+ * needs_rebase. Preserves D-215's inspect-then-choose workflow: a pull
+ * preview always runs first, and pending hosted proposals or conflicts
+ * refuse the adopt unless --accept-divergence is passed.
+ */
+export async function adoptRemoteHead(options = {}, environment = {}) {
+  const context = await loadSyncContext(options, environment);
+  const existingManifest = await readJsonIfPresent(context.manifestPath);
+  const manifestResult = await writeStateManifest(context.rootDir, {
+    sync: existingManifest?.sync,
+  });
+  const manifest = manifestResult.manifest;
+  const cursor = readSyncCursor(manifest.sync, context.binding);
+
+  const response = await postJson(context, 'pull-preview', {
+    state_version: manifest.state_version,
+    base_remote_revision_id: normalizeUuid(cursor.last_successful_remote_revision),
+    local_root_revision: manifest.canonical.local_root_revision,
+    local_manifest_hash: manifest.canonical.manifest_hash,
+    local_documents: buildLocalDocumentSummaries(manifest.documents),
+    include_pending_proposals: true,
+  });
+
+  const targetRemoteRevisionId = normalizeUuid(response.target_remote_revision_id);
+  if (!targetRemoteRevisionId) {
+    throw new Error('The hosted project has no baseline revision to adopt yet. Run vibecompass push first.');
+  }
+
+  const proposals = Array.isArray(response.proposals) ? response.proposals : [];
+  const conflicts = Array.isArray(response.conflicts) ? response.conflicts : [];
+  if ((proposals.length > 0 || conflicts.length > 0) && options.acceptDivergence !== true) {
+    throw new Error(
+      `Refusing to adopt the hosted head: ${proposals.length} pending proposal${proposals.length === 1 ? '' : 's'} and ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'} exist for this project (D-215: inspect divergence before choosing a baseline). Review with vibecompass pull-preview, then re-run sync-adopt --accept-divergence to adopt anyway.`,
+    );
+  }
+
+  const sync = buildSyncStateWithCursor(manifest.sync, context.binding, {
+    ...cursor,
+    last_successful_remote_revision: targetRemoteRevisionId,
+    last_successful_local_root_revision: manifest.canonical.local_root_revision,
+    last_successful_manifest_hash: manifest.canonical.manifest_hash,
+    last_sync_direction: 'adopt',
+    last_sync_at: new Date().toISOString(),
+    pending_previews: [],
+  });
+  const updatedManifest = await writeStateManifest(context.rootDir, { sync });
+
+  return {
+    status: 'adopted',
+    rootDir: context.rootDir,
+    manifestPath: updatedManifest.manifestPath,
+    remoteRevisionId: targetRemoteRevisionId,
+    proposalCount: proposals.length,
+    conflictCount: conflicts.length,
+    warnings: [
+      'The next push will record this root\'s content as a new revision on top of the adopted head. If local files differ from the hosted head, the hosted content is replaced (visibly, as a new revision).',
+    ],
+    message: `Adopted hosted head ${targetRemoteRevisionId} as this root's sync baseline.`,
   };
 }
 

@@ -18,6 +18,7 @@ import { refreshWorkflow } from './refresh-workflow.js';
 import { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
 import { PACKAGE_VERSION } from './version.js';
 import {
+  adoptRemoteHead,
   applyPullExport,
   bootstrapFromBundle,
   pullExportProjectMemory,
@@ -438,6 +439,23 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'sync-adopt') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await adoptRemoteHead(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Sync adopt: ${result.status}\n`);
+    io.stdout.write(`Adopted head: ${result.remoteRevisionId}\n`);
+    io.stdout.write(`Recorded ${result.manifestPath}\n`);
+    for (const warning of result.warnings) {
+      io.stdout.write(`Warning: ${warning}\n`);
+    }
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
   if (parsed.command === 'bootstrap') {
     const result = await bootstrapFromBundle(parsed.options, {
       cwd: runtime.cwd,
@@ -729,6 +747,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'push') {
       return parsePushArgs(rest);
+    }
+
+    if (command === 'sync-adopt') {
+      return parseSyncAdoptArgs(rest);
     }
 
     if (command === 'bootstrap') {
@@ -1803,6 +1825,44 @@ function parseDocsReviewArgs(argv) {
   };
 }
 
+function parseSyncAdoptArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--accept-divergence') {
+      parsed.acceptDivergence = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for sync-adopt.`);
+    }
+  }
+
+  return {
+    command: 'sync-adopt',
+    options: parsed,
+  };
+}
+
 function parseBootstrapArgs(argv) {
   const parsed = {};
 
@@ -2246,6 +2306,7 @@ function usageText() {
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
     '  vibecompass bootstrap --bundle <file> [--root <dir>]',
+    '  vibecompass sync-adopt [--accept-divergence] [options]',
     '  vibecompass pull-preview [options]',
     '  vibecompass pull-export [options]',
     '  vibecompass apply-export [options]',

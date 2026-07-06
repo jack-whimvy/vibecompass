@@ -4,6 +4,7 @@ import { inspectProjectCompatibility } from './compatibility.js';
 import { sha256Text } from './hash.js';
 import { resolveLaneMarkerContext } from './lane-marker.js';
 import { parseSimpleYaml } from './simple-yaml.js';
+import { resolveSyncBinding } from './sync-binding.js';
 import { inferToolingRootForMemoryRoot, listProjectSessions } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { scanProjectMemory } from './project-memory.js';
@@ -30,12 +31,18 @@ export async function getProjectStatus(options = {}) {
     readAgentFileStatus(rootDir, toolingRootDir),
     readProjectMemoryStatus(rootDir),
   ]);
+  const hostedSync = await readHostedModeCheck(
+    compatibility.projectFilePath,
+    project.mode ?? null,
+    options,
+  );
 
   return {
     generatedAt: new Date().toISOString(),
     rootDir,
     toolingRootDir,
     project,
+    hostedSync,
     compatibility: {
       cliPackageVersion: compatibility.cliPackageVersion,
       package: compatibility.package,
@@ -111,6 +118,13 @@ export function renderStatusText(status) {
     `Generated: ${status.generatedAt}`,
     `Project: ${status.project.name ?? 'Unknown'}`,
     `Mode: ${status.project.mode ?? 'Unknown'}`,
+    ...(status.hostedSync?.status === 'ok' && status.hostedSync.mismatch
+      ? [
+          `WARNING: mode mismatch — local project.yaml says "${status.hostedSync.localMode}" but the hosted project is "${status.hostedSync.hostedMode}". The two mode records are unreconciled: sync and dashboard actions will refuse until they agree. Do not hand-edit mode; a supported promote/demote flow flips both records together.`,
+        ]
+      : status.hostedSync?.status === 'unreachable'
+        ? [`Hosted mode check: unreachable (${status.hostedSync.detail}).`]
+        : []),
     `Root: ${status.rootDir}`,
     `Repos: ${status.project.repos.length > 0 ? status.project.repos.map((repo) => repo.id).join(', ') : 'None recorded'}`,
     `Active lanes: ${formatActiveLanes(status.sessions)}`,
@@ -162,6 +176,7 @@ export function toStatusJson(status) {
   return {
     generatedAt: status.generatedAt,
     rootDir: status.rootDir,
+    hostedSync: status.hostedSync ?? null,
     toolingRootDir: status.toolingRootDir,
     project: status.project,
     compatibility: status.compatibility,
@@ -171,6 +186,69 @@ export function toStatusJson(status) {
     projectMemory: status.projectMemory,
     recommendations: status.recommendations,
   };
+}
+
+/**
+ * Mode-mismatch diagnostic (plan 3.8): compares the local project.yaml mode
+ * against the hosted project's mode via the side-effect-free sync status
+ * endpoint. A hand-edited mode previously wedged a project with opaque 409s
+ * on both sides and no diagnostic anywhere. Network problems degrade to an
+ * "unreachable" note — status stays offline-safe.
+ */
+async function readHostedModeCheck(projectFilePath, localMode, options = {}) {
+  let binding;
+  try {
+    const config = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+      sourceName: projectFilePath,
+    });
+    binding = resolveSyncBinding(config, null);
+  } catch {
+    return { status: 'not-configured' };
+  }
+  if (!binding) return { status: 'not-configured' };
+
+  const env = options.env ?? process.env;
+  const credential = typeof env[binding.credentialEnvVar] === 'string'
+    ? env[binding.credentialEnvVar].trim()
+    : '';
+  if (!credential) {
+    return { status: 'no-credential', credentialEnvVar: binding.credentialEnvVar };
+  }
+
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') return { status: 'not-configured' };
+
+  const baseUrl = binding.apiUrl.endsWith('/') ? binding.apiUrl : `${binding.apiUrl}/`;
+  const endpoint = new URL(
+    `api/sync/projects/${encodeURIComponent(binding.projectId)}/status`,
+    baseUrl,
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetchImpl(endpoint.href, {
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${credential}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return { status: 'unreachable', detail: `HTTP ${response.status}` };
+    }
+    const data = typeof response.json === 'function' ? await response.json() : {};
+    const hostedMode = typeof data.mode === 'string' ? data.mode : null;
+    return {
+      status: 'ok',
+      hostedMode,
+      localMode,
+      mismatch: Boolean(hostedMode && localMode && hostedMode !== localMode),
+    };
+  } catch (error) {
+    return { status: 'unreachable', detail: error?.message ?? 'network error' };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function readProjectSummary(projectFilePath) {

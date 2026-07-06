@@ -7,6 +7,7 @@ export { initializeProjectMemory } from './init.js';
 export { preflightDocsReview } from './docs-review.js';
 export { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 export {
+  adoptRemoteHead,
   applyPullExport,
   bootstrapFromBundle,
   pullExportProjectMemory,
