@@ -17,8 +17,11 @@ import { getProjectStatus, renderStatusText, toStatusJson } from './status.js';
 import { refreshWorkflow } from './refresh-workflow.js';
 import { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
 import { PACKAGE_VERSION } from './version.js';
+import { demoteHosted, promoteHosted } from './mode-transition.js';
 import {
+  adoptRemoteHead,
   applyPullExport,
+  bootstrapFromBundle,
   pullExportProjectMemory,
   pullPreviewProjectMemory,
   pushProjectMemory,
@@ -437,6 +440,71 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'promote-hosted' || parsed.command === 'demote-hosted') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const run = parsed.command === 'promote-hosted' ? promoteHosted : demoteHosted;
+    const result = await run(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Mode transition: ${result.status}\n`);
+    if (result.completeness) {
+      io.stdout.write(`Carries over: ${result.completeness.carries_over}\n`);
+      for (const [kind, total] of Object.entries(result.completeness.documents_by_kind ?? {})) {
+        io.stdout.write(`  ${kind}: ${total}\n`);
+      }
+      io.stdout.write('Does not carry over:\n');
+      for (const item of result.completeness.does_not_carry_over ?? []) {
+        io.stdout.write(`  - ${item}\n`);
+      }
+    }
+    for (const warning of result.warnings) {
+      io.stdout.write(`Note: ${warning}\n`);
+    }
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'sync-adopt') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await adoptRemoteHead(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Sync adopt: ${result.status}\n`);
+    io.stdout.write(`Adopted head: ${result.remoteRevisionId}\n`);
+    io.stdout.write(`Recorded ${result.manifestPath}\n`);
+    for (const warning of result.warnings) {
+      io.stdout.write(`Warning: ${warning}\n`);
+    }
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
+  if (parsed.command === 'bootstrap') {
+    const result = await bootstrapFromBundle(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      runtime,
+    });
+    io.stdout.write(`Bootstrap: ${result.status}\n`);
+    io.stdout.write(`Root: ${result.rootDir}\n`);
+    io.stdout.write(`Documents: ${result.documentCount}\n`);
+    if (result.mode) {
+      io.stdout.write(`Mode: ${result.mode}\n`);
+    }
+    if (result.manifestPath) {
+      io.stdout.write(`Recorded ${result.manifestPath}\n`);
+    }
+    for (const warning of result.warnings) {
+      io.stdout.write(`Warning: ${warning}\n`);
+    }
+    io.stdout.write(`${result.message}\n`);
+    return 0;
+  }
+
   if (parsed.command === 'pull-preview') {
     await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await pullPreviewProjectMemory(parsed.options, {
@@ -706,6 +774,18 @@ export function parseCliArgs(argv) {
 
     if (command === 'push') {
       return parsePushArgs(rest);
+    }
+
+    if (command === 'promote-hosted' || command === 'demote-hosted') {
+      return parseModeTransitionArgs(command, rest);
+    }
+
+    if (command === 'sync-adopt') {
+      return parseSyncAdoptArgs(rest);
+    }
+
+    if (command === 'bootstrap') {
+      return parseBootstrapArgs(rest);
     }
 
     if (command === 'pull-preview') {
@@ -1776,6 +1856,122 @@ function parseDocsReviewArgs(argv) {
   };
 }
 
+function parseModeTransitionArgs(command, argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--resume') {
+      parsed.resume = true;
+      continue;
+    }
+    if (token === '--abort') {
+      parsed.abort = true;
+      continue;
+    }
+    if (token === '--accept-divergence') {
+      parsed.acceptDivergence = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for ${command}.`);
+    }
+  }
+
+  return { command, options: parsed };
+}
+
+function parseSyncAdoptArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--accept-divergence') {
+      parsed.acceptDivergence = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for sync-adopt.`);
+    }
+  }
+
+  return {
+    command: 'sync-adopt',
+    options: parsed,
+  };
+}
+
+function parseBootstrapArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--bundle':
+        parsed.bundlePath = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for bootstrap.`);
+    }
+  }
+
+  return {
+    command: 'bootstrap',
+    options: parsed,
+  };
+}
+
 function parsePushArgs(argv) {
   return {
     command: 'push',
@@ -2183,6 +2379,10 @@ function usageText() {
     '  vibecompass next-decision-id [options]',
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
+    '  vibecompass bootstrap --bundle <file> [--root <dir>]',
+    '  vibecompass sync-adopt [--accept-divergence] [options]',
+    '  vibecompass promote-hosted [--resume|--abort] [options]',
+    '  vibecompass demote-hosted [--accept-divergence] [options]',
     '  vibecompass pull-preview [options]',
     '  vibecompass pull-export [options]',
     '  vibecompass apply-export [options]',

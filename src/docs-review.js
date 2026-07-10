@@ -434,6 +434,15 @@ async function applyDecisionArtifactLocked(options) {
     throw new Error(`Decision artifact ${artifactId} must include a non-empty rationale before it can be appended locally.`);
   }
 
+  // Idempotency guard: never append the same artifact twice. The marker is
+  // the fast path; the file-content check covers a crash between the file
+  // write and the marker update.
+  if (artifact.local_status === 'applied') {
+    throw new Error(
+      `Decision artifact ${artifactId} is already applied locally as ${artifact.local_decision_id ? `decision ${artifact.local_decision_id}` : 'a decision entry'}. Re-applying would append a duplicate entry.`,
+    );
+  }
+
   const nextDecisionId = await readNextDecisionId(options.rootDir);
   const targetFilePath = path.join(options.rootDir, targetPath);
   await mkdir(path.dirname(targetFilePath), { recursive: true });
@@ -446,27 +455,99 @@ async function applyDecisionArtifactLocked(options) {
     existingContent = `# ${path.basename(targetPath, '.md')} decisions\n`;
   }
 
-  const entry = renderDecisionEntry({
-    decisionId: nextDecisionId,
-    title,
-    decision,
-    rationale,
-    context,
-    artifactId,
-  });
-  await writeFile(targetFilePath, `${existingContent.trimEnd()}\n\n${entry}`, 'utf8');
-  const indexResult = options.refreshIndex
-    ? await refreshDecisionIndex(options.rootDir)
-    : {
+  const applyWarnings = [];
+  const alreadyInFile = existingContent.includes(
+    `hosted docs-review artifact ${artifactId}`,
+  );
+  let appliedDecisionIdForMarker = nextDecisionId;
+
+  if (alreadyInFile) {
+    // A previous apply wrote the file but crashed before recording the
+    // marker. Repair the marker instead of appending a duplicate.
+    applyWarnings.push(
+      `Artifact ${artifactId} was already present in ${targetPath}; repaired the marker without appending a duplicate entry.`,
+    );
+    const existingIdMatch = existingContent.match(
+      new RegExp(
+        `### (D-\\d+)[^\\n]*(?:\\n(?!### ).*)*hosted docs-review artifact ${artifactId.replaceAll(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}`,
+      ),
+    );
+    appliedDecisionIdForMarker = existingIdMatch
+      ? Number.parseInt(existingIdMatch[1].slice(2), 10)
+      : nextDecisionId;
+  } else {
+    const entry = renderDecisionEntry({
+      decisionId: nextDecisionId,
+      title,
+      decision,
+      rationale,
+      context,
+      artifactId,
+    });
+    const nextContent = `${existingContent.trimEnd()}\n\n${entry}`;
+    // Append-only enforced in code, not just convention: the previous file
+    // content must survive verbatim as a prefix of what we write.
+    if (!nextContent.startsWith(existingContent.trimEnd())) {
+      throw new Error(
+        `Refusing to apply artifact ${artifactId}: the write would not preserve the existing content of ${targetPath} (decisions are append-only).`,
+      );
+    }
+    await writeFile(targetFilePath, nextContent, 'utf8');
+
+    // Post-write verification: the canonical write must be durable and
+    // intact before the marker records the artifact as applied.
+    const verification = await readFile(targetFilePath, 'utf8');
+    if (verification !== nextContent) {
+      throw new Error(
+        `Post-write verification failed for ${targetPath}: the file on disk does not match the appended content. The marker was NOT updated; inspect the file and retry.`,
+      );
+    }
+  }
+
+  // Hosted-only roots can apply locally but can never push the result back
+  // until the project is demoted to local-primary — say so instead of letting
+  // the user discover it at push time.
+  try {
+    const projectConfig = parseSimpleYaml(
+      await readFile(path.join(options.rootDir, 'project.yaml'), 'utf8'),
+      { sourceName: 'project.yaml' },
+    );
+    if (projectConfig?.mode === 'hosted-only') {
+      applyWarnings.push(
+        'This is a hosted-only project: the locally applied decision cannot be pushed back to the hosted canonical store. The hosted copy was already recorded when the artifact was accepted; treat this local root as a working copy.',
+      );
+    }
+  } catch {
+    // Unreadable project.yaml is surfaced by other commands; not fatal here.
+  }
+
+  let indexResult;
+  if (options.refreshIndex) {
+    try {
+      indexResult = await refreshDecisionIndex(options.rootDir);
+    } catch (error) {
+      // An index-refresh failure after a verified canonical write must not
+      // strand the marker (a retry would duplicate the entry): degrade to a
+      // warning and keep going.
+      indexResult = {
+        refreshed: false,
+        warnings: [
+          `decisions/INDEX.md refresh failed after the entry was appended: ${error.message}. Run vibecompass refresh-decision-index manually.`,
+        ],
+      };
+    }
+  } else {
+    indexResult = {
       refreshed: false,
       warnings: [
         'decisions/INDEX.md was not refreshed. Run again with --refresh-index if this root uses the package-generated flat index, or update the project-specific index manually.',
       ],
     };
+  }
 
   const appliedDecisionArtifact = {
     artifact_id: artifactId,
-    decision_id: nextDecisionId,
+    decision_id: appliedDecisionIdForMarker,
     target_path: targetPath,
     applied_at: new Date().toISOString(),
     refreshed_index: indexResult.refreshed,
@@ -478,7 +559,7 @@ async function applyDecisionArtifactLocked(options) {
       ...current.hosted,
       artifacts: (current.hosted?.artifacts ?? []).map((item) =>
         item?.artifact_id === artifactId
-          ? { ...item, local_status: 'applied', local_decision_id: nextDecisionId }
+          ? { ...item, local_status: 'applied', local_decision_id: appliedDecisionIdForMarker }
           : item,
       ),
     },
@@ -494,8 +575,10 @@ async function applyDecisionArtifactLocked(options) {
     hosted: current.hosted ?? null,
     appliedDecisionArtifact,
     reviewPrompt: null,
-    warnings: indexResult.warnings,
-    message: `Applied decision artifact ${artifactId} as D-${String(nextDecisionId).padStart(3, '0')} in ${targetPath}.`,
+    warnings: [...applyWarnings, ...indexResult.warnings],
+    message: alreadyInFile
+      ? `Repaired the marker for decision artifact ${artifactId} (already present in ${targetPath} as D-${String(appliedDecisionIdForMarker).padStart(3, '0')}).`
+      : `Applied decision artifact ${artifactId} as D-${String(appliedDecisionIdForMarker).padStart(3, '0')} in ${targetPath}.`,
   };
 }
 
@@ -1972,6 +2055,10 @@ function renderDecisionEntry(options) {
     `**Decision:** ${options.decision}`,
     `**Rationale:** ${options.rationale}`,
     ...(options.context ? [`**Context:** ${options.context}`] : []),
+    // Provenance makes re-application detectable from the file itself, so a
+    // crash between the file write and the marker update can never cause a
+    // silent duplicate append on retry.
+    ...(options.artifactId ? [`**Source:** hosted docs-review artifact ${options.artifactId}`] : []),
     '',
   ].join('\n');
 }

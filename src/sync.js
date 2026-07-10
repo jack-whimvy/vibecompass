@@ -155,21 +155,28 @@ async function applyPullExportLocked(options, rootDir) {
     throw new Error(`Pull-export bundle at ${outputPath} has no operations.`);
   }
 
-  const applied = [];
+  // Pre-validate EVERY operation before writing anything, and classify
+  // operations whose target already matches the after-state as
+  // already-applied. This makes a retry after a partial failure converge
+  // instead of failing forever on the ops that succeeded last time.
+  const plan = [];
   for (const operation of operations) {
     const relativePath = normalizeCanonicalPath(operation.path);
     const targetPath = path.join(rootDir, relativePath);
     const currentHash = await readCurrentHash(targetPath);
     const expectedBefore = operation.before_content_hash ?? null;
-    if (currentHash !== expectedBefore) {
-      throw new Error(
-        `Cannot apply ${relativePath}: local content hash ${currentHash ?? 'missing'} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
-      );
-    }
 
     if (operation.op === 'delete') {
-      await unlink(targetPath);
-      applied.push({ path: relativePath, status: 'deleted' });
+      if (currentHash === null) {
+        plan.push({ relativePath, targetPath, action: 'skip', status: 'already-deleted' });
+        continue;
+      }
+      if (currentHash !== expectedBefore) {
+        throw new Error(
+          `Cannot apply ${relativePath}: local content hash ${currentHash} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
+        );
+      }
+      plan.push({ relativePath, targetPath, action: 'delete' });
       continue;
     }
 
@@ -180,10 +187,32 @@ async function applyPullExportLocked(options, rootDir) {
     if (afterHash !== operation.after_content_hash) {
       throw new Error(`Exported content hash does not match raw_text for ${relativePath}.`);
     }
+    if (currentHash === afterHash) {
+      plan.push({ relativePath, targetPath, action: 'skip', status: 'already-applied' });
+      continue;
+    }
+    if (currentHash !== expectedBefore) {
+      throw new Error(
+        `Cannot apply ${relativePath}: local content hash ${currentHash ?? 'missing'} does not match expected ${expectedBefore ?? 'missing'}. Run pull-preview again or resolve locally.`,
+      );
+    }
+    plan.push({ relativePath, targetPath, action: 'write', rawText: operation.raw_text });
+  }
 
-    await mkdir(path.dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, ensureTrailingNewline(operation.raw_text), 'utf8');
-    applied.push({ path: relativePath, status: 'written' });
+  const applied = [];
+  for (const step of plan) {
+    if (step.action === 'skip') {
+      applied.push({ path: step.relativePath, status: step.status });
+      continue;
+    }
+    if (step.action === 'delete') {
+      await unlink(step.targetPath);
+      applied.push({ path: step.relativePath, status: 'deleted' });
+      continue;
+    }
+    await mkdir(path.dirname(step.targetPath), { recursive: true });
+    await writeFile(step.targetPath, ensureTrailingNewline(step.rawText), 'utf8');
+    applied.push({ path: step.relativePath, status: 'written' });
   }
 
   bundle.applied_at = new Date().toISOString();
@@ -200,6 +229,220 @@ async function applyPullExportLocked(options, rootDir) {
   };
 }
 
+/**
+ * Re-baselines this root's sync cursor onto the hosted head (D-287 sync
+ * trust): the recovery path for a fresh clone or second device whose
+ * gitignored cursor is missing, which previously hit a permanent 409
+ * needs_rebase. Preserves D-215's inspect-then-choose workflow: a pull
+ * preview always runs first, and pending hosted proposals or conflicts
+ * refuse the adopt unless --accept-divergence is passed.
+ */
+export async function adoptRemoteHead(options = {}, environment = {}) {
+  const context = await loadSyncContext(options, environment);
+  const existingManifest = await readJsonIfPresent(context.manifestPath);
+  const manifestResult = await writeStateManifest(context.rootDir, {
+    sync: existingManifest?.sync,
+  });
+  const manifest = manifestResult.manifest;
+  const cursor = readSyncCursor(manifest.sync, context.binding);
+
+  const response = await postJson(context, 'pull-preview', {
+    state_version: manifest.state_version,
+    base_remote_revision_id: normalizeUuid(cursor.last_successful_remote_revision),
+    local_root_revision: manifest.canonical.local_root_revision,
+    local_manifest_hash: manifest.canonical.manifest_hash,
+    local_documents: buildLocalDocumentSummaries(manifest.documents),
+    include_pending_proposals: true,
+  });
+
+  const targetRemoteRevisionId = normalizeUuid(response.target_remote_revision_id);
+  if (!targetRemoteRevisionId) {
+    throw new Error('The hosted project has no baseline revision to adopt yet. Run vibecompass push first.');
+  }
+
+  const proposals = Array.isArray(response.proposals) ? response.proposals : [];
+  const conflicts = Array.isArray(response.conflicts) ? response.conflicts : [];
+  if ((proposals.length > 0 || conflicts.length > 0) && options.acceptDivergence !== true) {
+    throw new Error(
+      `Refusing to adopt the hosted head: ${proposals.length} pending proposal${proposals.length === 1 ? '' : 's'} and ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'} exist for this project (D-215: inspect divergence before choosing a baseline). Review with vibecompass pull-preview, then re-run sync-adopt --accept-divergence to adopt anyway.`,
+    );
+  }
+
+  const sync = buildSyncStateWithCursor(manifest.sync, context.binding, {
+    ...cursor,
+    last_successful_remote_revision: targetRemoteRevisionId,
+    last_successful_local_root_revision: manifest.canonical.local_root_revision,
+    last_successful_manifest_hash: manifest.canonical.manifest_hash,
+    last_sync_direction: 'adopt',
+    last_sync_at: new Date().toISOString(),
+    pending_previews: [],
+  });
+  const updatedManifest = await writeStateManifest(context.rootDir, { sync });
+
+  return {
+    status: 'adopted',
+    rootDir: context.rootDir,
+    manifestPath: updatedManifest.manifestPath,
+    remoteRevisionId: targetRemoteRevisionId,
+    proposalCount: proposals.length,
+    conflictCount: conflicts.length,
+    warnings: [
+      'The next push will record this root\'s content as a new revision on top of the adopted head. If local files differ from the hosted head, the hosted content is replaced (visibly, as a new revision).',
+    ],
+    message: `Adopted hosted head ${targetRemoteRevisionId} as this root's sync baseline.`,
+  };
+}
+
+/**
+ * Materializes a complete local memory root from a hosted bootstrap bundle
+ * (D-289): the escape hatch, disaster-recovery, and second-device path. All
+ * document hashes are verified before anything is written (fail closed). For
+ * local-primary bundles with a resolvable sync binding, the bundle's server
+ * head is seeded as the sync cursor so the first push has the correct parent;
+ * hosted-only bundles materialize a fully usable offline root (the server
+ * rejects hosted-only push until the project is demoted).
+ */
+export async function bootstrapFromBundle(options = {}, environment = {}) {
+  const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
+  const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
+  if (!options.bundlePath) {
+    throw new Error('bootstrap requires --bundle <file> (download it from the hosted Setup page).');
+  }
+  const bundlePath = path.resolve(cwd, options.bundlePath);
+  return withMemoryRootLock(rootDir, 'bootstrap', () =>
+    bootstrapFromBundleLocked(options, rootDir, bundlePath),
+  );
+}
+
+async function bootstrapFromBundleLocked(options, rootDir, bundlePath) {
+  const bundle = await readJsonRequired(bundlePath, 'bootstrap bundle');
+  if (bundle.bundle_kind !== 'bootstrap_export') {
+    throw new Error(
+      `File at ${bundlePath} is not a bootstrap bundle (bundle_kind: ${bundle.bundle_kind ?? 'missing'}).`,
+    );
+  }
+  const documents = Array.isArray(bundle.documents) ? bundle.documents : [];
+  if (documents.length === 0) {
+    throw new Error(`Bootstrap bundle at ${bundlePath} has no documents.`);
+  }
+
+  const projectFilePath = path.join(rootDir, 'project.yaml');
+  let existingProjectFile = false;
+  try {
+    await readFile(projectFilePath, 'utf8');
+    existingProjectFile = true;
+  } catch {
+    existingProjectFile = false;
+  }
+  if (existingProjectFile) {
+    throw new Error(
+      `${rootDir} already contains project.yaml. Bootstrap only materializes fresh roots — pick an empty --root or move the existing one aside.`,
+    );
+  }
+
+  // Fail closed BEFORE writing anything: verify every document's hash and
+  // path, and require the bundle to carry project.yaml.
+  let hasProjectFile = false;
+  const validated = documents.map((document) => {
+    const relativePath = normalizeCanonicalPath(document.path);
+    if (document.op !== 'write' || typeof document.raw_text !== 'string') {
+      throw new Error(`Unsupported bootstrap operation for ${relativePath}.`);
+    }
+    const hash = sha256Text(document.raw_text);
+    if (hash !== document.after_content_hash) {
+      throw new Error(
+        `Bootstrap bundle content hash does not match raw_text for ${relativePath}. The bundle is corrupt — download it again.`,
+      );
+    }
+    if (relativePath === 'project.yaml') hasProjectFile = true;
+    return { relativePath, rawText: document.raw_text };
+  });
+  if (!hasProjectFile) {
+    throw new Error('Bootstrap bundle does not include project.yaml.');
+  }
+
+  // Content is written verbatim (no newline normalization) so the local root
+  // byte-matches the hosted head the bundle's cursor points at.
+  const written = [];
+  for (const document of validated) {
+    const targetPath = path.join(rootDir, document.relativePath);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, document.rawText, 'utf8');
+    written.push(document.relativePath);
+  }
+
+  const warnings = [];
+  let manifestPath = null;
+  let cursorSeeded = false;
+  let projectMode = null;
+  try {
+    const project = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), {
+      sourceName: projectFilePath,
+    });
+    projectMode = typeof project.mode === 'string' ? project.mode : null;
+
+    let sync;
+    const serverHead = bundle.server_head ?? null;
+    if (projectMode === 'local-primary' && serverHead?.remote_revision_id) {
+      const binding = resolveSyncBinding(project, options.syncTarget ?? null);
+      if (binding) {
+        const manifestResult = await writeStateManifest(rootDir);
+        // Fail closed on cursor seeding: the cursor claims "this root's
+        // content IS the server head" — only true when the materialized
+        // manifest hash matches the head hash captured in the bundle. A
+        // mismatched bundle still materializes (files are hash-verified
+        // individually) but must not claim the head as its baseline.
+        const localHash = manifestResult.manifest.canonical.manifest_hash;
+        if (serverHead.manifest_hash && localHash !== serverHead.manifest_hash) {
+          warnings.push(
+            `Sync cursor NOT seeded: the materialized root's manifest hash (${localHash}) does not match the bundle's server head (${serverHead.manifest_hash}). `
+            + 'The files are intact, but run vibecompass sync-adopt (after reviewing divergence) before pushing.',
+          );
+        } else {
+          sync = buildSyncStateWithCursor(manifestResult.manifest.sync, binding, {
+            last_successful_remote_revision: serverHead.remote_revision_id,
+            last_successful_local_root_revision:
+              manifestResult.manifest.canonical.local_root_revision,
+            last_successful_manifest_hash: localHash,
+            last_sync_direction: 'bootstrap',
+            last_sync_at: new Date().toISOString(),
+            pending_previews: [],
+          });
+          cursorSeeded = true;
+        }
+      } else {
+        warnings.push(
+          'No sync binding found in the bundled project.yaml; run connect-hosted before pushing.',
+        );
+      }
+    }
+    const manifestResult = await writeStateManifest(rootDir, sync ? { sync } : undefined);
+    manifestPath = manifestResult.manifestPath;
+  } catch (error) {
+    warnings.push(
+      `Documents were written, but the state manifest could not be generated: ${error.message}`,
+    );
+  }
+
+  if (projectMode === 'hosted-only') {
+    warnings.push(
+      'This is a hosted-only project: the root is fully usable offline, but hosted sync rejects local push until the project is demoted. '
+      + 'To make this root canonical: run vibecompass connect-hosted (with the API URL, project id, and token env var from the hosted Setup page) to add the sync binding, then vibecompass demote-hosted.',
+    );
+  }
+
+  return {
+    status: 'bootstrapped',
+    rootDir,
+    manifestPath,
+    documentCount: written.length,
+    mode: projectMode,
+    cursorSeeded,
+    warnings,
+    message: `Materialized ${written.length} document${written.length === 1 ? '' : 's'} into ${rootDir}${cursorSeeded ? ' and seeded the sync cursor from the bundle head' : ''}.`,
+  };
+}
+
 async function loadSyncContext(options, environment) {
   const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
@@ -210,7 +453,11 @@ async function loadSyncContext(options, environment) {
   });
 
   if (project.mode !== 'local-primary') {
-    throw new Error('Hosted sync commands require project.yaml mode: local-primary.');
+    throw new Error(
+      `Hosted sync commands require project.yaml mode: local-primary (this root says "${project.mode}"). `
+      + 'Mode is recorded twice — locally in project.yaml and on the hosted project — and they must agree. '
+      + 'Run vibecompass status to compare both records; use promote-hosted/demote-hosted to change modes on both sides together instead of hand-editing.',
+    );
   }
 
   const binding = resolveSyncBinding(project, options.syncTarget ?? null);
@@ -220,7 +467,11 @@ async function loadSyncContext(options, environment) {
 
   const credential = normalizeOptionalString((environment.env ?? process.env)[binding.credentialEnvVar]);
   if (!credential) {
-    throw new Error(`Hosted sync command requires ${binding.credentialEnvVar}.`);
+    throw new Error(
+      `Hosted sync command requires ${binding.credentialEnvVar}. New terminals do not inherit one-off exports: `
+      + `re-export it (export ${binding.credentialEnvVar}="<sync token>") or persist it in your shell profile (~/.zshenv or ~/.bashrc). `
+      + 'Lost the token? Rotate it on the hosted dashboard under Setup -> Hosted sync, then export the new value.',
+    );
   }
 
   const fetchImpl = environment.runtime?.fetch ?? globalThis.fetch;

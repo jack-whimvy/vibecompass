@@ -4849,7 +4849,9 @@ test('docs-review applies hosted decision artifacts append-only with next D-numb
     assert.match(stdout.join(''), /Applied decision artifact: artifact_decision_1/);
     assert.match(stderr.join(''), /decisions\/INDEX\.md was not refreshed/);
     assert.match(decisions, /### D-125 — Decision artifacts append locally/);
-    assert.doesNotMatch(decisions, /\*\*Source:\*\*/);
+    // Provenance line makes re-application detectable from the file itself
+    // (crash-safe idempotency for the hosted->local apply channel).
+    assert.match(decisions, /\*\*Source:\*\* hosted docs-review artifact artifact_decision_1/);
     await assert.rejects(
       () => access(path.join(rootDir, 'decisions/INDEX.md')),
       /ENOENT/,
@@ -4857,6 +4859,80 @@ test('docs-review applies hosted decision artifacts append-only with next D-numb
     assert.equal(marker.applied_decision_artifact.decision_id, 125);
     assert.equal(marker.applied_decision_artifact.refreshed_index, false);
     assert.equal(marker.hosted.artifacts[0].local_status, 'applied');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('docs-review decision-artifact apply is idempotent: re-apply refuses, crash-window retry repairs the marker', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-decision-artifact-idem-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await mkdir(path.join(rootDir, 'decisions'), { recursive: true });
+    await mkdir(path.join(rootDir, 'state'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'decisions/cross-cutting.md'),
+      ['# Cross-cutting decisions', '', '### D-124 — Existing decision', '', '**Timestamp:** 2026-04-19 00:01 UTC-07:00', '**Decision:** Existing decision text.', '**Rationale:** Existing rationale.', ''].join('\n'),
+      'utf8',
+    );
+    const markerPath = path.join(rootDir, 'state/docs-review.json');
+    const marker = {
+      status: 'hosted-review-completed',
+      hosted: {
+        run_id: 'run_docs_review_idem',
+        artifacts: [
+          {
+            artifact_id: 'artifact_decision_idem',
+            artifact_type: 'decision_recommendation',
+            title: 'Idempotent applies',
+            summary: 'Apply must never duplicate entries.',
+            target_path: 'decisions/cross-cutting.md',
+            content: {
+              target_path: 'decisions/cross-cutting.md',
+              title: 'Idempotent applies',
+              decision: 'Apply must never duplicate entries.',
+              rationale: 'Retries after crashes must not double-append decision entries.',
+            },
+          },
+        ],
+      },
+    };
+    await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+
+    const io = () => ({
+      stdout: { write() {} },
+      stderr: { write() {} },
+    });
+    const applyArgs = [
+      'docs-review',
+      '--root',
+      rootDir,
+      '--apply-decision-artifact',
+      '--artifact',
+      'artifact_decision_idem',
+    ];
+
+    await runCli(applyArgs, io(), { cwd: tempDir, env: {} });
+
+    // Marker says applied: a straight re-apply refuses.
+    await assert.rejects(
+      () => runCli(applyArgs, io(), { cwd: tempDir, env: {} }),
+      /already applied locally/,
+    );
+
+    // Crash window: the file was written but the marker update was lost.
+    // A retry must repair the marker, not append a duplicate.
+    await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+    const stdout = [];
+    await runCli(applyArgs, { stdout: { write(c) { stdout.push(c); } }, stderr: { write() {} } }, { cwd: tempDir, env: {} });
+    assert.match(stdout.join(''), /already present in decisions\/cross-cutting\.md/);
+
+    const decisions = await readFile(path.join(rootDir, 'decisions/cross-cutting.md'), 'utf8');
+    const occurrences = decisions.split('hosted docs-review artifact artifact_decision_idem').length - 1;
+    assert.equal(occurrences, 1, 'the entry must exist exactly once');
+    const repairedMarker = JSON.parse(await readFile(markerPath, 'utf8'));
+    assert.equal(repairedMarker.hosted.artifacts[0].local_status, 'applied');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
