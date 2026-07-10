@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-07-10
+
 - New `vibecompass bootstrap --bundle <file>` materializes a complete local
   root from a hosted bootstrap-export bundle (fail-closed hash validation,
   verbatim writes, sync-cursor seeding for local-primary bundles).
