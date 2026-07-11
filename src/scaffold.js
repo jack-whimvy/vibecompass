@@ -215,7 +215,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 
 ## Canonical files
 - \`${rootRelativePath}/project.yaml\` — machine-oriented project metadata
-- \`${rootRelativePath}/architecture/\` — canonical architecture docs
+- \`${rootRelativePath}/architecture/\` — canonical architecture docs; the mutable current-state layer, rewritten in place as contracts change (D-292)
 - \`${rootRelativePath}/decisions/\` — append-only decision log for this project-memory root
 - \`${rootRelativePath}/sessions/\` — finalized session notes
 
@@ -240,6 +240,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - Every lane gets a per-lane runtime assignment at start (D-282): a lane port and temp dir recorded in \`session.yaml\` and exported with \`eval "$(vibecompass lane-env)"\` (includes conventional \`PORT\`/\`TMPDIR\` aliases), so parallel lanes never fight over dev-server ports or temp paths. Defaults are configurable under \`project.yaml\` \`runtime:\`; \`close-session\` removes the lane temp dir under guards.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
+- Architecture docs are the opposite of the append-only surfaces (D-292): they are current-state contracts, rewritten in place. Fold changes into the existing sections and keep the durable plan, unresolved next steps, and material rollout state in the doc. Work/ship chronology belongs in finalized session notes; decision entries record accepted choices and rationale; lane scratch holds only transient execution/review state, and anything still pending at close moves to the session note's next steps and, when durable, into architecture (D-293). Intentionally dated ledger/report docs may declare frontmatter \`content_mode: chronological-ledger\`.
 
 ## Repos in scope
 ${repos}
@@ -320,7 +321,7 @@ During the session:
 - keep \`handoff.md\` current after substantive work blocks
 - run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used (D-282); do not hardcode ports in lane work
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
-- after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh
+- after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh — fold the changes into the doc's current-state sections (rewrite in place; no dated "update" sections, lane names in headings, or completed-task chronology; D-292)
 - use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
@@ -338,12 +339,12 @@ If \`vibecompass start-session\` reports stale scratch files, read the existing 
 At session close:
 - prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --architecture-docs updated|not-needed|deferred --decision-log updated|not-needed|deferred --session-maintenance updated|not-needed|deferred --next-step "..."\`; \`vibecompass end-session\` is a supported alias
 - close-session prints the same targeted docs-update plan — including the pre-close staleness set (new decisions since lane start, stale base revisions, newer finalized notes touching this lane's scope, claim overlap with other active lanes) — before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
-- document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship
+- document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship — architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale (D-292, D-293)
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
 - if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
 - close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, the container, and the lane temp dir when they are safely removable; leftover pieces come with printed guidance
-- refresh any affected architecture/decision docs
+- refresh any affected architecture/decision docs by folding changes into their current-state contract prose — do not append session chronology; distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs (D-292, D-293)
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
 - for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred
 
@@ -523,6 +524,7 @@ architecture/<domain-slug>/<feature-slug>/<component>.md
 - Retrieval guidance should say when to consult the doc, what it does not cover, and which related docs or decisions matter.
 - Details should distinguish confirmed behavior from known gaps or open follow-up.
 - Involved files should use concrete \`repo:path\` references that match the affected implementation surface.
+- Docs are mutable current-state contracts (D-292): fold updates into the existing sections by rewriting them in place, keeping the durable plan, unresolved next steps, and material rollout state in the doc. Dated session headings, lane names, and completed-task chronology belong in session notes; decision entries record accepted choices and rationale (D-293). Docs whose artifact itself is dated (migration ledgers, incident/upstream reports) may declare frontmatter \`content_mode: chronological-ledger\` to suppress the changelog-shape advisory.
 
 Each component doc is canonical. This README is only a convenience guide.
 `;
@@ -635,7 +637,7 @@ function renderWorkflowDefaults(workflow) {
   const lines = [
     `- reviewer handback: ${describeReviewerHandback(workflow)}`,
     '- close-session: require document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch',
-    '- close-session: refresh any relevant architecture docs before finalizing the session',
+    '- close-session: refresh any relevant architecture docs before finalizing the session, folding changes into their current-state contract prose (D-292)',
     '- close-session: refresh any relevant decision files before finalizing the session',
   ];
 

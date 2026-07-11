@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { parseFrontmatter } from './frontmatter.js';
 import { readCurrentRepoHead, resolveRepoSourceDir } from './git-binding.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
-import { scanProjectMemory } from './project-memory.js';
+import { ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES, scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +139,9 @@ export function renderDocsUpdatePlan(plan) {
       }
       if (doc.qualityWarnings.length > 0) {
         lines.push(`  - quality warnings: ${doc.qualityWarnings.map((warning) => warning.code).join(', ')}`);
+      }
+      if (doc.size?.exceedsSoftLimit) {
+        lines.push(`  - size advisory: ${doc.size.byteLength} bytes exceeds the ${doc.size.softLimitBytes}-byte soft budget; this session is about to edit the doc — split it into focused component docs or trim low-value detail while folding in changes.`);
       }
     }
   }
@@ -817,6 +820,7 @@ function summarizeArchitectureDocument(document) {
     feature: normalizeOptionalString(data.feature),
     component: normalizeOptionalString(data.component),
     involvedFiles: extractInvolvedFiles(frontmatter.body),
+    byteLength: document.byteLength,
     warnings: document.warnings,
   };
 }
@@ -853,6 +857,14 @@ function findAffectedArchitectureDocs(docs, delta) {
         path: doc.path,
         reasons: Array.from(new Set(reasons)),
         qualityWarnings: doc.warnings,
+        // Session-scoped size advisory (D-292): surfaced only for docs the
+        // session is about to touch, deliberately not a standing status
+        // check. Self-describing so every renderer reads the same values.
+        size: {
+          byteLength: typeof doc.byteLength === 'number' ? doc.byteLength : null,
+          softLimitBytes: ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
+          exceedsSoftLimit: typeof doc.byteLength === 'number' && doc.byteLength > ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
+        },
       };
     })
     .filter((doc) => doc.reasons.length > 0)
@@ -906,9 +918,9 @@ function buildRecommendations(options) {
   const recommendations = [];
 
   if (options.affectedArchitectureDocs.length > 0) {
-    recommendations.push('Review and update the affected architecture docs listed above, then close with --architecture-docs updated.');
+    recommendations.push('Fold the session changes into the affected architecture docs as current-state contracts — rewrite sections in place, keep the durable plan/next steps/rollout state in the doc, and move work/ship chronology to the session note (D-292, D-293) — then close with --architecture-docs updated.');
   } else if (options.changedFiles.length > 0 && options.affectedArchitectureDocs.length === 0) {
-    recommendations.push('No matching architecture doc was found for the session delta; create a focused doc, mark docs not-needed with evidence, or defer explicitly.');
+    recommendations.push('No matching architecture doc was found for the session delta; create a focused doc written as a current-state contract, mark docs not-needed with evidence, or defer explicitly.');
   } else {
     recommendations.push('No architecture doc update is indicated by the current delta; close with --architecture-docs not-needed if that remains true.');
   }

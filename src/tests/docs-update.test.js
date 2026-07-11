@@ -31,7 +31,7 @@ test('planDocsUpdate maps session-delta files to affected architecture docs', as
     assert.ok(plan.architecture.affected[0].reasons.some((reason) => reason.includes('matches changed file')));
     assert.deepEqual(plan.architecture.affected[0].qualityWarnings, []);
     assert.match(renderDocsUpdatePlan(plan), /Docs update plan:/);
-    assert.match(renderDocsUpdatePlan(plan), /Review and update the affected architecture docs listed above/);
+    assert.match(renderDocsUpdatePlan(plan), /Fold the session changes into the affected architecture docs as current-state contracts/);
   } finally {
     await fixture.cleanup();
   }
@@ -348,6 +348,159 @@ test('planDocsUpdate uses the destination path for quoted git porcelain renames'
       plan.architecture.affected.map((doc) => doc.path),
       ['architecture/product/auth/login.md'],
     );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate adds a session-scoped size advisory for oversized affected docs', async () => {
+  const fixture = await createDocsUpdateFixture();
+
+  try {
+    const padding = 'The login contract line is repeated to exceed the soft size budget. '.repeat(200);
+    await writeFile(
+      path.join(fixture.rootDir, 'architecture/product/auth/login.md'),
+      [
+        '---',
+        'domain: Product',
+        'feature: Auth',
+        'component: Login',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Login flow docs.',
+        '',
+        '## Review metadata',
+        '- Evidence: `app:src/auth/login.ts`',
+        '- Blindspots: None identified for this fixture.',
+        '',
+        '## Details',
+        padding,
+        '',
+        '## Retrieval guidance',
+        '- Use this doc when changing login flow implementation.',
+        '- It does not cover signup.',
+        '',
+        '## Next steps',
+        '- None.',
+        '',
+        '## Involved files',
+        '- `app:src/auth/login.ts`',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+      changedFiles: ['app:src/auth/login.ts'],
+    });
+
+    const affected = plan.architecture.affected[0];
+    assert.equal(affected.path, 'architecture/product/auth/login.md');
+    assert.equal(affected.size.exceedsSoftLimit, true);
+    assert.equal(affected.size.softLimitBytes, 12000);
+    assert.ok(affected.size.byteLength > 12000);
+    // Text renderer reads the same self-describing size object the JSON plan
+    // exposes — assert the rendered numbers match the plan values.
+    assert.match(
+      renderDocsUpdatePlan(plan),
+      new RegExp(`size advisory: ${affected.size.byteLength} bytes exceeds the ${affected.size.softLimitBytes}-byte soft budget`),
+    );
+
+    const stdout = [];
+    const exitCode = await runCli(
+      ['docs-update', '--root', fixture.rootDir, '--session', 'auth-flow', '--changed', 'app:src/auth/login.ts', '--json'],
+      { stdout: { write: (chunk) => stdout.push(chunk) }, stderr: { write() {} } },
+      { cwd: fixture.tempDir },
+    );
+    assert.equal(exitCode, 0);
+    const jsonPlan = JSON.parse(stdout.join(''));
+    assert.deepEqual(jsonPlan.architecture.affected[0].size, {
+      byteLength: affected.size.byteLength,
+      softLimitBytes: affected.size.softLimitBytes,
+      exceedsSoftLimit: true,
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate keeps the size advisory out of plans for docs within budget', async () => {
+  const fixture = await createDocsUpdateFixture();
+
+  try {
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+      changedFiles: ['app:src/auth/login.ts'],
+    });
+
+    assert.equal(plan.architecture.affected[0].size.exceedsSoftLimit, false);
+    assert.equal(plan.architecture.affected[0].size.softLimitBytes, 12000);
+    assert.doesNotMatch(renderDocsUpdatePlan(plan), /size advisory:/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('planDocsUpdate surfaces the changelog-smell advisory on affected docs', async () => {
+  const fixture = await createDocsUpdateFixture();
+
+  try {
+    await writeFile(
+      path.join(fixture.rootDir, 'architecture/product/auth/login.md'),
+      [
+        '---',
+        'domain: Product',
+        'feature: Auth',
+        'component: Login',
+        'status: In progress',
+        'repo: app',
+        '---',
+        '',
+        '## Description',
+        'Login flow docs.',
+        '',
+        '## Review metadata',
+        '- Evidence: `app:src/auth/login.ts`',
+        '- Blindspots: None identified for this fixture.',
+        '',
+        '## Details',
+        'Current contract prose.',
+        '',
+        '## Audit deepening — 2026-07-07 (verified)',
+        'Dated audit narrative appended by a session.',
+        '',
+        '## Retrieval guidance',
+        '- Use this doc when changing login flow implementation.',
+        '- It does not cover signup.',
+        '',
+        '## Next steps',
+        '- None.',
+        '',
+        '## Involved files',
+        '- `app:src/auth/login.ts`',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const plan = await planDocsUpdate({
+      cwd: fixture.tempDir,
+      rootDir: fixture.rootDir,
+      sessionId: 'auth-flow',
+      changedFiles: ['app:src/auth/login.ts'],
+    });
+
+    const warningCodes = plan.architecture.affected[0].qualityWarnings.map((warning) => warning.code);
+    assert.ok(warningCodes.includes('architecture-changelog-smell'));
+    assert.match(renderDocsUpdatePlan(plan), /architecture-changelog-smell/);
   } finally {
     await fixture.cleanup();
   }

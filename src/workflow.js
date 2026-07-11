@@ -83,6 +83,9 @@ export function buildCloseSessionGuidance(workflowSettings, options = {}) {
 
   guidance.push('Reviewer handback stays in the selected sessions/active/<lane-id>/wip.md and handoff.md before close-session runs.');
   guidance.push('Close-session requires document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch: updated, not-needed, or deferred.');
+  // D-292/D-293: unconditional — the authorship rule holds even when the
+  // refresh-architecture-docs workflow step is disabled.
+  guidance.push('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).');
 
   if (workflowSettings.closeSession.refreshArchitectureDocs) {
     guidance.push('Refresh any relevant architecture docs before finalizing the session.');

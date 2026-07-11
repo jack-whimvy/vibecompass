@@ -4,7 +4,11 @@ import { createInterface } from 'node:readline/promises';
 import { parseFrontmatter } from './frontmatter.js';
 import { sha256Text } from './hash.js';
 import { writeStateManifest } from './manifest.js';
-import { scanProjectMemory } from './project-memory.js';
+import {
+  ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
+  detectChangelogShapedLines,
+  scanProjectMemory,
+} from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import {
   buildDocsReviewSourceInventory,
@@ -20,12 +24,11 @@ import { withMemoryRootLock } from './serialization.js';
 import { listDecisionFileNames, readNextDecisionId } from './decisions.js';
 import { looksLikeGroupedDecisionIndex } from './decision-index.js';
 
-const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v7';
-const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v1';
+const DOCS_REVIEW_PROMPT_VERSION = 'VibeCompass Docs Review Prompt v8';
+const DOCS_REVIEW_PARSER_VERSION = 'docs-review-parser-v2';
 const DOCS_REVIEW_ACCEPTED_OUTPUT_CONTRACT_VERSION = 'docs-review-accepted-output-v7';
 const DOCS_REVIEW_DOCUMENTATION_PLAN_PROJECTION_VERSION = 'docs-review-documentation-plan-v1';
 const DOCUMENTATION_PLAN_STATE_VERSION = 1;
-const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
 const COVERAGE_PLAN_OUTPUT_VERSION = 1;
 const COVERAGE_PLAN_STATUSES = new Set(['accepted', 'deferred', 'missing']);
 const COVERAGE_LEVELS = new Set(['comprehensive', 'partial', 'initial', 'missing']);
@@ -1496,6 +1499,24 @@ function createArchitectureDocQualityWarnings(blocks) {
     ) {
       warnings.push(`missing_repo_scope: ${block.path} should declare repo or repos in frontmatter when implementation-scoped.`);
     }
+
+    let contentMode = null;
+    if (Object.hasOwn(data, 'content_mode')) {
+      const rawContentMode = data.content_mode;
+      contentMode = typeof rawContentMode === 'string' ? rawContentMode.trim() : null;
+      if (contentMode !== 'chronological-ledger') {
+        const rendered = typeof rawContentMode === 'string' ? `"${rawContentMode}"` : JSON.stringify(rawContentMode) ?? 'undefined';
+        warnings.push(`unknown_content_mode: ${block.path} declares content_mode ${rendered}; the recognized value is "chronological-ledger" (absence means current-state).`);
+        contentMode = null;
+      }
+    }
+    if (contentMode !== 'chronological-ledger') {
+      const changelogLines = detectChangelogShapedLines(body);
+      if (changelogLines.length > 0) {
+        const example = changelogLines[0].length > 80 ? `${changelogLines[0].slice(0, 77)}...` : changelogLines[0];
+        warnings.push(`changelog_shaped_architecture_doc: ${block.path} contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"); architecture docs are current-state contracts (D-292) — fold the content into the existing sections and move work/ship chronology to the session note; decisions record accepted choices (D-293). Intentionally dated ledgers/reports declare content_mode: chronological-ledger.`);
+      }
+    }
   }
 
   return warnings;
@@ -2333,7 +2354,7 @@ function renderAnchorContext(anchors) {
     '',
     'Required prior-doc classifications for Stage 2:',
     '- `reuse`: keep path/frontmatter identity and update only if needed',
-    '- `update`: keep path/frontmatter identity but refresh content or coverage',
+    '- `update`: keep path/frontmatter identity but refresh content or coverage by rewriting the affected sections in place — deepening or audit findings fold into the current contract, never an appended dated section',
     '- `split`: replace one broad prior doc with multiple focused docs',
     '- `merge`: combine overlapping prior docs',
     '- `defer`: leave prior area documented but out of the accepted generation scope',
@@ -2532,7 +2553,7 @@ function renderReviewPrompt(options) {
     '- Propose the smallest useful architecture-doc set that will let future agents understand the project and retrieve targeted context.',
     '- The minimum useful set must cover: user journey, project/system map (frontend/backend/API/data/integration structure and connections), and summaries of the core journey-facing features.',
     '- Treat Stage 2 as a documentation-plan gate: each proposed doc needs a title, target path, purpose, parent/backbone grouping, linked inventory ids, evidence set, expected coverage level, prior-anchor action, and `baseline` or `deepening` run scope.',
-    '- Keep baseline docs breadth-first and compact. Use `deepening` only for scoped follow-up docs that should not block the first project-understanding baseline.',
+    '- Keep baseline docs breadth-first and compact. Use `deepening` only for scoped follow-up docs that should not block the first project-understanding baseline. Deepening output still rewrites existing docs in place or creates new focused docs; it never appends dated audit/session sections to an existing doc.',
     '- Prioritize entry points, user-flow/gating relationships, data ownership, external integrations, jobs/async boundaries, auth/security boundaries, and test surfaces.',
     '- Account for each completeness-inventory item in the coverage plan as accepted, deferred, or missing. Do not inflate coverage by omitting large discovered subsystems; honest deferred/missing entries are expected when the first pass cannot cover everything.',
     '- Before generating prose, self-check that every `completeness_inventory[].coverage_area_ids[]` value points to an `areas[].id` in the same accepted plan. Fix all dangling ids together at the plan gate.',
@@ -2550,6 +2571,7 @@ function renderReviewPrompt(options) {
     '- Ensure `architecture/overview/project-shape.md` includes compact backbone sections for topology, core feature inventory, user journey map, project systems map, and coverage/quality summary.',
     '- Ensure `architecture/overview/project-shape.md` includes exactly one `vibecompass-project-map version=1` JSON fence that lists journey-facing features, supported feature relationships, and minimal optional derived `systems[]` metadata.',
     '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
+    '- Write every doc as a current-state contract (D-292): when updating an existing doc, rewrite the affected sections in place or propose a new focused doc — never append dated session/audit sections (for example "Audit deepening — YYYY-MM-DD"). Keep the durable plan, unresolved next steps, and material rollout state in the doc; work/ship chronology belongs in session notes, and decision entries record accepted choices (D-293). Intentionally dated ledgers/reports declare frontmatter `content_mode: chronological-ledger`.',
     `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
     '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
     '- Do not put transient apply-state instructions inside architecture docs, such as "this artifact has not been applied". Apply state belongs in the chat response and package marker, not canonical docs.',

@@ -261,7 +261,7 @@ test('docs-review preflight writes source inventory and apply-output records rec
     const coverage = JSON.parse(await readFile(path.join(rootDir, 'state/docs-review-coverage.json'), 'utf8'));
     assert.equal(coverage.score_basis, 'model_declared_inventory');
     assert.equal(coverage.producer.scanner_version, SOURCE_INVENTORY_SCANNER_VERSION);
-    assert.equal(coverage.producer.parser_version, 'docs-review-parser-v1');
+    assert.equal(coverage.producer.parser_version, 'docs-review-parser-v2');
     assert.equal(coverage.producer.coverage_projection_version, 1);
     assert.equal(coverage.source_inventory_summary.item_count, 2);
     assert.equal(coverage.documentation_plan_summary.item_count, 1);

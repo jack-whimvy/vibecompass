@@ -294,11 +294,20 @@ import {
   scanProjectMemory,
   loadProjectReadModel,
   getProjectContext,
+  detectChangelogShapedLines,
+  ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
 } from "@vibecompass/vibecompass";
 ```
 
 Use the JavaScript API when building tools that need to inspect or manage a
 local VibeCompass project-memory root.
+
+`detectChangelogShapedLines(body)` takes architecture-doc body text (frontmatter
+already stripped) and returns the changelog-shaped lines it matched — the same
+D-292 advisory detector the scanner and `docs-review --apply-output` use, shared
+so external validators (for example the hosted proposal parser) stay in parity.
+`ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES` is the byte-valued soft size budget
+(12000) both docs-review apply warnings and the docs-update size advisory read.
 
 ## More Documentation
 

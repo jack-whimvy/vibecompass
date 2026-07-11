@@ -15,7 +15,11 @@ export {
   pullPreviewProjectMemory,
   pushProjectMemory,
 } from './sync.js';
-export { scanProjectMemory } from './project-memory.js';
+export {
+  ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
+  detectChangelogShapedLines,
+  scanProjectMemory,
+} from './project-memory.js';
 export {
   closeProjectSession,
   listProjectSessions,

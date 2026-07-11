@@ -5,6 +5,15 @@ import { sha256Text } from './hash.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 const PROJECT_FILE = 'project.yaml';
+// Shared soft size budget for architecture docs (docs-review apply and the
+// docs-update affected-doc advisory read the same threshold).
+export const ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES = 12000;
+const KNOWN_ARCHITECTURE_CONTENT_MODES = new Set(['chronological-ledger']);
+const ISO_DATE_PATTERN = /\b\d{4}-\d{2}-\d{2}\b/;
+const HEADING_CHRONOLOGY_CUES = /\b(audit deepening|updated|fixes|fixed|shipped|done|completed|activation gate)\b/i;
+// ATX heading start: 1-6 hashes followed by space, tab, or end of line
+// (CommonMark permits bare `#`..`######`); deliberately not broad \s.
+const ATX_HEADING_START = /^#{1,6}([ \t]|$)/;
 const NON_CANONICAL_DECISION_FILES = new Set(['EXAMPLE.md', 'INDEX.md', 'README.md']);
 const NON_CANONICAL_SESSION_FILES = new Set(['wip.md', 'handoff.md', 'README.md']);
 const NON_CANONICAL_ARCHITECTURE_FILES = new Set(['README.md']);
@@ -462,6 +471,24 @@ function parseArchitectureDocument(options) {
       );
     }
 
+    // Only an absent content_mode key means current-state; any explicit value
+    // that is not the exact string "chronological-ledger" warns (D-292).
+    let contentMode = null;
+    if (Object.hasOwn(data, 'content_mode')) {
+      const rawContentMode = data.content_mode;
+      contentMode = typeof rawContentMode === 'string' ? rawContentMode.trim() : null;
+      if (!contentMode || !KNOWN_ARCHITECTURE_CONTENT_MODES.has(contentMode)) {
+        const rendered = typeof rawContentMode === 'string' ? `"${rawContentMode}"` : JSON.stringify(rawContentMode) ?? 'undefined';
+        warnings.push(
+          createWarning(
+            'architecture-unknown-content-mode',
+            `Unknown architecture content_mode ${rendered}; the recognized value is "chronological-ledger" (absence means current-state).`,
+          ),
+        );
+        contentMode = null;
+      }
+    }
+
     const sections = extractLevelTwoSections(frontmatter.body);
     for (const section of RECOMMENDED_ARCHITECTURE_SECTIONS) {
       if (!sections.has(section.toLowerCase())) {
@@ -508,6 +535,21 @@ function parseArchitectureDocument(options) {
       );
     }
 
+    // D-292: architecture docs are current-state contracts; one aggregated
+    // advisory per doc, suppressed only by content_mode: chronological-ledger.
+    if (contentMode !== 'chronological-ledger') {
+      const changelogLines = detectChangelogShapedLines(frontmatter.body);
+      if (changelogLines.length > 0) {
+        const example = changelogLines[0].length > 80 ? `${changelogLines[0].slice(0, 77)}...` : changelogLines[0];
+        warnings.push(
+          createWarning(
+            'architecture-changelog-smell',
+            `Architecture doc contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"). Architecture docs are current-state contracts (D-292): fold the change into the existing sections, keep the durable plan and rollout state in the doc, and move work/ship chronology to the session note — decisions record accepted choices (D-293). Intentionally dated ledgers/reports can declare content_mode: chronological-ledger.`,
+          ),
+        );
+      }
+    }
+
     return {
       kind: 'architecture',
       extracted: {
@@ -515,6 +557,7 @@ function parseArchitectureDocument(options) {
         feature: typeof data.feature === 'string' ? data.feature : null,
         component: typeof data.component === 'string' ? data.component : null,
         status: typeof data.status === 'string' ? data.status : null,
+        content_mode: contentMode,
         repo_ids: repoIds,
       },
       warnings,
@@ -715,6 +758,385 @@ function extractLevelTwoSections(content) {
     sections.add(match[1].trim().toLowerCase());
   }
   return sections;
+}
+
+// D-292 changelog-shape detector, shared by the scanner and the docs-review
+// apply validator. Signals are deliberately conjunctive and line-local so
+// legitimate content never trips it: bare dates, Track/Phase plan headings,
+// lane/session vocabulary, completion words in prose, and strikethrough alone
+// must not trigger. Frontmatter is expected to be stripped by the caller;
+// fenced code, inline code, and HTML comments are masked here because dates
+// inside artifact names (migration filenames, example blocks) are legitimate.
+export function detectChangelogShapedLines(body) {
+  // Block-aware masking approximating CommonMark, deliberately short of a
+  // full tokenizer. Modeled exactly: fenced code (character + run length,
+  // whitespace-only closers within 3 columns relative to the containing
+  // block), 4+ column indented code with tab-stop arithmetic (never
+  // interrupting an open paragraph), block-level HTML comments, ATX headings
+  // interrupting paragraphs, single-level list containers
+  // (marker-width/padding-derived content indent, lazy item-paragraph
+  // continuation until a blank or block interrupter, container exit with
+  // line reprocessing, list-contained fences and comments, and the
+  // paragraph-interruption rule: only non-empty bullets or ordered markers
+  // with start value 1 interrupt), and source-ordered escape-aware inline
+  // masking of code spans and comments. Known approximations, guarded by the
+  // checked-in nine-doc calibration fixture matrix plus the separately rerun
+  // three-root live calibration: nested containers, setext headings,
+  // thematic-break paragraph boundaries, and lazy blockquote continuation.
+  const hits = [];
+  // fence/htmlComment carry `container` when opened inside a list item;
+  // `container` alone means an active list item with no open child block.
+  // `container.paragraphOpen` tracks whether the item has an open paragraph
+  // eligible for lazy continuation by under-indented lines.
+  let fence = null;
+  let htmlComment = null;
+  let container = null;
+  let paragraph = [];
+
+  const evaluateLeadIn = (maskedLine, rawLine) => {
+    const trimmed = maskedLine.trim();
+    if (trimmed === '') {
+      return;
+    }
+    // Blockquoted lines are quoted examples, not the doc's own lead-ins.
+    const isListItem = /^([-*+]|\d+[.)])\s/.test(trimmed);
+    const isBlockquote = trimmed.startsWith('>');
+    if (
+      !isListItem &&
+      !isBlockquote &&
+      trimmed.endsWith(':') &&
+      trimmed.length <= 160 &&
+      ISO_DATE_PATTERN.test(trimmed) &&
+      /\bupdated\b/i.test(trimmed)
+    ) {
+      hits.push(rawLine.trim());
+    }
+  };
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) {
+      return;
+    }
+    const maskedLines = maskInlineConstructs(paragraph.map((entry) => entry.raw).join('\n')).split('\n');
+    for (let index = 0; index < paragraph.length; index += 1) {
+      evaluateLeadIn(maskedLines[index], paragraph[index].raw);
+    }
+    paragraph = [];
+  };
+
+  const openContainerBlock = (rest) => {
+    const opener = /^(`{3,}|~{3,})(.*)$/.exec(rest);
+    if (opener && !(opener[1][0] === '`' && opener[2].includes('`'))) {
+      fence = { char: opener[1][0], length: opener[1].length, container };
+      return true;
+    }
+    if (rest.startsWith('<!--') && !rest.slice(4).includes('-->')) {
+      htmlComment = { container };
+      return true;
+    }
+    return false;
+  };
+
+  // Lines at valid root position (columns 0-3) that start a new block and
+  // therefore end lazy paragraph continuation. Any valid list marker —
+  // empty or not, of any type — closes the current item here: marker type
+  // only decides whether the reprocessed line joins the old list or starts
+  // a new one. The empty/start-number paragraph-interruption limits apply
+  // only where a document-level paragraph itself is open.
+  const interruptsLazyContinuation = (content) => {
+    if (ATX_HEADING_START.test(content) || content.startsWith('>') || content.startsWith('<!--')) {
+      return true;
+    }
+    const opener = /^(`{3,}|~{3,})(.*)$/.exec(content);
+    if (opener && !(opener[1][0] === '`' && opener[2].includes('`'))) {
+      return true;
+    }
+    return /^([-*+]|\d{1,9}[.)])([ \t]+\S|[ \t]*$)/.test(content);
+  };
+
+  // Whether a container content line is item PARAGRAPH text (eligible for
+  // lazy continuation) as opposed to a non-persistent child block: an ATX
+  // heading (with content or bare), blockquote, complete one-line HTML
+  // comment, or nested list marker occupies the line without leaving a
+  // paragraph open.
+  const startsContainerParagraph = (rest) => {
+    if (ATX_HEADING_START.test(rest) || rest.startsWith('>') || rest.startsWith('<!--')) {
+      return false;
+    }
+    return !/^([-*+]|\d{1,9}[.)])([ \t]+\S|[ \t]*$)/.test(rest);
+  };
+
+  // Normalize CRLF and lone CR at ingress: the exported helper's contract is
+  // "frontmatter-stripped body text", and end-anchored block predicates
+  // (bare ATX, fence closers, bare markers) break on trailing \r.
+  const lines = (body ?? '').split(/\r\n?|\n/);
+  let index = 0;
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const blank = rawLine.trim() === '';
+    const indent = expandedIndentColumns(rawLine);
+
+    if (fence) {
+      if (blank) {
+        index += 1;
+        continue;
+      }
+      if (fence.container && indent < fence.container.contentIndent) {
+        // Container exit ends the child fence with its enclosing item; the
+        // exiting line is reprocessed at document level.
+        fence = null;
+        container = null;
+        continue;
+      }
+      const baseIndent = fence.container ? fence.container.contentIndent : 0;
+      const closer = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(rawLine);
+      if (
+        closer &&
+        closer[1][0] === fence.char &&
+        closer[1].length >= fence.length &&
+        indent - baseIndent <= 3
+      ) {
+        fence = null;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (htmlComment) {
+      if (!blank && htmlComment.container && indent < htmlComment.container.contentIndent) {
+        htmlComment = null;
+        container = null;
+        continue;
+      }
+      if (rawLine.includes('-->')) {
+        htmlComment = null;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (container) {
+      if (blank) {
+        container.paragraphOpen = false;
+        index += 1;
+        continue;
+      }
+      if (indent < container.contentIndent) {
+        // A lazy continuation of the item's open paragraph stays inside the
+        // item (item text is non-signal); a valid root block start (columns
+        // 0-3 only — at 4+ columns nothing can start a root block, and
+        // indented code cannot interrupt the open paragraph) exits the
+        // container and is reprocessed at document level.
+        if (
+          container.paragraphOpen &&
+          (indent >= 4 || !interruptsLazyContinuation(rawLine.trimStart()))
+        ) {
+          index += 1;
+          continue;
+        }
+        container = null;
+        continue;
+      }
+      // Container content: only child fences/comments matter for masking;
+      // item text (including nested lists, an out-of-scope approximation)
+      // never produces signals itself. 4+ relative columns is indented code
+      // within the item, not a fence opener. Non-persistent child blocks
+      // (headings, one-line comments, blockquotes, nested markers) close the
+      // item paragraph rather than opening one.
+      if (indent - container.contentIndent <= 3) {
+        const rest = rawLine.trimStart();
+        container.paragraphOpen = openContainerBlock(rest) ? false : startsContainerParagraph(rest);
+      }
+      index += 1;
+      continue;
+    }
+
+    const content = rawLine.trimStart();
+
+    if (blank) {
+      flushParagraph();
+      index += 1;
+      continue;
+    }
+    if (indent >= 4) {
+      // Indented code cannot interrupt an open paragraph (CommonMark): an
+      // indented line after prose is paragraph continuation text.
+      if (paragraph.length > 0) {
+        paragraph.push({ raw: rawLine });
+      }
+      index += 1;
+      continue;
+    }
+
+    const listMarker = /^([-*+]|\d{1,9}[.)])(?:([ \t]+)(.*)|[ \t]*)$/.exec(content);
+    if (listMarker) {
+      const rest = listMarker[3] ?? '';
+      const orderedDigits = /^(\d{1,9})[.)]$/.exec(listMarker[1]);
+      // Interrupting an open paragraph requires a non-empty item, and for
+      // ordered lists a start VALUE of 1 (so `01.` may interrupt while `2.`
+      // may not).
+      const canInterrupt =
+        rest.trim() !== '' && (!orderedDigits || Number.parseInt(orderedDigits[1], 10) === 1);
+      if (paragraph.length > 0 && !canInterrupt) {
+        paragraph.push({ raw: rawLine });
+        index += 1;
+        continue;
+      }
+      flushParagraph();
+      const markerWidth = listMarker[1].length;
+      let paddingColumns = 0;
+      if (listMarker[2]) {
+        let column = indent + markerWidth;
+        for (const character of listMarker[2]) {
+          column += character === '\t' ? 4 - (column % 4) : 1;
+        }
+        paddingColumns = column - indent - markerWidth;
+      }
+      const contentIndent =
+        rest === '' || paddingColumns === 0 || paddingColumns > 4
+          ? indent + markerWidth + 1
+          : indent + markerWidth + paddingColumns;
+      container = { contentIndent, paragraphOpen: false };
+      if (rest !== '') {
+        // Residual logical indentation of the marker line's own content: with
+        // more than four padding columns, one column is list padding and the
+        // remainder is a child INDENTED CODE block (CommonMark), so no item
+        // paragraph opens and the text is never a fence/comment/heading.
+        const restRelativeIndent = indent + markerWidth + paddingColumns - contentIndent;
+        if (restRelativeIndent >= 4) {
+          container.paragraphOpen = false;
+        } else {
+          container.paragraphOpen = openContainerBlock(rest) ? false : startsContainerParagraph(rest);
+        }
+      }
+      index += 1;
+      continue;
+    }
+
+    const opener = /^(`{3,}|~{3,})(.*)$/.exec(content);
+    if (opener && !(opener[1][0] === '`' && opener[2].includes('`'))) {
+      flushParagraph();
+      fence = { char: opener[1][0], length: opener[1].length, container: null };
+      index += 1;
+      continue;
+    }
+
+    if (content.startsWith('<!--')) {
+      flushParagraph();
+      if (!content.slice(4).includes('-->')) {
+        htmlComment = { container: null };
+      }
+      index += 1;
+      continue;
+    }
+
+    if (ATX_HEADING_START.test(content)) {
+      flushParagraph();
+      if (/^#{2,3}\s/.test(content)) {
+        const masked = maskInlineConstructs(content);
+        if (ISO_DATE_PATTERN.test(masked) && HEADING_CHRONOLOGY_CUES.test(masked)) {
+          hits.push(rawLine.trim());
+        }
+      }
+      index += 1;
+      continue;
+    }
+
+    paragraph.push({ raw: rawLine });
+    index += 1;
+  }
+  flushParagraph();
+
+  return hits;
+}
+
+// Source-ordered inline masking: scans left to right so the first valid
+// construct wins (a comment containing a backtick masks before that backtick
+// can pair with later code), backslash-escaped backticks are not code
+// delimiters, an unmatched backtick run or unterminated `<!--` is literal
+// text, and closer runs inside an open code span count regardless of
+// backslashes (escapes are literal inside code). Masked spans preserve
+// newlines so paragraph line mapping stays exact.
+function maskInlineConstructs(text) {
+  let result = '';
+  let position = 0;
+
+  while (position < text.length) {
+    const character = text[position];
+
+    if (character === '\\' && position + 1 < text.length) {
+      result += text.slice(position, position + 2);
+      position += 2;
+      continue;
+    }
+
+    if (character === '`') {
+      let runEnd = position;
+      while (runEnd < text.length && text[runEnd] === '`') {
+        runEnd += 1;
+      }
+      const runLength = runEnd - position;
+      let closerStart = -1;
+      let scan = runEnd;
+      while (scan < text.length) {
+        if (text[scan] === '`') {
+          let scanEnd = scan;
+          while (scanEnd < text.length && text[scanEnd] === '`') {
+            scanEnd += 1;
+          }
+          if (scanEnd - scan === runLength) {
+            closerStart = scan;
+            break;
+          }
+          scan = scanEnd;
+        } else {
+          scan += 1;
+        }
+      }
+      if (closerStart !== -1) {
+        const spanEnd = closerStart + runLength;
+        result += text.slice(position, spanEnd).replace(/[^\n]/g, ' ');
+        position = spanEnd;
+      } else {
+        result += text.slice(position, runEnd);
+        position = runEnd;
+      }
+      continue;
+    }
+
+    if (text.startsWith('<!--', position)) {
+      const commentEnd = text.indexOf('-->', position + 4);
+      if (commentEnd !== -1) {
+        const spanEnd = commentEnd + 3;
+        result += text.slice(position, spanEnd).replace(/[^\n]/g, ' ');
+        position = spanEnd;
+      } else {
+        result += '<!--';
+        position += 4;
+      }
+      continue;
+    }
+
+    result += character;
+    position += 1;
+  }
+
+  return result;
+}
+
+// CommonMark column arithmetic: a tab advances to the next 4-column stop.
+function expandedIndentColumns(line) {
+  let columns = 0;
+  for (const character of line) {
+    if (character === ' ') {
+      columns += 1;
+    } else if (character === '\t') {
+      columns += 4 - (columns % 4);
+    } else {
+      break;
+    }
+  }
+  return columns;
 }
 
 function extractSessionTitle(content, filenameMatch) {

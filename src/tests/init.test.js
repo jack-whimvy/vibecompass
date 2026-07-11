@@ -950,7 +950,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localFetchCalls[0].request.headers['x-api-key'], 'anthropic_test');
     assert.equal(localBody.model, 'claude-sonnet-4-6');
     assert.equal(localBody.max_tokens, 20000);
-    assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v7/);
+    assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v8/);
+    assert.match(localBody.messages[0].content, /Write every doc as a current-state contract \(D-292\)/);
     assert.match(localBody.messages[0].content, /Execution mode: single-turn \(emit accepted proposal output now\)/);
     assert.match(localBody.messages[0].content, /there is no mid-review user approval turn/);
     assert.match(localBody.messages[0].content, /output the machine-readable coverage-plan block in this response/);
@@ -1522,7 +1523,8 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /LLM: codex/);
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
-    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v7/);
+    assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v8/);
+    assert.match(stdout.join(''), /Write every doc as a current-state contract \(D-292\)/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
@@ -1647,7 +1649,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(hostedBody.evidence_scope.documentation_plan_summary.item_count, 2);
     assert.deepEqual(hostedBody.evidence_scope.reconciliation_summary.unaccounted_ids, ['app:route_group:settings']);
     assert.deepEqual(hostedBody.evidence_scope.warning_provenance.codes, { scanned_unaccounted: 1 });
-    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v7/);
+    assert.match(hostedBody.prompt, /# VibeCompass Docs Review Prompt v8/);
     assert.match(hostedBody.prompt, /Execution mode: single-turn \(emit accepted proposal output now\)/);
     assert.match(hostedBody.prompt, /there is no mid-review user approval turn/);
     assert.match(hostedBody.prompt, /generated output is not canonical until accepted and applied/);

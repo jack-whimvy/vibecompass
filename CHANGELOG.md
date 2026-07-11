@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.13.0 - 2026-07-11
+
+- Architecture docs are now explicitly current-state contracts (D-292/D-293):
+  generated context/README/workflow guidance, the docs-update recommendations,
+  close-session guidance, and the docs-review prompt all state that updates
+  fold into existing sections in place — work/ship chronology goes to session
+  notes, decisions record accepted choices, and the doc keeps the durable
+  plan, unresolved next steps, and rollout state.
+- New advisory changelog-shape detection: the shared scanner emits one
+  aggregated `architecture-changelog-smell` warning per doc (conjunctive
+  line-local signals; fenced/inline code, comments, and blockquotes masked),
+  and `docs-review --apply-output` emits the matching
+  `changelog_shaped_architecture_doc` warning. Optional frontmatter
+  `content_mode: chronological-ledger` suppresses only this advisory;
+  explicit unknown/non-string values warn. Advisory-only — never gates
+  close-session or read-model projection.
+- `docs-update` affected docs now carry a self-describing
+  `size: { byteLength, softLimitBytes, exceedsSoftLimit }` advisory (the
+  12000-byte soft budget is hoisted from docs-review into the shared
+  scanner); a session-scoped size advisory renders in the plan instead of a
+  standing status warning.
+- Local docs-review prompt is v8; local parser is `docs-review-parser-v2`
+  (new warning codes). `detectChangelogShapedLines` and
+  `ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES` are exported as public API for
+  hosted-parser parity consumers.
+
 ## 0.12.0 - 2026-07-10
 
 - New `vibecompass bootstrap --bundle <file>` materializes a complete local

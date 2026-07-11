@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  detectChangelogShapedLines,
   inspectProjectCompatibility,
   PACKAGE_VERSION,
   generateStateManifest,
@@ -604,6 +605,229 @@ sync:
   } finally {
     await fixture.cleanup();
   }
+});
+
+test('scanProjectMemory flags changelog-shaped architecture docs with one aggregated advisory warning', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Changelog Smell Root
+mode: local-only
+repos:
+  - id: app
+    remote: https://github.com/example/app.git
+`,
+    'architecture/product/places/place-store.md': `
+---
+domain: Product
+feature: Places
+component: Place Store
+status: In progress
+repo: app
+---
+
+## Description
+Place store contract.
+
+## Review metadata
+- Evidence: app:src/places/store.ts
+- Blindspots: None identified for this fixture.
+
+## Details
+Current contract prose.
+
+## Audit deepening — 2026-07-07 (verified)
+Findings appended by an audit session.
+
+## Track 1 schema v2 — Phase 4 W1-W3 SHIPPED 2026-07-10
+Ship narrative.
+
+Updated 2026-07-08 (lane \`track0-hotfixes\`, D-004):
+- Session job dedupe keys are namespaced.
+
+### Phase 5 — Rollout plan
+Forward-looking plan headings without completion markers stay legitimate.
+
+The migration lives in \`retired-2026-07-08/\` and \`2026-07-11_w4_sweep.sql\`.
+
+\`\`\`md
+Updated 2026-01-01 (fenced example, must be masked):
+\`\`\`
+
+## Retrieval guidance
+- Use for place-store contract questions.
+- It does not cover imports.
+
+## Next steps
+- None.
+
+## Involved files
+- \`app:src/places/store.ts\`
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+    const document = result.documents.find(
+      (item) => item.path === 'architecture/product/places/place-store.md',
+    );
+    const smellWarnings = document.warnings.filter(
+      (warning) => warning.code === 'architecture-changelog-smell',
+    );
+
+    assert.equal(document.errors.length, 0);
+    assert.equal(smellWarnings.length, 1);
+    assert.match(smellWarnings[0].message, /3 changelog-shaped line\(s\)/);
+    assert.match(smellWarnings[0].message, /Audit deepening — 2026-07-07/);
+    assert.match(smellWarnings[0].message, /current-state contracts \(D-292\)/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('content_mode chronological-ledger suppresses the changelog advisory and unknown values warn', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Content Mode Root
+mode: local-only
+repos:
+  - id: app
+    remote: https://github.com/example/app.git
+`,
+    'architecture/platform/data/migration-ledger.md': `
+---
+domain: Platform
+feature: Data
+component: Migration Ledger
+status: In progress
+repo: app
+content_mode: chronological-ledger
+---
+
+## Description
+Intentionally dated migration governance ledger.
+
+## Review metadata
+- Evidence: app:db/migrations
+- Blindspots: None identified for this fixture.
+
+## Details
+
+## Audit deepening — 2026-07-07 (verified)
+Both envs at migration 131; drizzle-kit diffs are trustworthy.
+
+## Retrieval guidance
+- Use for migration history questions.
+- It does not cover schema design.
+
+## Next steps
+- None.
+
+## Involved files
+- \`app:db/migrations\`
+`,
+    'architecture/platform/data/bad-mode.md': `
+---
+domain: Platform
+feature: Data
+component: Bad Mode
+status: In progress
+repo: app
+content_mode: weekly-log
+---
+
+## Description
+Doc with an unrecognized content_mode value.
+
+## Review metadata
+- Evidence: app:src/data/index.ts
+- Blindspots: None identified for this fixture.
+
+## Details
+Current-state prose only.
+
+## Retrieval guidance
+- Use for content-mode validation tests.
+- It does not describe runtime behavior.
+
+## Next steps
+- None.
+
+## Involved files
+- \`app:src/data/index.ts\`
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+    const ledger = result.documents.find(
+      (item) => item.path === 'architecture/platform/data/migration-ledger.md',
+    );
+    const badMode = result.documents.find(
+      (item) => item.path === 'architecture/platform/data/bad-mode.md',
+    );
+
+    assert.equal(
+      ledger.warnings.some((warning) => warning.code === 'architecture-changelog-smell'),
+      false,
+    );
+    assert.equal(
+      ledger.warnings.some((warning) => warning.code === 'architecture-unknown-content-mode'),
+      false,
+    );
+    assert.equal(ledger.extracted.content_mode, 'chronological-ledger');
+    assert.ok(
+      badMode.warnings.some((warning) => warning.code === 'architecture-unknown-content-mode'),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('detectChangelogShapedLines requires conjunctive line-local signals', () => {
+  const triggers = [
+    '## Audit deepening — 2026-07-07 (verified)',
+    '## Track 1 schema v2 — Phase 4 W1-W3 SHIPPED 2026-07-10',
+    '### Track 0 fixes — 2026-07-08',
+    'Updated 2026-07-08 (lane `track0-hotfixes`, D-004):',
+    'Scheduler/cron auth (updated 2026-07-08, lane `track0-hotfixes`, D-003):',
+  ];
+  for (const line of triggers) {
+    assert.equal(detectChangelogShapedLines(line).length, 1, `expected trigger: ${line}`);
+  }
+
+  const nonTriggers = [
+    // dated heading without a chronology cue
+    '## Phase 8 Implementation Plan (accepted 2026-07-02, session 2026-07-01-2)',
+    '## Snapshot 2026-07-07',
+    // cue without a date
+    '## Rollout completed',
+    // forward-looking plan heading
+    '### Phase 5 — Rollout plan',
+    // list items never match the lead-in signal
+    '- Updated 2026-07-08 (lane x): namespaced dedupe keys',
+    // strikethrough and completion words alone
+    '~~old task~~ done',
+    // domain vocabulary
+    'Supabase session changes require re-auth.',
+    // date hidden inside inline code on a cue-bearing heading
+    '## Migration ledger for `retired-2026-07-08/` FIXED',
+    // non-colon-terminated dated prose
+    '**Timestamp:** 2026-04-19 00:22 PDT',
+  ];
+  for (const line of nonTriggers) {
+    assert.equal(detectChangelogShapedLines(line).length, 0, `expected no trigger: ${line}`);
+  }
+
+  const masked = [
+    '```',
+    'Updated 2026-07-08 (fenced, masked):',
+    '```',
+    '<!-- Updated 2026-07-08 (comment, masked): -->',
+    '## Audit deepening — 2026-07-07 (verified)',
+  ].join('\n');
+  assert.deepEqual(detectChangelogShapedLines(masked), ['## Audit deepening — 2026-07-07 (verified)']);
 });
 
 async function createFixture(files) {

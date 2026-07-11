@@ -276,6 +276,7 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.match(claude, /Working on: Session closed\. Ready for the next builder session\./);
     assert.match(claude, /Last thing completed: Closed session 1 and wrote `sessions\/2026-04-20-1-workflow-parity-commands\.md`\./);
     assert.ok(result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'));
+    assert.ok(result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).'));
     assert.ok(result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'));
     assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
     assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
@@ -341,6 +342,9 @@ test('closeProjectSession falls back to default workflow guidance when project.y
 
       assert.ok(
         result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'),
+      );
+      assert.ok(
+        result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).'),
       );
       assert.ok(
         result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'),
