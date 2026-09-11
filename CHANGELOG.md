@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.13.1 - 2026-09-11
+
+- Add strict backward compatibility for intentional legacy recovery checkpoints
+  at root `sessions/YYYY-MM-DD.md` paths with an exact
+  `# Recovery checkpoint — YYYY-MM-DD — <title>` H1; project them with their
+  matching `session_date`, title, and
+  `session_number: null` without inventing numbered-session chronology.
+- Preserve fail-closed behavior for malformed, mismatched, untitled, or nested
+  recovery checkpoints and all existing numbered-session behavior, with focused
+  parser, manifest, read-model, and session-lifecycle regression coverage.
+
 ## 0.13.0 - 2026-07-11
 
 - Architecture docs are now explicitly current-state contracts (D-292/D-293):
