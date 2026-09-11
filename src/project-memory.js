@@ -665,11 +665,34 @@ function parseSessionDocument(options) {
   const h1Match = options.content.match(/^#\s+Session(?:\s+—\s+(.+))?$/m);
 
   if (!filenameMatch && !h1Match) {
+    const recoveryCheckpoint = parseRecoveryCheckpointIdentity(options);
+    if (recoveryCheckpoint.candidate) {
+      if (recoveryCheckpoint.error) {
+        errors.push(recoveryCheckpoint.error);
+        return { kind: 'session', extracted: null, warnings, errors };
+      }
+
+      warnings.push(
+        createWarning(
+          'session-filename-mismatch',
+          'Recovery checkpoint uses the supported legacy sessions/YYYY-MM-DD.md filename instead of the recommended YYYY-MM-DD-N-display-title.md pattern.',
+        ),
+      );
+      appendMissingSessionSectionWarnings(options.content, warnings);
+
+      return {
+        kind: 'session',
+        extracted: recoveryCheckpoint.extracted,
+        warnings,
+        errors,
+      };
+    }
+
     errors.push(
       createError(
         options.relativePath,
         'session-unrecognized',
-        'Session note must use the session filename pattern or a "# Session" heading.',
+        'Session note must use the session filename pattern, a "# Session" heading, or the strict legacy recovery-checkpoint form.',
       ),
     );
     return { kind: 'session', extracted: null, warnings, errors };
@@ -684,14 +707,7 @@ function parseSessionDocument(options) {
     );
   }
 
-  const sections = extractLevelTwoSections(options.content);
-  for (const section of RECOMMENDED_SESSION_SECTIONS) {
-    if (!sections.has(section.toLowerCase())) {
-      warnings.push(
-        createWarning('session-missing-section', `Session note is missing recommended section "## ${section}".`),
-      );
-    }
-  }
+  appendMissingSessionSectionWarnings(options.content, warnings);
 
   const title = extractSessionTitle(options.content, filenameMatch);
 
@@ -705,6 +721,98 @@ function parseSessionDocument(options) {
     warnings,
     errors,
   };
+}
+
+function parseRecoveryCheckpointIdentity(options) {
+  const filenameMatch = options.relativePath.match(/^sessions\/(\d{4}-\d{2}-\d{2})\.md$/);
+  const firstLine = options.content.split(/\r?\n/, 1)[0];
+  const headingCandidate = /^# Recovery checkpoint(?:\s|$)/.test(firstLine);
+  const candidate = Boolean(filenameMatch) || headingCandidate;
+
+  if (!candidate) {
+    return { candidate: false, extracted: null, error: null };
+  }
+
+  if (!filenameMatch) {
+    return {
+      candidate: true,
+      extracted: null,
+      error: createError(
+        options.relativePath,
+        'session-recovery-checkpoint-path-invalid',
+        'Legacy recovery checkpoints must be root session files named sessions/YYYY-MM-DD.md.',
+      ),
+    };
+  }
+
+  const headingMatch = firstLine.match(
+    /^# Recovery checkpoint — (\d{4}-\d{2}-\d{2}) — (\S(?:.*\S)?)$/,
+  );
+  if (!headingMatch) {
+    return {
+      candidate: true,
+      extracted: null,
+      error: createError(
+        options.relativePath,
+        'session-recovery-checkpoint-heading-invalid',
+        'Legacy recovery checkpoints require "# Recovery checkpoint — YYYY-MM-DD — <nonempty title>".',
+      ),
+    };
+  }
+
+  const filenameDate = filenameMatch[1];
+  const headingDate = headingMatch[1];
+  if (!isValidIsoCalendarDate(filenameDate) || !isValidIsoCalendarDate(headingDate)) {
+    return {
+      candidate: true,
+      extracted: null,
+      error: createError(
+        options.relativePath,
+        'session-recovery-checkpoint-date-invalid',
+        'Legacy recovery checkpoint dates must be valid ISO calendar dates.',
+      ),
+    };
+  }
+
+  if (filenameDate !== headingDate) {
+    return {
+      candidate: true,
+      extracted: null,
+      error: createError(
+        options.relativePath,
+        'session-recovery-checkpoint-date-mismatch',
+        `Legacy recovery checkpoint filename date ${filenameDate} does not match heading date ${headingDate}.`,
+      ),
+    };
+  }
+
+  return {
+    candidate: true,
+    extracted: {
+      title: headingMatch[2].trim(),
+      session_date: filenameDate,
+      // A checkpoint records continuity inside an open lane; assigning a
+      // number would invent a close-session chronology that never occurred.
+      session_number: null,
+    },
+    error: null,
+  };
+}
+
+function appendMissingSessionSectionWarnings(content, warnings) {
+  const sections = extractLevelTwoSections(content);
+  for (const section of RECOMMENDED_SESSION_SECTIONS) {
+    if (!sections.has(section.toLowerCase())) {
+      warnings.push(
+        createWarning('session-missing-section', `Session note is missing recommended section "## ${section}".`),
+      );
+    }
+  }
+}
+
+function isValidIsoCalendarDate(value) {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 function extractDecisionEntries(content) {

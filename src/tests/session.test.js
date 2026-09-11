@@ -94,6 +94,64 @@ test('startProjectSession creates scratch files and updates CLAUDE.md', async ()
   }
 });
 
+test('startProjectSession does not count an unnumbered recovery checkpoint as close-session chronology', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-recovery-checkpoint-'));
+  const rootDir = path.join(tempDir, '.compass');
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir,
+      name: 'Recovery Checkpoint Session Project',
+      mode: 'local-only',
+      repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+      bootstrap: {
+        workflow: true,
+        claude: true,
+      },
+    });
+    await writeFile(
+      path.join(rootDir, 'sessions/2026-07-12.md'),
+      [
+        '# Recovery checkpoint — 2026-07-12 — Billing B1 production attestation and collision evidence',
+        '',
+        '## What we worked on',
+        'Billing B1 recovery.',
+        '',
+        '## Completed',
+        '- Captured evidence.',
+        '',
+        '## Decisions made',
+        '- None.',
+        '',
+        '## Models used',
+        '- Codex.',
+        '',
+        '## Blockers / open questions',
+        '- The active lane continues.',
+        '',
+        '## Next session should start with',
+        '- Resume the active lane.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'post-checkpoint-work',
+      workingOn: 'Continue after the recovery checkpoint.',
+      date: '2026-07-12',
+    });
+
+    assert.equal(result.sessionNumber, 1);
+    assert.equal(result.manifest.manifest.documents['sessions/2026-07-12.md'].extracted.session_number, null);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('startProjectSession finds the current-session fence even if another code block appears first', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-session-fence-'));
   const rootDir = path.join(tempDir, '.compass');

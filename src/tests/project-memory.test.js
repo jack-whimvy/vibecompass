@@ -226,6 +226,181 @@ Manifest generation.
   }
 });
 
+test('scanProjectMemory recognizes the strict legacy July recovery checkpoint without inventing a session number', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Recovery Checkpoint Root
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+    'sessions/2026-07-12.md': `
+# Recovery checkpoint — 2026-07-12 — Billing B1 production attestation and collision evidence
+
+This recovery note records the July 12 B1 sitting after the active lane crossed
+midnight without close-out. The checkpoint does not replace its eventual
+numbered close-session note.
+
+## What we worked on
+Billing B1 production attestation and collision evidence.
+
+## Completed
+- Preserved the recovery evidence.
+
+## Decisions made
+- D-300 and D-301.
+
+## Models used
+- Codex.
+
+## Blockers / open questions
+- The active lane continues.
+
+## Next session should start with
+1. Resume the active lane.
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+    const checkpoint = result.documents.find((document) => document.path === 'sessions/2026-07-12.md');
+
+    assert.equal(result.errors.length, 0);
+    assert.deepEqual(checkpoint.extracted, {
+      title: 'Billing B1 production attestation and collision evidence',
+      session_date: '2026-07-12',
+      session_number: null,
+    });
+    assert.deepEqual(checkpoint.warnings.map((warning) => warning.code), ['session-filename-mismatch']);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('writeStateManifest includes the strict legacy July recovery checkpoint extraction', async () => {
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Recovery Checkpoint Manifest
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+    'sessions/2026-07-12.md': `
+# Recovery checkpoint — 2026-07-12 — Billing B1 production attestation and collision evidence
+
+## What we worked on
+Billing B1 recovery.
+
+## Completed
+- Captured evidence.
+
+## Decisions made
+- None.
+
+## Models used
+- Codex.
+
+## Blockers / open questions
+- None.
+
+## Next session should start with
+- Continue.
+`,
+  });
+
+  try {
+    const { manifest } = await writeStateManifest(fixture.rootDir, {
+      generatedAt: new Date('2026-07-12T12:00:00Z'),
+    });
+    const checkpoint = manifest.documents['sessions/2026-07-12.md'];
+
+    assert.equal(checkpoint.kind, 'session');
+    assert.deepEqual(checkpoint.extracted, {
+      title: 'Billing B1 production attestation and collision evidence',
+      session_date: '2026-07-12',
+      session_number: null,
+    });
+    assert.deepEqual(checkpoint.warnings.map((warning) => warning.code), ['session-filename-mismatch']);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('scanProjectMemory fails closed on malformed recovery checkpoints', async (t) => {
+  const cases = [
+    {
+      name: 'filename and heading dates differ',
+      path: 'sessions/2026-07-12.md',
+      heading: '# Recovery checkpoint — 2026-07-13 — Billing evidence',
+      code: 'session-recovery-checkpoint-date-mismatch',
+    },
+    {
+      name: 'title is missing',
+      path: 'sessions/2026-07-12.md',
+      heading: '# Recovery checkpoint — 2026-07-12 —',
+      code: 'session-recovery-checkpoint-heading-invalid',
+    },
+    {
+      name: 'file is nested',
+      path: 'sessions/archive/2026-07-12.md',
+      heading: '# Recovery checkpoint — 2026-07-12 — Billing evidence',
+      code: 'session-recovery-checkpoint-path-invalid',
+    },
+    {
+      name: 'heading is arbitrary',
+      path: 'sessions/2026-07-12.md',
+      heading: '# Recovery checkpoint',
+      code: 'session-recovery-checkpoint-heading-invalid',
+    },
+    {
+      name: 'valid-looking heading is not the document H1',
+      path: 'sessions/2026-07-12.md',
+      heading: '# Notes\n\n# Recovery checkpoint — 2026-07-12 — Billing evidence',
+      code: 'session-recovery-checkpoint-heading-invalid',
+    },
+    {
+      name: 'calendar date is invalid',
+      path: 'sessions/2026-02-30.md',
+      heading: '# Recovery checkpoint — 2026-02-30 — Billing evidence',
+      code: 'session-recovery-checkpoint-date-invalid',
+    },
+  ];
+
+  for (const malformed of cases) {
+    await t.test(malformed.name, async () => {
+      const fixture = await createFixture({
+        'project.yaml': `
+format_version: 1
+name: Malformed Recovery Checkpoint
+mode: local-only
+repos:
+  - id: docs
+    remote: https://github.com/example/docs.git
+`,
+        [malformed.path]: `${malformed.heading}\n`,
+      });
+
+      try {
+        const result = await scanProjectMemory(fixture.rootDir);
+        const checkpointError = result.errors.find((error) => error.path === malformed.path);
+
+        assert.equal(checkpointError?.code, malformed.code);
+        assert.equal(
+          result.documents.find((document) => document.path === malformed.path)?.extracted,
+          null,
+        );
+        assert.throws(() => generateStateManifest(result), /canonical parse errors/i);
+      } finally {
+        await fixture.cleanup();
+      }
+    });
+  }
+});
+
 test('inspectProjectCompatibility separates legacy package stamps from state version drift', async () => {
   const fixture = await createFixture({
     'project.yaml': `
@@ -497,7 +672,7 @@ Details.
 ## Involved files
 - \`docs:architecture/platform/project-memory/frontend.md\`
 `,
-    'sessions/custom-name.md': `
+    'sessions/2026-04-19.md': `
 # Session — Parser Fallback Title
 
 ## What we worked on
@@ -526,7 +701,7 @@ Test the fallback.
       (document) => document.path === 'architecture/platform/project-memory/frontend.md',
     );
     const sessionDocument = result.documents.find(
-      (document) => document.path === 'sessions/custom-name.md',
+      (document) => document.path === 'sessions/2026-04-19.md',
     );
 
     assert.equal(result.errors.length, 0);
@@ -535,6 +710,8 @@ Test the fallback.
       architectureDocument.warnings.some((warning) => warning.code === 'architecture-unknown-status'),
     );
     assert.equal(sessionDocument.extracted.title, 'Parser Fallback Title');
+    assert.equal(sessionDocument.extracted.session_date, null);
+    assert.equal(sessionDocument.extracted.session_number, null);
     assert.ok(
       sessionDocument.warnings.some((warning) => warning.code === 'session-filename-mismatch'),
     );

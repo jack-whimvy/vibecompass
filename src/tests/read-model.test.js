@@ -169,3 +169,68 @@ test('loadProjectReadModel builds grouped feature, decision, session, and file o
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test('loadProjectReadModel exposes a recovery checkpoint as dated but unnumbered continuity', async () => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-recovery-read-model-'));
+
+  try {
+    await mkdir(path.join(rootDir, 'sessions'), { recursive: true });
+    await writeFile(
+      path.join(rootDir, 'project.yaml'),
+      [
+        'format_version: 1',
+        'name: Recovery Read Model',
+        'mode: local-only',
+        'repos:',
+        '  - id: docs',
+        '    remote: https://github.com/example/docs.git',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'sessions/2026-07-12.md'),
+      [
+        '# Recovery checkpoint — 2026-07-12 — Billing B1 production attestation and collision evidence',
+        '',
+        '## What we worked on',
+        'Billing B1 recovery.',
+        '',
+        '## Completed',
+        '- Captured evidence.',
+        '',
+        '## Decisions made',
+        '- D-300 and D-301.',
+        '',
+        '## Models used',
+        '- Codex.',
+        '',
+        '## Blockers / open questions',
+        '- The active lane continues.',
+        '',
+        '## Next session should start with',
+        '- Resume the active lane.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    await writeFile(
+      path.join(rootDir, 'sessions/2026-07-11-3-billing-b0.md'),
+      '# Session — 2026-07-11-3 — Billing B0\n',
+      'utf8',
+    );
+
+    const readModel = await loadProjectReadModel(rootDir);
+
+    assert.deepEqual(readModel.sessions[0], {
+      title: 'Billing B1 production attestation and collision evidence',
+      session_date: '2026-07-12',
+      session_number: null,
+      path: 'sessions/2026-07-12.md',
+    });
+    assert.equal(readModel.sessions[1].title, 'Billing B0');
+    assert.equal(getProjectContext(readModel, { sessionLimit: 1 }).recent_sessions[0].session_number, null);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
