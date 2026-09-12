@@ -378,6 +378,85 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
     assert.match(copilot, /Agent File Project Copilot Instructions/);
 
+    stdout.length = 0;
+    const afterApplyDryRunExitCode = await runCli(
+      ['sync-agents', '--root', '.compass', '--dry-run'],
+      {
+        stdout: {
+          write(chunk) {
+            stdout.push(chunk);
+          },
+        },
+        stderr: {
+          write(chunk) {
+            stderr.push(chunk);
+          },
+        },
+      },
+      { cwd: tempDir },
+    );
+
+    const afterApplyDryRunOutput = stdout.join('');
+    assert.equal(afterApplyDryRunExitCode, 0);
+    assert.match(afterApplyDryRunOutput, /CLAUDE\.md: unchanged/);
+    assert.match(afterApplyDryRunOutput, /AGENTS\.md: unchanged/);
+    assert.match(afterApplyDryRunOutput, /\.cursorrules: unchanged/);
+    assert.match(afterApplyDryRunOutput, /\.github\/copilot-instructions\.md: unchanged/);
+    assert.doesNotMatch(afterApplyDryRunOutput, /dry-run-update/);
+
+    const captureSyncAgents = async (...args) => {
+      const capturedStdout = [];
+      const capturedStderr = [];
+      const capturedExitCode = await runCli(
+        ['sync-agents', '--root', '.compass', ...args],
+        {
+          stdout: { write: (chunk) => capturedStdout.push(chunk) },
+          stderr: { write: (chunk) => capturedStderr.push(chunk) },
+        },
+        { cwd: tempDir },
+      );
+
+      return {
+        exitCode: capturedExitCode,
+        stdout: capturedStdout.join(''),
+        stderr: capturedStderr.join(''),
+      };
+    };
+
+    const projectFilePath = path.join(rootDir, 'project.yaml');
+    await writeFile(
+      projectFilePath,
+      (await readFile(projectFilePath, 'utf8')).replace(
+        'name: Agent File Project',
+        'name: Updated Agent File Project',
+      ),
+      'utf8',
+    );
+
+    const changedDryRun = await captureSyncAgents('--dry-run');
+    assert.equal(changedDryRun.exitCode, 0);
+    assert.match(changedDryRun.stdout, /CLAUDE\.md: dry-run-update/);
+    assert.match(changedDryRun.stdout, /AGENTS\.md: dry-run-update/);
+    assert.match(changedDryRun.stdout, /\.cursorrules: dry-run-update/);
+    assert.match(changedDryRun.stdout, /\.github\/copilot-instructions\.md: dry-run-update/);
+    assert.doesNotMatch(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Updated Agent File Project/);
+
+    const changedApply = await captureSyncAgents();
+    assert.equal(changedApply.exitCode, 0);
+    assert.match(changedApply.stdout, /CLAUDE\.md: update/);
+    assert.match(changedApply.stdout, /AGENTS\.md: update/);
+    assert.match(changedApply.stdout, /\.cursorrules: update/);
+    assert.match(changedApply.stdout, /\.github\/copilot-instructions\.md: update/);
+    assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Updated Agent File Project/);
+
+    const afterChangedApplyDryRun = await captureSyncAgents('--dry-run');
+    assert.equal(afterChangedApplyDryRun.exitCode, 0);
+    assert.match(afterChangedApplyDryRun.stdout, /CLAUDE\.md: unchanged/);
+    assert.match(afterChangedApplyDryRun.stdout, /AGENTS\.md: unchanged/);
+    assert.match(afterChangedApplyDryRun.stdout, /\.cursorrules: unchanged/);
+    assert.match(afterChangedApplyDryRun.stdout, /\.github\/copilot-instructions\.md: unchanged/);
+    assert.doesNotMatch(afterChangedApplyDryRun.stdout, /dry-run-update/);
+
     await writeFile(
       path.join(tempDir, 'CLAUDE.md'),
       `User header\n\n${claude}\nUser footer\n`,
@@ -466,7 +545,7 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     );
 
     const readoptedAgents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
-    assert.match(stdout.join(''), /AGENTS\.md: update/);
+    assert.match(stdout.join(''), /AGENTS\.md: unchanged/);
     assert.equal((readoptedAgents.match(/vibecompass:start/g) ?? []).length, 1);
     assert.equal(readoptedAgents, adoptedAgents);
 

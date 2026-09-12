@@ -86,11 +86,19 @@ async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
     const applied = applyManagedBlock(existingContent, generatedContent, {
       adoptExisting,
     });
+    const changed = applied.warning === null && applied.content !== existingContent;
     const conflicts = applied.status === 'adopt'
       ? scanPotentialWorkflowConflicts(existingContent)
       : [];
+    let status = applied.status;
 
-    if (!dryRun && applied.warning === null && applied.content !== existingContent) {
+    if (applied.warning === null) {
+      status = changed
+        ? (dryRun ? `dry-run-${applied.status}` : applied.status)
+        : 'unchanged';
+    }
+
+    if (!dryRun && changed) {
       await mkdir(path.dirname(outputPath), { recursive: true });
       await writeFile(outputPath, applied.content, 'utf8');
     }
@@ -99,9 +107,9 @@ async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
       format: format.name,
       path: outputPath,
       relativePath: toPosix(path.relative(toolingRootDir, outputPath)),
-      status: dryRun && applied.warning === null ? `dry-run-${applied.status}` : applied.status,
+      status,
       warning: applied.warning,
-      changed: applied.warning === null && applied.content !== existingContent,
+      changed,
       conflicts,
     });
   }

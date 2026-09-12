@@ -340,8 +340,8 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
     assert.equal(result.docsUpdatePlan.session.id, 'workflow-parity');
     assert.deepEqual(result.docsUpdatePlan.delta.changedFiles, []);
-    assert.equal(result.agentFileSync.results.find((item) => item.format === 'claude_md')?.status, 'update');
-    assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'update');
+    assert.equal(result.agentFileSync.results.find((item) => item.format === 'claude_md')?.status, 'unchanged');
+    assert.equal(result.agentFileSync.results.find((item) => item.format === 'agents_md')?.status, 'unchanged');
     assert.match(await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8'), /Session Project Agent Instructions/);
     assert.equal(result.manifest.manifest.active_sessions, undefined);
 

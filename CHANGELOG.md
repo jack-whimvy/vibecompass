@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Report byte-identical managed agent instruction files as `unchanged` from
+  `sync-agents`, `refresh-workflow`, and session lifecycle syncs instead of
+  reporting a no-op as `update` / `dry-run-update`; missing or incomplete
+  managed markers remain warning-only and are never overwritten.
+
 ## 0.13.1 - 2026-09-11
 
 - Add strict backward compatibility for intentional legacy recovery checkpoints
