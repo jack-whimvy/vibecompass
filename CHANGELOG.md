@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.14.0 - 2026-09-23
 
+- Add `continue-session [<lane-id>]` (D-353): resume an already-open lane
+  through the D-277 resolver (explicit id → worktree marker → single lane).
+  The lane keeps its opening date and session number; the command records
+  `resumed_at` / `resume_count` in `session.yaml`, appends a dated `Resumed`
+  line to `wip.md ## Log`, moves the index `current` hint and the Current
+  session block to the lane (showing the resume date), optionally refreshes
+  `--working-on`, prints the wip/handoff/latest-note paths plus runtime and
+  git-binding reminders, re-emits the docs-update staleness set as
+  `Resume staleness` warnings, and supports `--json`. With two or more active
+  lanes and no selection, or with an unknown explicit id, it fails closed and
+  prints the lane inventory. All inputs are read and outputs prepared before
+  the first write, so a refusal (missing CLAUDE.md, unparseable scratch or
+  metadata) changes no bytes; `--working-on` text is written literally,
+  hand-spaced or CRLF metadata keys are replaced rather than duplicated, and
+  Current-session fields carry over only for the exact same lane id.
+- `list-sessions` renders the shared lane inventory (opened date/session
+  number, resume count, branch/worktrees, port, last log line, current hint)
+  and accepts `--json`; the header now says `current hint`.
+- `start-session --id <existing-lane>` fails closed before any preflight and
+  names `continue-session`; starting a lane while others are active warns with
+  the resume alternative.
+- Generated `context.md` gains an "Open, resume, or choose" protocol and a
+  `continue session` prompt command; the managed agent block gains the
+  matching hard rule (resume instead of re-start; with 2+ lanes inventory and
+  ask, never adopt the current hint silently).
 - Report byte-identical managed agent instruction files as `unchanged` from
   `sync-agents`, `refresh-workflow`, and session lifecycle syncs instead of
   reporting a no-op as `update` / `dry-run-update`; missing or incomplete
