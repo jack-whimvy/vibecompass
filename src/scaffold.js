@@ -235,6 +235,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
 - Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
+- An active lane directory is an open session, not an unclosed crash (D-353). Resume it with \`vibecompass continue-session [<lane-id>]\`: the lane keeps its opening date and session number; the command records \`resumed_at\`/\`resume_count\` in \`session.yaml\`, appends a dated \`Resumed\` line to \`wip.md\`, moves the index \`current\` hint and the Current session block to the lane, and re-emits runtime, git-binding, and staleness warnings. \`start-session --id <existing-lane>\` fails closed and names \`continue-session\`.
 - Optional git binding (D-281): \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
 - At close, \`close-session\` removes a bound lane's recorded clean worktrees (guarded and never forced: dirty, in-use, or unverifiable worktrees survive with guidance, the lane marker is kept while any worktree survives, and branches are never deleted). Do not hand-remove provisioned worktrees; follow the printed guidance instead.
 - Every lane gets a per-lane runtime assignment at start (D-282): a lane port and temp dir recorded in \`session.yaml\` and exported with \`eval "$(vibecompass lane-env)"\` (includes conventional \`PORT\`/\`TMPDIR\` aliases), so parallel lanes never fight over dev-server ports or temp paths. Defaults are configurable under \`project.yaml\` \`runtime:\`; \`close-session\` removes the lane temp dir under guards.
@@ -248,7 +249,8 @@ ${repos}
 ## Session roles
 | Entry trigger | Role | Owns session lifecycle? |
 |---|---|---|
-| "start session" | Builder | Yes — opens the session, keeps scratch files current, and writes the final session note |
+| "start session" | Builder | Yes — opens a new lane, keeps scratch files current, and writes the final session note |
+| "continue session" | Builder | Yes — resumes an already-open lane and owns its lifecycle from there |
 | "join as reviewer" | Reviewer | No — reviews the builder's work, appends findings, and updates handoff guidance |
 
 ## Session prompt commands
@@ -271,10 +273,19 @@ ${renderWorkflowDefaults(workflow)}
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
 2. Read the latest finalized session note in \`${rootRelativePath}/sessions/\`.
-3. If present, read \`${rootRelativePath}/sessions/active/index.yaml\` for the lane inventory; select the lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane (D-277).
+3. Inventory active lanes with \`vibecompass list-sessions\` (or read \`${rootRelativePath}/sessions/active/index.yaml\`), then follow the "Open, resume, or choose" protocol below to decide between opening a new lane and resuming one; select a lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane (D-277).
 4. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
 5. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
 6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
+
+## Open, resume, or choose (D-353)
+Both \`start session\` and \`continue session\` begin with the active-lane inventory. Then:
+- **No active lane:** open one with \`vibecompass start-session --id <lane-id> --working-on "..."\`. \`continue session\` with no lane reports that there is nothing to resume and hands off to \`start session\`.
+- **Exactly one active lane, or a cwd bound to a lane by a worktree marker:** resume it with \`vibecompass continue-session\` without asking. Open a second lane only when the user is clearly asking for separate new work; never re-open a lane that already exists.
+- **Two or more active lanes, no marker, no lane named by the user:** do not guess. Present the inventory (lane id, working-on, opened date, resume count, branch/worktree, last log line) and ask which lane to continue or whether to open a new one. The index \`current\` pointer and the Current session block are continuity hints to mention, never defaults to adopt silently. Resume with \`vibecompass continue-session <lane-id>\` once the user answers (\`continue session <lane-id>\`).
+- **Lane named by the user:** \`continue session <lane-id>\` resumes that lane; an unknown id fails closed with the inventory.
+- After resuming, read the lane's \`wip.md\` (latest \`## Log\` entries and \`## Reviewer input needed\`), \`handoff.md\`, and the latest finalized note; treat resume-staleness warnings (new decisions past the lane snapshot, stale base revisions, newer finalized notes touching the lane scope, claim overlap) as required reading before editing.
+- Run recovery (reconstruct a missing finalized note from git history) only when the Current session block date is in the past *and* no active lane exists *and* no finalized note covers that date. An active lane with a past date is simply resumable.
 
 ## Builder workflow
 At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--feature\`, \`--repo\`, \`--claim\`, \`--architecture-doc\`, and \`--decision-domain-file\` values when the lane's scope is known so overlap warnings can be precise. Add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees (D-281).
@@ -322,13 +333,13 @@ During the session:
 - run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used (D-282); do not hardcode ports in lane work
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
 - after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh — fold the changes into the doc's current-state sections (rewrite in place; no dated "update" sections, lane names in headings, or completed-task chronology; D-292)
-- use \`vibecompass list-sessions\` and \`vibecompass switch-session <lane-id>\` to inspect or change the current lane
+- use \`vibecompass list-sessions\` (\`--json\` for the machine-readable inventory) to inspect active lanes, \`vibecompass continue-session [<lane-id>]\` to resume one at the start of a sitting, and \`vibecompass switch-session <lane-id>\` to move the continuity pointer without recording a resume
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them; \`vibecompass append-decision\` allocates the D-number at write time and refreshes the grouped \`decisions/INDEX.md\` when the lane context is resolvable (D-283); run \`vibecompass refresh-decision-index\` after hand-appends
 
-If \`vibecompass start-session\` reports stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
+If \`vibecompass start-session\` reports that the lane already exists, resume it with \`vibecompass continue-session <lane-id>\` instead (D-353). If it reports legacy or stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
 
 ## Optional planning mode
 - Use planning mode for risky, ambiguous, cross-file, or architectural work before implementation.

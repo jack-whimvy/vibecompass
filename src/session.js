@@ -157,6 +157,18 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
   const decisionDomainFiles = normalizeStringArray(options?.decisionDomainFiles ?? options?.decisionDomains)
     .map(normalizeDecisionDomainFile);
   const existingLanes = await listActiveSessionLanes(normalized);
+  // D-353: an already-open lane is resumed, never re-opened; fail closed
+  // before any preflight so the root stays untouched.
+  if (existingLanes.some((lane) => lane.id === sessionId)) {
+    throw new Error(
+      `Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work (D-353).`,
+    );
+  }
+  const priorIndex = await readActiveSessionIndex(normalized);
+  const resumeAlternativeWarnings = buildResumeAlternativeWarnings(
+    existingLanes,
+    resolveValidatedCurrentLane(priorIndex.current, existingLanes),
+  );
   const overlapWarnings = buildOverlapWarnings({
     sessionId,
     features,
@@ -267,7 +279,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
   await mkdir(normalized.activeSessionsDir, { recursive: true });
   await mkdir(lanePaths.laneDir, { recursive: false }).catch((error) => {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
-      throw new Error(`Active session lane "${sessionId}" already exists. Choose a different --id or close that lane first.`);
+      throw new Error(`Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work (D-353).`);
     }
 
     throw error;
@@ -401,6 +413,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     warnings: [
       ...markerContext.warnings,
       ...metadataWarnings,
+      ...resumeAlternativeWarnings,
       ...overlapWarnings,
       ...baseRevisionCapture.warnings,
       ...runtimeSettings.warnings,
@@ -767,13 +780,13 @@ async function canonicalizePathBestEffort(value) {
 }
 
 /** Flattens the docs-update pre-close staleness set into close warnings (A:192 re-emission). */
-function collectStalenessWarnings(plan) {
+function collectStalenessWarnings(plan, label = 'Pre-close staleness') {
   const staleness = plan?.staleness;
   if (!staleness) {
     return [];
   }
 
-  return (staleness.entries ?? []).map((entry) => `Pre-close staleness: ${entry}`);
+  return (staleness.entries ?? []).map((entry) => `${label}: ${entry}`);
 }
 
 function normalizeDocumentMaintenanceCheckpoint(value) {
@@ -893,10 +906,12 @@ export async function listProjectSessions(options = {}) {
   const index = await readActiveSessionIndex(normalized);
   const lanes = await listActiveSessionLanes(normalized);
 
+  const current = resolveValidatedCurrentLane(index.current, lanes);
   return {
     rootDir: normalized.rootDir,
-    current: resolveValidatedCurrentLane(index.current, lanes),
+    current,
     lanes,
+    inventory: buildLaneInventory(lanes, current),
   };
 }
 
@@ -968,6 +983,429 @@ async function switchProjectSessionLocked(normalized, options, markerContext) {
     manifest: manifestRefresh.manifest,
     agentFileSync,
   };
+}
+
+/**
+ * D-353: resumes an already-open lane. Lane selection is the D-277 resolver
+ * (explicit id → worktree marker → single active lane); with two or more
+ * active lanes and no selection the command fails closed, but the error
+ * carries the rendered lane inventory so the caller can choose without a
+ * second command. Resuming never renumbers or re-dates the lane — the wip
+ * header, session number, and eventual finalized-note name stay anchored to
+ * the opening date; only the continuity surfaces (index pointer, Current
+ * session block, wip log, session.yaml resume bookkeeping) move.
+ */
+export async function continueProjectSession(options = {}) {
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  return withMemoryRootLock(normalized.rootDir, 'continue-session', () =>
+    continueProjectSessionLocked(normalized, options, markerContext));
+}
+
+async function continueProjectSessionLocked(normalized, options, markerContext) {
+  await assertLaneMarkerSnapshotCurrent(markerContext);
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const lanes = await listActiveSessionLanes(normalized);
+  const index = await readActiveSessionIndex(normalized);
+  const inventory = buildLaneInventory(lanes, resolveValidatedCurrentLane(index.current, lanes));
+
+  if (lanes.length === 0) {
+    throw new Error(
+      'No active session lane exists to continue. Open one with `vibecompass start-session --id <lane-id> --working-on "..."` (D-353).',
+    );
+  }
+
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  if (!explicitId && !markerContext.marker && lanes.length > 1) {
+    throw new Error(
+      [
+        `Multiple active session lanes exist; continue-session will not guess which one to resume (D-277/D-353).`,
+        ...renderLaneInventoryLines(inventory),
+        'Choose explicitly: `vibecompass continue-session <lane-id>`, or run the command from a directory bound to the intended lane (worktree lane marker).',
+        'The `current` pointer above is a continuity hint, not a selection.',
+      ].join('\n'),
+    );
+  }
+  // An unknown explicit id fails closed with the same inventory the multi-lane
+  // refusal prints, so the caller can correct the id without a second command.
+  if (explicitId && !lanes.some((item) => item.id === validateLaneId(explicitId))) {
+    throw new Error(
+      [
+        `Session lane "${explicitId}" is not an active lane in ${normalized.rootDir}.`,
+        ...renderLaneInventoryLines(inventory),
+        'Resume one of the lanes above with `vibecompass continue-session <lane-id>`.',
+      ].join('\n'),
+    );
+  }
+
+  const selection = resolveLaneSelection({
+    explicitSessionId: explicitId ? validateLaneId(explicitId) : null,
+    marker: markerContext.marker,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose: 'continue',
+  });
+  const lane = lanes.find((item) => item.id === selection.sessionId);
+  if (lane.warnings.length > 0) {
+    throw new Error(
+      `Lane "${lane.id}"'s session.yaml could not be parsed (${lane.warnings[0]}); repair the lane metadata before continuing it, or close the lane.`,
+    );
+  }
+
+  const lanePaths = getLanePaths(normalized, lane.id);
+  const missingScratch = [];
+  if (!(await fileExists(lanePaths.wipFilePath))) {
+    missingScratch.push(lanePaths.wipFilePath);
+  }
+  if (!(await fileExists(lanePaths.handoffFilePath))) {
+    missingScratch.push(lanePaths.handoffFilePath);
+  }
+  if (missingScratch.length > 0) {
+    throw new Error(
+      `Lane "${lane.id}" is missing ${missingScratch.join(' and ')}. Recreate the scratch file(s) from the templates in context.md (or close the lane) before continuing it.`,
+    );
+  }
+
+  // Every required input is read and every output is prepared before the
+  // first write, so a deterministic refusal (missing CLAUDE.md, unparseable
+  // scratch, metadata that would not round-trip) leaves all lane, index, and
+  // tooling bytes untouched.
+  const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
+  const activeSession = parseActiveSession(wipContent, lanePaths.wipFilePath);
+  const sessionContent = await readFile(lanePaths.sessionFilePath, 'utf8');
+  const claude = await readClaudeFile(normalized.claudePath);
+  const currentSession = parseCurrentSessionBlock(claude.content, { optional: true });
+
+  const sessionDate = lane.sessionDate ?? activeSession.sessionDate;
+  const sessionNumber = lane.sessionNumber || activeSession.sessionNumber;
+  const resumeDate = normalizeSessionDate(options?.date);
+  const resumedAt = formatLocalDateTime(new Date());
+  const resumeCount = (lane.resumeCount ?? 0) + 1;
+  const workingOnUpdate = normalizeOptionalString(options?.workingOn);
+  const workingOn = workingOnUpdate ?? lane.workingOn ?? 'No summary recorded';
+  const otherLanes = lanes.filter((item) => item.id !== lane.id);
+
+  const updatedSessionContent = upsertTopLevelYamlScalars(
+    sessionContent,
+    {
+      ...(workingOnUpdate ? { working_on: quoteYamlString(workingOnUpdate) } : {}),
+      resumed_at: resumedAt,
+      resume_count: String(resumeCount),
+    },
+    lanePaths.sessionFilePath,
+  );
+  const otherLaneNote = otherLanes.length > 0
+    ? `; ${otherLanes.length} other active lane${otherLanes.length === 1 ? '' : 's'}: ${otherLanes.map((item) => item.id).join(', ')}`
+    : '';
+  const logLine = `- Resumed lane on ${resumeDate} (continue-session #${resumeCount}${otherLaneNote})${workingOnUpdate ? `. Working on updated: ${workingOnUpdate}` : ''}`;
+  const updatedWipContent = appendWipLogLine(
+    workingOnUpdate ? replaceWipSectionBody(wipContent, 'Working on', workingOnUpdate) : wipContent,
+    logLine,
+  );
+  // Continuity fields carry over only when the block already described this
+  // exact lane (a prefix match such as `billing` vs `billing-tax` must not).
+  const blockNamesThisLane = parseCurrentSessionLaneId(currentSession?.date) === lane.id;
+  const updatedClaudeContent = replaceCurrentSessionBlock(
+    claude.content,
+    {
+      date: `${sessionDate} (session ${sessionNumber}, lane ${lane.id}; resumed ${resumeDate})`,
+      workingOn: `${workingOn} [${lane.id}]`,
+      lastThingCompleted:
+        normalizeOptionalString(options?.lastThingCompleted) ??
+        (blockNamesThisLane ? currentSession.lastThingCompleted : null) ??
+        `Resumed lane ${lane.id} (continue-session #${resumeCount}).`,
+      blockers:
+        normalizeOptionalString(options?.blockers) ??
+        (blockNamesThisLane ? currentSession.blockers : null) ??
+        'No blocker recorded for the selected lane.',
+      nextSessionShould:
+        normalizeOptionalString(options?.nextSessionShould) ??
+        (blockNamesThisLane ? currentSession.nextSessionShould : null) ??
+        'Continue this lane from its wip.md/handoff.md and close it with a finalized session note.',
+    },
+    {
+      lanes: lanes.map((item) => ({ id: item.id, workingOn: item.id === lane.id ? workingOn : item.workingOn })),
+      selectedId: lane.id,
+    },
+  );
+
+  await writeFile(lanePaths.sessionFilePath, updatedSessionContent, 'utf8');
+  await writeFile(lanePaths.wipFilePath, updatedWipContent, 'utf8');
+  await upsertActiveSessionIndex(normalized, { id: lane.id, status: 'active', workingOn }, { current: lane.id });
+  await writeFile(normalized.claudePath, updatedClaudeContent, 'utf8');
+
+  const docsUpdate = await planDocsUpdateSafely({
+    rootDir: normalized.rootDir,
+    cwd: normalized.cwd,
+    sessionId: lane.id,
+    suppressLaneWarnings: true,
+    planner: options?.docsUpdatePlanner,
+  });
+  const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
+  const agentFileSync = await syncAgentInstructionFilesSafely({
+    rootDir: normalized.rootDir,
+    toolingRootDir: normalized.toolingRootDir,
+  });
+  const finalizedSessions = await listFinalizedSessions(normalized.sessionsDir);
+  const latestFinalized = finalizedSessions.length > 0 ? finalizedSessions[finalizedSessions.length - 1] : null;
+  // The returned inventory is the post-resume state (what list-sessions shows
+  // now), not the pre-mutation snapshot used for the refusal messages.
+  const inventoryAfter = buildLaneInventory(await listActiveSessionLanes(normalized), lane.id);
+
+  return {
+    rootDir: normalized.rootDir,
+    toolingRootDir: normalized.toolingRootDir,
+    claudePath: normalized.claudePath,
+    sessionId: lane.id,
+    selectionSource: selection.source,
+    sessionFilePath: lanePaths.sessionFilePath,
+    wipFilePath: lanePaths.wipFilePath,
+    handoffFilePath: lanePaths.handoffFilePath,
+    latestFinalizedSessionPath: latestFinalized ? path.join(normalized.sessionsDir, latestFinalized.fileName) : null,
+    sessionDate,
+    sessionNumber,
+    resumeDate,
+    resumedAt,
+    resumeCount,
+    workingOn,
+    workingOnUpdated: Boolean(workingOnUpdate),
+    startedAt: lane.startedAt ?? null,
+    laneAgeDays: computeLaneAgeDays(sessionDate, resumeDate),
+    runtime: lane.runtime ?? null,
+    gitBinding: lane.branch
+      ? {
+          branch: lane.branch,
+          worktreeContainer: lane.worktreeContainer ?? null,
+          worktrees: lane.worktrees ?? {},
+        }
+      : null,
+    otherLanes: inventoryAfter.lanes.filter((item) => item.id !== lane.id),
+    inventory: inventoryAfter,
+    docsUpdatePlan: docsUpdate.plan,
+    warnings: [
+      ...markerContext.warnings,
+      ...selection.warnings,
+      ...collectLaneMetadataWarnings(otherLanes),
+      ...collectStalenessWarnings(docsUpdate.plan, 'Resume staleness'),
+      ...buildSharedCheckoutWarnings({
+        sessionId: lane.id,
+        repos: lane.repos ?? [],
+        claims: lane.claims ?? [],
+        existingLanes: otherLanes,
+        hasWorktree: Boolean(lane.worktreeContainer),
+        context: 'continue-session',
+      }),
+      ...docsUpdate.warnings,
+      ...manifestRefresh.warnings,
+    ],
+    manifest: manifestRefresh.manifest,
+    agentFileSync,
+  };
+}
+
+/**
+ * Lane inventory (D-353): the one summary shape shared by `list-sessions`,
+ * the continue-session multi-lane failure, and the start-session resume
+ * hint, so every surface an agent might read describes lanes the same way.
+ */
+function buildLaneInventory(lanes, current) {
+  return {
+    current: current ?? null,
+    lanes: [...lanes]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((lane) => ({
+        id: lane.id,
+        workingOn: lane.workingOn ?? null,
+        sessionDate: lane.sessionDate ?? null,
+        sessionNumber: lane.sessionNumber || null,
+        startedAt: lane.startedAt ?? null,
+        resumedAt: lane.resumedAt ?? null,
+        resumeCount: lane.resumeCount ?? 0,
+        branch: lane.branch ?? null,
+        worktreeContainer: lane.worktreeContainer ?? null,
+        worktreeRepos: Object.keys(lane.worktrees ?? {}),
+        runtimePort: lane.runtime?.port ?? null,
+        lastLogEntry: lane.lastLogEntry ?? null,
+        isCurrentHint: current != null && lane.id === current,
+        warnings: lane.warnings ?? [],
+      })),
+  };
+}
+
+export function renderLaneInventoryLines(inventory) {
+  const lines = [`Active session lanes${inventory.current ? ` (current hint: ${inventory.current})` : ''}:`];
+  if (inventory.lanes.length === 0) {
+    lines.push('- None');
+    return lines;
+  }
+
+  for (const lane of inventory.lanes) {
+    const marker = lane.isCurrentHint ? '*' : '-';
+    lines.push(`${marker} ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}${lane.isCurrentHint ? ' [current hint]' : ''}`);
+    const facts = [];
+    if (lane.sessionDate) {
+      facts.push(`opened ${lane.sessionDate}${lane.sessionNumber ? ` (session ${lane.sessionNumber})` : ''}`);
+    }
+    if (lane.resumeCount > 0) {
+      facts.push(`resumed ${lane.resumeCount}×${lane.resumedAt ? ` (last ${lane.resumedAt})` : ''}`);
+    }
+    if (lane.branch) {
+      facts.push(`branch ${lane.branch}${lane.worktreeRepos.length > 0 ? ` (worktrees: ${lane.worktreeRepos.join(', ')})` : ''}`);
+    }
+    if (lane.runtimePort != null) {
+      facts.push(`port ${lane.runtimePort}`);
+    }
+    if (facts.length > 0) {
+      lines.push(`    ${facts.join('; ')}`);
+    }
+    if (lane.lastLogEntry) {
+      lines.push(`    last log: ${lane.lastLogEntry}`);
+    }
+    for (const warning of lane.warnings) {
+      lines.push(`    warning: ${warning}`);
+    }
+  }
+
+  return lines;
+}
+
+function buildResumeAlternativeWarnings(existingLanes, currentHint = null) {
+  if (existingLanes.length === 0) {
+    return [];
+  }
+
+  const ids = existingLanes.map((lane) => lane.id).sort((left, right) => left.localeCompare(right));
+  const inventoryLines = renderLaneInventoryLines(buildLaneInventory(existingLanes, currentHint)).map((line) => `  ${line}`);
+  return [
+    [
+      `${ids.length} lane${ids.length === 1 ? ' is' : 's are'} already active (${ids.join(', ')}). Opening a second lane is fine for new work; to resume existing work instead, run \`vibecompass continue-session <lane-id>\` (D-353).`,
+      ...inventoryLines,
+    ].join('\n'),
+  ];
+}
+
+/**
+ * Replaces or appends top-level scalar lines in a lane session.yaml without
+ * re-rendering the file, so keys this writer does not know about survive.
+ * Values are written verbatim through a function replacer (callers quote
+ * where needed; `$&`-style replacement tokens in user text are never
+ * interpreted). Key matching accepts the horizontal spacing parseSimpleYaml
+ * accepts (`key :`) and is CRLF-tolerant, so an existing spaced key is
+ * replaced rather than duplicated. The result is parsed before it is returned
+ * and an unparseable result is refused, so the caller never writes metadata
+ * that the next reader would null-degrade.
+ */
+function upsertTopLevelYamlScalars(content, scalars, sourceName = 'session.yaml') {
+  let next = content;
+  for (const [key, value] of Object.entries(scalars)) {
+    const pattern = new RegExp(`^${key}[ \\t]*:[^\\r\\n]*(\\r?\\n|$)`, 'm');
+    const line = `${key}: ${value}\n`;
+    if (pattern.test(next)) {
+      next = next.replace(pattern, () => line);
+    } else {
+      next = `${next.endsWith('\n') || next.length === 0 ? next : `${next}\n`}${line}`;
+    }
+  }
+
+  try {
+    parseSimpleYaml(next, { sourceName });
+  } catch (error) {
+    throw new Error(
+      `continue-session refused to write ${sourceName}: the updated lane metadata would not parse (${error instanceof Error ? error.message : String(error)}). Nothing was written.`,
+    );
+  }
+
+  return next;
+}
+
+/**
+ * Extracts the lane id recorded in a Current session block Date field
+ * (`YYYY-MM-DD (session N, lane <id>[; resumed YYYY-MM-DD])`). Returns null
+ * when the field has no lane clause, so callers compare full ids for
+ * equality instead of substring-matching.
+ */
+function parseCurrentSessionLaneId(dateField) {
+  if (typeof dateField !== 'string') {
+    return null;
+  }
+
+  const match = dateField.match(/\blane ([a-z0-9][a-z0-9-]*)(?=[;)\s]|$)/);
+  return match ? match[1] : null;
+}
+
+function findWipSection(content, sectionTitle) {
+  const lines = content.split('\n');
+  const heading = `## ${sectionTitle}`.toLowerCase();
+  const start = lines.findIndex((line) => line.trim().toLowerCase() === heading);
+  if (start < 0) {
+    return null;
+  }
+
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^##\s+/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+
+  return { lines, start, end };
+}
+
+function appendWipLogLine(content, logLine) {
+  const section = findWipSection(content, 'Log');
+  if (!section) {
+    const base = content.endsWith('\n') ? content : `${content}\n`;
+    return `${base}\n## Log\n${logLine}\n`;
+  }
+
+  const { lines, start, end } = section;
+  let bodyEnd = end;
+  while (bodyEnd > start + 1 && lines[bodyEnd - 1].trim() === '') {
+    bodyEnd -= 1;
+  }
+  const body = lines.slice(start + 1, bodyEnd);
+  // A template placeholder ("- None yet.") is replaced by the first real entry.
+  const kept = body.length === 1 && /^-\s*none yet\.?$/i.test(body[0].trim()) ? [] : body;
+  const trailer = end < lines.length ? [''] : [];
+  return [...lines.slice(0, start + 1), ...kept, logLine, ...trailer, ...lines.slice(end)].join('\n');
+}
+
+function replaceWipSectionBody(content, sectionTitle, bodyText) {
+  const section = findWipSection(content, sectionTitle);
+  if (!section) {
+    return content;
+  }
+
+  const { lines, start, end } = section;
+  const trailer = end < lines.length ? [''] : [];
+  return [...lines.slice(0, start + 1), bodyText, ...trailer, ...lines.slice(end)].join('\n');
+}
+
+function extractLastLogEntry(content) {
+  const section = findWipSection(content, 'Log');
+  if (!section) {
+    return null;
+  }
+
+  const { lines, start, end } = section;
+  for (let index = end - 1; index > start; index -= 1) {
+    const trimmed = lines[index].trim();
+    if (trimmed.length > 0) {
+      return trimmed.length > 200 ? `${trimmed.slice(0, 197)}...` : trimmed;
+    }
+  }
+
+  return null;
+}
+
+function computeLaneAgeDays(openedDate, resumeDate) {
+  const opened = Date.parse(`${openedDate}T00:00:00Z`);
+  const resumed = Date.parse(`${resumeDate}T00:00:00Z`);
+  if (!Number.isFinite(opened) || !Number.isFinite(resumed)) {
+    return null;
+  }
+
+  return Math.max(0, Math.round((resumed - opened) / 86_400_000));
 }
 
 /**
@@ -1532,6 +1970,9 @@ async function listActiveSessionLanes(normalized) {
         architectureDocs: metadata.architectureDocs,
         decisionDomainFiles: metadata.decisionDomainFiles,
         startedAt: metadata.startedAt,
+        resumedAt: metadata.resumedAt ?? null,
+        resumeCount: metadata.resumeCount ?? 0,
+        lastLogEntry: wipSession?.lastLogEntry ?? null,
         decisionSnapshot: metadata.decisionSnapshot,
         branch: metadata.branch ?? null,
         worktreeContainer: metadata.worktreeContainer ?? null,
@@ -1557,7 +1998,11 @@ async function listActiveSessionLanes(normalized) {
 
 async function readLaneWipSession(wipFilePath) {
   try {
-    return parseActiveSession(await readFile(wipFilePath, 'utf8'), wipFilePath);
+    const content = await readFile(wipFilePath, 'utf8');
+    return {
+      ...parseActiveSession(content, wipFilePath),
+      lastLogEntry: extractLastLogEntry(content),
+    };
   } catch {
     return null;
   }
@@ -1576,6 +2021,9 @@ async function readLaneMetadata(sessionFilePath) {
       architectureDocs: normalizeStringArray(data.architecture_docs).map(normalizeArchitectureDocPath),
       decisionDomainFiles: normalizeStringArray(data.decision_domain_files).map(normalizeDecisionDomainFile),
       startedAt: normalizeOptionalString(data.started_at),
+      // D-353 resume bookkeeping; absent on lanes opened before continue-session existed.
+      resumedAt: normalizeOptionalString(data.resumed_at),
+      resumeCount: Math.max(0, Math.trunc(parseNullableNumber(data.resume_count) ?? 0)),
       decisionSnapshot: {
         highestDecisionId: parseNullableNumber(data.decision_snapshot?.highest_decision_id),
       },
@@ -1611,6 +2059,8 @@ async function readLaneMetadata(sessionFilePath) {
       architectureDocs: [],
       decisionDomainFiles: [],
       startedAt: null,
+      resumedAt: null,
+      resumeCount: 0,
       decisionSnapshot: {
         highestDecisionId: null,
       },
@@ -1727,6 +2177,7 @@ async function listFinalizedSessions(sessionsDir) {
       .map((entry) => entry.name.match(SESSION_FILENAME_PATTERN))
       .filter(Boolean)
       .map((match) => ({
+        fileName: match[0],
         sessionDate: match[1],
         sessionNumber: Number(match[2]),
         slug: match[3],

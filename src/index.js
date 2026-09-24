@@ -22,7 +22,9 @@ export {
 } from './project-memory.js';
 export {
   closeProjectSession,
+  continueProjectSession,
   listProjectSessions,
+  renderLaneInventoryLines,
   startProjectSession,
   switchProjectSession,
 } from './session.js';

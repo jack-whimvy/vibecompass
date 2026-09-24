@@ -195,7 +195,10 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /Optional planning mode/);
     assert.match(context, /`close session` — builder runs the close-out checklist/);
     assert.match(context, /end-session` is also accepted as an alias/);
-    assert.match(context, /reports stale scratch files/);
+    assert.match(context, /reports legacy or stale scratch files/);
+    assert.match(context, /`continue session` — builder resumes an already-open lane with `vibecompass continue-session \[<lane-id>\]` \(D-353\)/);
+    assert.match(context, /## Open, resume, or choose \(D-353\)/);
+    assert.match(context, /\| "continue session" \| Builder \|/);
     assert.match(context, /Documentation coverage/);
     assert.match(context, /permanent note distills decisions, completions, blockers, and next steps/);
     assert.match(context, /granular reviewer trail must remain durable/);

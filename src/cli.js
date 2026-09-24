@@ -8,7 +8,7 @@ import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { closeProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
+import { closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
@@ -298,20 +298,66 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'continue-session') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await continueProjectSession({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      const { manifest: _manifest, docsUpdatePlan: _plan, agentFileSync, ...json } = result;
+      io.stdout.write(`${JSON.stringify({ ...json, agentFileSync: agentFileSync?.results ?? [] }, null, 2)}\n`);
+      writeWarnings(io, result.warnings);
+      return 0;
+    }
+    {
+      // Text mode.
+      io.stdout.write(`Continued lane ${result.sessionId} (session ${result.sessionDate}-${result.sessionNumber}, resume #${result.resumeCount}${result.laneAgeDays != null ? `, opened ${result.laneAgeDays} day${result.laneAgeDays === 1 ? '' : 's'} ago` : ''}; selected via ${result.selectionSource})\n`);
+      io.stdout.write(`Working on: ${result.workingOn}${result.workingOnUpdated ? ' (updated)' : ''}\n`);
+      io.stdout.write(`Updated ${result.claudePath}\n`);
+      io.stdout.write('Read next:\n');
+      io.stdout.write(`- ${result.wipFilePath}\n`);
+      io.stdout.write(`- ${result.handoffFilePath}\n`);
+      if (result.latestFinalizedSessionPath) {
+        io.stdout.write(`- ${result.latestFinalizedSessionPath} (latest finalized note)\n`);
+      }
+      if (result.gitBinding) {
+        const worktreeRepos = Object.keys(result.gitBinding.worktrees);
+        io.stdout.write(`Git binding: branch "${result.gitBinding.branch}"${worktreeRepos.length > 0 ? ` with worktrees for ${worktreeRepos.join(', ')} under ${result.gitBinding.worktreeContainer}` : ' (no worktrees)'}\n`);
+      }
+      if (result.runtime) {
+        io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
+        io.stdout.write(`Export into a shell with: eval "$(vibecompass lane-env${result.otherLanes.length > 0 ? ` --session ${result.sessionId}` : ''})" (D-282).\n`);
+      }
+      if (result.otherLanes.length > 0) {
+        io.stdout.write(`Other active lanes (${result.otherLanes.length}) — pass --session ${result.sessionId} to lane-scoped commands, or run them from this lane's worktree:\n`);
+        for (const lane of result.otherLanes) {
+          io.stdout.write(`- ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}\n`);
+        }
+      }
+    }
+    writeWarnings(io, result.warnings);
+    writeAgentFileSyncResult(io, result.agentFileSync);
+    return 0;
+  }
+
   if (parsed.command === 'list-sessions') {
     await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const result = await listProjectSessions({
       ...parsed.options,
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
     });
-    io.stdout.write(`Active session lanes${result.current ? ` (current: ${result.current})` : ''}:\n`);
-    if (result.lanes.length === 0) {
-      io.stdout.write('- None\n');
-    } else {
-      for (const lane of result.lanes) {
-        const marker = lane.id === result.current ? '*' : '-';
-        io.stdout.write(`${marker} ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}\n`);
-      }
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({ root_dir: result.rootDir, ...result.inventory }, null, 2)}\n`);
+      return 0;
+    }
+    for (const line of renderLaneInventoryLines(result.inventory)) {
+      io.stdout.write(`${line}\n`);
+    }
+    if (result.inventory.lanes.length > 1) {
+      io.stdout.write('Multiple lanes are active: resume one with `vibecompass continue-session <lane-id>`; the current hint is not a selection (D-277/D-353).\n');
+    } else if (result.inventory.lanes.length === 1) {
+      io.stdout.write(`Resume with \`vibecompass continue-session\` (single active lane resolves implicitly; D-353).\n`);
     }
     return 0;
   }
@@ -734,6 +780,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'list-sessions') {
       return parseListSessionsArgs(rest);
+    }
+
+    if (command === 'continue-session') {
+      return parseContinueSessionArgs(rest);
     }
 
     if (command === 'switch-session') {
@@ -1393,6 +1443,11 @@ function parseListSessionsArgs(argv) {
       throw new Error(`Unexpected argument "${token}".`);
     }
 
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
     const value = argv[index + 1];
     if (value === undefined) {
       throw new Error(`Flag "${token}" requires a value.`);
@@ -1634,6 +1689,77 @@ function parseNextDecisionIdArgs(argv) {
   }
 
   return { command: 'next-decision-id', options: parsed };
+}
+
+function parseContinueSessionArgs(argv) {
+  const parsed = {};
+  const positional = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      positional.push(token);
+      continue;
+    }
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--tooling-root':
+        parsed.toolingRootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--working-on':
+        parsed.workingOn = value;
+        break;
+      case '--date':
+        parsed.date = value;
+        break;
+      case '--last-thing-completed':
+        parsed.lastThingCompleted = value;
+        break;
+      case '--blockers':
+        parsed.blockers = value;
+        break;
+      case '--next-session-should':
+        parsed.nextSessionShould = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  if (positional.length > 1) {
+    throw new Error(`Unexpected argument "${positional[1]}".`);
+  }
+
+  if (parsed.sessionId && positional[0] && parsed.sessionId !== positional[0]) {
+    throw new Error(`Conflicting lane IDs: positional "${positional[0]}" and --session "${parsed.sessionId}".`);
+  }
+
+  if (!parsed.sessionId && positional[0]) {
+    parsed.sessionId = positional[0];
+  }
+
+  return {
+    command: 'continue-session',
+    options: parsed,
+  };
 }
 
 function parseSwitchSessionArgs(argv) {
@@ -2369,7 +2495,8 @@ function usageText() {
     '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
-    '  vibecompass list-sessions [options]',
+    '  vibecompass continue-session [<lane-id>] [--session <lane-id>] [--working-on <text>] [--json] [options]',
+    '  vibecompass list-sessions [--json] [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
     '  vibecompass write-lane-marker --session <lane-id> [--dir <path>] [options]',
@@ -2481,9 +2608,21 @@ function usageText() {
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md completed summary',
     '  --next-session-should <text>         Optional override for the CLAUDE.md next-session summary',
     '',
+    'Continue-session options (D-353):',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root',
+    '  --session <lane-id>                  Lane to resume; positional ID is also accepted. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes fail closed and print the lane inventory (D-277)',
+    '  --working-on <text>                  Optional refreshed lane scope; rewrites working_on in session.yaml, the index, wip.md, and CLAUDE.md',
+    '  --date <YYYY-MM-DD>                  Optional explicit resume date (the lane keeps its opening date and session number)',
+    '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
+    '  --blockers <text>                    Optional current blockers summary',
+    '  --next-session-should <text>         Optional current-session handoff summary',
+    '  --json                               Print the resume result (lane, paths, runtime, other lanes, warnings) as JSON',
+    '',
     'List/switch-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
+    '  --json                               list-sessions: print the lane inventory as JSON',
     '',
     'Rebuild-active-index options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

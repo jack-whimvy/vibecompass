@@ -128,10 +128,20 @@ npx -y @vibecompass/vibecompass@latest status --root .compass
 
 # Session workflow
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "Auth flow"
-npx -y @vibecompass/vibecompass@latest list-sessions --root .compass
+npx -y @vibecompass/vibecompass@latest list-sessions --root .compass            # --json for the machine-readable lane inventory
+npx -y @vibecompass/vibecompass@latest continue-session --root .compass         # resume the open lane (D-353); name it with 2+ lanes: continue-session auth-flow
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
+
+# Resuming (D-353): an active lane is an open session, not a crash. continue-session
+# keeps the lane's opening date and session number, records resumed_at/resume_count
+# in session.yaml, appends a dated "Resumed" line to wip.md, moves the index current
+# hint and the Current session block to the lane, and prints the files to read next
+# plus resume-staleness warnings. With two or more active lanes and no worktree
+# marker it fails closed and prints the lane inventory instead of guessing;
+# start-session --id <existing-lane> fails closed and points at continue-session.
+npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
 
 # Optional git binding for a lane (D-281): create/reuse a branch in each bound
 # repo; --worktree provisions per-repo worktrees under

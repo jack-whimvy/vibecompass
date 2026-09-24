@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
-import { closeProjectSession, listProjectSessions, readLaneEnvironment, startProjectSession, switchProjectSession } from '../session.js';
+import { closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from '../session.js';
 
 const DOCUMENT_MAINTENANCE_UPDATED = {
   architectureDocs: 'updated',
@@ -1751,9 +1751,11 @@ test('runCli supports list-sessions, switch-session, and close-session --session
 
     const output = stdout.join('');
     assert.doesNotMatch(stderr.join(''), /CLAUDE\.md: warning/);
-    assert.match(output, /Active session lanes \(current: marketing-copy\):/);
-    assert.match(output, /\* marketing-copy: Build marketing copy\./);
+    assert.match(output, /Active session lanes \(current hint: marketing-copy\):/);
+    assert.match(output, /\* marketing-copy: Build marketing copy\. \[current hint\]/);
     assert.match(output, /- billing-plans: Build billing plans\./);
+    assert.match(output, /opened 2026-04-20 \(session 1\); port 3100/);
+    assert.match(output, /resume one with `vibecompass continue-session <lane-id>`/);
     assert.match(output, /Current session lane: billing-plans/);
     assert.match(output, /Closed session 2026-04-20-1/);
 
@@ -1836,6 +1838,462 @@ test('runCli supports end-session as a close-session alias', async () => {
     assert.equal(exitCode, 0);
     assert.ok(stdout.join('').includes('Closed session 2026-04-27-1'));
     assert.ok(stdout.join('').includes('2026-04-27-1-end-alias-flow.md'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+async function createContinueSessionRoot(prefix) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), prefix));
+  const rootDir = path.join(tempDir, '.compass');
+  await initializeProjectMemory({
+    cwd: tempDir,
+    rootDir,
+    name: 'Continue Project',
+    mode: 'local-only',
+    repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+    bootstrap: {
+      workflow: true,
+      claude: true,
+    },
+  });
+  return { tempDir, rootDir };
+}
+
+function currentSessionBlock(claudeContent) {
+  const start = claudeContent.indexOf('## Current session');
+  const fenceStart = claudeContent.indexOf('```', start);
+  const fenceEnd = claudeContent.indexOf('```', fenceStart + 3);
+  return claudeContent.slice(fenceStart + 3, fenceEnd);
+}
+
+test('continueProjectSession resumes the single active lane without renumbering or re-dating it (D-353)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-single-');
+
+  try {
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-plans',
+      workingOn: 'Build the billing plans lane.',
+      date: '2026-04-20',
+    });
+
+    const first = await continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-22' });
+    assert.equal(first.sessionId, 'billing-plans');
+    assert.equal(first.selectionSource, 'single-lane');
+    assert.equal(first.sessionDate, '2026-04-20');
+    assert.equal(first.sessionNumber, 1);
+    assert.equal(first.resumeDate, '2026-04-22');
+    assert.equal(first.resumeCount, 1);
+    assert.equal(first.laneAgeDays, 2);
+    assert.equal(first.workingOn, 'Build the billing plans lane.');
+    assert.equal(first.workingOnUpdated, false);
+    assert.equal(first.runtime.port, 3100);
+    assert.deepEqual(first.otherLanes, []);
+    assert.ok(first.latestFinalizedSessionPath, 'the init note is reported as the latest finalized note');
+
+    const sessionYaml = await readFile(path.join(rootDir, 'sessions/active/billing-plans/session.yaml'), 'utf8');
+    assert.match(sessionYaml, /^session_date: 2026-04-20$/m);
+    assert.match(sessionYaml, /^session_number: 1$/m);
+    assert.match(sessionYaml, /^resumed_at: \d{4}-\d{2}-\d{2}T/m);
+    assert.match(sessionYaml, /^resume_count: 1$/m);
+    assert.equal((sessionYaml.match(/^resume_count:/gm) ?? []).length, 1);
+
+    const wip = await readFile(path.join(rootDir, 'sessions/active/billing-plans/wip.md'), 'utf8');
+    assert.match(wip, /^# WIP — 2026-04-20 \(session 1\)$/m);
+    assert.match(wip, /^- Opened session 1\. Working on: Build the billing plans lane\.\n- Resumed lane on 2026-04-22 \(continue-session #1\)\n\n## Reviewer input needed/m);
+
+    const claude = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+    const block = currentSessionBlock(claude);
+    assert.match(block, /^Date: 2026-04-20 \(session 1, lane billing-plans; resumed 2026-04-22\)$/m);
+    assert.match(block, /^Working on: Build the billing plans lane\. \[billing-plans\]$/m);
+    assert.match(block, /^Last thing completed: Project memory bootstrap completed\.$/m);
+
+    const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    assert.match(index, /^current: billing-plans$/m);
+
+    // Second resume with a scope refresh: counter increments, working_on moves
+    // through session.yaml, the index, wip.md, and CLAUDE.md; the block's
+    // completed/blockers/next fields survive because they describe this lane.
+    const second = await continueProjectSession({
+      cwd: tempDir,
+      rootDir,
+      date: '2026-04-23',
+      workingOn: 'Build the billing plans lane, phase 2.',
+    });
+    assert.equal(second.resumeCount, 2);
+    assert.equal(second.workingOnUpdated, true);
+    const sessionYamlAfter = await readFile(path.join(rootDir, 'sessions/active/billing-plans/session.yaml'), 'utf8');
+    assert.match(sessionYamlAfter, /^working_on: "Build the billing plans lane, phase 2\."$/m);
+    assert.match(sessionYamlAfter, /^resume_count: 2$/m);
+    assert.equal((sessionYamlAfter.match(/^resumed_at:/gm) ?? []).length, 1);
+    const wipAfter = await readFile(path.join(rootDir, 'sessions/active/billing-plans/wip.md'), 'utf8');
+    assert.match(wipAfter, /^## Working on\nBuild the billing plans lane, phase 2\.\n\n## Log/m);
+    assert.match(wipAfter, /^- Resumed lane on 2026-04-23 \(continue-session #2\)\. Working on updated: Build the billing plans lane, phase 2\.$/m);
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.equal(listed.lanes[0].workingOn, 'Build the billing plans lane, phase 2.');
+    assert.equal(listed.lanes[0].resumeCount, 2);
+    assert.match(listed.lanes[0].lastLogEntry, /^- Resumed lane on 2026-04-23/);
+    assert.equal(listed.inventory.current, 'billing-plans');
+    assert.equal(listed.inventory.lanes[0].isCurrentHint, true);
+    const blockAfter = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockAfter, /^Working on: Build the billing plans lane, phase 2\. \[billing-plans\]$/m);
+    assert.match(blockAfter, /^Last thing completed: Project memory bootstrap completed\.$/m);
+
+    // Closing still finalizes under the opening date and number.
+    const closed = await closeProjectSession({
+      cwd: tempDir,
+      rootDir,
+      title: 'Billing lane',
+      completed: ['Done'],
+      nextSteps: ['None'],
+      documentMaintenance: DOCUMENT_MAINTENANCE_UPDATED,
+    });
+    assert.equal(closed.sessionDate, '2026-04-20');
+    assert.equal(closed.sessionNumber, 1);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession fails closed with the lane inventory when multiple lanes are active', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-multi-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-plans', workingOn: 'Build billing plans.', date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'marketing-copy', workingOn: 'Build marketing copy.', date: '2026-04-21' });
+
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-22' }),
+      (error) => {
+        assert.match(error.message, /Multiple active session lanes exist; continue-session will not guess/);
+        assert.match(error.message, /Active session lanes \(current hint: marketing-copy\):/);
+        assert.match(error.message, /^- billing-plans: Build billing plans\.$/m);
+        assert.match(error.message, /^\* marketing-copy: Build marketing copy\. \[current hint\]$/m);
+        assert.match(error.message, /opened 2026-04-20 \(session 1\); port 3100/);
+        assert.match(error.message, /last log: - Opened session 1\. Working on: Build marketing copy\./);
+        assert.match(error.message, /`vibecompass continue-session <lane-id>`/);
+        assert.match(error.message, /continuity hint, not a selection/);
+        return true;
+      },
+    );
+    // The refusal wrote nothing: no resume bookkeeping on either lane.
+    for (const laneId of ['billing-plans', 'marketing-copy']) {
+      const sessionYaml = await readFile(path.join(rootDir, `sessions/active/${laneId}/session.yaml`), 'utf8');
+      assert.doesNotMatch(sessionYaml, /resume_count/);
+    }
+
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'unknown-lane' }),
+      /Session lane "unknown-lane" is not an active lane/,
+    );
+
+    const resumed = await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-plans', date: '2026-04-22' });
+    assert.equal(resumed.sessionId, 'billing-plans');
+    assert.equal(resumed.selectionSource, 'flag');
+    assert.deepEqual(resumed.otherLanes.map((lane) => lane.id), ['marketing-copy']);
+    const wip = await readFile(path.join(rootDir, 'sessions/active/billing-plans/wip.md'), 'utf8');
+    assert.match(wip, /^- Resumed lane on 2026-04-22 \(continue-session #1; 1 other active lane: marketing-copy\)$/m);
+    const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    assert.match(index, /^current: billing-plans$/m);
+    const block = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(block, /^Active lanes:$/m);
+    assert.match(block, /^- billing-plans — Build billing plans\. \[selected\]$/m);
+    assert.match(block, /^Date: 2026-04-20 \(session 1, lane billing-plans; resumed 2026-04-22\)$/m);
+    // The block previously described marketing-copy, so its fields are not carried over.
+    assert.match(block, /^Last thing completed: Resumed lane billing-plans \(continue-session #1\)\.$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession follows a worktree lane marker and errors when nothing is active', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-marker-');
+
+  try {
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir }),
+      /No active session lane exists to continue\. Open one with `vibecompass start-session/,
+    );
+
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', date: '2026-04-20' });
+    const worktreeDir = path.join(tempDir, 'worktrees', 'lane-a', 'docs');
+    await mkdir(worktreeDir, { recursive: true });
+    await writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: worktreeDir });
+
+    // Neither --root nor --session: the marker supplies both.
+    const resumed = await continueProjectSession({ cwd: worktreeDir, date: '2026-04-21' });
+    assert.equal(resumed.sessionId, 'lane-a');
+    assert.equal(resumed.selectionSource, 'marker');
+    assert.equal(resumed.rootDir, rootDir);
+    assert.equal(resumed.claudePath, path.join(tempDir, 'CLAUDE.md'));
+
+    // An explicit id still wins over the marker, with the D-277 override warning.
+    const overridden = await continueProjectSession({ cwd: worktreeDir, sessionId: 'lane-b', date: '2026-04-21' });
+    assert.equal(overridden.sessionId, 'lane-b');
+    assert.match(overridden.warnings.join('\n'), /--session lane-b overrides the lane marker/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('startProjectSession fails closed on an existing lane id and points at continue-session', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-dup-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    const indexBefore = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    const claudeBefore = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+
+    await assert.rejects(
+      startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A again.', date: '2026-04-21' }),
+      /Active session lane "lane-a" already exists\. Resume it with `vibecompass continue-session lane-a`/,
+    );
+    assert.equal(await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8'), indexBefore);
+    assert.equal(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'), claudeBefore);
+    const wip = await readFile(path.join(rootDir, 'sessions/active/lane-a/wip.md'), 'utf8');
+    assert.match(wip, /Working on: Lane A\.$/m);
+
+    const second = await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', date: '2026-04-21' });
+    assert.match(second.warnings.join('\n'), /1 lane is already active \(lane-a\)\. Opening a second lane is fine for new work; to resume existing work instead, run `vibecompass continue-session <lane-id>`/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli supports continue-session (text and --json) and list-sessions --json', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-cli-');
+  const stdout = [];
+  const stderr = [];
+  const io = {
+    stdout: { write(chunk) { stdout.push(chunk); } },
+    stderr: { write(chunk) { stderr.push(chunk); } },
+  };
+
+  try {
+    assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'lane-a', '--working-on', 'Lane A.', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
+    assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'lane-b', '--working-on', 'Lane B.', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
+    assert.match(stderr.join(''), /Warning: 1 lane is already active \(lane-a\)/);
+
+    await assert.rejects(
+      runCli(['continue-session', '--root', rootDir], io, { cwd: tempDir }),
+      /Multiple active session lanes exist[\s\S]*\* lane-b: Lane B\. \[current hint\]/,
+    );
+    await assert.rejects(
+      runCli(['continue-session', '--root', rootDir, 'lane-a', '--session', 'lane-b'], io, { cwd: tempDir }),
+      /Conflicting lane IDs/,
+    );
+
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, 'lane-a', '--date', '2026-04-22'], io, { cwd: tempDir }), 0);
+    const text = stdout.join('');
+    assert.match(text, /^Continued lane lane-a \(session 2026-04-20-1, resume #1, opened 2 days ago; selected via flag\)$/m);
+    assert.match(text, /^Read next:\n- .*lane-a\/wip\.md\n- .*lane-a\/handoff\.md\n- .*\(latest finalized note\)$/m);
+    assert.match(text, /eval "\$\(vibecompass lane-env --session lane-a\)"/);
+    assert.match(text, /^Other active lanes \(1\) — pass --session lane-a to lane-scoped commands.*\n- lane-b: Lane B\.$/m);
+
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, '--session', 'lane-a', '--date', '2026-04-23', '--json'], io, { cwd: tempDir }), 0);
+    const json = JSON.parse(stdout.join(''));
+    assert.equal(json.sessionId, 'lane-a');
+    assert.equal(json.resumeCount, 2);
+    assert.equal(json.sessionDate, '2026-04-20');
+    assert.deepEqual(json.otherLanes.map((lane) => lane.id), ['lane-b']);
+    assert.equal('manifest' in json, false);
+    assert.ok(Array.isArray(json.agentFileSync), 'JSON mode carries the agent-file sync results instead of printing them');
+
+    stdout.length = 0;
+    assert.equal(await runCli(['list-sessions', '--root', rootDir, '--json'], io, { cwd: tempDir }), 0);
+    const inventory = JSON.parse(stdout.join(''));
+    assert.equal(inventory.current, 'lane-a');
+    assert.deepEqual(inventory.lanes.map((lane) => [lane.id, lane.resumeCount, lane.isCurrentHint]), [['lane-a', 2, true], ['lane-b', 0, false]]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession writes --working-on literally even when it contains replacement tokens (review R1)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-r1-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    const scope = "Fix replacement $& $` $' $$ $1 handling";
+    const result = await continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21', workingOn: scope });
+    assert.equal(result.workingOn, scope);
+
+    const sessionYaml = await readFile(path.join(rootDir, 'sessions/active/lane-a/session.yaml'), 'utf8');
+    assert.equal((sessionYaml.match(/^working_on/gm) ?? []).length, 1);
+    assert.match(sessionYaml, /^working_on: "Fix replacement \$& \$` \$' \$\$ \$1 handling"$/m);
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(listed.lanes[0].warnings, []);
+    assert.equal(listed.lanes[0].workingOn, scope);
+    const wip = await readFile(path.join(rootDir, 'sessions/active/lane-a/wip.md'), 'utf8');
+    assert.match(wip, /^## Working on\nFix replacement \$& \$` \$' \$\$ \$1 handling\n/m);
+    const index = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    assert.match(index, /working_on: "Fix replacement \$& \$` \$' \$\$ \$1 handling"/);
+    const block = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(block, /^Working on: Fix replacement \$& \$` \$' \$\$ \$1 handling \[lane-a\]$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession replaces spaced YAML keys in CRLF metadata instead of duplicating them (review R2)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-r2-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/lane-a/session.yaml');
+    const original = await readFile(sessionFilePath, 'utf8');
+    // Hand-edited shape the reader accepts: spaced keys, CRLF line endings, a
+    // prior resume with spaced bookkeeping keys, and an unrelated custom key.
+    const edited = `${original
+      .replace(/^working_on: /m, 'working_on : ')
+      .replace(/\n/g, '\r\n')}resume_count : 1\r\nresumed_at : 2026-04-20T10:00:00-07:00\r\ncustom_note : "keep me"\r\n`;
+    await writeFile(sessionFilePath, edited, 'utf8');
+    const before = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(before.lanes[0].warnings, []);
+    assert.equal(before.lanes[0].resumeCount, 1);
+
+    const result = await continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21', workingOn: 'Lane A, phase 2.' });
+    assert.equal(result.resumeCount, 2);
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    for (const key of ['working_on', 'resume_count', 'resumed_at']) {
+      assert.equal((sessionYaml.match(new RegExp(`^${key}[ \\t]*:`, 'gm')) ?? []).length, 1, `${key} must appear once`);
+    }
+    assert.match(sessionYaml, /^working_on: "Lane A, phase 2\."$/m);
+    assert.match(sessionYaml, /^resume_count: 2$/m);
+    assert.match(sessionYaml, /^custom_note : "keep me"\r?$/m);
+    const after = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(after.lanes[0].warnings, []);
+    assert.equal(after.lanes[0].workingOn, 'Lane A, phase 2.');
+    assert.equal(after.lanes[0].resumeCount, 2);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession carries Current-session fields only for the exact same lane id (review R3)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-r3-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', workingOn: 'Billing.', date: '2026-04-20' });
+    await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'billing-tax',
+      workingOn: 'Billing tax.',
+      date: '2026-04-20',
+      lastThingCompleted: 'Tax completed item.',
+      blockers: 'Tax blocker.',
+      nextSessionShould: 'Tax next step.',
+    });
+    const blockBefore = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockBefore, /lane billing-tax\)/);
+
+    const first = await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', date: '2026-04-21' });
+    assert.equal(first.sessionId, 'billing');
+    const blockAfterFirst = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockAfterFirst, /^Date: 2026-04-20 \(session 1, lane billing; resumed 2026-04-21\)$/m);
+    assert.match(blockAfterFirst, /^Last thing completed: Resumed lane billing \(continue-session #1\)\.$/m);
+    assert.match(blockAfterFirst, /^Blockers: No blocker recorded for the selected lane\.$/m);
+    assert.doesNotMatch(blockAfterFirst, /Tax completed item|Tax blocker|Tax next step/);
+
+    // A repeated resume of the same lane carries its own fields forward.
+    await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', date: '2026-04-22', blockers: 'Billing blocker.' });
+    const blockAfterSecond = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockAfterSecond, /^Last thing completed: Resumed lane billing \(continue-session #1\)\.$/m);
+    assert.match(blockAfterSecond, /^Blockers: Billing blocker\.$/m);
+    await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', date: '2026-04-23' });
+    const blockAfterThird = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockAfterThird, /^Blockers: Billing blocker\.$/m);
+    assert.match(blockAfterThird, /^Date: 2026-04-20 \(session 1, lane billing; resumed 2026-04-23\)$/m);
+
+    // And resuming the prefix-sharing lane afterwards does not inherit billing's fields.
+    await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-tax', date: '2026-04-23' });
+    const blockTax = currentSessionBlock(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'));
+    assert.match(blockTax, /^Last thing completed: Resumed lane billing-tax \(continue-session #1\)\.$/m);
+    assert.doesNotMatch(blockTax, /Billing blocker/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession refuses before any write when CLAUDE.md is missing (review R4)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-r4-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', date: '2026-04-20' });
+    const paths = [
+      path.join(rootDir, 'sessions/active/lane-a/session.yaml'),
+      path.join(rootDir, 'sessions/active/lane-a/wip.md'),
+      path.join(rootDir, 'sessions/active/lane-a/handoff.md'),
+      path.join(rootDir, 'sessions/active/lane-b/session.yaml'),
+      path.join(rootDir, 'sessions/active/index.yaml'),
+    ];
+    const snapshot = await Promise.all(paths.map((file) => readFile(file, 'utf8')));
+    await rm(path.join(tempDir, 'CLAUDE.md'));
+
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', date: '2026-04-21', workingOn: 'Lane A, phase 2.' }),
+      /CLAUDE\.md/,
+    );
+    const after = await Promise.all(paths.map((file) => readFile(file, 'utf8')));
+    assert.deepEqual(after, snapshot, 'a refusal leaves every lane and index byte unchanged');
+    assert.match(after[4], /^current: lane-b$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continueProjectSession returns the post-resume inventory that list-sessions reports (review S1)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-s1-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', workingOn: 'Billing.', date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing-tax', workingOn: 'Billing tax.', date: '2026-04-20' });
+
+    const result = await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'billing', date: '2026-04-21', workingOn: 'Billing, phase 2.' });
+    assert.equal(result.inventory.current, 'billing');
+    const entry = result.inventory.lanes.find((lane) => lane.id === 'billing');
+    assert.equal(entry.resumeCount, 1);
+    assert.equal(entry.workingOn, 'Billing, phase 2.');
+    assert.equal(entry.isCurrentHint, true);
+    assert.match(entry.lastLogEntry, /^- Resumed lane on 2026-04-21 \(continue-session #1; 1 other active lane: billing-tax\)/);
+    assert.equal(typeof entry.resumedAt, 'string');
+    assert.deepEqual(result.otherLanes.map((lane) => [lane.id, lane.isCurrentHint]), [['billing-tax', false]]);
+
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(result.inventory, listed.inventory);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('unknown-id refusal and start-session resume warning both render the lane inventory (review S2)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-continue-s2-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-zzz' }),
+      (error) => {
+        assert.match(error.message, /^Session lane "lane-zzz" is not an active lane in /);
+        assert.match(error.message, /Active session lanes \(current hint: lane-a\):/);
+        assert.match(error.message, /^\* lane-a: Lane A\. \[current hint\]$/m);
+        assert.match(error.message, /opened 2026-04-20 \(session 1\); port 3100/);
+        return true;
+      },
+    );
+
+    const second = await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', date: '2026-04-20' });
+    const warning = second.warnings.find((item) => /already active/.test(item));
+    assert.ok(warning, 'start-session warns about the already-active lane');
+    assert.match(warning, /^1 lane is already active \(lane-a\)\./);
+    assert.match(warning, /\n {2}Active session lanes \(current hint: lane-a\):\n {2}\* lane-a: Lane A\. \[current hint\]\n {6}opened 2026-04-20 \(session 1\); port 3100/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

@@ -7,7 +7,8 @@ export const WORKFLOW_REGISTRY = [
     detailPath: 'context.md',
     summary: 'Builder/reviewer lane lifecycle, handoffs, planning mode, and close-out.',
     promptCommands: [
-      { trigger: 'start session', summary: 'builder role trigger' },
+      { trigger: 'start session', summary: 'builder role trigger; opens a new named lane — if a lane is already active, resume it with `continue session` instead of opening a duplicate' },
+      { trigger: 'continue session', summary: 'builder resumes an already-open lane with `vibecompass continue-session [<lane-id>]` (D-353); with multiple active lanes name the lane explicitly: `continue session <lane-id>` — the agent presents the lane inventory and asks rather than guessing' },
       { trigger: 'join as reviewer', summary: 'reviewer role trigger' },
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
       { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and appends findings; with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
