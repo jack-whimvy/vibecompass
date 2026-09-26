@@ -18,6 +18,17 @@ import { refreshWorkflow } from './refresh-workflow.js';
 import { inspectProjectCompatibility, formatCompatibilityWarnings } from './compatibility.js';
 import { PACKAGE_VERSION } from './version.js';
 import { demoteHosted, promoteHosted } from './mode-transition.js';
+import { loginHosted } from './login.js';
+import {
+  credentialStoreKey,
+  credentialStoreOptionsFrom,
+  listSyncCredentials,
+  removeSyncCredential,
+  storeSyncCredential,
+} from './credential-store.js';
+import { canPromptSecret, promptSecret, readSecretFromStdin } from './secret-prompt.js';
+import { resolveSyncBinding, readSyncTargets } from './sync-binding.js';
+import { parseSimpleYaml } from './simple-yaml.js';
 import {
   adoptRemoteHead,
   applyPullExport,
@@ -71,7 +82,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.syncEnvVar) {
       const rootFlag = formatOptionalRootFlag(initPlan.initOptions.rootDir);
       io.stdout.write(`Hosted binding: configured for ${initPlan.initOptions.mode}\n`);
-      io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first hosted command.\n`);
+      io.stdout.write(`Next step: sign in with "vibecompass login${rootFlag}" (opens the dashboard and stores the sync token locally).\n`);
       if (initPlan.initOptions.mode === 'local-primary') {
         io.stdout.write(`Then run: vibecompass push${rootFlag}\n`);
         io.stdout.write(`Hosted docs-review: vibecompass docs-review --submit-hosted${rootFlag}\n`);
@@ -204,7 +215,22 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Sync target: ${result.syncTarget.name} (default: ${result.syncTarget.defaultTarget})\n`);
       io.stdout.write(`Select per command with --sync-target ${result.syncTarget.name}, or switch the default with: vibecompass sync-target ${result.syncTarget.name}\n`);
     }
-    io.stdout.write(`Next step: set ${result.syncEnvVar} locally before your first hosted command.\n`);
+    const capture = await captureSyncTokenAfterConnect(io, runtime, {
+      binding: {
+        apiUrl: connectPlan.sync.apiUrl,
+        projectId: connectPlan.sync.projectId,
+        credentialEnvVar: result.syncEnvVar,
+        target: result.syncTarget?.name ?? null,
+      },
+      rootDir: parsed.options.rootDir,
+      tokenStdin: Boolean(parsed.options.tokenStdin),
+      noStore: Boolean(parsed.options.noStore),
+      credentialStore: parsed.options.credentialStore,
+      rootFlag: formatOptionalRootFlag(parsed.options.rootDir),
+    });
+    if (capture?.viaLogin) {
+      return 0;
+    }
     if (result.mode === 'local-primary') {
       io.stdout.write('Then run: vibecompass push\n');
       io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
@@ -212,6 +238,22 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write('Hosted docs-review: vibecompass docs-review --submit-hosted\n');
     }
     return 0;
+  }
+
+  if (parsed.command === 'login') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await loginHosted(parsed.options, {
+      cwd: runtime.cwd,
+      env: runtime.env,
+      io,
+      runtime,
+    });
+    writeLoginResult(io, result);
+    return 0;
+  }
+
+  if (parsed.command === 'sync-credential') {
+    return runSyncCredentialCommand(io, runtime, parsed.options);
   }
 
   if (parsed.command === 'sync-target') {
@@ -762,6 +804,14 @@ export function parseCliArgs(argv) {
       return parseSyncTargetArgs(rest);
     }
 
+    if (command === 'login') {
+      return parseLoginArgs(rest);
+    }
+
+    if (command === 'sync-credential') {
+      return parseSyncCredentialArgs(rest);
+    }
+
     if (command === 'status') {
       return parseStatusArgs(rest);
     }
@@ -1162,6 +1212,16 @@ function parseConnectHostedArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
+    if (token === '--token-stdin') {
+      parsed.tokenStdin = true;
+      continue;
+    }
+
+    if (token === '--no-store') {
+      parsed.noStore = true;
+      continue;
+    }
+
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
     }
@@ -1188,6 +1248,9 @@ function parseConnectHostedArgs(argv) {
       case '--sync-credential-env-var':
         parsed.syncCredentialEnvVar = value;
         break;
+      case '--credential-store':
+        parsed.credentialStore = value;
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -1203,6 +1266,9 @@ function parseConnectHostedArgs(argv) {
     command: 'connect-hosted',
     options: {
       rootDir: parsed.rootDir,
+      ...(parsed.tokenStdin ? { tokenStdin: true } : {}),
+      ...(parsed.noStore ? { noStore: true } : {}),
+      ...(parsed.credentialStore ? { credentialStore: parsed.credentialStore } : {}),
       ...(parsed.targetName ? { targetName: parsed.targetName } : {}),
       ...(syncValues.length > 0
         ? {
@@ -1215,6 +1281,363 @@ function parseConnectHostedArgs(argv) {
         : {}),
     },
   };
+}
+
+function parseLoginArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--no-browser') {
+      parsed.noBrowser = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      case '--api-url':
+        parsed.apiUrl = value;
+        break;
+      case '--project-id':
+        parsed.projectId = value;
+        break;
+      case '--sync-credential-env-var':
+        parsed.credentialEnvVar = value;
+        break;
+      case '--label':
+        parsed.label = value;
+        break;
+      case '--credential-store':
+        parsed.credentialStore = value;
+        break;
+      case '--poll-timeout': {
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+          throw new Error('--poll-timeout requires a positive number of seconds.');
+        }
+        parsed.pollTimeoutSeconds = seconds;
+        break;
+      }
+      default:
+        throw new Error(`Unknown flag "${token}" for login.`);
+    }
+  }
+
+  return { command: 'login', options: parsed };
+}
+
+const SYNC_CREDENTIAL_ACTIONS = new Set(['set', 'remove', 'list']);
+
+function parseSyncCredentialArgs(argv) {
+  const parsed = { action: null };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (token === '--token-stdin') {
+      parsed.tokenStdin = true;
+      continue;
+    }
+    if (token === '--from-env') {
+      parsed.fromEnv = true;
+      continue;
+    }
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      if (parsed.action !== null) {
+        throw new Error(`Unexpected argument "${token}".`);
+      }
+      if (!SYNC_CREDENTIAL_ACTIONS.has(token)) {
+        throw new Error(`Unknown sync-credential action "${token}". Use set, remove, or list.`);
+      }
+      parsed.action = token;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--sync-target':
+        parsed.syncTarget = value;
+        break;
+      case '--api-url':
+        parsed.apiUrl = value;
+        break;
+      case '--project-id':
+        parsed.projectId = value;
+        break;
+      case '--label':
+        parsed.label = value;
+        break;
+      case '--credential-store':
+        parsed.credentialStore = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for sync-credential.`);
+    }
+  }
+
+  if (!parsed.action) {
+    throw new Error('sync-credential requires an action: set, remove, or list.');
+  }
+  if ((parsed.apiUrl && !parsed.projectId) || (!parsed.apiUrl && parsed.projectId)) {
+    throw new Error('--api-url and --project-id must be given together.');
+  }
+
+  return { command: 'sync-credential', options: parsed };
+}
+
+async function readRootSyncBindings(cwd, rootDirOption) {
+  const rootDir = path.resolve(cwd, rootDirOption ?? '.compass');
+  const projectFilePath = path.join(rootDir, 'project.yaml');
+  let project;
+  try {
+    project = parseSimpleYaml(await readFile(projectFilePath, 'utf8'), { sourceName: projectFilePath });
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return { rootDir, project: null, bindings: [] };
+    }
+    throw error;
+  }
+  const named = readSyncTargets(project);
+  const bindings = [];
+  if (named) {
+    for (const name of Object.keys(named.targets)) {
+      try {
+        bindings.push(resolveSyncBinding(project, name));
+      } catch {
+        // incomplete target; skip in listings
+      }
+    }
+  } else {
+    const flat = resolveSyncBinding(project, null);
+    if (flat) bindings.push(flat);
+  }
+  return { rootDir, project, bindings };
+}
+
+async function resolveSyncCredentialBinding(runtime, options) {
+  if (options.apiUrl && options.projectId) {
+    return {
+      target: null,
+      apiUrl: options.apiUrl,
+      projectId: options.projectId,
+      credentialEnvVar: 'VIBECOMPASS_SYNC_TOKEN',
+    };
+  }
+  const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+  const { rootDir, project } = await readRootSyncBindings(cwd, options.rootDir);
+  if (!project) {
+    throw new Error(`No project.yaml found in ${rootDir}. Run "vibecompass login" from an initialized root, or pass --api-url and --project-id.`);
+  }
+  const binding = resolveSyncBinding(project, options.syncTarget ?? null);
+  if (!binding) {
+    throw new Error('This root has no hosted sync binding yet. Run "vibecompass login" (recommended) or "vibecompass connect-hosted", or pass --api-url and --project-id.');
+  }
+  return binding;
+}
+
+function writeLoginResult(io, result) {
+  io.stdout.write(`Signed in to ${result.apiUrl} for project ${result.project.name} (${result.project.id}).\n`);
+  writeStoredCredentialLines(io, result.stored, {
+    apiUrl: result.apiUrl,
+    projectId: result.project.id,
+    credentialEnvVar: result.binding?.syncEnvVar ?? result.previousBinding?.credentialEnvVar ?? 'VIBECOMPASS_SYNC_TOKEN',
+  });
+  if (result.binding) {
+    io.stdout.write(`Connected hosted VibeCompass for ${result.binding.mode}\n`);
+    if (result.binding.modeChanged) {
+      io.stdout.write(`Project mode: ${result.binding.previousMode} -> ${result.binding.mode}\n`);
+    }
+    io.stdout.write(`Updated ${result.binding.projectFilePath}\n`);
+    if (result.binding.syncTarget) {
+      io.stdout.write(`Sync target: ${result.binding.syncTarget.name} (default: ${result.binding.syncTarget.defaultTarget})\n`);
+    }
+  }
+  for (const warning of result.warnings) {
+    io.stdout.write(`WARNING: ${warning}\n`);
+  }
+  const targetFlag = result.previousBinding?.target ?? result.binding?.syncTarget?.name;
+  const targetSuffix = targetFlag ? ` --sync-target ${targetFlag}` : '';
+  if (result.mode === 'local-primary') {
+    io.stdout.write(`Then run: vibecompass push${targetSuffix}\n`);
+  }
+  io.stdout.write(`Hosted docs-review: vibecompass docs-review --submit-hosted${targetSuffix}\n`);
+}
+
+function writeStoredCredentialLines(io, stored, binding) {
+  for (const warning of stored.warnings ?? []) {
+    io.stdout.write(`WARNING: ${warning}\n`);
+  }
+  const where = stored.backend === 'keychain' ? `the ${stored.backendDescription}` : stored.storePath;
+  io.stdout.write(`Stored the sync token for ${binding.apiUrl} (project ${binding.projectId}) in ${where}${stored.replaced ? ', replacing the previous entry' : ''}.\n`);
+  io.stdout.write(`Hosted commands find it automatically in every terminal; ${binding.credentialEnvVar} still overrides it per shell.\n`);
+}
+
+async function captureSyncTokenAfterConnect(io, runtime, spec) {
+  const { binding } = spec;
+  const env = runtime.env ?? process.env;
+  const targetFlag = binding.target ? ` --sync-target ${binding.target}` : '';
+  const loginHint = `vibecompass login${spec.rootFlag}${targetFlag}`;
+
+  if (spec.noStore) {
+    io.stdout.write(`Token not stored (--no-store). Set ${binding.credentialEnvVar} in every shell that runs hosted commands, or later run: ${loginHint}\n`);
+    return null;
+  }
+
+  let token = null;
+  if (spec.tokenStdin) {
+    token = await readSecretFromStdin(io, runtime);
+    if (!token) {
+      throw new Error('--token-stdin was given but no token arrived on stdin.');
+    }
+  } else if (typeof env[binding.credentialEnvVar] === 'string' && env[binding.credentialEnvVar].trim() !== '') {
+    io.stdout.write(`${binding.credentialEnvVar} is set in this shell and takes precedence for hosted commands. Persist it for new terminals with: vibecompass sync-credential set${spec.rootFlag}${targetFlag} --from-env\n`);
+    return null;
+  } else if (canPromptSecret(io, runtime)) {
+    // D-356: the recommended path is the browser sign-in. A pasted dashboard
+    // token is the advanced alternative; Enter falls through to login.
+    token = await promptSecret('Press Enter to sign in with your browser, or paste a dashboard token (input hidden)', io, runtime);
+    if (!token) {
+      const result = await loginHosted(
+        {
+          rootDir: spec.rootDir,
+          ...(binding.target ? { syncTarget: binding.target } : {}),
+          ...(spec.credentialStore ? { credentialStore: spec.credentialStore } : {}),
+        },
+        { cwd: runtime.cwd, env, io, runtime },
+      );
+      writeLoginResult(io, result);
+      return { viaLogin: true, stored: result.stored };
+    }
+  } else {
+    io.stdout.write(`Next step: sign in with "${loginHint}" (opens the dashboard and stores the sync token locally). CI or scripts: set ${binding.credentialEnvVar}, or pipe a dashboard token into "vibecompass connect-hosted ... --token-stdin".\n`);
+    return null;
+  }
+
+  const stored = await storeSyncCredential(
+    {
+      apiUrl: binding.apiUrl,
+      projectId: binding.projectId,
+      token,
+      label: `VibeCompass sync token (${binding.projectId})`,
+      source: 'connect-hosted',
+      backend: spec.credentialStore,
+    },
+    credentialStoreOptionsFrom({ env, runtime }),
+  );
+  writeStoredCredentialLines(io, stored, binding);
+  return stored;
+}
+
+async function runSyncCredentialCommand(io, runtime, options) {
+  const env = runtime.env ?? process.env;
+  const storeOptions = credentialStoreOptionsFrom({ env, runtime });
+
+  if (options.action === 'list') {
+    const listing = await listSyncCredentials(storeOptions);
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    const { bindings } = await readRootSyncBindings(cwd, options.rootDir).catch(() => ({ bindings: [] }));
+    const boundKeys = new Map();
+    for (const binding of bindings) {
+      try {
+        boundKeys.set(credentialStoreKey(binding.apiUrl, binding.projectId), binding);
+      } catch {
+        // an unparseable binding URL cannot be annotated; the entry still lists
+      }
+    }
+    if (options.json) {
+      io.stdout.write(`${JSON.stringify({ storePath: listing.storePath, entries: listing.entries }, null, 2)}\n`);
+      return 0;
+    }
+    io.stdout.write(`Credential store: ${listing.storePath} (${listing.entries.length} ${listing.entries.length === 1 ? 'entry' : 'entries'})\n`);
+    if (listing.entries.length === 0) {
+      io.stdout.write('No stored sync tokens. Run "vibecompass login" to sign in from this terminal.\n');
+      return 0;
+    }
+    for (const entry of listing.entries) {
+      const bound = boundKeys.get(entry.key);
+      const boundNote = bound ? (bound.target ? ` — bound here as target ${bound.target}` : ' — bound here') : '';
+      io.stdout.write(
+        `- ${entry.apiUrl} project ${entry.projectId}: ${entry.backend}, prefix ${entry.tokenPrefix ?? '?'}, stored ${entry.storedAt ?? '?'} via ${entry.source ?? '?'}${boundNote}\n`,
+      );
+    }
+    return 0;
+  }
+
+  const binding = await resolveSyncCredentialBinding(runtime, options);
+
+  if (options.action === 'remove') {
+    const result = await removeSyncCredential(binding, storeOptions);
+    io.stdout.write(
+      result.removed
+        ? `Removed the stored sync token for ${binding.apiUrl} (project ${binding.projectId}) from the ${result.backend === 'keychain' ? 'OS keychain' : 'credential store file'}.\n`
+        : `No stored sync token for ${binding.apiUrl} (project ${binding.projectId}).\n`,
+    );
+    io.stdout.write('Revoke the credential on the hosted dashboard under Setup -> Hosted sync if it should stop working everywhere.\n');
+    return 0;
+  }
+
+  let token = null;
+  if (options.tokenStdin) {
+    token = await readSecretFromStdin(io, runtime);
+    if (!token) {
+      throw new Error('--token-stdin was given but no token arrived on stdin.');
+    }
+  } else if (options.fromEnv) {
+    token = typeof env[binding.credentialEnvVar] === 'string' ? env[binding.credentialEnvVar].trim() : '';
+    if (!token) {
+      throw new Error(`--from-env requires ${binding.credentialEnvVar} to be set in this shell.`);
+    }
+  } else if (canPromptSecret(io, runtime)) {
+    token = await promptSecret('Paste the sync token from the dashboard (input hidden)', io, runtime);
+    if (!token) {
+      throw new Error('No token entered.');
+    }
+  } else {
+    throw new Error('sync-credential set needs a token: run it in an interactive terminal, pipe one with --token-stdin, or use --from-env.');
+  }
+
+  const stored = await storeSyncCredential(
+    {
+      apiUrl: binding.apiUrl,
+      projectId: binding.projectId,
+      token,
+      label: options.label ?? `VibeCompass sync token (${binding.projectId})`,
+      source: 'sync-credential',
+      backend: options.credentialStore,
+    },
+    storeOptions,
+  );
+  writeStoredCredentialLines(io, stored, binding);
+  return 0;
 }
 
 function parseStatusArgs(argv) {
@@ -2487,8 +2910,12 @@ function usageText() {
     '  vibecompass --version',
     '  vibecompass version',
     '  vibecompass init --name <project-name> --mode <local-only|local-primary|hosted-only> --repo <id=remote> [options]',
-    '  vibecompass connect-hosted [options]',
+    '  vibecompass login [--sync-target <name>] [--api-url <url>] [--no-browser] [options]',
+    '                                        Recommended: connect this root to hosted VibeCompass from your browser',
     '  vibecompass sync-target [<name>] [options]',
+    '  vibecompass connect-hosted [options]  Advanced: bind with a dashboard token (login does this for you)',
+    '  vibecompass sync-credential <set|remove|list> [--sync-target <name>] [options]',
+    '                                        Advanced: manage stored tokens for CI or scripts',
     '  vibecompass status [options]',
     '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
     '  vibecompass docs-update [--session <lane-id>] [options]',
@@ -2541,19 +2968,50 @@ function usageText() {
     '  --force                              Overwrite an existing project.yaml',
     '  --replace-active-lanes               Allow --force to replace a root that has active session lanes',
     '',
-    'Connect-hosted options:',
+    'Connect-hosted options (advanced; on a terminal, Enter at the token prompt starts the browser sign-in):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --target <name>                      Add or update a named sync target (e.g. dev, prod)',
     '                                        First named target becomes the default; flat sync fields mirror the default target',
     '  --sync-api-url <url>                 Hosted sync api_url',
     '  --sync-project-id <id>               Hosted sync project_id',
     '  --sync-credential-env-var <name>     Hosted sync env var reference',
+    '  --token-stdin                        Store the sync token read from stdin (first non-empty line)',
+    '  --no-store                           Do not store a token; rely on the env var only',
+    '  --credential-store <auto|keychain|file>',
+    '                                        Where to keep the token (D-355). auto prefers the OS keychain',
     '                                        Without --target, replaces any existing flat project.yaml sync binding',
     '',
     'Sync-target options:',
     '  vibecompass sync-target              List named sync targets and the current default',
     '  vibecompass sync-target <name>       Switch the default sync target (re-mirrors flat sync fields)',
     '  --root <path>                        Project-memory root. Defaults to .compass',
+    '',
+    'Login options (recommended path, D-355/D-356):',
+    '  vibecompass login                    Sign in from the terminal: opens the dashboard, you approve a short code, the sync token is stored locally',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --sync-target <name>                 Sign in for a named sync target (add --api-url to create a new one)',
+    '  --api-url <url>                      Hosted URL for an unbound root or a new target. Defaults to https://vibecompass.dev',
+    '  --project-id <id>                    Pre-select a hosted project on the approval page',
+    '  --sync-credential-env-var <name>     Override env-var name recorded in a new binding. Defaults to VIBECOMPASS_SYNC_TOKEN',
+    '  --label <text>                       Device label shown in the dashboard. Defaults to the hostname',
+    '  --credential-store <auto|keychain|file>',
+    '                                        Where to keep the token. auto prefers the OS keychain',
+    '  --poll-timeout <seconds>             Stop waiting for approval after this long. Defaults to the code lifetime',
+    '  --no-browser                         Print the link without opening a browser',
+    '',
+    'Sync-credential options (advanced, D-355):',
+    '  vibecompass sync-credential set      Store a dashboard token for the bound project (hidden prompt, --token-stdin, or --from-env)',
+    '  vibecompass sync-credential remove   Forget the stored token for the bound project',
+    '  vibecompass sync-credential list     List stored tokens (metadata only, never values)',
+    '  --root <path>                        Project-memory root. Defaults to .compass',
+    '  --sync-target <name>                 Address a named sync target',
+    '  --api-url <url> --project-id <id>    Address a hosted project without a bound root',
+    '  --token-stdin                        Read the token from stdin (first non-empty line)',
+    '  --from-env                           Store the value currently in the binding env var',
+    '  --credential-store <auto|keychain|file>',
+    '                                        Where to keep the token. auto prefers the OS keychain',
+    '  --label <text>                       Label recorded with the stored token',
+    '  --json                               list: print entries as JSON',
     '',
     'Status options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

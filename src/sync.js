@@ -5,6 +5,11 @@ import { writeStateManifest } from './manifest.js';
 import { withMemoryRootLock } from './serialization.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import {
+  credentialStoreOptionsFrom,
+  formatMissingCredentialError,
+  resolveSyncCredential,
+} from './credential-store.js';
+import {
   buildSyncStateWithCursor,
   readSyncCursor,
   resolveSyncBinding,
@@ -465,12 +470,14 @@ async function loadSyncContext(options, environment) {
     throw new Error('Hosted sync commands require sync.api_url, sync.project_id, and sync.credential_env_var in project.yaml (or a named target under sync.targets).');
   }
 
-  const credential = normalizeOptionalString((environment.env ?? process.env)[binding.credentialEnvVar]);
+  // D-355: env var override first, then the local credential store
+  // (keychain or per-user file). The resolved value is used only as the
+  // bearer credential and never written anywhere.
+  const resolution = await resolveSyncCredential(binding, credentialStoreOptionsFrom(environment));
+  const credential = resolution.credential;
   if (!credential) {
     throw new Error(
-      `Hosted sync command requires ${binding.credentialEnvVar}. New terminals do not inherit one-off exports: `
-      + `re-export it (export ${binding.credentialEnvVar}="<sync token>") or persist it in your shell profile (~/.zshenv or ~/.bashrc). `
-      + 'Lost the token? Rotate it on the hosted dashboard under Setup -> Hosted sync, then export the new value.',
+      formatMissingCredentialError(binding, { action: 'This hosted sync command', detail: resolution.detail }),
     );
   }
 
@@ -485,6 +492,7 @@ async function loadSyncContext(options, environment) {
     manifestPath,
     fetch: fetchImpl,
     credential,
+    credentialSource: resolution.source,
     apiUrl: binding.apiUrl,
     projectId: binding.projectId,
     syncTarget: binding.target,

@@ -2656,7 +2656,7 @@ test('runCli prints hosted next steps when init configures a sync binding', asyn
     assert.equal(exitCode, 0);
     assert.equal(stderr.length, 0);
     assert.match(output, /Hosted binding: configured for local-primary/);
-    assert.match(output, /Next step: set VIBECOMPASS_SYNC_TOKEN locally before your first hosted command\./);
+    assert.match(output, /Next step: sign in with "vibecompass login" \(opens the dashboard and stores the sync token locally\)\./);
     assert.match(output, /Then run: vibecompass push\n/);
     assert.match(output, /Hosted docs-review: vibecompass docs-review --submit-hosted\n/);
   } finally {

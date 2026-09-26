@@ -7,6 +7,16 @@ export { initializeProjectMemory } from './init.js';
 export { preflightDocsReview } from './docs-review.js';
 export { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 export { demoteHosted, promoteHosted } from './mode-transition.js';
+export { loginHosted } from './login.js';
+export {
+  describeCredentialSource,
+  formatMissingCredentialError,
+  listSyncCredentials,
+  removeSyncCredential,
+  resolveCredentialStoreDir,
+  resolveSyncCredential,
+  storeSyncCredential,
+} from './credential-store.js';
 export {
   adoptRemoteHead,
   applyPullExport,

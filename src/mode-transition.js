@@ -2,6 +2,11 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { resolveSyncBinding } from './sync-binding.js';
+import {
+  credentialStoreOptionsFrom,
+  formatMissingCredentialError,
+  resolveSyncCredential,
+} from './credential-store.js';
 import { withMemoryRootLock } from './serialization.js';
 import { adoptRemoteHead, pushProjectMemory } from './sync.js';
 
@@ -186,9 +191,10 @@ async function loadModeAgnosticSyncContext(rootDir, options, environment) {
   if (!binding) {
     throw new Error('Mode transitions require a sync binding in project.yaml (run connect-hosted first).');
   }
-  const credential = ((environment.env ?? process.env)[binding.credentialEnvVar] ?? '').trim();
+  const resolution = await resolveSyncCredential(binding, credentialStoreOptionsFrom(environment));
+  const credential = resolution.credential;
   if (!credential) {
-    throw new Error(`Mode transitions require ${binding.credentialEnvVar} to be set.`);
+    throw new Error(formatMissingCredentialError(binding, { action: 'This mode transition', detail: resolution.detail }));
   }
   const fetchImpl = environment.runtime?.fetch ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') {

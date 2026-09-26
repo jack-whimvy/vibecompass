@@ -243,7 +243,22 @@ maintenance tied to the current lane.
 ## Hosted Sync
 
 Use hosted sync when you want browser review, team workflows, or hosted
-docs-review proposals:
+docs-review proposals. The quickest path signs you in from the terminal and
+keeps the token in your OS keychain (or a private per-user file), so it works
+in every new terminal and in agents launched from a desktop app:
+
+```bash
+npx -y @vibecompass/vibecompass@latest login --root .compass
+# opens vibecompass.dev, you confirm a short code and pick the project,
+# the token is stored locally, and the hosted binding is written to project.yaml
+
+npx -y @vibecompass/vibecompass@latest push --root .compass
+```
+
+Advanced (CI, scripts, a machine without a browser, or a hosted-only demote):
+bind the root with a dashboard-created token, pasted at the hidden prompt or
+piped in. On a terminal, pressing Enter at that prompt starts the browser
+sign-in instead:
 
 ```bash
 npx -y @vibecompass/vibecompass@latest connect-hosted \
@@ -251,8 +266,12 @@ npx -y @vibecompass/vibecompass@latest connect-hosted \
   --sync-api-url https://vibecompass.dev \
   --sync-project-id vc_proj_example \
   --sync-credential-env-var VIBECOMPASS_SYNC_TOKEN
+# "Paste the sync token from the dashboard (input hidden)"
 
-npx -y @vibecompass/vibecompass@latest push --root .compass
+# non-interactive:
+printf '%s' "$TOKEN" | npx -y @vibecompass/vibecompass@latest connect-hosted --root .compass \
+  --sync-api-url https://vibecompass.dev --sync-project-id vc_proj_example \
+  --sync-credential-env-var VIBECOMPASS_SYNC_TOKEN --token-stdin
 ```
 
 After `close-session`, run `push` again when a connected local-primary root
@@ -260,16 +279,29 @@ changed canonical project-memory files and the hosted dashboard should catch
 up. Hosted-only projects do not use a local authoritative push; update or
 refresh them through the hosted dashboard/proposal flow.
 
-The sync token is read from the environment variable you bind (for example
-`VIBECOMPASS_SYNC_TOKEN`). One-off `export`s do not survive new terminals —
-persist the token in your shell profile (`~/.zshenv` or `~/.bashrc`):
+### Where the token lives (D-355)
+
+Hosted commands look for the token in this order:
+
+1. the environment variable named in `project.yaml` (`VIBECOMPASS_SYNC_TOKEN`
+   by default) — a per-shell override for CI and scripts;
+2. the local credential store, keyed by hosted URL + project id: the OS
+   keychain when available (macOS Keychain, Linux `secret-tool`), otherwise
+   `~/.config/vibecompass/credentials.json` (`0600`; `%APPDATA%\vibecompass`
+   on Windows; `VIBECOMPASS_CONFIG_DIR` overrides the location).
+
+The token value is never written to `project.yaml`, `state/`, or any file in
+your repo. Manage stored tokens with:
 
 ```bash
-echo 'export VIBECOMPASS_SYNC_TOKEN="<your sync token>"' >> ~/.zshenv
+npx -y @vibecompass/vibecompass@latest sync-credential list --root .compass
+npx -y @vibecompass/vibecompass@latest sync-credential set --root .compass    # hidden prompt, --token-stdin, or --from-env
+npx -y @vibecompass/vibecompass@latest sync-credential remove --root .compass
 ```
 
-If the token is lost, rotate it on the hosted dashboard under Setup -> Hosted
-sync and export the new value.
+`vibecompass status` shows which source is in use (never the value). Lost a
+token? Run `login` again, or create a new one on the dashboard under Setup ->
+Hosted sync and revoke the old one there.
 
 ### Multiple environments
 

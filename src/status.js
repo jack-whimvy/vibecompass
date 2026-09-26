@@ -5,6 +5,7 @@ import { sha256Text } from './hash.js';
 import { resolveLaneMarkerContext } from './lane-marker.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { resolveSyncBinding } from './sync-binding.js';
+import { describeCredentialSource, resolveSyncCredential } from './credential-store.js';
 import { inferToolingRootForMemoryRoot, listProjectSessions } from './session.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
 import { scanProjectMemory } from './project-memory.js';
@@ -68,6 +69,7 @@ export async function getProjectStatus(options = {}) {
       docsReview,
       agentFiles,
       projectMemory,
+      hostedSync,
     }),
   };
 }
@@ -125,6 +127,7 @@ export function renderStatusText(status) {
       : status.hostedSync?.status === 'unreachable'
         ? [`Hosted mode check: unreachable (${status.hostedSync.detail}).`]
         : []),
+    ...formatHostedSyncLines(status.hostedSync),
     `Root: ${status.rootDir}`,
     `Repos: ${status.project.repos.length > 0 ? status.project.repos.map((repo) => repo.id).join(', ') : 'None recorded'}`,
     `Active lanes: ${formatActiveLanes(status.sessions)}`,
@@ -207,16 +210,36 @@ async function readHostedModeCheck(projectFilePath, localMode, options = {}) {
   }
   if (!binding) return { status: 'not-configured' };
 
-  const env = options.env ?? process.env;
-  const credential = typeof env[binding.credentialEnvVar] === 'string'
-    ? env[binding.credentialEnvVar].trim()
-    : '';
+  const bindingSummary = {
+    apiUrl: binding.apiUrl,
+    projectId: binding.projectId,
+    target: binding.target ?? null,
+    credentialEnvVar: binding.credentialEnvVar,
+  };
+  // D-355: report only the source of the credential (env / keychain / file /
+  // missing), never its value.
+  const resolution = await resolveSyncCredential(binding, {
+    env: options.env ?? process.env,
+    ...(options.credentialStore ?? {}),
+  });
+  const credential = resolution.credential;
+  const credentialSource = credential ? resolution.source : 'missing';
+  const credentialSourceLabel = credential ? describeCredentialSource(resolution) : 'missing';
   if (!credential) {
-    return { status: 'no-credential', credentialEnvVar: binding.credentialEnvVar };
+    return {
+      status: 'no-credential',
+      credentialEnvVar: binding.credentialEnvVar,
+      credentialSource,
+      credentialSourceLabel,
+      ...(resolution.detail ? { detail: resolution.detail } : {}),
+      binding: bindingSummary,
+    };
   }
 
   const fetchImpl = options.fetch ?? globalThis.fetch;
-  if (typeof fetchImpl !== 'function') return { status: 'not-configured' };
+  if (typeof fetchImpl !== 'function') {
+    return { status: 'not-configured', credentialSource, credentialSourceLabel, binding: bindingSummary };
+  }
 
   const baseUrl = binding.apiUrl.endsWith('/') ? binding.apiUrl : `${binding.apiUrl}/`;
   const endpoint = new URL(
@@ -234,7 +257,7 @@ async function readHostedModeCheck(projectFilePath, localMode, options = {}) {
       signal: controller.signal,
     });
     if (!response.ok) {
-      return { status: 'unreachable', detail: `HTTP ${response.status}` };
+      return { status: 'unreachable', detail: `HTTP ${response.status}`, credentialSource, credentialSourceLabel, binding: bindingSummary };
     }
     const data = typeof response.json === 'function' ? await response.json() : {};
     const hostedMode = typeof data.mode === 'string' ? data.mode : null;
@@ -243,9 +266,12 @@ async function readHostedModeCheck(projectFilePath, localMode, options = {}) {
       hostedMode,
       localMode,
       mismatch: Boolean(hostedMode && localMode && hostedMode !== localMode),
+      credentialSource,
+      credentialSourceLabel,
+      binding: bindingSummary,
     };
   } catch (error) {
-    return { status: 'unreachable', detail: error?.message ?? 'network error' };
+    return { status: 'unreachable', detail: error?.message ?? 'network error', credentialSource, credentialSourceLabel, binding: bindingSummary };
   } finally {
     clearTimeout(timer);
   }
@@ -460,11 +486,30 @@ async function readProjectMemoryStatus(rootDir) {
   }
 }
 
-function buildRecommendations({ project, compatibility, sessions, docsReview, agentFiles, projectMemory }) {
+function formatHostedSyncLines(hostedSync) {
+  if (!hostedSync?.binding) {
+    return [];
+  }
+  const { binding } = hostedSync;
+  const where = `${binding.apiUrl} (project ${binding.projectId}${binding.target ? `, target ${binding.target}` : ''})`;
+  const credential = hostedSync.credentialSource === 'missing'
+    ? `missing${hostedSync.detail ? ` (${hostedSync.detail})` : ''} — run \`vibecompass login\` to sign in from this terminal`
+    : hostedSync.credentialSourceLabel ?? hostedSync.credentialSource;
+  return [
+    `Hosted sync: ${where}`,
+    `Sync credential: ${credential}`,
+  ];
+}
+
+function buildRecommendations({ project, compatibility, sessions, docsReview, agentFiles, projectMemory, hostedSync }) {
   const recommendations = [];
   if (project.status === 'unreadable') {
     recommendations.push('vibecompass init --guided');
     return recommendations;
+  }
+
+  if (hostedSync?.status === 'no-credential') {
+    recommendations.push('vibecompass login');
   }
 
   const packageStatus = compatibility.package.status;

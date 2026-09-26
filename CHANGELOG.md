@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.15.0 - 2026-09-25
+
+- Add a layered local credential store for hosted sync tokens (D-355). Every
+  hosted command now resolves the token in a fixed order: the binding's env
+  var when set (per-shell override for CI, automation, and agents), then the
+  per-user credential store keyed by hosted URL + project id. The store lives
+  outside every project root (`VIBECOMPASS_CONFIG_DIR`, else
+  `$XDG_CONFIG_HOME/vibecompass`, else `~/.config/vibecompass`;
+  `%APPDATA%\vibecompass` on Windows); its `credentials.json` index is
+  written `0600` inside a `0700` directory and a world-readable file is
+  refused. Secrets go to the OS keychain when one is available (macOS
+  Keychain via `security`, Linux `secret-tool`) and otherwise into the file;
+  the index records which backend holds each entry. `project.yaml` is
+  unchanged (`credential_source: env` + `credential_env_var` stay required),
+  so older CLIs keep working against the env var.
+- `connect-hosted` captures the token after writing the binding: a hidden
+  prompt on a TTY, `--token-stdin` for scripts and agents, `--no-store` to
+  keep the env-only path, and `--credential-store <auto|keychain|file>`.
+  When the env var is already set it says so and points at
+  `sync-credential set --from-env` instead of storing silently.
+- Add `vibecompass login [--sync-target <name>] [--api-url <url>]
+  [--project-id <id>] [--label <text>] [--no-browser] [--poll-timeout <s>]`:
+  a browser device-code sign-in. The CLI prints and opens the dashboard
+  approval link with a short code, polls until the project owner approves,
+  stores the minted token, and writes the sync binding when the root is not
+  bound yet (promoting `local-only` to `local-primary` like `connect-hosted`).
+  An unknown `--sync-target` is created only with an explicit `--api-url`;
+  a mismatched `--api-url` on a bound root fails closed.
+- Add `vibecompass sync-credential <set|remove|list>`: store a dashboard
+  token (hidden prompt, `--token-stdin`, or `--from-env`), forget one, or
+  list stored entries (metadata only, never values; `--json`). `--api-url`
+  + `--project-id` address a hosted project without a bound root.
+- `status` prints `Hosted sync:` and `Sync credential:` lines (source only:
+  env var, OS keychain, credential store file, or missing) and recommends
+  `vibecompass login` when nothing holds a token. Missing-credential errors
+  from push, pull, mode transitions, and hosted docs-review now name
+  `login` first, then `sync-credential set`, then the env var override.
+- Init and connect-hosted no longer tell users to export the token in
+  every terminal or persist it in a shell profile.
+- Credential store hardening (review passes 1–3): every store mutation
+  takes a cross-process lock file next to the index that appears atomically
+  (owner record hard-linked into place) and names its owner (id, pid, host).
+  The lock is never taken from a live process on this host, however long it
+  waits on a keychain prompt; writers wait up to 10s, then fail naming the
+  owner. A lock whose owner process no longer exists is recovered through a
+  second reclaim lock so exactly one reclaimer removes it after re-reading
+  the owner; locks from another host, unreadable locks, and a reclaim lock
+  left by a crashed reclaimer are never removed automatically (the error
+  names them). The index is written through an exclusively created random
+  temp file plus atomic rename while the lock is held, so parallel logins,
+  `sync-credential set`, and `remove` never drop each other's entries;
+  target identity lowercases only scheme and host (paths keep their case);
+  keychain labels are sanitized and keys outside the keychain-safe charset
+  map to a digest account, so any project name can be stored; under the
+  default `auto` policy a failed keychain write (headless session, locked
+  keychain, missing Secret Service) falls back to the file store with a
+  printed warning instead of losing a one-time claim. `login` bounds every
+  network wait (start, polls, body reads) by `--poll-timeout`.
+- `login` is the one recommended connection path (D-356): help lists it
+  right after `init`, `init` and missing-token errors point only at it, and
+  `connect-hosted` on a terminal starts the browser sign-in when you press
+  Enter at its token prompt. Dashboard tokens, `--token-stdin`,
+  `sync-credential`, and the env-var override remain for CI, scripts, and
+  browserless machines and are labelled advanced.
+
 ## 0.14.0 - 2026-09-23
 
 - Add `continue-session [<lane-id>]` (D-353): resume an already-open lane

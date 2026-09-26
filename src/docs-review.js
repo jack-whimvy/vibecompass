@@ -19,6 +19,7 @@ import {
   writeDocsReviewSourceInventory,
 } from './source-inventory.js';
 import { readSyncCursor, resolveSyncBinding } from './sync-binding.js';
+import { formatMissingCredentialError, resolveSyncCredential } from './credential-store.js';
 import { PACKAGE_VERSION } from './version.js';
 import { withMemoryRootLock } from './serialization.js';
 import { listDecisionFileNames, readNextDecisionId } from './decisions.js';
@@ -89,6 +90,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
       rootDir,
       statePath,
       env: environment.env ?? process.env,
+      credentialStore: environment.runtime?.credentialStore ?? null,
       fetch: environment.runtime?.fetch ?? globalThis.fetch,
     });
   }
@@ -137,6 +139,7 @@ export async function preflightDocsReview(options = {}, environment = {}) {
   const hosted = options.submitHosted
     ? await submitHostedDocsReview({
       env,
+      credentialStore: environment.runtime?.credentialStore ?? null,
       project,
       reviewConfig,
       reviewPrompt,
@@ -1588,9 +1591,20 @@ async function submitHostedDocsReview(options) {
     throw new Error('docs-review --submit-hosted requires sync.credential_env_var in project.yaml.');
   }
 
-  const credential = normalizeOptionalString(options.env?.[credentialEnvVar]);
+  // D-355: env override, then the local credential store.
+  const submitBinding = {
+    apiUrl: options.runtime.api_url,
+    projectId: options.runtime.project_id,
+    credentialEnvVar,
+    target: options.runtime.sync_target ?? null,
+  };
+  const submitResolution = await resolveSyncCredential(submitBinding, {
+    env: options.env ?? process.env,
+    ...(options.credentialStore ?? {}),
+  });
+  const credential = submitResolution.credential;
   if (!credential) {
-    throw new Error(`docs-review --submit-hosted requires ${credentialEnvVar}.`);
+    throw new Error(formatMissingCredentialError(submitBinding, { action: 'docs-review --submit-hosted', detail: submitResolution.detail }));
   }
 
   const endpoint = new URL(
@@ -1758,9 +1772,19 @@ async function pollHostedDocsReview(options) {
     throw new Error('docs-review --poll-hosted requires runtime.credential_env_var in state/docs-review.json.');
   }
 
-  const credential = normalizeOptionalString(options.env?.[credentialEnvVar]);
+  const pollBinding = {
+    apiUrl: runtime.api_url,
+    projectId: runtime.project_id,
+    credentialEnvVar,
+    target: runtime.sync_target ?? null,
+  };
+  const pollResolution = await resolveSyncCredential(pollBinding, {
+    env: options.env ?? process.env,
+    ...(options.credentialStore ?? {}),
+  });
+  const credential = pollResolution.credential;
   if (!credential) {
-    throw new Error(`docs-review --poll-hosted requires ${credentialEnvVar}.`);
+    throw new Error(formatMissingCredentialError(pollBinding, { action: 'docs-review --poll-hosted', detail: pollResolution.detail }));
   }
 
   const endpoint = new URL(
