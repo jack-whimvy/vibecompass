@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { connectHostedProjectMemory, initializeProjectMemory, setDefaultSyncTarget } from './init.js';
 import { preflightDocsReview } from './docs-review.js';
 import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
+import { buildSessionBrief, resolveBriefRequest } from './brief.js';
+import { renderBrief } from './brief-render.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -311,6 +313,34 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     } else {
       io.stdout.write(renderDocsUpdatePlan(result));
     }
+    return 0;
+  }
+
+  if (parsed.command === 'brief') {
+    // Strictly read-only (plan task A3): no manifest refresh, state write,
+    // lane write, or agent-file sync, so it is safe against a legacy root.
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const request = await resolveBriefRequest({
+      rootDir: parsed.options.rootDir,
+      sessionId: parsed.options.sessionId,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    const result = await buildSessionBrief({
+      rootDir: request.rootDir,
+      laneId: request.laneId,
+      task: parsed.options.task,
+      files: parsed.options.files,
+      featureSlugs: parsed.options.featureSlugs,
+      claims: parsed.options.claims,
+      budget: parsed.options.budget,
+    });
+    const markdown = renderBrief(result);
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({ ...result, lane_source: request.laneSource, cli_warnings: request.warnings, markdown }, null, 2)}\n`);
+    } else {
+      io.stdout.write(markdown);
+    }
+    writeWarnings(io, request.warnings);
     return 0;
   }
 
@@ -822,6 +852,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'docs-update') {
       return parseDocsUpdateArgs(rest);
+    }
+
+    if (command === 'brief') {
+      return parseBriefArgs(rest);
     }
 
     if (command === 'close-session' || command === 'end-session') {
@@ -1853,6 +1887,72 @@ function parseDocsUpdateArgs(argv) {
 
   return {
     command: 'docs-update',
+    options: parsed,
+  };
+}
+
+function parseBriefArgs(argv) {
+  const parsed = {
+    files: [],
+    featureSlugs: [],
+    claims: [],
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--')) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--task':
+        parsed.task = value;
+        break;
+      case '--files':
+      case '--file':
+        // `--files a b c` and repeated `--files a --files b` both work.
+        parsed.files.push(value);
+        while (argv[index + 1] !== undefined && !argv[index + 1].startsWith('--')) {
+          index += 1;
+          parsed.files.push(argv[index]);
+        }
+        break;
+      case '--feature':
+        parsed.featureSlugs.push(value);
+        break;
+      case '--claim':
+        parsed.claims.push(value);
+        break;
+      case '--budget':
+        if (!/^\d+$/.test(value)) {
+          throw new Error(`--budget must be a whole number of estimated tokens (got "${value}").`);
+        }
+        parsed.budget = Number(value);
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'brief',
     options: parsed,
   };
 }
@@ -2919,6 +3019,8 @@ function usageText() {
     '  vibecompass status [options]',
     '  vibecompass refresh-workflow [--dry-run|--apply] [options]',
     '  vibecompass docs-update [--session <lane-id>] [options]',
+    '  vibecompass brief --task <text> [--files <repo:path>...] [--feature <slug>] [--claim <path>] [--session <lane-id>] [--budget <n>] [--json] [options]',
+    '                                        Read-only session brief: relevant memory, packed into an estimated token budget',
     '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',

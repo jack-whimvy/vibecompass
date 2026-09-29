@@ -38,6 +38,24 @@
   `extractSessionNoteRelations`, `extractArchitectureDocCitations`,
   `scanDecisionReferences`, `buildDecisionLineageModel`) with shared fixtures
   in `src/tests/fixtures/decision-lineage/` for the app port.
+- Add `vibecompass brief` and the read-only session brief engine
+  (`buildSessionBrief`, `renderBrief`; plan task A3, D-359). Given a task, and
+  optionally files, feature slugs, claims, a lane, and a budget, it selects the
+  memory a session should read first — through the file-owner index (repo
+  aliases and workspace paths such as `vibecompass-app/src/…` both match),
+  lane-declared docs, feature slugs, and deterministic keyword matching on
+  titles, Description, and Retrieval guidance (no embeddings, no network, no
+  model) — and packs whole units (lane, decision-lineage, doc, note,
+  watch-out) into an estimated token budget (Unicode code points ÷ 4 over the
+  whole rendered brief; default 6,000, minimum 800). Every brief states
+  `complete`, `partial`, `incomplete` (with prioritized required reads, also
+  used for retrieval errors), or `no-match`, lists at most 12 follow-up reads
+  plus "+N more" (the full list is in `--json`), and never emits a decision
+  without every declared superseding or amending successor. Uncertified
+  lineage wording becomes a follow-up read, never a status. The command
+  writes nothing: no manifest refresh, state write, lane write, or agent-file
+  sync, so it is safe against a hand-maintained root. Lifecycle integration
+  (`brief.md` in the lane) is not part of this release.
 
 ## 0.15.0 - 2026-09-25
 

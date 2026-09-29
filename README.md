@@ -186,6 +186,12 @@ npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 npx -y @vibecompass/vibecompass@latest append-decision --root .compass --target cross-cutting.md --entry staged-entry.md
 npx -y @vibecompass/vibecompass@latest refresh-decision-index --root .compass --check
 
+# Session brief (read-only): the memory a task should start from, packed into
+# an estimated token budget, with a complete/partial/incomplete/no-match status
+# and follow-up reads. Decisions always appear with their declared successors.
+npx -y @vibecompass/vibecompass@latest brief --root .compass --task "Change the refresh denial message" --files app:src/lib/entitlements.ts
+npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --budget 3000 --json
+
 # Targeted and comprehensive architecture docs maintenance
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow --changed app:src/auth/login.ts
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided
@@ -337,6 +343,8 @@ import {
   loadProjectReadModel,
   getProjectContext,
   getDecisionLineage,
+  buildSessionBrief,
+  renderBrief,
   detectChangelogShapedLines,
   ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
 } from "@vibecompass/vibecompass";
@@ -363,6 +371,12 @@ returns one decision's incoming and outgoing lineage and its declared
 successors, followed transitively. Nothing is ever reported as "governs" or
 "currently valid". Architecture components also carry `retrieval_guidance`
 and `retrieval_scope` when their docs define them.
+
+`buildSessionBrief({ rootDir, task, files, featureSlugs, claims, laneId, budget })`
+is the read-only engine behind `vibecompass brief`: it returns the selection
+result (status, packed units, omitted units, follow-up reads, gaps, and the
+estimated size), and `renderBrief(result)` turns it into markdown. It never
+writes to the root.
 
 ## More Documentation
 

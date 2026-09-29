@@ -9,6 +9,15 @@ const SECTION_PATTERN = /^##\s+(.+)$/gm;
 const DECISION_HEADING_PATTERN = /^###\s+D-(\d{3,})\s+—\s+(.+)$/gm;
 
 export async function loadProjectReadModel(rootDir) {
+  return (await loadProjectReadModelWithDocuments(rootDir)).readModel;
+}
+
+/**
+ * The read model plus the scanned canonical documents (`{ path, kind,
+ * content, … }`) it was built from, for read-only consumers such as the
+ * session brief that need section text the read model does not keep.
+ */
+export async function loadProjectReadModelWithDocuments(rootDir) {
   const scanResult = await scanProjectMemory(rootDir);
   if (scanResult.errors.length > 0) {
     const details = scanResult.errors.map((error) => `${error.path}: ${error.message}`).join('\n');
@@ -38,7 +47,7 @@ export async function loadProjectReadModel(rootDir) {
   const fileOwners = buildFileOwnershipIndex(features);
   const decisionLineage = buildDecisionLineageModel(scanResult.documents);
 
-  return {
+  const readModel = {
     freshness,
     repo_aliases: repoAliases,
     manifest_state: {
@@ -55,6 +64,8 @@ export async function loadProjectReadModel(rootDir) {
     file_owners: fileOwners,
     decision_lineage: decisionLineage,
   };
+
+  return { readModel, documents: scanResult.documents };
 }
 
 export function getProjectContext(readModel, options = {}) {

@@ -62,3 +62,16 @@ export {
   parseDecisionEntries,
   scanDecisionReferences,
 } from './decision-lineage.js';
+export {
+  BRIEF_CONTRACT_VERSION,
+  BRIEF_DEFAULT_BUDGET,
+  BRIEF_FOLLOW_UP_CAP,
+  BRIEF_MIN_BUDGET,
+  BRIEF_OVERVIEW_PATH,
+  BRIEF_RESERVE_TOKENS,
+  BRIEF_STATUSES,
+  buildSessionBrief,
+  estimateBriefTokens,
+  resolveBriefRequest,
+} from './brief.js';
+export { renderBrief } from './brief-render.js';

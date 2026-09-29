@@ -1,0 +1,11 @@
+format_version: 1
+name: Acme Widgets
+slug: acme-widgets
+mode: local-primary
+repos:
+  - id: app
+    remote: https://github.com/example/acme-app.git
+    default_branch: main
+  - id: core
+    remote: https://github.com/example/acme-core.git
+    default_branch: main
