@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- Read model: architecture components now carry `retrieval_guidance` (the
+  `## Retrieval guidance` section) and `retrieval_scope` (the "Retrieval
+  scope" bullet under `## Review metadata`); both are `null` when absent.
+  Existing fields are unchanged.
+- Add typed decision references and declared decision lineage
+  (`decision_lineage` on the read model, contract version 1). Architecture
+  docs `cites` decisions, session notes `references` them and `made` the ones
+  listed at the start of a top-level "Decisions made" bullet, and decision
+  entries declare `supersedes` / `amends` / `preserves` only from their own
+  wording, with extent (`full` / `partial` / `scoped` / `unqualified`) and
+  scope. Other lineage-like wording is `unknown`; mentions are `references`;
+  nothing is inferred as "governs" or "currently valid" (D-359). Every
+  relation carries source path, section, line, document and section hashes,
+  and explicit-or-inferred evidence (range interiors are inferred).
+- Recognize the optional structured lineage fields `**Supersedes:**`,
+  `**Partially supersedes:**`, `**Amends:**`, and `**Preserves:**` on new
+  decision entries (D-363); they win over prose for the targets they name, and
+  malformed items become diagnostics.
+- Add `getDecisionLineage(readModel, id)` (declared successors transitively,
+  incoming and outgoing lineage, citations, and the notes that made it) and
+  export the pure extractors (`extractDecisionFileRelations`,
+  `extractSessionNoteRelations`, `extractArchitectureDocCitations`,
+  `scanDecisionReferences`, `buildDecisionLineageModel`) with shared fixtures
+  in `src/tests/fixtures/decision-lineage/` for the app port.
+
 ## 0.15.0 - 2026-09-25
 
 - Add a layered local credential store for hosted sync tokens (D-355). Every

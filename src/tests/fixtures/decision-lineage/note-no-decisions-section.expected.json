@@ -1,0 +1,61 @@
+{
+  "contract_version": 1,
+  "input": {
+    "kind": "session",
+    "path": "sessions/no-decisions-section.md"
+  },
+  "relations": [
+    {
+      "relation": "references",
+      "source_kind": "session",
+      "source_path": "sessions/no-decisions-section.md",
+      "source_decision_id": null,
+      "source_section": "What we worked on",
+      "source_field": null,
+      "source_line": 5,
+      "source_hash": "sha256:937ceee4a7fe4629c892282600c574cff9c624323aa8799524a86f3f9b5f9b89",
+      "section_hash": "sha256:463b0bb71bca04e2eb996387244236b931a0081a71c1f233031f847fbee40965",
+      "target_decision_id": 13,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 2
+    },
+    {
+      "relation": "references",
+      "source_kind": "session",
+      "source_path": "sessions/no-decisions-section.md",
+      "source_decision_id": null,
+      "source_section": "Next session should start with",
+      "source_field": null,
+      "source_line": 9,
+      "source_hash": "sha256:937ceee4a7fe4629c892282600c574cff9c624323aa8799524a86f3f9b5f9b89",
+      "section_hash": "sha256:884e23167b1898399612c2113647b18876fe4b289efa758f9ff6254955076d2d",
+      "target_decision_id": 14,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 1
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "malformed-decision-reference",
+      "path": "sessions/no-decisions-section.md",
+      "line": 5,
+      "message": "\"D-0013\" is not a canonical decision ID (D-NNN, zero-padded to three digits); it was not treated as a reference."
+    },
+    {
+      "code": "malformed-decision-reference",
+      "path": "sessions/no-decisions-section.md",
+      "line": 5,
+      "message": "\"D-99\" is not a canonical decision ID (D-NNN, zero-padded to three digits); it was not treated as a reference."
+    }
+  ]
+}

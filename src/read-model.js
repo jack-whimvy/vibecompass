@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { buildDecisionLineageModel, collectDeclaredSuccessors } from './decision-lineage.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { generateStateManifest } from './manifest.js';
 import { scanProjectMemory } from './project-memory.js';
@@ -35,6 +36,7 @@ export async function loadProjectReadModel(rootDir) {
   const decisions = buildDecisionList(scanResult);
   const sessions = buildSessionList(scanResult);
   const fileOwners = buildFileOwnershipIndex(features);
+  const decisionLineage = buildDecisionLineageModel(scanResult.documents);
 
   return {
     freshness,
@@ -51,6 +53,7 @@ export async function loadProjectReadModel(rootDir) {
     decisions,
     sessions,
     file_owners: fileOwners,
+    decision_lineage: decisionLineage,
   };
 }
 
@@ -87,6 +90,50 @@ export function getDecisionLog(readModel, options = {}) {
   return {
     freshness: readModel.freshness,
     decisions: readModel.decisions.slice(0, limit),
+  };
+}
+
+/**
+ * Typed lineage for one decision (plan task A2; D-359). `outgoing` is what
+ * this decision's own text declares about earlier decisions, `incoming` is
+ * what later decisions declare about it, and `declared_successors` follows
+ * declared `supersedes`/`amends` transitively. Mentions stay mentions: no
+ * relation here certifies that a decision governs anything or is currently
+ * valid.
+ */
+export function getDecisionLineage(readModel, decisionId, options = {}) {
+  const id = typeof decisionId === 'number' ? decisionId : Number(String(decisionId ?? '').replace(/^D-/i, ''));
+  if (!Number.isInteger(id) || id <= 0) {
+    return null;
+  }
+
+  const citationLimit = Math.max(1, Math.min(options.citationLimit ?? 50, 500));
+  const relations = readModel.decision_lineage.relations;
+  const decision = readModel.decisions.find((entry) => entry.decision_id === id) ?? null;
+  const lineageRelations = new Set(['supersedes', 'amends', 'preserves', 'unknown']);
+  const outgoing = relations.filter(
+    (relation) => relation.source_decision_id === id && lineageRelations.has(relation.relation),
+  );
+  const incoming = relations.filter(
+    (relation) =>
+      relation.target_decision_id === id && relation.source_kind === 'decision' && lineageRelations.has(relation.relation),
+  );
+  const mentions = relations.filter(
+    (relation) => relation.target_decision_id === id && ['cites', 'references', 'made'].includes(relation.relation),
+  );
+
+  return {
+    freshness: readModel.freshness,
+    decision_id: id,
+    exists: Boolean(decision),
+    title: decision?.title ?? null,
+    path: decision?.path ?? null,
+    outgoing,
+    incoming,
+    declared_successors: collectDeclaredSuccessors(relations, id),
+    made_in: mentions.filter((relation) => relation.relation === 'made').map((relation) => relation.source_path),
+    cited_by: mentions.filter((relation) => relation.relation !== 'made').slice(0, citationLimit),
+    cited_by_total: mentions.filter((relation) => relation.relation !== 'made').length,
   };
 }
 
@@ -194,6 +241,8 @@ function buildComponentRecord(document, repoAliases, projectRepos) {
     description: normalizeSectionText(sections.get('Description')),
     details: normalizeSectionText(sections.get('Details')),
     next_steps: normalizeSectionText(sections.get('Next steps')),
+    retrieval_guidance: normalizeSectionText(sections.get('Retrieval guidance')),
+    retrieval_scope: extractReviewMetadataField(sections.get('Review metadata'), 'Retrieval scope'),
     involved_files: involvedFiles,
     warnings: document.warnings,
     warning_count: document.warnings.length,
@@ -527,6 +576,33 @@ function slugify(value) {
 
 function normalizeSectionText(value) {
   return value ? value.trim() : null;
+}
+
+// One bullet from the `## Review metadata` list ("- Retrieval scope: …"),
+// including indented continuation lines; null when the section or bullet is
+// missing or empty.
+function extractReviewMetadataField(section, label) {
+  if (!section) {
+    return null;
+  }
+
+  const lines = section.split(/\r?\n/);
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const start = lines.findIndex((line) => new RegExp(`^\\s*[-*]\\s+${escaped}:`, 'i').test(line));
+  if (start === -1) {
+    return null;
+  }
+
+  const parts = [lines[start].replace(new RegExp(`^\\s*[-*]\\s+${escaped}:\\s*`, 'i'), '')];
+  for (const line of lines.slice(start + 1)) {
+    if (!/^\s+\S/.test(line) || /^\s*[-*]\s+/.test(line)) {
+      break;
+    }
+    parts.push(line.trim());
+  }
+
+  const value = parts.join(' ').trim();
+  return value || null;
 }
 
 function extractLabeledValue(body, label) {

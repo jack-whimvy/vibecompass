@@ -47,5 +47,18 @@ export {
   getProjectContext,
   getFeatureContext,
   getDecisionLog,
+  getDecisionLineage,
   getFileContext,
 } from './read-model.js';
+export {
+  DECISION_LINEAGE_CONTRACT_VERSION,
+  DECISION_RELATION_TYPES,
+  DECLARED_LINEAGE_RELATIONS,
+  buildDecisionLineageModel,
+  collectDeclaredSuccessors,
+  extractArchitectureDocCitations,
+  extractDecisionFileRelations,
+  extractSessionNoteRelations,
+  parseDecisionEntries,
+  scanDecisionReferences,
+} from './decision-lineage.js';
