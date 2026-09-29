@@ -4,6 +4,7 @@
 // package.
 //
 //   node scripts/evaluate-lineage-labels.js <memory-root> [labels-doc]
+//   node scripts/evaluate-lineage-labels.js <memory-root> --sample <n> --seed <s>
 //
 // <memory-root> is a project-memory root with a decisions/ folder (for
 // example ../vibecompass-docs). The labels doc defaults to
@@ -12,6 +13,14 @@
 // rows whose Wording column is `ambiguous` are excluded from scoring, and a
 // source decision listed under a set's "Sources with no declared lineage" line
 // still counts toward precision.
+//
+// --sample draws n distinct certified relations (supersedes / amends /
+// preserves) from the whole decision log for a hand precision check, so the
+// draw is reproducible: the pool is every certified relation in extractor
+// order (decision files sorted by name, relations in `sortRelations` order),
+// and indices come from an exact 31-bit LCG (x = (1103515245·x + 12345) mod
+// 2^31, index = floor(x·pool / 2^31)), skipping repeats. Output lists the
+// records in draw order.
 
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -20,22 +29,58 @@ import { extractDecisionFileRelations } from '../src/decision-lineage.js';
 const DECLARED = new Set(['supersedes', 'amends', 'preserves']);
 const EXCLUDED_FILES = new Set(['INDEX.md', 'README.md', 'EXAMPLE.md']);
 
-const [rootArg, labelsArg] = process.argv.slice(2);
-if (!rootArg) {
-  console.error('Usage: node scripts/evaluate-lineage-labels.js <memory-root> [labels-doc]');
+const args = process.argv.slice(2);
+const option = (name) => {
+  const index = args.indexOf(name);
+  if (index === -1) return null;
+  const [value] = args.splice(index, 2).slice(1);
+  return value;
+};
+const sampleSize = option('--sample');
+const sampleSeed = option('--seed');
+const [rootArg, labelsArg] = args;
+if (!rootArg || (sampleSize !== null && sampleSeed === null)) {
+  console.error('Usage: node scripts/evaluate-lineage-labels.js <memory-root> [labels-doc] | <memory-root> --sample <n> --seed <s>');
   process.exit(2);
 }
 
 const root = path.resolve(rootArg);
-const labelsPath = path.resolve(labelsArg ?? path.join(root, 'architecture/platform/project-memory/decision-lineage-labels.md'));
-const sets = parseLabelSets(await readFile(labelsPath, 'utf8'));
 const relations = await extractCorpus(root);
 
-for (const set of sets) {
-  report(set, relations);
+if (sampleSize !== null) {
+  printSample(relations, Number(sampleSize), BigInt(sampleSeed));
+} else {
+  const labelsPath = path.resolve(labelsArg ?? path.join(root, 'architecture/platform/project-memory/decision-lineage-labels.md'));
+  for (const set of parseLabelSets(await readFile(labelsPath, 'utf8'), labelsPath)) {
+    report(set, relations);
+  }
 }
 
-function parseLabelSets(markdown) {
+function printSample(allRelations, size, seed) {
+  const pool = allRelations.filter((relation) => DECLARED.has(relation.relation));
+  const modulus = 2147483648n;
+  const picked = [];
+  const seen = new Set();
+  let state = seed % modulus;
+  while (picked.length < Math.min(size, pool.length)) {
+    state = (1103515245n * state + 12345n) % modulus;
+    const index = Number((state * BigInt(pool.length)) / modulus);
+    if (seen.has(index)) continue;
+    seen.add(index);
+    picked.push(pool[index]);
+  }
+
+  console.log(`Sample: ${picked.length} of ${pool.length} certified relations (seed ${seed})`);
+  console.log('| # | Source | Target | Relation | Extent | Field | Line | Cue |');
+  console.log('|---|---|---|---|---|---|---|---|');
+  picked.forEach((relation, index) => {
+    console.log(
+      `| ${index + 1} | D-${pad(relation.source_decision_id)} | D-${pad(relation.target_decision_id)} | ${relation.relation} | ${relation.extent} | ${relation.source_field} | ${relation.source_path}:${relation.source_line} | ${relation.cue} |`,
+    );
+  });
+}
+
+function parseLabelSets(markdown, labelsPath) {
   const result = [];
   let current = null;
 

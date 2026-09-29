@@ -30,8 +30,9 @@ export const DECISION_RELATION_TYPES = Object.freeze([
 ]);
 export const DECLARED_LINEAGE_RELATIONS = Object.freeze(['supersedes', 'amends', 'preserves']);
 
-// Which clause produced a prose relation; internal, never serialized.
-const CLAUSE_OF = new WeakMap();
+// The claim (field + target span) a prose relation came from; internal,
+// never serialized. Coordinated verbs share one span, so one claim.
+const CLAIM_OF = new WeakMap();
 const RELATION_ORDER = new Map(DECISION_RELATION_TYPES.map((relation, index) => [relation, index]));
 const MAX_RANGE_SPAN = 50;
 const EXCERPT_LIMIT = 280;
@@ -159,18 +160,35 @@ const OBJECT_TERMINATOR_PATTERN =
 const SUBJECT_BOUNDARY_PATTERN =
   /(?:[:;]|\s[—–]\s|,?\s+(?:but|while|whereas|although|though|because|since|yet|so\s+that|where|when|if|unless|until)\s+)/gi;
 const LEAVES_TERMINAL_PATTERN = /(?<![\w-])(?:intact|untouched|unchanged|in\s+place|as\s+is|in\s+force)(?![\w-])/gi;
-const NEGATION_WINDOW_PATTERN = /(?<![\w-])(?:not|never|no\s+longer)\s+(?:[\w-]+\s+)?$/i;
+// Polarity is separate from modality: "cannot preserve" and "D-010 cannot
+// remain unchanged" negate a preservation; they are not a requirement.
+const NEGATION_WINDOW_PATTERN = /(?<![\w-])(?:not|never|no\s+longer|cannot|[a-z]+n['’]t)\s+(?:[\w-]+\s+)?$/i;
 const MODAL_ADVERBS = '(?:(?:not|never|explicitly|also|later|eventually|first|then|each|now|only|still|ever|thereby)\\s+){0,2}';
 const HYPOTHETICAL_AUXILIARY_PATTERN = new RegExp(
   `(?<![\\w-])(?:may|might|could|would|can|should|to)\\s+${MODAL_ADVERBS}(?:be\\s+|have\\s+been\\s+)?$`,
   'i',
 );
-const REQUIREMENT_AUXILIARY_PATTERN = new RegExp(`(?<![\\w-])(?:must|shall|will|cannot)\\s+${MODAL_ADVERBS}(?:be\\s+)?$`, 'i');
+const REQUIREMENT_AUXILIARY_PATTERN = new RegExp(`(?<![\\w-])(?:must|shall|will)\\s+${MODAL_ADVERBS}(?:be\\s+)?$`, 'i');
 const HYPOTHETICAL_CUE_PATTERN = /^(?:may|might|could|would|can|should)\s/i;
-const REQUIREMENT_CUE_PATTERN = /^(?:must|shall|will|cannot)\s/i;
+const REQUIREMENT_CUE_PATTERN = /^(?:must|shall|will)\s/i;
 const CONDITIONAL_BEFORE_PATTERN = /(?<![\w-])(?:if|unless|whether|provided\s+that|assuming|in\s+case)(?![\w-])/i;
 const CONDITIONAL_OPENING_PATTERN = /^\s*(?:when|whenever|once|until|should|were)(?![\w-])/i;
 const CONDITIONAL_AFTER_PATTERN = /(?<![\w-])(?:if|unless|provided\s+that)(?![\w-])/i;
+const CONDITIONAL_TAIL_PATTERN = /^\s*,?\s*(?:unless|if|provided\s+that|only\s+if)(?![\w-])/i;
+// Verbs that open an implicit-subject sentence in decision prose ("Confirms
+// D-246 … and preserves D-004"): IDs after them are their objects and the
+// entry is the actor. Closed on purpose — an actor phrase that names another
+// decision without one of these openings is left uncertified.
+const IMPLICIT_SUBJECT_VERB_PATTERN = new RegExp(
+  `^\\s*(?:(?:and|also|then)\\s+)?(?:[a-z]+ly\\s+)?(?:${[
+    'adds', 'aligns', 'amends', 'applies', 'avoids', 'builds', 'carries', 'clarifies', 'closes', 'complements',
+    'completes', 'confirms', 'corrects', 'covers', 'creates', 'defers', 'delivers', 'documents', 'extends',
+    'follows', 'generalizes', 'implements', 'keeps', 'leaves', 'matches', 'moves', 'narrows', 'operationalizes',
+    'preserves', 'qualifies', 'reaffirms', 'records', 'reduces', 'refines', 'replaces', 'resolves', 'retains',
+    'reuses', 'scopes', 'simplifies', 'supersedes', 'supplies', 'supports', 'treats', 'updates', 'uses',
+  ].join('|')})(?![\\w-])`,
+  'i',
+);
 const OBJECT_PRONOUN_PATTERN = /^\s*(?:this|that|it|them|these|those|which|what|itself|themselves|such)(?![\w-])/i;
 const OBJECT_RELATIONAL_PATTERN =
   /(?<![\w-])(?:separate|separately|apart|distinct|independent|independently|different|differently|unlike|like|consistent|aligned|compatible|comparable|similar|relative|than|alongside|versus|vs)(?![\w-])/i;
@@ -621,7 +639,7 @@ function extractEntryRelations({ entry, path, content, sourceHash, lineStarts })
         message: `D-${pad(sourceId)} declares "${relation.relation}" for later decision D-${pad(relation.target_decision_id)}; recorded as unknown.`,
       });
       const moved = { ...relation, relation: 'unknown', extent: null, scope: null, cue: `forward-reference:${relation.cue}` };
-      if (CLAUSE_OF.has(relation)) CLAUSE_OF.set(moved, CLAUSE_OF.get(relation));
+      if (CLAIM_OF.has(relation)) CLAIM_OF.set(moved, CLAIM_OF.get(relation));
       lineage.push(moved);
       continue;
     }
@@ -654,22 +672,23 @@ function extractEntryRelations({ entry, path, content, sourceHash, lineStarts })
     kept.push(relation);
   }
 
-  // An `unknown` is dropped only when the same clause certifies a relation
-  // for the same target (coordinated verbs: "partially supersedes and refines
-  // D-015"). Anywhere else it is an independent claim — a change beside a
-  // preservation of another part — and stays as a follow-up read.
-  const clauseTarget = (relation) => `${CLAUSE_OF.get(relation) ?? ''}\u0000${relation.target_decision_id}`;
-  const certifiedInClause = new Set(
+  // An `unknown` is dropped only when a certified relation for the same
+  // target comes from the same claim — coordinated verbs sharing one object
+  // ("partially supersedes and refines D-015"). A change and a preservation
+  // with separate objects ("Refines D-010's X while preserving D-010's Y")
+  // are independent claims, so the `unknown` stays as a follow-up read.
+  const claimTarget = (relation) => `${CLAIM_OF.get(relation) ?? ''}\u0000${relation.target_decision_id}`;
+  const certifiedClaims = new Set(
     kept
-      .filter((relation) => DECLARED_LINEAGE_RELATIONS.includes(relation.relation) && CLAUSE_OF.has(relation))
-      .map(clauseTarget),
+      .filter((relation) => DECLARED_LINEAGE_RELATIONS.includes(relation.relation) && CLAIM_OF.has(relation))
+      .map(claimTarget),
   );
   const unknownSeen = new Set();
   const relations = [];
   for (const relation of kept) {
     if (relation.relation === 'unknown') {
-      if (CLAUSE_OF.has(relation) && certifiedInClause.has(clauseTarget(relation))) continue;
-      const key = `${clauseTarget(relation)}\u0000${relation.cue}`;
+      if (CLAIM_OF.has(relation) && certifiedClaims.has(claimTarget(relation))) continue;
+      const key = `${claimTarget(relation)}\u0000${relation.cue}`;
       if (unknownSeen.has(key)) continue;
       unknownSeen.add(key);
     }
@@ -819,9 +838,11 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
       const current = ordered[index];
       if (current.form === 'subject') continue;
       const span = spans.get(current);
-      const between = masked.slice(span.start, span.end);
       const next = ordered[index + 1];
-      if (next && next.form !== 'subject' && /^\s*(?:and\/or|and|or|\/|,)?\s*$/i.test(between) && span.end === next.start) {
+      // Judge by the text between the two verbs, not by where this verb's own
+      // object stopped (a terminator may already have cut it at " and").
+      const between = next ? masked.slice(span.start, next.start) : null;
+      if (next && next.form !== 'subject' && next.start >= span.start && /^\s*(?:and\/or|and|or|\/|,)?\s*$/i.test(between)) {
         spans.set(current, { ...spans.get(next), shared: true });
       }
     }
@@ -854,15 +875,26 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
 
       const objectForm = !(current.form === 'subject' || (current.form === 'verb' && current.passive) || current.form === 'agent-self');
       if (objectForm) {
-        // Another decision as the explicit subject ("D-020 supersedes D-010")
-        // is that decision's claim, restated here: never certified for this
-        // entry. The targets stay references.
-        const actor = masked.slice(
-          subjectBoundary(current, clause, masked, depth, actorStart, clauses, clauseIndex, cues, sourceId),
-          current.start,
-        );
-        const subject = actor.match(/^\s*(?:(?:and|also|then|the)\s+)*D-(\d+)/i);
-        if (subject && toDecisionId(subject[1]) !== sourceId) continue;
+        // The actor is the phrase before the verb, after any introductory
+        // prose ending in a comma ("According to D-020, D-020 supersedes …").
+        // If it names another decision ("D-020 supersedes D-010", "As D-020
+        // supersedes D-010, …"), the claim is that decision's, restated here,
+        // or its actor is uncertain: never certified. Targets stay references.
+        const actorFrom = subjectBoundary(current, clause, masked, depth, actorStart, clauses, clauseIndex, cues, sourceId);
+        let phraseFrom = actorFrom;
+        for (let index = current.start - 1; index >= actorFrom; index -= 1) {
+          if (masked[index] === ',' && depth[index] === current.depth) {
+            phraseFrom = index + 1;
+            break;
+          }
+        }
+        const actorPhrase = masked.slice(phraseFrom, current.start);
+        if (
+          scanDecisionReferences(actorPhrase).refs.some((ref) => ref.id !== sourceId) &&
+          !IMPLICIT_SUBJECT_VERB_PATTERN.test(actorPhrase)
+        ) {
+          continue;
+        }
         // The object must name the decision or a part of it, not a contrast or
         // comparison around it ("Keeping this separate from D-169 …").
         const lead = masked.slice(targetSpan.start, Math.min(...targets.map((target) => target.start)));
@@ -906,7 +938,7 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
           cue: classification.cue,
           excerpt,
         });
-        CLAUSE_OF.set(relation, `${field.name}\u0000${clause.start}`);
+        CLAIM_OF.set(relation, `${field.name}\u0000${targetSpan.start}:${targetSpan.end}`);
         relations.push(relation);
       }
     }
@@ -987,15 +1019,20 @@ function readAgentRefs(masked, from) {
 
 // Modality decides what a cue may certify. Hypothetical wording (may, might,
 // could, would, can, should, to, or a conditional) certifies nothing. A
-// requirement (must, shall, will, cannot) certifies preservation — the entry
-// requires the earlier rule to hold — but not a supersession or amendment,
-// which would be a future act.
+// requirement (must, shall, will) certifies preservation — the entry requires
+// the earlier rule to hold — but not a supersession or amendment, which would
+// be a future act. Negation (not, never, cannot, …) is polarity, handled in
+// classifyCue.
 function cueModality(current, masked, clause, spanEnd) {
   const before = masked.slice(clause.start, current.start);
   // A trailing condition only counts inside the cue's own object or qualifier
   // ("supersedes D-010 if approved"), not in a later coordinated verb phrase.
   const after = masked.slice(current.end, spanEnd ?? clause.end);
+  // …or opening the text right after it, where the object boundary stopped
+  // ("supersedes D-010 unless the proposal is rejected").
+  const tail = masked.slice(spanEnd ?? clause.end, clause.end);
   if (
+    CONDITIONAL_TAIL_PATTERN.test(tail) ||
     CONDITIONAL_BEFORE_PATTERN.test(before) ||
     CONDITIONAL_OPENING_PATTERN.test(before) ||
     CONDITIONAL_AFTER_PATTERN.test(after) ||
@@ -1070,11 +1107,15 @@ function objectSpan(current, clause, masked, depth, cues) {
     }
   }
 
+  // Match against the rest of the clause so a terminator's lookahead can see
+  // past the next cue ("… and D-125 by keeping …"); accept only matches that
+  // start before the stop.
   const terminator = new RegExp(OBJECT_TERMINATOR_PATTERN.source, 'gi');
-  const window = masked.slice(current.end, stop);
+  const window = masked.slice(current.end, clause.end);
   let match;
   while ((match = terminator.exec(window)) !== null) {
     const at = current.end + match.index;
+    if (at >= stop) break;
     if (depth[at] !== level) continue;
     if (insideRestatement(at, cues)) continue;
     stop = at;
@@ -1332,6 +1373,8 @@ function trimScopeRange(range, masked, kind) {
     if (!/^only\s+(?:where|insofar|to|for|in|as|when)(?![\w-])/i.test(text())) skipLeading(/^only(?:\s+|$)/i);
     skipLeading(/^by\s+this\s+(?:decision|entry)(?![\w-])/i);
     skipLeading(/^(?:(?:and|but)\s+)?(?:(?:is|are)\s+)?(?:kept|retained|preserved)\s+(?:only\s+)?(?:for|as)\s+(?:a\s+|the\s+)?historical\s+(?:reference|record|context)(?![\w-])/i);
+    // "keeps D-321 and D-322 intact": the state word is the verb's complement, not a part.
+    skipTrailing(/(?:^|\s+)(?:intact|untouched|unchanged|in\s+place|as\s+is)$/i);
     skipTrailing(/(?:^|\s+)(?:and|or|plus|also)$/i);
   }
   trimEdges();

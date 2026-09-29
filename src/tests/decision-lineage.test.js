@@ -434,6 +434,100 @@ test('hypothetical wording is uncertified in every cue form; a requirement still
   assert.equal(collectDeclaredSuccessors(buildDecisionLineageModel([{ kind: 'decision', path: 'd.md', content }]).relations, 12).length, 0);
 });
 
+test('a change and a preservation with separate objects stay separate claims (review pass 2, R3; real D-277)', () => {
+  const content = decisionFile([
+    ...[10, 11, 15, 185, 187].map((id) => entry(id, '**Decision:** Base.')),
+    entry(
+      277,
+      "**Impact on prior decisions:** Refines D-185/D-187 lane semantics for true concurrency while preserving D-187's explicit-ID requirement.",
+    ),
+    entry(
+      300,
+      "**Decision:** Refines D-010's storage rule while preserving D-010's audience rule. Preserves D-011's billing rule while narrowing D-011's reporting rule. Partially supersedes and refines D-015's pricing.",
+    ),
+  ]);
+  const real = lineageOf(content, 277);
+  const probes = lineageOf(content, 300);
+  const summary = (relations, id) => pick(relations, id).map((relation) => [relation.relation, relation.cue]);
+
+  assert.deepEqual(summary(real, 185), [['unknown', 'refines']]);
+  assert.deepEqual(summary(real, 187), [
+    ['preserves', 'preserving'],
+    ['unknown', 'refines'],
+  ]);
+  assert.deepEqual(summary(probes, 10), [
+    ['preserves', 'preserving'],
+    ['unknown', 'refines'],
+  ]);
+  assert.deepEqual(summary(probes, 11), [
+    ['preserves', 'preserves'],
+    ['unknown', 'narrowing'],
+  ]);
+  assert.deepEqual(summary(probes, 15), [['supersedes', 'partially supersedes']]);
+});
+
+test('an actor phrase that names another decision is never certified, even after introductory prose (review pass 2, R4)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12].map((id) => entry(id, '**Decision:** Base.')),
+    entry(20, '**Decision:** Supersedes D-010 and D-011.'),
+    entry(
+      30,
+      '**Rationale:** As D-020 supersedes D-010, this decision adds documentation. According to D-020, D-020 supersedes D-011. Confirms D-020 and preserves D-012.',
+    ),
+  ]);
+  const own = lineageOf(content, 30);
+
+  assert.deepEqual(pick(own, 10).map((relation) => relation.relation), ['references']);
+  assert.deepEqual(pick(own, 11).map((relation) => relation.relation), ['references']);
+  // An implicit-subject verb ("Confirms D-020 …") leaves this entry as the actor.
+  assert.deepEqual(pick(own, 12).map((relation) => relation.relation), ['preserves']);
+  const relations = buildDecisionLineageModel([{ kind: 'decision', path: 'decisions/fixture.md', content }]).relations;
+  for (const target of [10, 11]) {
+    assert.deepEqual(collectDeclaredSuccessors(relations, target).map((successor) => successor.decision_id), [20]);
+  }
+});
+
+test('a trailing unless or if right after the object keeps any cue uncertified (review pass 2, R6a)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12, 13, 14, 95, 306].map((id) => entry(id, '**Decision:** Base.')),
+    entry(
+      400,
+      [
+        '**Decision:** This supersedes D-010 unless the proposal is rejected. Preserves D-011 unless the founder objects. This does not supersede D-012 unless asked. D-013 remains unchanged unless the fixture changes. This supersedes D-014 if the proposal is approved.',
+        // D-231 / D-309 shapes: a later "assuming" or "if" in another phrase is not the cue's condition.
+        '**Impact on prior decisions:** D-095 remains valid as a safety requirement, but its step graph must become branch-aware instead of assuming a single path. Limiting this to one replacement preserves D-306’s fail-closed bootstrap and requires a new decision if diagnosis reveals a semantic fix.',
+      ].join('\n'),
+    ),
+  ]);
+  const relations = lineageOf(content, 400);
+
+  for (const id of [10, 11, 12, 13, 14]) {
+    assert.deepEqual(pick(relations, id).map((relation) => relation.relation), ['unknown'], `D-0${id}`);
+    assert.match(pick(relations, id)[0].cue, /^modal:/);
+  }
+  assert.deepEqual(pick(relations, 95).map((relation) => relation.relation), ['preserves']);
+  assert.deepEqual(pick(relations, 306).map((relation) => relation.relation), ['preserves']);
+});
+
+test('negative polarity never certifies preservation; a requirement to keep still does (review pass 2, R6b)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12, 13, 14].map((id) => entry(id, '**Decision:** Base.')),
+    entry(
+      30,
+      "**Rationale:** This cannot preserve D-010. D-011 cannot remain unchanged. It must retain D-012's safety checks. This cannot supersede D-013. D-014 doesn't remain valid.",
+    ),
+  ]);
+  const relations = lineageOf(content, 30);
+  const summary = (id) => pick(relations, id).map((relation) => [relation.relation, relation.cue]);
+
+  assert.deepEqual(summary(10), [['unknown', 'negated:preserve']]);
+  assert.deepEqual(summary(11), [['unknown', 'negated:remain unchanged']]);
+  assert.deepEqual(summary(12), [['preserves', 'retain']]);
+  // Prohibited change is negated change: the earlier decision stands.
+  assert.deepEqual(summary(13), [['preserves', 'negated:supersede']]);
+  assert.deepEqual(summary(14), [['unknown', 'negated:remain valid']]);
+});
+
 test('session notes: every mention is a reference; only leading top-level Decisions made listings are made', () => {
   const note = [
     '# Session — 2026-06-10-1 — Fixture',
