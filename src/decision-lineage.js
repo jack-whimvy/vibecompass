@@ -414,7 +414,7 @@ function extractMentionRelations({ path, content, sourceKind, relation }) {
   for (const ref of refs) {
     const offset = bodyStart + ref.start;
     const section = sectionAt(sections, offset);
-    const key = `${section.path ?? ''}\u0000${ref.id}`;
+    const key = `${section.start ?? -1}\u0000${ref.id}`; // position, so repeated headings stay distinct
     const existing = grouped.get(key);
     if (existing) {
       existing.occurrences += 1;
