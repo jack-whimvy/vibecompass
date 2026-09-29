@@ -16,6 +16,14 @@
   nothing is inferred as "governs" or "currently valid" (D-359). Every
   relation carries source path, section, line, document and section hashes,
   and explicit-or-inferred evidence (range interiors are inferred).
+- Lineage stays conservative: fenced examples, another decision's restated
+  claim ("D-020 supersedes D-010" quoted in a later entry), contrast objects
+  ("separate from D-169"), and hypothetical wording (may, would, if, …) never
+  certify a relation; a requirement ("must retain") still certifies
+  preservation. An `unknown` is kept beside certified relations unless the
+  same clause certifies the same target. Historical retention ("kept for
+  historical reference") never overrides partial or scoped wording. Decision
+  IDs must be positive safe integers, so malformed ranges cannot loop.
 - Recognize the optional structured lineage fields `**Supersedes:**`,
   `**Partially supersedes:**`, `**Amends:**`, and `**Preserves:**` on new
   decision entries (D-363); they win over prose for the targets they name, and

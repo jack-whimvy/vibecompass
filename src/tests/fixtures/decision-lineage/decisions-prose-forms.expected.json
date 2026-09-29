@@ -6,6 +6,25 @@
   },
   "relations": [
     {
+      "relation": "unknown",
+      "source_kind": "decision",
+      "source_path": "decisions/prose-forms.md",
+      "source_decision_id": 15,
+      "source_section": "D-015 — Multi-repository projects (replaces D-010 single-repo constraint)",
+      "source_field": "Title",
+      "source_line": 47,
+      "source_hash": "sha256:cbaeda31f40a12e77f28f8cae5acea5d3a121de61e820afbbc4011285aa87e9e",
+      "section_hash": "sha256:0cd11073079c2ee97bb893f63a6e83455423cc155c55968b29e841ad1cbba908",
+      "target_decision_id": 10,
+      "evidence": "explicit",
+      "basis": "prose",
+      "extent": null,
+      "scope": null,
+      "cue": "replaces",
+      "excerpt": "Multi-repository projects (replaces D-010 single-repo constraint)",
+      "occurrences": 1
+    },
+    {
       "relation": "supersedes",
       "source_kind": "decision",
       "source_path": "decisions/prose-forms.md",
@@ -18,8 +37,8 @@
       "target_decision_id": 10,
       "evidence": "explicit",
       "basis": "prose",
-      "extent": "full",
-      "scope": null,
+      "extent": "scoped",
+      "scope": "for implementation",
       "cue": "is superseded",
       "excerpt": "D-010 (\"one project = one repository\") is superseded for implementation but kept for historical reference",
       "occurrences": 1

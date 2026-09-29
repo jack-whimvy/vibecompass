@@ -30,6 +30,8 @@ export const DECISION_RELATION_TYPES = Object.freeze([
 ]);
 export const DECLARED_LINEAGE_RELATIONS = Object.freeze(['supersedes', 'amends', 'preserves']);
 
+// Which clause produced a prose relation; internal, never serialized.
+const CLAUSE_OF = new WeakMap();
 const RELATION_ORDER = new Map(DECISION_RELATION_TYPES.map((relation, index) => [relation, index]));
 const MAX_RANGE_SPAN = 50;
 const EXCERPT_LIMIT = 280;
@@ -158,8 +160,20 @@ const SUBJECT_BOUNDARY_PATTERN =
   /(?:[:;]|\s[—–]\s|,?\s+(?:but|while|whereas|although|though|because|since|yet|so\s+that|where|when|if|unless|until)\s+)/gi;
 const LEAVES_TERMINAL_PATTERN = /(?<![\w-])(?:intact|untouched|unchanged|in\s+place|as\s+is|in\s+force)(?![\w-])/gi;
 const NEGATION_WINDOW_PATTERN = /(?<![\w-])(?:not|never|no\s+longer)\s+(?:[\w-]+\s+)?$/i;
-const MODAL_WINDOW_PATTERN =
-  /(?:(?<![\w-])(?:must|should|would|could|may|might|will|shall|can|cannot|to)\s+(?:(?:explicitly|also|later|eventually|first|then|each|now)\s+){0,2}(?:be\s+)?$|(?<![\w-])(?:if|unless|whether|once|until|when|whenever)(?:\s+\S+){0,4}\s*$)/i;
+const MODAL_ADVERBS = '(?:(?:not|never|explicitly|also|later|eventually|first|then|each|now|only|still|ever|thereby)\\s+){0,2}';
+const HYPOTHETICAL_AUXILIARY_PATTERN = new RegExp(
+  `(?<![\\w-])(?:may|might|could|would|can|should|to)\\s+${MODAL_ADVERBS}(?:be\\s+|have\\s+been\\s+)?$`,
+  'i',
+);
+const REQUIREMENT_AUXILIARY_PATTERN = new RegExp(`(?<![\\w-])(?:must|shall|will|cannot)\\s+${MODAL_ADVERBS}(?:be\\s+)?$`, 'i');
+const HYPOTHETICAL_CUE_PATTERN = /^(?:may|might|could|would|can|should)\s/i;
+const REQUIREMENT_CUE_PATTERN = /^(?:must|shall|will|cannot)\s/i;
+const CONDITIONAL_BEFORE_PATTERN = /(?<![\w-])(?:if|unless|whether|provided\s+that|assuming|in\s+case)(?![\w-])/i;
+const CONDITIONAL_OPENING_PATTERN = /^\s*(?:when|whenever|once|until|should|were)(?![\w-])/i;
+const CONDITIONAL_AFTER_PATTERN = /(?<![\w-])(?:if|unless|provided\s+that)(?![\w-])/i;
+const OBJECT_PRONOUN_PATTERN = /^\s*(?:this|that|it|them|these|those|which|what|itself|themselves|such)(?![\w-])/i;
+const OBJECT_RELATIONAL_PATTERN =
+  /(?<![\w-])(?:separate|separately|apart|distinct|independent|independently|different|differently|unlike|like|consistent|aligned|compatible|comparable|similar|relative|than|alongside|versus|vs)(?![\w-])/i;
 const HISTORICAL_RETENTION_PATTERN =
   /(?<![\w-])(?:kept|retained|preserved)\s+(?:only\s+)?(?:for|as)\s+(?:a\s+|the\s+)?historical\s+(?:reference|record|context)(?![\w-])/i;
 const FULL_EXTENT_PATTERN = /^(?:in\s+full|entirely|completely|wholly|comprehensively|in\s+(?:its|their)\s+entirety|in\s+whole)(?![\w-])/i;
@@ -190,21 +204,23 @@ export function scanDecisionReferences(text) {
     const start = match.index;
     const end = start + match[0].length;
 
-    if (!isCanonicalDecisionDigits(digits)) {
+    const id = toDecisionId(digits);
+    if (id === null) {
       malformed.push({ token: match[0], start, end });
       continue;
     }
 
-    const id = Number(digits);
     const tail = RANGE_TAIL_PATTERN.exec(text.slice(end));
-    if (tail && isCanonicalDecisionDigits(tail[1])) {
-      const last = Number(tail[1]);
-      if (last > id && last - id <= MAX_RANGE_SPAN) {
+    const last = tail ? toDecisionId(tail[1]) : null;
+    if (last !== null) {
+      const span = last - id;
+      if (span > 0 && span <= MAX_RANGE_SPAN) {
         const rangeEnd = end + tail[0].length;
         const range = { start, end: rangeEnd };
         refs.push({ id, start, end, evidence: 'explicit', basis: 'mention', range });
-        for (let interior = id + 1; interior < last; interior += 1) {
-          refs.push({ id: interior, start, end: rangeEnd, evidence: 'inferred', basis: 'range-expansion', range });
+        // Counted loop: bounded by MAX_RANGE_SPAN regardless of ID magnitude.
+        for (let offset = 1; offset < span; offset += 1) {
+          refs.push({ id: id + offset, start, end: rangeEnd, evidence: 'inferred', basis: 'range-expansion', range });
         }
         refs.push({ id: last, start: rangeEnd - `D-${tail[1]}`.length, end: rangeEnd, evidence: 'explicit', basis: 'mention', range });
         pattern.lastIndex = rangeEnd;
@@ -353,7 +369,11 @@ export function collectDeclaredSuccessors(relations, decisionId) {
 
 /** Splits a decision domain file into entries and labeled fields. */
 export function parseDecisionEntries(content) {
-  const headings = [...content.matchAll(new RegExp(DECISION_HEADING_PATTERN.source, 'gm'))];
+  // Headings and field labels inside fenced code are examples, not structure.
+  const fenced = findFencedRanges(content);
+  const headings = [...content.matchAll(new RegExp(DECISION_HEADING_PATTERN.source, 'gm'))].filter(
+    (heading) => !insideRanges(heading.index, fenced) && toDecisionId(heading[1]) !== null,
+  );
 
   return headings.map((heading, index) => {
     const start = heading.index;
@@ -370,7 +390,9 @@ export function parseDecisionEntries(content) {
     const titleStart = headingEnd - heading[2].length + heading[2].indexOf(title);
     const fields = [{ name: 'Title', start: titleStart, text: title }];
 
-    const labels = [...content.slice(headingEnd, end).matchAll(new RegExp(FIELD_LABEL_PATTERN.source, 'gm'))];
+    const labels = [...content.slice(headingEnd, end).matchAll(new RegExp(FIELD_LABEL_PATTERN.source, 'gm'))].filter(
+      (label) => !insideRanges(headingEnd + label.index, fenced),
+    );
     const bodyLead = labels.length > 0 ? labels[0].index : end - headingEnd;
     const leading = content.slice(headingEnd, headingEnd + bodyLead);
     if (leading.trim()) {
@@ -464,7 +486,9 @@ function extractMadeRelations({ path, content, context }) {
 
   const relations = [];
   const seen = new Set();
-  const lines = content.slice(section.start, section.end).split('\n');
+  const sectionText = content.slice(section.start, section.end);
+  const fenced = findFencedRanges(sectionText);
+  const lines = sectionText.split('\n');
   let offset = section.start;
   let item = null;
   const flush = () => {
@@ -477,6 +501,10 @@ function extractMadeRelations({ path, content, context }) {
     const lineOffset = offset;
     offset += line.length + 1;
     if (index === 0) continue; // the heading line
+    if (insideRanges(lineOffset - section.start, fenced)) {
+      flush(); // fenced examples never list decisions
+      continue;
+    }
 
     const topLevel = line.match(/^[-*+][ \t]+(.*)$/);
     if (topLevel) {
@@ -592,13 +620,16 @@ function extractEntryRelations({ entry, path, content, sourceHash, lineStarts })
         decision_id: sourceId,
         message: `D-${pad(sourceId)} declares "${relation.relation}" for later decision D-${pad(relation.target_decision_id)}; recorded as unknown.`,
       });
-      lineage.push({ ...relation, relation: 'unknown', extent: null, scope: null, cue: `forward-reference:${relation.cue}` });
+      const moved = { ...relation, relation: 'unknown', extent: null, scope: null, cue: `forward-reference:${relation.cue}` };
+      if (CLAUSE_OF.has(relation)) CLAUSE_OF.set(moved, CLAUSE_OF.get(relation));
+      lineage.push(moved);
       continue;
     }
     lineage.push(relation);
   }
 
-  // D-363: a structured field is authoritative for the targets it names.
+  // D-363: a structured field is authoritative for the targets it names;
+  // prose `unknown` wording about them is still kept as a follow-up read.
   const structuredTargets = new Map();
   for (const relation of lineage.filter((candidate) => candidate.basis === 'structured-field')) {
     if (!structuredTargets.has(relation.target_decision_id)) structuredTargets.set(relation.target_decision_id, new Set());
@@ -608,7 +639,7 @@ function extractEntryRelations({ entry, path, content, sourceHash, lineStarts })
   const kept = [];
   for (const relation of lineage) {
     const named = structuredTargets.get(relation.target_decision_id);
-    if (relation.basis !== 'structured-field' && named) {
+    if (relation.basis !== 'structured-field' && named && relation.relation !== 'unknown') {
       if (DECLARED_LINEAGE_RELATIONS.includes(relation.relation) && !named.has(relation.relation)) {
         diagnostics.push({
           code: 'lineage-structured-prose-conflict',
@@ -623,15 +654,23 @@ function extractEntryRelations({ entry, path, content, sourceHash, lineStarts })
     kept.push(relation);
   }
 
-  const declaredTargets = new Set(
-    kept.filter((relation) => DECLARED_LINEAGE_RELATIONS.includes(relation.relation)).map((relation) => relation.target_decision_id),
+  // An `unknown` is dropped only when the same clause certifies a relation
+  // for the same target (coordinated verbs: "partially supersedes and refines
+  // D-015"). Anywhere else it is an independent claim — a change beside a
+  // preservation of another part — and stays as a follow-up read.
+  const clauseTarget = (relation) => `${CLAUSE_OF.get(relation) ?? ''}\u0000${relation.target_decision_id}`;
+  const certifiedInClause = new Set(
+    kept
+      .filter((relation) => DECLARED_LINEAGE_RELATIONS.includes(relation.relation) && CLAUSE_OF.has(relation))
+      .map(clauseTarget),
   );
   const unknownSeen = new Set();
   const relations = [];
   for (const relation of kept) {
     if (relation.relation === 'unknown') {
-      const key = `${relation.target_decision_id}\u0000${relation.cue}`;
-      if (declaredTargets.has(relation.target_decision_id) || unknownSeen.has(key)) continue;
+      if (CLAUSE_OF.has(relation) && certifiedInClause.has(clauseTarget(relation))) continue;
+      const key = `${clauseTarget(relation)}\u0000${relation.cue}`;
+      if (unknownSeen.has(key)) continue;
       unknownSeen.add(key);
     }
     relations.push(relation);
@@ -808,11 +847,29 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
         targetSpan = span;
       }
 
+      const actorStart = previousEnd;
       previousEnd = Math.max(previousEnd, span.shared ? current.end : span.end);
       const targets = refsIn(targetSpan.start, targetSpan.end);
       if (targets.length === 0) continue;
 
-      const classification = classifyCue(current, masked, clause);
+      const objectForm = !(current.form === 'subject' || (current.form === 'verb' && current.passive) || current.form === 'agent-self');
+      if (objectForm) {
+        // Another decision as the explicit subject ("D-020 supersedes D-010")
+        // is that decision's claim, restated here: never certified for this
+        // entry. The targets stay references.
+        const actor = masked.slice(
+          subjectBoundary(current, clause, masked, depth, actorStart, clauses, clauseIndex, cues, sourceId),
+          current.start,
+        );
+        const subject = actor.match(/^\s*(?:(?:and|also|then|the)\s+)*D-(\d+)/i);
+        if (subject && toDecisionId(subject[1]) !== sourceId) continue;
+        // The object must name the decision or a part of it, not a contrast or
+        // comparison around it ("Keeping this separate from D-169 …").
+        const lead = masked.slice(targetSpan.start, Math.min(...targets.map((target) => target.start)));
+        if (OBJECT_PRONOUN_PATTERN.test(lead) || OBJECT_RELATIONAL_PATTERN.test(lead)) continue;
+      }
+
+      const classification = classifyCue(current, masked, clause, Math.max(span.end, targetSpan.end));
       if (!classification) continue;
 
       const excerptStart = Math.min(clause.start, targetSpan.start);
@@ -836,7 +893,7 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
           classification.relation === 'unknown'
             ? null
             : resolveExtent({ classification, scopeInfo, clauseAfterCue, current });
-        relations.push(createRelation({
+        const relation = createRelation({
           ...base,
           relation: classification.relation,
           source_field: field.name,
@@ -848,7 +905,9 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
           scope: extent === 'scoped' || extent === 'partial' ? scopeInfo.text : null,
           cue: classification.cue,
           excerpt,
-        }));
+        });
+        CLAUSE_OF.set(relation, `${field.name}\u0000${clause.start}`);
+        relations.push(relation);
       }
     }
   }
@@ -926,35 +985,63 @@ function readAgentRefs(masked, from) {
   return { ids, end: from + match[0].length };
 }
 
-function classifyCue(current, masked, clause) {
+// Modality decides what a cue may certify. Hypothetical wording (may, might,
+// could, would, can, should, to, or a conditional) certifies nothing. A
+// requirement (must, shall, will, cannot) certifies preservation — the entry
+// requires the earlier rule to hold — but not a supersession or amendment,
+// which would be a future act.
+function cueModality(current, masked, clause, spanEnd) {
+  const before = masked.slice(clause.start, current.start);
+  // A trailing condition only counts inside the cue's own object or qualifier
+  // ("supersedes D-010 if approved"), not in a later coordinated verb phrase.
+  const after = masked.slice(current.end, spanEnd ?? clause.end);
+  if (
+    CONDITIONAL_BEFORE_PATTERN.test(before) ||
+    CONDITIONAL_OPENING_PATTERN.test(before) ||
+    CONDITIONAL_AFTER_PATTERN.test(after) ||
+    HYPOTHETICAL_AUXILIARY_PATTERN.test(before) ||
+    HYPOTHETICAL_CUE_PATTERN.test(current.text)
+  ) {
+    return 'hypothetical';
+  }
+  if (REQUIREMENT_AUXILIARY_PATTERN.test(before) || REQUIREMENT_CUE_PATTERN.test(current.text)) {
+    return 'requirement';
+  }
+  return 'asserted';
+}
+
+function classifyCue(current, masked, clause, spanEnd) {
   const before = masked.slice(clause.start, current.start);
   const negatedWindow = NEGATION_WINDOW_PATTERN.test(before);
-  const modalWindow = MODAL_WINDOW_PATTERN.test(before);
+  const modality = cueModality(current, masked, clause, spanEnd);
   const verb = normalizeCueVerb(current);
+  const uncertified = (prefix) => ({ relation: 'unknown', cue: `${prefix}:${verb}` });
 
   if (current.family === 'negated') {
-    return { relation: 'preserves', cue: verb };
+    return modality === 'hypothetical' ? uncertified('modal') : { relation: 'preserves', cue: verb };
   }
 
   if (current.form === 'agent-self') {
     const relation = current.verb === 'superseded' ? 'supersedes' : current.verb === 'amended' ? 'amends' : 'unknown';
+    if (modality !== 'asserted' && relation !== 'unknown') return uncertified('modal');
     return { relation, cue: verb };
   }
 
   if (current.family === 'supersede' || current.family === 'amend') {
     const relation = current.family === 'supersede' ? 'supersedes' : 'amends';
-    if (negatedWindow) return { relation: 'preserves', cue: `negated:${verb}` };
-    if (modalWindow) return { relation: 'unknown', cue: `modal:${verb}` };
+    if (negatedWindow) return modality === 'hypothetical' ? uncertified('modal') : { relation: 'preserves', cue: `negated:${verb}` };
+    if (modality !== 'asserted') return uncertified('modal');
     return { relation, cue: verb };
   }
 
   if (current.family === 'preserve') {
-    if (negatedWindow) return { relation: 'unknown', cue: `negated:${verb}` };
+    if (negatedWindow) return uncertified('negated');
+    if (modality === 'hypothetical') return uncertified('modal');
     return { relation: 'preserves', cue: verb };
   }
 
   if (current.family === 'unknown') {
-    return { relation: 'unknown', cue: modalWindow ? `modal:${verb}` : verb };
+    return modality === 'asserted' ? { relation: 'unknown', cue: verb } : uncertified('modal');
   }
 
   return null;
@@ -1244,6 +1331,7 @@ function trimScopeRange(range, masked, kind) {
     // this decision".
     if (!/^only\s+(?:where|insofar|to|for|in|as|when)(?![\w-])/i.test(text())) skipLeading(/^only(?:\s+|$)/i);
     skipLeading(/^by\s+this\s+(?:decision|entry)(?![\w-])/i);
+    skipLeading(/^(?:(?:and|but)\s+)?(?:(?:is|are)\s+)?(?:kept|retained|preserved)\s+(?:only\s+)?(?:for|as)\s+(?:a\s+|the\s+)?historical\s+(?:reference|record|context)(?![\w-])/i);
     skipTrailing(/(?:^|\s+)(?:and|or|plus|also)$/i);
   }
   trimEdges();
@@ -1252,11 +1340,12 @@ function trimScopeRange(range, masked, kind) {
   return kind === 'prefix' ? { start, end } : { range: { start, end } };
 }
 
+// Explicit wording wins: partial, then full, then a named part. Keeping a
+// superseded entry "for historical reference" only upgrades an otherwise
+// unqualified supersession to full; it never overrides a partial or scoped
+// qualifier (retention is the append-only norm, not an extent claim).
 function resolveExtent({ classification, scopeInfo, clauseAfterCue, current }) {
   const modifier = current.text.toLowerCase();
-  if (classification.relation === 'supersedes' && HISTORICAL_RETENTION_PATTERN.test(clauseAfterCue)) {
-    return 'full';
-  }
   if (/(?<![\w-])(?:partially|partly)(?![\w-])/.test(modifier) || scopeInfo.partialWording) {
     return 'partial';
   }
@@ -1270,6 +1359,9 @@ function resolveExtent({ classification, scopeInfo, clauseAfterCue, current }) {
   if (scopeInfo.text) {
     return 'scoped';
   }
+  if (classification.relation === 'supersedes' && HISTORICAL_RETENTION_PATTERN.test(clauseAfterCue)) {
+    return 'full';
+  }
   return 'unqualified';
 }
 
@@ -1279,8 +1371,8 @@ function resolveExtent({ classification, scopeInfo, clauseAfterCue, current }) {
 
 /**
  * Blanks (same length, newlines kept) text whose wording must never become a
- * lineage declaration: blockquotes, code spans, double-quoted prose, and link
- * targets.
+ * lineage declaration: fenced code, blockquotes, code spans, double-quoted
+ * prose, and link targets.
  */
 export function maskForLineage(text) {
   const chars = text.split(''); // UTF-16 units, so offsets stay aligned with the original
@@ -1291,6 +1383,7 @@ export function maskForLineage(text) {
   };
   const current = () => chars.join('');
 
+  for (const [start, end] of findFencedRanges(text)) blank(start, end);
   for (const match of current().matchAll(/^[ \t]*>.*$/gm)) blank(match.index, match.index + match[0].length);
   for (const match of current().matchAll(/``[^\n]*?``|`[^`\n]*`/g)) blank(match.index, match.index + match[0].length);
   for (const match of current().matchAll(/\]\(([^)\s]*)\)/g)) blank(match.index + 2, match.index + match[0].length - 1);
@@ -1304,6 +1397,35 @@ export function maskForLineage(text) {
 function nextLineOf(text, newlineIndex) {
   const end = text.indexOf('\n', newlineIndex + 1);
   return end === -1 ? null : text.slice(newlineIndex + 1, end);
+}
+
+// [start, end) offsets of fenced code blocks (``` or ~~~, CommonMark-style
+// closing rule), fence lines included; an unclosed fence runs to the end.
+export function findFencedRanges(text) {
+  const ranges = [];
+  let fence = null;
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    const lineStart = offset;
+    offset += line.length + 1;
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line)) {
+        ranges.push([fence.start, Math.min(offset - 1, text.length)]);
+        fence = null;
+      }
+      continue;
+    }
+    if (marker && !(marker[1][0] === '`' && line.slice(line.indexOf(marker[1]) + marker[1].length).includes('`'))) {
+      fence = { char: marker[1][0], length: marker[1].length, start: lineStart };
+    }
+  }
+  if (fence) ranges.push([fence.start, text.length]);
+  return ranges;
+}
+
+function insideRanges(offset, ranges) {
+  return ranges.some(([start, end]) => offset >= start && offset < end);
 }
 
 function computeParenDepth(text, original) {
@@ -1505,8 +1627,14 @@ function sortDiagnostics(diagnostics) {
   );
 }
 
-function isCanonicalDecisionDigits(digits) {
-  return digits.length >= 3 && (digits.length === 3 || digits[0] !== '0');
+// Canonical decision IDs: three or more digits, no extra leading zero, and a
+// positive safe integer (so range arithmetic stays exact).
+function toDecisionId(digits) {
+  if (digits.length < 3 || (digits.length > 3 && digits[0] === '0')) {
+    return null;
+  }
+  const id = Number(digits);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function collapse(value) {

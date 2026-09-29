@@ -21,6 +21,14 @@ Reviewed D-011 and D-012; D-020–D-023 were discussed.
 - This session aligned with existing decisions:
   - D-016 — nested bullets list existing decisions, not new ones.
 
+```md
+- D-039 — fenced example, not a listing.
+```
+
+~~~
+- D-038 — tilde-fenced example.
+~~~
+
 ## Models used
 
 - Fixture model.

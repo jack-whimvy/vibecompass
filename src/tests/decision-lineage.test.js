@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -136,22 +137,27 @@ test('full, unqualified, partial, and scoped supersession are typed from declare
   }
 });
 
-test('passive supersession reads its subject; historical retention means full', () => {
+test('passive supersession reads its subject; explicit extent wording beats historical retention', () => {
   const content = decisionFile([
-    entry(1, '**Decision:** One project = one repo.'),
-    entry(2, '**Decision:** Linear onboarding.'),
+    ...[1, 2, 3, 4].map((id) => entry(id, '**Decision:** Base.')),
     entry(
       70,
-      '**Decision:** D-001 ("one project = one GitHub repo") is superseded for implementation but kept for historical reference. D-002 is superseded for hosted onboarding structure.',
+      [
+        '**Decision:** D-001 ("one project = one GitHub repo") is superseded for implementation but kept for historical reference. D-002 is superseded for hosted onboarding structure.',
+        '**Impact on prior decisions:** D-003 is superseded but kept for historical reference. D-004 is partially superseded for billing but kept for historical reference.',
+      ].join('\n'),
     ),
   ]);
   const relations = lineageOf(content, 70);
+  const extentOf = (id) => {
+    const [relation] = pick(relations, id, 'supersedes');
+    return [relation.extent, relation.scope];
+  };
 
-  assert.equal(pick(relations, 1, 'supersedes')[0].extent, 'full');
-  assert.deepEqual(
-    [pick(relations, 2, 'supersedes')[0].extent, pick(relations, 2, 'supersedes')[0].scope],
-    ['scoped', 'for hosted onboarding structure'],
-  );
+  assert.deepEqual(extentOf(1), ['scoped', 'for implementation']);
+  assert.deepEqual(extentOf(2), ['scoped', 'for hosted onboarding structure']);
+  assert.deepEqual(extentOf(3), ['full', null]);
+  assert.deepEqual(extentOf(4), ['partial', 'for billing']);
 });
 
 test('amends, preserves, and negated change are declared relations; other lineage verbs are unknown', () => {
@@ -279,6 +285,153 @@ test('structured lineage fields (D-363) are authoritative for the targets they n
     'lineage-field-invalid',
     'lineage-structured-prose-conflict',
   ]);
+});
+
+test('unsafe or zero decision IDs are malformed and ranges terminate (review R1)', () => {
+  // Run in a child process: a regression here is an infinite loop that would
+  // otherwise hang the test runner.
+  const probe = [
+    `const m = await import(${JSON.stringify(new URL('../decision-lineage.js', import.meta.url).href)});`,
+    "const r = m.scanDecisionReferences('D-9007199254740992–D-9007199254740994, D-000, D-9007199254740991, D-999–D-1001');",
+    'console.log(JSON.stringify({ ids: r.refs.map((ref) => ref.id), malformed: r.malformed.map((token) => token.token) }));',
+  ].join('\n');
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', probe], { encoding: 'utf8', timeout: 10000 });
+
+  assert.equal(result.error, undefined, 'probe must terminate');
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    ids: [9007199254740991, 999, 1000, 1001],
+    malformed: ['D-9007199254740992', 'D-9007199254740994', 'D-000'],
+  });
+});
+
+test('fenced examples never declare lineage, fields, entries, or made listings (review R2)', () => {
+  const content = decisionFile([
+    entry(10, '**Decision:** Base.'),
+    entry(11, '**Decision:** Base.'),
+    entry(
+      30,
+      [
+        '**Decision:** Illustration only:',
+        '',
+        '```md',
+        'Supersedes D-010.',
+        '**Supersedes:** D-010',
+        '**Rationale:** Example only.',
+        '### D-099 — Fenced heading',
+        '```',
+        '',
+        '~~~',
+        'Amends D-011.',
+        '~~~',
+        '**Rationale:** Real rationale.',
+      ].join('\n'),
+    ),
+  ]);
+  const { relations, diagnostics } = extractDecisionFileRelations({ path: 'decisions/fixture.md', content });
+
+  assert.deepEqual(
+    relations.filter((relation) => relation.source_decision_id === 30).map((relation) => [relation.target_decision_id, relation.relation]),
+    [
+      [10, 'references'],
+      [99, 'references'],
+      [11, 'references'],
+    ],
+  );
+  assert.deepEqual(diagnostics, []);
+
+  const note = [
+    '# Session — 2026-06-12-1 — Fenced',
+    '',
+    '## Decisions made',
+    '- D-030 — Real.',
+    '',
+    '```md',
+    '- D-031 — Example only.',
+    '```',
+    '',
+    '~~~',
+    '- D-032 — Example only.',
+    '~~~',
+  ].join('\n');
+  const made = extractSessionNoteRelations({ path: 'sessions/2026-06-12-1-fenced.md', content: note }).relations.filter(
+    (relation) => relation.relation === 'made',
+  );
+  assert.deepEqual(made.map((relation) => relation.target_decision_id), [30]);
+});
+
+test('an unknown change survives beside a preservation of another part (review R3)', () => {
+  const content = decisionFile([
+    entry(10, '**Decision:** Base.'),
+    entry(15, '**Decision:** Base.'),
+    entry(
+      30,
+      "**Impact on prior decisions:** Preserves D-010's storage rule. Narrows D-010's audience rule. Partially supersedes and refines D-015's pricing clause.",
+    ),
+  ]);
+  const relations = lineageOf(content, 30);
+
+  assert.deepEqual(pick(relations, 10).map((relation) => [relation.relation, relation.cue]), [
+    ['preserves', 'preserves'],
+    ['unknown', 'narrows'],
+  ]);
+  // Coordinated verbs in one clause make one claim: the certified relation stands alone.
+  assert.deepEqual(pick(relations, 15).map((relation) => [relation.relation, relation.extent]), [['supersedes', 'partial']]);
+});
+
+test('another decision as the explicit subject is a restatement, not a declaration (review R4)', () => {
+  const content = decisionFile([
+    entry(10, '**Decision:** Base.'),
+    entry(11, '**Decision:** Base.'),
+    entry(20, '**Decision:** Supersedes D-010.'),
+    entry(30, '**Rationale:** D-020 supersedes D-010. D-030 supersedes D-011. D-020 does not change D-011.'),
+  ]);
+  const relations = lineageOf(content, 30);
+
+  assert.deepEqual(pick(relations, 10).map((relation) => relation.relation), ['references']);
+  assert.deepEqual(pick(relations, 11).map((relation) => relation.relation), ['supersedes']);
+  assert.deepEqual(pick(relations, 20).map((relation) => relation.relation), ['references']);
+  assert.deepEqual(
+    buildDecisionLineageModel([{ kind: 'decision', path: 'decisions/fixture.md', content }]).relations
+      .filter((relation) => relation.target_decision_id === 10 && relation.relation === 'supersedes')
+      .map((relation) => relation.source_decision_id),
+    [20],
+  );
+});
+
+test('a contrast or comparison around an ID is not the preserved object (review R5, real D-170)', () => {
+  const content = decisionFile([
+    entry(169, '**Decision:** Hero copy.'),
+    entry(
+      170,
+      '**Rationale:** Keeping this separate from D-169 allows the eyebrow framing to be changed independently from the profanity-led hero if either performs poorly.',
+    ),
+  ]);
+
+  assert.deepEqual(lineageOf(content, 170).map((relation) => relation.relation), ['references']);
+});
+
+test('hypothetical wording is uncertified in every cue form; a requirement still preserves (review R6)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12, 13, 14, 15].map((id) => entry(id, '**Decision:** Base.')),
+    entry(
+      30,
+      [
+        '**Decision:** If approved, this may preserve D-010. If adopted, this would not supersede D-011. D-012 may be superseded by D-030.',
+        'If the team approves the proposal next quarter, this supersedes D-013. It must retain D-014\'s audit trail. This will supersede D-015 once teams ship.',
+      ].join(' '),
+    ),
+  ]);
+  const relations = lineageOf(content, 30);
+  const summary = (id) => pick(relations, id).map((relation) => [relation.relation, relation.cue]);
+
+  assert.deepEqual(summary(10), [['unknown', 'modal:preserve']]);
+  assert.deepEqual(summary(11), [['unknown', 'modal:would not supersede']]);
+  assert.deepEqual(summary(12), [['unknown', 'modal:be superseded by']]);
+  assert.deepEqual(summary(13), [['unknown', 'modal:supersedes']]);
+  assert.deepEqual(summary(14), [['preserves', 'retain']]);
+  assert.deepEqual(summary(15), [['unknown', 'modal:supersede']]);
+  assert.equal(collectDeclaredSuccessors(buildDecisionLineageModel([{ kind: 'decision', path: 'd.md', content }]).relations, 12).length, 0);
 });
 
 test('session notes: every mention is a reference; only leading top-level Decisions made listings are made', () => {
