@@ -655,7 +655,9 @@ function buildLineageUnit(decision, tier, selection) {
   const members = chain.map((member) => {
     const entry = selection.decisionEntries.get(member.decisionId);
     const record = selection.decisionById.get(member.decisionId);
-    const earlier = new Set([decision.decisionId, ...member.via]);
+    // Show every declared relation from this successor to another member of
+    // the unit, not only the one along its `via` path.
+    const earlier = new Set(chain.map((entry) => entry.decisionId).filter((id) => id !== member.decisionId));
     const declared =
       member.role === 'successor'
         ? selection.relations.filter(

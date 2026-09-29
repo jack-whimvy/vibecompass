@@ -164,13 +164,13 @@ function renderLineage(unit, emittedDecisions) {
     lines.push(`### ${formatId(root.decision_id)} — shown above`);
   } else {
     lines.push(`### ${formatId(root.decision_id)} — ${root.title ?? 'untitled'}`);
-    lines.push(`\`${root.path}\`${root.date ? ` · ${root.date}` : ''} · ${unit.tier}${reasonText(unit.reasons)}`);
+    lines.push(`\`${root.path}\`${root.date ? ` · ${root.date}` : ''}${reasonText(unit.reasons)}`);
     lines.push(`- Decision: ${excerpt(root.decision, LIMITS.decision) || 'not recorded'}`);
     if (root.impact) lines.push(`- Impact on prior decisions: ${excerpt(root.impact, LIMITS.impact)}`);
   }
 
   if (successors.length > 0) {
-    lines.push('- Declared successors, newest first:');
+    lines.push('- Declared successors (transitive), newest first:');
     for (const member of successors) {
       const declared = describeDeclared(member);
       if (emittedDecisions.has(member.decision_id)) {
@@ -259,7 +259,7 @@ function flattenList(value) {
     .split(/\r?\n/)
     .map((line) => line.replace(/^\s*(?:[-*+]|\d+\.)\s+/, '').trim())
     .filter(Boolean)
-    .join('; ');
+    .reduce((joined, item) => (joined ? `${joined}${/[.!?]$/.test(joined) ? ' ' : '; '}${item}` : item), '');
 }
 
 function reasonText(reasons) {
