@@ -336,6 +336,7 @@ import {
   scanProjectMemory,
   loadProjectReadModel,
   getProjectContext,
+  getDecisionLineage,
   detectChangelogShapedLines,
   ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
 } from "@vibecompass/vibecompass";
@@ -350,6 +351,18 @@ D-292 advisory detector the scanner and `docs-review --apply-output` use, shared
 so external validators (for example the hosted proposal parser) stay in parity.
 `ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES` is the byte-valued soft size budget
 (12000) both docs-review apply warnings and the docs-update size advisory read.
+
+`loadProjectReadModel(root)` also returns `decision_lineage`: evidence-typed
+relations between documents and decisions. Architecture docs `cites`
+decisions; session notes `references` them and `made` the ones listed under
+"Decisions made". Decision entries declare `supersedes`, `amends`, or
+`preserves` only from their own wording, with an extent and scope; anything
+the parser cannot certify is `unknown`. Every relation carries its source
+path, section, line, and content hashes. `getDecisionLineage(readModel, id)`
+returns one decision's incoming and outgoing lineage and its declared
+successors, followed transitively. Nothing is ever reported as "governs" or
+"currently valid". Architecture components also carry `retrieval_guidance`
+and `retrieval_scope` when their docs define them.
 
 ## More Documentation
 
