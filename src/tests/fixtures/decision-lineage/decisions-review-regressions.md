@@ -71,3 +71,10 @@ If approved, this may preserve D-040. If adopted, this would not supersede D-041
 **Decision:** Scope-only regressions.
 **Impact on prior decisions:** Preserves D-040 and D-041 by keeping the rules append-only. Keeps D-042 and D-043 intact.
 **Rationale:** A terminator before a following verb and a trailing state word are not scope.
+
+---
+
+### D-048 — Review pass 3 regressions
+**Timestamp:** 2026-07-09 10:00 UTC
+**Decision:** D-040 cannot be superseded by D-048. D-041 can't be amended by D-048. D-042 may be superseded by D-048. D-043 is superseded by D-048.
+**Rationale:** Documents how D-044 supersedes D-045. Confirms that D-044 amends D-046. Confirms D-044 and preserves D-047.

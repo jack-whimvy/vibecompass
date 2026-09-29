@@ -189,6 +189,21 @@ const IMPLICIT_SUBJECT_VERB_PATTERN = new RegExp(
   ].join('|')})(?![\\w-])`,
   'i',
 );
+// The shared-actor shape behind the implicit-subject exception: the phrase
+// opens with one of those verbs, carries no complement clause of its own
+// ("Documents how D-020 supersedes …", "Confirms that D-020 …"), and the cue
+// is coordinated with the opening predicate ("… and preserves", "… by
+// keeping", "… while preserving", or a "without changing …" phrase).
+const COMPLEMENT_CLAUSE_PATTERN = /(?<![\w-])(?:that|how|whether|why|where|when|which|who|whom|whose|what|if)(?![\w-])/i;
+const COORDINATED_TAIL_PATTERN = /(?:(?<![\w-])(?:and|or|then|also|by|while)|,)\s*$/i;
+
+function sharesImplicitActor(actorPhrase, current) {
+  if (!IMPLICIT_SUBJECT_VERB_PATTERN.test(actorPhrase)) return false;
+  const afterOpening = actorPhrase.replace(IMPLICIT_SUBJECT_VERB_PATTERN, '');
+  if (COMPLEMENT_CLAUSE_PATTERN.test(afterOpening)) return false;
+  return current.id === 'without-change' || COORDINATED_TAIL_PATTERN.test(actorPhrase);
+}
+
 const OBJECT_PRONOUN_PATTERN = /^\s*(?:this|that|it|them|these|those|which|what|itself|themselves|such)(?![\w-])/i;
 const OBJECT_RELATIONAL_PATTERN =
   /(?<![\w-])(?:separate|separately|apart|distinct|independent|independently|different|differently|unlike|like|consistent|aligned|compatible|comparable|similar|relative|than|alongside|versus|vs)(?![\w-])/i;
@@ -889,10 +904,7 @@ function parseProseField({ field, sourceId, base, lineStarts }) {
           }
         }
         const actorPhrase = masked.slice(phraseFrom, current.start);
-        if (
-          scanDecisionReferences(actorPhrase).refs.some((ref) => ref.id !== sourceId) &&
-          !IMPLICIT_SUBJECT_VERB_PATTERN.test(actorPhrase)
-        ) {
+        if (scanDecisionReferences(actorPhrase).refs.some((ref) => ref.id !== sourceId) && !sharesImplicitActor(actorPhrase, current)) {
           continue;
         }
         // The object must name the decision or a part of it, not a contrast or
@@ -1060,7 +1072,11 @@ function classifyCue(current, masked, clause, spanEnd) {
 
   if (current.form === 'agent-self') {
     const relation = current.verb === 'superseded' ? 'supersedes' : current.verb === 'amended' ? 'amends' : 'unknown';
-    if (modality !== 'asserted' && relation !== 'unknown') return uncertified('modal');
+    if (relation === 'unknown') return { relation, cue: verb };
+    // Same polarity as the active form: "D-010 cannot be superseded by
+    // D-030" is prohibited change, so preservation, never a successor.
+    if (negatedWindow) return modality === 'hypothetical' ? uncertified('modal') : { relation: 'preserves', cue: `negated:${verb}` };
+    if (modality !== 'asserted') return uncertified('modal');
     return { relation, cue: verb };
   }
 
@@ -1375,6 +1391,13 @@ function trimScopeRange(range, masked, kind) {
     skipLeading(/^(?:(?:and|but)\s+)?(?:(?:is|are)\s+)?(?:kept|retained|preserved)\s+(?:only\s+)?(?:for|as)\s+(?:a\s+|the\s+)?historical\s+(?:reference|record|context)(?![\w-])/i);
     // "keeps D-321 and D-322 intact": the state word is the verb's complement, not a part.
     skipTrailing(/(?:^|\s+)(?:intact|untouched|unchanged|in\s+place|as\s+is)$/i);
+    // "D-040 cannot be superseded": auxiliaries and negators before a passive
+    // or predicate verb belong to the verb, not to the subject's scope.
+    let previousEnd;
+    do {
+      previousEnd = end;
+      skipTrailing(/(?:^|\s+)(?:cannot|[a-z]+n['’]t|not|never|longer|no|may|might|must|will|shall|should|would|could|can|also|still|now|is|are|was|were|be|been|being)$/i);
+    } while (end !== previousEnd && end > start);
     skipTrailing(/(?:^|\s+)(?:and|or|plus|also)$/i);
   }
   trimEdges();

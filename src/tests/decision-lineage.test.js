@@ -528,6 +528,57 @@ test('negative polarity never certifies preservation; a requirement to keep stil
   assert.deepEqual(summary(14), [['unknown', 'negated:remain valid']]);
 });
 
+test('a reporting or complement clause about another decision is not a shared-actor predicate (review pass 3, R4)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12, 13, 14, 246, 248, 249, 258].map((id) => entry(id, '**Decision:** Base.')),
+    entry(20, '**Decision:** Supersedes D-010 and D-011.'),
+    entry(30, '**Rationale:** Documents how D-020 supersedes D-010. Confirms that D-020 supersedes D-011.'),
+    // Real shared-actor shapes (D-247, D-259) keep the entry as the actor.
+    entry(
+      300,
+      "**Impact on prior decisions:** Confirms D-246 for the release and preserves D-012. Implements D-258's everyday path without weakening D-248/D-249's heavier workflow. Extends D-020 by keeping D-013's rule.",
+    ),
+  ]);
+  const own = lineageOf(content, 30);
+  assert.deepEqual(pick(own, 10).map((relation) => relation.relation), ['references']);
+  assert.deepEqual(pick(own, 11).map((relation) => relation.relation), ['references']);
+
+  const shared = lineageOf(content, 300);
+  for (const id of [12, 248, 249, 13]) {
+    assert.deepEqual(pick(shared, id).map((relation) => relation.relation), ['preserves'], `D-${id}`);
+  }
+
+  const relations = buildDecisionLineageModel([{ kind: 'decision', path: 'decisions/fixture.md', content }]).relations;
+  for (const target of [10, 11]) {
+    assert.deepEqual(collectDeclaredSuccessors(relations, target).map((successor) => successor.decision_id), [20]);
+  }
+});
+
+test('negated self-agent passives are prohibited change, never a successor (review pass 3, R6b)', () => {
+  const content = decisionFile([
+    ...[10, 11, 12, 13, 14, 15].map((id) => entry(id, '**Decision:** Base.')),
+    entry(
+      30,
+      "**Decision:** D-010 cannot be superseded by D-030. D-011 cannot be amended by D-030. D-012 can't be superseded by D-030. This cannot supersede D-013. D-014 may be superseded by D-030. D-015 is superseded by D-030.",
+    ),
+  ]);
+  const own = lineageOf(content, 30);
+  const summary = (id) => pick(own, id).map((relation) => [relation.relation, relation.cue]);
+
+  assert.deepEqual(summary(10), [['preserves', 'negated:be superseded by']]);
+  assert.deepEqual(summary(11), [['preserves', 'negated:be amended by']]);
+  assert.deepEqual(summary(12), [['preserves', 'negated:be superseded by']]);
+  assert.deepEqual(summary(13), [['preserves', 'negated:supersede']]);
+  assert.deepEqual(summary(14), [['unknown', 'modal:be superseded by']]);
+  assert.deepEqual(summary(15), [['supersedes', 'is superseded by']]);
+
+  const relations = buildDecisionLineageModel([{ kind: 'decision', path: 'decisions/fixture.md', content }]).relations;
+  for (const target of [10, 11, 12, 13, 14]) {
+    assert.deepEqual(collectDeclaredSuccessors(relations, target), [], `D-0${target}`);
+  }
+  assert.deepEqual(collectDeclaredSuccessors(relations, 15).map((successor) => successor.decision_id), [30]);
+});
+
 test('session notes: every mention is a reference; only leading top-level Decisions made listings are made', () => {
   const note = [
     '# Session — 2026-06-10-1 — Fixture',
