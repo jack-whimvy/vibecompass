@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { refreshLaneBriefForLifecycle } from './brief-lifecycle.js';
 import { scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
@@ -398,6 +399,16 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
   });
+  // D-359/D-364: the default-on lane brief is written only after every
+  // lifecycle write succeeded, still inside the memory-root lock; it never
+  // throws, so a brief failure cannot overturn the start.
+  const brief = await refreshLaneBriefForLifecycle({
+    trigger: 'start',
+    rootDir: normalized.rootDir,
+    laneId: sessionId,
+    disabled: options?.brief === false,
+    buildBrief: options?.briefBuilder,
+  });
 
   return {
     rootDir: normalized.rootDir,
@@ -420,7 +431,9 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       ...(gitBinding?.warnings ?? []),
       ...manifestRefresh.warnings,
       ...auditWarnings,
+      ...brief.warnings,
     ],
+    brief,
     ...(gitBinding
       ? {
           gitBinding: {
@@ -1145,6 +1158,18 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
   });
+  // D-359/D-364: keep a current lane brief, regenerate a missing or stale
+  // one. `--source-root` (D-255 dogfood) is read only when named here; it is
+  // never inferred from the existing brief's header.
+  const brief = await refreshLaneBriefForLifecycle({
+    trigger: 'continue',
+    rootDir: normalized.rootDir,
+    laneId: lane.id,
+    disabled: options?.brief === false,
+    sourceRootDir: options?.sourceRootDir ? path.resolve(normalized.cwd, options.sourceRootDir) : undefined,
+    sourceSessionId: normalizeOptionalString(options?.sourceSessionId) ?? undefined,
+    buildBrief: options?.briefBuilder,
+  });
   const finalizedSessions = await listFinalizedSessions(normalized.sessionsDir);
   const latestFinalized = finalizedSessions.length > 0 ? finalizedSessions[finalizedSessions.length - 1] : null;
   // The returned inventory is the post-resume state (what list-sessions shows
@@ -1181,6 +1206,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
     otherLanes: inventoryAfter.lanes.filter((item) => item.id !== lane.id),
     inventory: inventoryAfter,
     docsUpdatePlan: docsUpdate.plan,
+    brief,
     warnings: [
       ...markerContext.warnings,
       ...selection.warnings,
@@ -1196,6 +1222,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
       }),
       ...docsUpdate.warnings,
       ...manifestRefresh.warnings,
+      ...brief.warnings,
     ],
     manifest: manifestRefresh.manifest,
     agentFileSync,
@@ -2278,6 +2305,9 @@ ${options.workingOn}
 
 ## Reviewer input needed
 - None yet.
+
+## Context used
+- Optional: the docs and decisions this lane actually relied on (path or D-number, and what for) — an audit trail for the session brief; list what you used, not everything the brief showed.
 
 ## Review log
 `;

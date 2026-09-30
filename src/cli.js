@@ -6,6 +6,7 @@ import { connectHostedProjectMemory, initializeProjectMemory, setDefaultSyncTarg
 import { preflightDocsReview } from './docs-review.js';
 import { planDocsUpdate, renderDocsUpdatePlan } from './docs-update.js';
 import { buildSessionBrief, resolveBriefRequest } from './brief.js';
+import { generateLaneBrief, inspectLaneBrief } from './brief-lifecycle.js';
 import { renderBrief } from './brief-render.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
@@ -169,6 +170,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
       io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (D-282; pass --session <lane-id> when multiple lanes are active; use --worktree for independently runnable same-repo lanes).\n');
     }
+    writeLifecycleBriefResult(io, result.brief);
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
     return 0;
@@ -316,6 +318,66 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     return 0;
   }
 
+  if (parsed.command === 'brief' && (parsed.options.write || parsed.options.check)) {
+    // Lane brief (D-364): --write regenerates the lane's brief.md under the
+    // lane root's lock; --check reports its freshness and writes nothing. A
+    // --source-root is only ever read.
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    const request = await resolveBriefRequest({
+      rootDir: parsed.options.rootDir,
+      sessionId: parsed.options.sessionId,
+      cwd,
+    });
+    if (!request.laneId) {
+      throw new Error(`brief ${parsed.options.write ? '--write' : '--check'} needs an active lane: pass --session <lane-id>, or run it from a lane worktree.`);
+    }
+    const sourceRootDir = parsed.options.sourceRootDir ? path.resolve(cwd, parsed.options.sourceRootDir) : undefined;
+    if (parsed.options.check) {
+      const inspection = await inspectLaneBrief({
+        rootDir: request.rootDir,
+        laneId: request.laneId,
+        sourceRootDir,
+        sourceSessionId: parsed.options.sourceSessionId,
+      });
+      if (parsed.options.json) {
+        io.stdout.write(`${JSON.stringify({
+          lane_id: request.laneId,
+          path: inspection.path,
+          exists: inspection.exists,
+          stale: inspection.stale,
+          reasons: inspection.reasons,
+          status: inspection.status,
+          generated_at: inspection.generatedAt,
+        }, null, 2)}\n`);
+      } else {
+        const state = !inspection.exists ? 'missing' : inspection.stale ? 'stale' : 'current';
+        io.stdout.write(`Brief: ${state}${inspection.status ? ` (status ${inspection.status}${inspection.generatedAt ? `, generated ${inspection.generatedAt}` : ''})` : ''} — ${inspection.path}\n`);
+        for (const reason of inspection.exists ? inspection.reasons : []) {
+          io.stdout.write(`- ${reason}\n`);
+        }
+      }
+      writeWarnings(io, request.warnings);
+      return 0;
+    }
+
+    const generated = await generateLaneBrief({
+      rootDir: request.rootDir,
+      laneId: request.laneId,
+      sourceRootDir,
+      sourceSessionId: parsed.options.sourceSessionId,
+      ...(parsed.options.budget !== undefined ? { budget: parsed.options.budget } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({ lane_id: request.laneId, ...generated }, null, 2)}\n`);
+    } else {
+      const from = generated.source?.adapter ? ` from ${generated.source.root_dir}` : '';
+      io.stdout.write(`Brief: ${generated.status}${generated.state === 'written' ? '' : ` (${generated.state}: ${generated.reason})`} — wrote ${generated.path}${from}\n`);
+    }
+    writeWarnings(io, [...request.warnings, ...generated.warnings]);
+    return generated.state === 'written' ? 0 : 1;
+  }
+
   if (parsed.command === 'brief') {
     // Strictly read-only (plan task A3): no manifest refresh, state write,
     // lane write, or agent-file sync, so it is safe against a legacy root.
@@ -390,6 +452,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write('Read next:\n');
       io.stdout.write(`- ${result.wipFilePath}\n`);
       io.stdout.write(`- ${result.handoffFilePath}\n`);
+      if (result.brief?.path && result.brief.state !== 'off' && !(result.brief.state === 'failed' && !result.brief.status)) {
+        io.stdout.write(`- ${result.brief.path} (session brief — read before planning)\n`);
+      }
       if (result.latestFinalizedSessionPath) {
         io.stdout.write(`- ${result.latestFinalizedSessionPath} (latest finalized note)\n`);
       }
@@ -407,6 +472,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
           io.stdout.write(`- ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}\n`);
         }
       }
+      writeLifecycleBriefResult(io, result.brief);
     }
     writeWarnings(io, result.warnings);
     writeAgentFileSyncResult(io, result.agentFileSync);
@@ -1133,6 +1199,10 @@ function parseStartSessionArgs(argv) {
     }
     if (token.startsWith('--worktree=')) {
       throw new Error('Flag "--worktree" takes no value; the worktree container is fixed to <workspace>/worktrees/<lane-id> (D-279).');
+    }
+    if (token === '--no-brief') {
+      parsed.brief = false;
+      continue;
     }
 
     const value = argv[index + 1];
@@ -1904,6 +1974,10 @@ function parseBriefArgs(argv) {
       parsed.json = true;
       continue;
     }
+    if (token === '--write' || token === '--check') {
+      parsed[token.slice(2)] = true;
+      continue;
+    }
 
     if (!token.startsWith('--')) {
       throw new Error(`Unexpected argument "${token}".`);
@@ -1921,6 +1995,12 @@ function parseBriefArgs(argv) {
         break;
       case '--session':
         parsed.sessionId = value;
+        break;
+      case '--source-root':
+        parsed.sourceRootDir = value;
+        break;
+      case '--source-session':
+        parsed.sourceSessionId = value;
         break;
       case '--task':
         parsed.task = value;
@@ -1949,6 +2029,29 @@ function parseBriefArgs(argv) {
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
+  }
+
+  if (parsed.write && parsed.check) {
+    throw new Error('Choose one of --write (regenerate the lane brief) or --check (report its freshness).');
+  }
+  if (parsed.write || parsed.check) {
+    const laneDerived = [
+      parsed.task !== undefined && '--task',
+      parsed.files.length > 0 && '--files',
+      parsed.featureSlugs.length > 0 && '--feature',
+      parsed.claims.length > 0 && '--claim',
+      parsed.check && parsed.budget !== undefined && '--budget',
+    ].filter(Boolean);
+    if (laneDerived.length > 0) {
+      throw new Error(
+        `${laneDerived.join(', ')} cannot be combined with ${parsed.write ? '--write' : '--check'}: a lane brief takes its task from the lane's working-on, its files from the lane's claims, and its features from the lane's feature slugs (update them with continue-session --working-on or the lane metadata).`,
+      );
+    }
+  } else if (parsed.sourceRootDir || parsed.sourceSessionId) {
+    throw new Error('--source-root and --source-session apply only to --write or --check; to print a brief of another root, pass --root.');
+  }
+  if (parsed.sourceSessionId && !parsed.sourceRootDir) {
+    throw new Error('--source-session requires --source-root.');
   }
 
   return {
@@ -2230,6 +2333,10 @@ function parseContinueSessionArgs(argv) {
       parsed.json = true;
       continue;
     }
+    if (token === '--no-brief') {
+      parsed.brief = false;
+      continue;
+    }
 
     const value = argv[index + 1];
     if (value === undefined) {
@@ -2246,6 +2353,12 @@ function parseContinueSessionArgs(argv) {
         break;
       case '--session':
         parsed.sessionId = value;
+        break;
+      case '--source-root':
+        parsed.sourceRootDir = value;
+        break;
+      case '--source-session':
+        parsed.sourceSessionId = value;
         break;
       case '--working-on':
         parsed.workingOn = value;
@@ -2277,6 +2390,13 @@ function parseContinueSessionArgs(argv) {
 
   if (!parsed.sessionId && positional[0]) {
     parsed.sessionId = positional[0];
+  }
+
+  if (parsed.brief === false && (parsed.sourceRootDir || parsed.sourceSessionId)) {
+    throw new Error('--no-brief cannot be combined with --source-root or --source-session.');
+  }
+  if (parsed.sourceSessionId && !parsed.sourceRootDir) {
+    throw new Error('--source-session requires --source-root.');
   }
 
   return {
@@ -2990,6 +3110,31 @@ function writeWarnings(io, warnings = []) {
   }
 }
 
+/** One status line for the lifecycle brief (D-364); failures also arrive as warnings. */
+function writeLifecycleBriefResult(io, brief) {
+  if (!brief) return;
+  const location = brief.path ? ` — ${brief.path}` : '';
+  const from = brief.source?.adapter ? ` (from ${brief.source.root_dir})` : '';
+  switch (brief.state) {
+    case 'off':
+      io.stdout.write(`Brief: off (${brief.reason})\n`);
+      return;
+    case 'kept':
+      io.stdout.write(`Brief: current, kept (status ${brief.status ?? 'unknown'}${brief.generatedAt ? `, generated ${brief.generatedAt}` : ''})${location}\n`);
+      return;
+    case 'regenerated':
+      io.stdout.write(`Brief: regenerated, ${brief.status}${from} (was stale: ${(brief.staleReasons ?? []).join('; ') || 'unknown'})${location}\n`);
+      return;
+    case 'written':
+      io.stdout.write(`Brief: ${brief.status}${from}${location}\n`);
+      return;
+    default:
+      io.stdout.write(brief.status
+        ? `Brief: incomplete (${brief.state}: ${brief.reason})${location}\n`
+        : 'Brief: not written (see warning)\n');
+  }
+}
+
 function splitAssignment(value, flagName) {
   const separatorIndex = value.indexOf('=');
   if (separatorIndex <= 0 || separatorIndex === value.length - 1) {
@@ -3021,10 +3166,12 @@ function usageText() {
     '  vibecompass docs-update [--session <lane-id>] [options]',
     '  vibecompass brief --task <text> [--files <repo:path>...] [--feature <slug>] [--claim <path>] [--session <lane-id>] [--budget <n>] [--json] [options]',
     '                                        Read-only session brief: relevant memory, packed into an estimated token budget',
-    '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [options]',
+    '  vibecompass brief --write|--check [--session <lane-id>] [--source-root <path> [--source-session <lane-id>]] [--budget <n>] [--json] [options]',
+    '                                        Regenerate the lane\'s sessions/active/<lane-id>/brief.md, or report whether it is stale (D-364)',
+    '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [--no-brief] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
-    '  vibecompass continue-session [<lane-id>] [--session <lane-id>] [--working-on <text>] [--json] [options]',
+    '  vibecompass continue-session [<lane-id>] [--session <lane-id>] [--working-on <text>] [--no-brief | --source-root <path>] [--json] [options]',
     '  vibecompass list-sessions [--json] [options]',
     '  vibecompass switch-session <id> [options]',
     '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
@@ -3150,6 +3297,7 @@ function usageText() {
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
+    '  --no-brief                           Skip the default lane brief (sessions/active/<lane-id>/brief.md; D-359, D-364); project.yaml brief.enabled: false turns it off for every lane',
     '',
     'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
@@ -3177,7 +3325,23 @@ function usageText() {
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
-    '  --json                               Print the resume result (lane, paths, runtime, other lanes, warnings) as JSON',
+    '  --json                               Print the resume result (lane, paths, runtime, other lanes, brief, warnings) as JSON',
+    '  --no-brief                           Leave the lane brief as it is (default: keep a current brief, regenerate a missing or stale one)',
+    '  --source-root <path>                 D-255 dual-root dogfood: build the brief from this memory root\'s matching lane (same id, session date, and number) and write it only into this lane; the source root is only read',
+    '  --source-session <lane-id>           With --source-root: the source lane id, which must equal the resumed lane',
+    '',
+    'Brief options:',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --session <lane-id>                  Lane to brief. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --task <text>                        Task text (print mode). Omitted: the lane\'s working-on',
+    '  --files <repo:path>...               Files the task touches (print mode)',
+    '  --feature <slug>, --claim <path>     Repeatable feature slug and path claim (print mode)',
+    '  --budget <n>                         Estimated-token budget (default 6000, minimum 800)',
+    '  --write                              Regenerate the lane\'s brief.md from its working-on, claims, and feature slugs, under the root lock',
+    '  --check                              Report whether the lane\'s brief.md is current or stale against its header bindings; writes nothing',
+    '  --source-root <path>                 With --write/--check: read this memory root\'s matching lane instead (D-255 dogfood); never written',
+    '  --source-session <lane-id>           With --source-root: the source lane id, which must equal the lane being briefed',
+    '  --json                               Print the result as JSON',
     '',
     'List/switch-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

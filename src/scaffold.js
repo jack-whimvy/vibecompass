@@ -226,6 +226,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` — lane metadata (including the recorded \`lane_marker\` when one exists)
 - \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` — lane-local builder scratchpad
 - \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` — lane-local builder/reviewer relay
+- \`${rootRelativePath}/sessions/active/<lane-id>/brief.md\` — generated session brief (D-359, D-364): the memory this lane should read first, written by \`start-session\` and \`continue-session\`; refresh with \`vibecompass brief --write\`, never hand-edit
 - \`.vibecompass-lane.yaml\` — worktree-local lane marker (D-280); lives outside the memory root, written only by \`vibecompass write-lane-marker\` or worktree provisioning, never synced
 - \`${rootRelativePath}/decisions/INDEX.md\` — derived grouped decision index; refresh with \`vibecompass refresh-decision-index\` (D-283, structure-preserving) instead of hand-editing rows
 
@@ -233,6 +234,7 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
 - \`vibecompass start-session\` requires \`--id <lane-id>\` so each active lane has a meaningful feature or workstream name.
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
+- \`start-session\` and \`continue-session\` write the lane's generated \`brief.md\` by default (D-359, D-364): the task is the lane's working-on, the files its claims, and the features its feature slugs. A brief failure is reported as a warning or an incomplete brief and never fails the lifecycle command. \`--no-brief\` or \`${rootRelativePath}/project.yaml\` \`brief.enabled: false\` turns it off, and \`brief.exclude\` lists root-relative globs the brief must never read.
 - Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
 - An active lane directory is an open session, not an unclosed crash (D-353). Resume it with \`vibecompass continue-session [<lane-id>]\`: the lane keeps its opening date and session number; the command records \`resumed_at\`/\`resume_count\` in \`session.yaml\`, appends a dated \`Resumed\` line to \`wip.md\`, moves the index \`current\` hint and the Current session block to the lane, and re-emits runtime, git-binding, and staleness warnings. \`start-session --id <existing-lane>\` fails closed and names \`continue-session\`.
@@ -276,7 +278,8 @@ ${renderWorkflowDefaults(workflow)}
 3. Inventory active lanes with \`vibecompass list-sessions\` (or read \`${rootRelativePath}/sessions/active/index.yaml\`), then follow the "Open, resume, or choose" protocol below to decide between opening a new lane and resuming one; select a lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane (D-277).
 4. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
 5. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
-6. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`.
+6. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/brief.md\` before planning: the generated session brief selects the architecture docs, decisions (with their declared successors), and notes for the lane's task. Its status line says whether it is complete, partial, incomplete (read the listed required reads first), or no-match; \`vibecompass brief --check\` reports whether it is stale.
+7. Read the relevant docs under \`${rootRelativePath}/architecture/\` and \`${rootRelativePath}/decisions/\`, starting from the brief's units and follow-up reads.
 
 ## Open, resume, or choose (D-353)
 Both \`start session\` and \`continue session\` begin with the active-lane inventory. Then:
@@ -284,7 +287,7 @@ Both \`start session\` and \`continue session\` begin with the active-lane inven
 - **Exactly one active lane, or a cwd bound to a lane by a worktree marker:** resume it with \`vibecompass continue-session\` without asking. Open a second lane only when the user is clearly asking for separate new work; never re-open a lane that already exists.
 - **Two or more active lanes, no marker, no lane named by the user:** do not guess. Present the inventory (lane id, working-on, opened date, resume count, branch/worktree, last log line) and ask which lane to continue or whether to open a new one. The index \`current\` pointer and the Current session block are continuity hints to mention, never defaults to adopt silently. Resume with \`vibecompass continue-session <lane-id>\` once the user answers (\`continue session <lane-id>\`).
 - **Lane named by the user:** \`continue session <lane-id>\` resumes that lane; an unknown id fails closed with the inventory.
-- After resuming, read the lane's \`wip.md\` (latest \`## Log\` entries and \`## Reviewer input needed\`), \`handoff.md\`, and the latest finalized note; treat resume-staleness warnings (new decisions past the lane snapshot, stale base revisions, newer finalized notes touching the lane scope, claim overlap) as required reading before editing.
+- After resuming, read the lane's \`wip.md\` (latest \`## Log\` entries and \`## Reviewer input needed\`), \`handoff.md\`, \`brief.md\` (continue-session keeps a current brief and regenerates a missing or stale one), and the latest finalized note; treat resume-staleness warnings (new decisions past the lane snapshot, stale base revisions, newer finalized notes touching the lane scope, claim overlap) as required reading before editing.
 - Run recovery (reconstruct a missing finalized note from git history) only when the Current session block date is in the past *and* no active lane exists *and* no finalized note covers that date. An active lane with a past date is simply resumable.
 
 ## Builder workflow
@@ -301,6 +304,8 @@ Session lane: <lane-id>
 ## Log
 
 ## Reviewer input needed
+
+## Context used
 
 ## Review log
 \`\`\`
@@ -330,6 +335,8 @@ Session lane: <lane-id>
 During the session:
 - append short summaries to \`wip.md\` after meaningful exchanges
 - keep \`handoff.md\` current after substantive work blocks
+- optionally list under \`wip.md\` \`## Context used\` the docs and decisions the lane actually relied on (path or D-number, and what for), so the brief's usefulness can be audited
+- refresh the lane brief with \`vibecompass brief --write\` after the lane's scope changes; \`vibecompass brief --check\` reports whether it is stale
 - run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used (D-282); do not hardcode ports in lane work
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
 - after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh — fold the changes into the doc's current-state sections (rewrite in place; no dated "update" sections, lane names in headings, or completed-task chronology; D-292)
@@ -588,6 +595,7 @@ Finalized session notes for ${projectConfig.name} live here.
 - \`active/<lane-id>/session.yaml\` — lane metadata, including the recorded \`lane_marker\` when one exists
 - \`active/<lane-id>/wip.md\` — builder scratchpad during an active lane
 - \`active/<lane-id>/handoff.md\` — reviewer/builder baton-pass during an active lane
+- \`active/<lane-id>/brief.md\` — generated session brief for the lane (D-359, D-364); regenerated, never hand-edited
 
 Those scratch files are session-scoped working artifacts, not finalized history.
 `;

@@ -2090,9 +2090,16 @@ test('runCli supports continue-session (text and --json) and list-sessions --jso
     assert.equal(await runCli(['continue-session', '--root', rootDir, 'lane-a', '--date', '2026-04-22'], io, { cwd: tempDir }), 0);
     const text = stdout.join('');
     assert.match(text, /^Continued lane lane-a \(session 2026-04-20-1, resume #1, opened 2 days ago; selected via flag\)$/m);
-    assert.match(text, /^Read next:\n- .*lane-a\/wip\.md\n- .*lane-a\/handoff\.md\n- .*\(latest finalized note\)$/m);
+    assert.match(text, /^Read next:\n- .*lane-a\/wip\.md\n- .*lane-a\/handoff\.md\n- .*lane-a\/brief\.md \(session brief — read before planning\)\n- .*\(latest finalized note\)$/m);
     assert.match(text, /eval "\$\(vibecompass lane-env --session lane-a\)"/);
     assert.match(text, /^Other active lanes \(1\) — pass --session lane-a to lane-scoped commands.*\n- lane-b: Lane B\.$/m);
+
+    // With the brief off, the resume output keeps its pre-brief shape (D-364).
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, 'lane-b', '--date', '2026-04-22', '--no-brief'], io, { cwd: tempDir }), 0);
+    const quiet = stdout.join('');
+    assert.match(quiet, /^Read next:\n- .*lane-b\/wip\.md\n- .*lane-b\/handoff\.md\n- .*\(latest finalized note\)$/m);
+    assert.match(quiet, /^Brief: off \(--no-brief\)$/m);
 
     stdout.length = 0;
     assert.equal(await runCli(['continue-session', '--root', rootDir, '--session', 'lane-a', '--date', '2026-04-23', '--json'], io, { cwd: tempDir }), 0);
@@ -2101,6 +2108,7 @@ test('runCli supports continue-session (text and --json) and list-sessions --jso
     assert.equal(json.resumeCount, 2);
     assert.equal(json.sessionDate, '2026-04-20');
     assert.deepEqual(json.otherLanes.map((lane) => lane.id), ['lane-b']);
+    assert.equal(json.brief.state, 'kept', 'resume bookkeeping (its own and lane-b\'s) does not make lane-a\'s brief stale');
     assert.equal('manifest' in json, false);
     assert.ok(Array.isArray(json.agentFileSync), 'JSON mode carries the agent-file sync results instead of printing them');
 
@@ -2108,7 +2116,7 @@ test('runCli supports continue-session (text and --json) and list-sessions --jso
     assert.equal(await runCli(['list-sessions', '--root', rootDir, '--json'], io, { cwd: tempDir }), 0);
     const inventory = JSON.parse(stdout.join(''));
     assert.equal(inventory.current, 'lane-a');
-    assert.deepEqual(inventory.lanes.map((lane) => [lane.id, lane.resumeCount, lane.isCurrentHint]), [['lane-a', 2, true], ['lane-b', 0, false]]);
+    assert.deepEqual(inventory.lanes.map((lane) => [lane.id, lane.resumeCount, lane.isCurrentHint]), [['lane-a', 2, true], ['lane-b', 1, false]]);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

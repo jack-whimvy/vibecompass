@@ -16,9 +16,12 @@ export async function loadProjectReadModel(rootDir) {
  * The read model plus the scanned canonical documents (`{ path, kind,
  * content, … }`) it was built from, for read-only consumers such as the
  * session brief that need section text the read model does not keep.
+ * `options.exclude` (a root-relative path predicate) keeps excluded documents
+ * out of the scan before they are read (D-364); `loadProjectReadModel` never
+ * excludes.
  */
-export async function loadProjectReadModelWithDocuments(rootDir) {
-  const scanResult = await scanProjectMemory(rootDir);
+export async function loadProjectReadModelWithDocuments(rootDir, options = {}) {
+  const scanResult = await scanProjectMemory(rootDir, { exclude: options.exclude });
   if (scanResult.errors.length > 0) {
     const details = scanResult.errors.map((error) => `${error.path}: ${error.message}`).join('\n');
     throw new Error(`Cannot build read model with canonical parse errors.\n${details}`);

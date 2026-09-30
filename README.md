@@ -143,6 +143,16 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # start-session --id <existing-lane> fails closed and points at continue-session.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
 
+# Session brief in the lane (D-359, D-364): start-session and continue-session
+# write sessions/active/<lane-id>/brief.md by default — the memory the lane's
+# task should start from, with a YAML header binding the inputs it read.
+# continue-session keeps a current brief and regenerates a stale one; a brief
+# failure is a warning, never a failed start or resume. --no-brief or
+# project.yaml `brief: { enabled: false }` turns it off; `brief.exclude` lists
+# root-relative globs no brief may read.
+npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --check   # current or stale, and why
+npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --write   # regenerate it
+
 # Optional git binding for a lane (D-281): create/reuse a branch in each bound
 # repo; --worktree provisions per-repo worktrees under
 # <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
@@ -376,7 +386,8 @@ and `retrieval_scope` when their docs define them.
 is the read-only engine behind `vibecompass brief`: it returns the selection
 result (status, packed units, omitted units, follow-up reads, gaps, and the
 estimated size), and `renderBrief(result)` turns it into markdown. It never
-writes to the root.
+writes to the root, and it never reads a path the root's `project.yaml`
+`brief.exclude` names.
 
 ## More Documentation
 

@@ -1,5 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
+import { validateBriefSettings } from './brief-settings.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { sha256Text } from './hash.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -44,6 +45,7 @@ const KNOWN_PROJECT_FIELDS = new Set([
   'default_branch',
   'sync',
   'runtime',
+  'brief',
   'metadata',
 ]);
 // D-282 runtime-isolation settings; deep value validation (ranges, absolute
@@ -73,9 +75,16 @@ const SECRET_BEARING_SYNC_FIELDS = [
   'access_token',
 ];
 
-export async function scanProjectMemory(rootDir) {
+/**
+ * Scans a memory root's canonical documents. `options.exclude` is an optional
+ * predicate over root-relative paths (D-364, session brief exclusions): an
+ * excluded markdown file is dropped from the directory walk before it is
+ * opened, so it is never read. `project.yaml` is always read.
+ */
+export async function scanProjectMemory(rootDir, options = {}) {
   const errors = [];
   const documents = [];
+  const isExcluded = typeof options.exclude === 'function' ? options.exclude : () => false;
 
   const projectPath = path.join(rootDir, PROJECT_FILE);
   const projectDocument = await parseProjectDocument(rootDir, projectPath);
@@ -87,7 +96,8 @@ export async function scanProjectMemory(rootDir) {
   const architectureDocuments = await parseMarkdownTree({
     rootDir,
     directoryName: 'architecture',
-    shouldInclude: (filename) => !NON_CANONICAL_ARCHITECTURE_FILES.has(filename),
+    shouldInclude: (filename, relativePath) =>
+      !NON_CANONICAL_ARCHITECTURE_FILES.has(filename) && !isExcluded(relativePath),
     parseDocument: (documentPath, relativePath, content) =>
       parseArchitectureDocument({
         content,
@@ -99,7 +109,8 @@ export async function scanProjectMemory(rootDir) {
   const decisionDocuments = await parseMarkdownTree({
     rootDir,
     directoryName: 'decisions',
-    shouldInclude: (filename) => !NON_CANONICAL_DECISION_FILES.has(filename),
+    shouldInclude: (filename, relativePath) =>
+      !NON_CANONICAL_DECISION_FILES.has(filename) && !isExcluded(relativePath),
     parseDocument: (documentPath, relativePath, content) =>
       parseDecisionDocument({
         content,
@@ -115,7 +126,9 @@ export async function scanProjectMemory(rootDir) {
     // fail-close the whole scan as a malformed session note. The filename set
     // still covers the legacy root-level wip.md/handoff.md.
     shouldInclude: (filename, relativePath) =>
-      !NON_CANONICAL_SESSION_FILES.has(filename) && !relativePath.startsWith('sessions/active/'),
+      !NON_CANONICAL_SESSION_FILES.has(filename) &&
+      !relativePath.startsWith('sessions/active/') &&
+      !isExcluded(relativePath),
     parseDocument: (documentPath, relativePath, content) =>
       parseSessionDocument({
         content,
@@ -368,6 +381,19 @@ function validateProjectData(data, relativePath) {
           warnings.push(createWarning('project-runtime-unknown-field', `Unknown project.yaml runtime field "${key}".`));
         }
       }
+    }
+  }
+
+  // D-364 session brief settings; the brief fails closed on any problem, so
+  // each one is surfaced here rather than silently ignored.
+  if (data.brief !== undefined) {
+    for (const problem of validateBriefSettings(data.brief).problems) {
+      warnings.push(
+        createWarning(
+          'project-brief-invalid',
+          `project.yaml brief settings: ${problem}. Session briefs read no canonical document until this is fixed (D-364).`,
+        ),
+      );
     }
   }
 

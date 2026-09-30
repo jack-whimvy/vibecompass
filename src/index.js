@@ -75,3 +75,11 @@ export {
   resolveBriefRequest,
 } from './brief.js';
 export { renderBrief } from './brief-render.js';
+export {
+  LANE_BRIEF_FILENAME,
+  LANE_BRIEF_FORMAT,
+  generateLaneBrief,
+  inspectLaneBrief,
+  laneBriefPath,
+} from './brief-lifecycle.js';
+export { validateBriefSettings } from './brief-settings.js';

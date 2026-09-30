@@ -2,8 +2,9 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createKeywordIndex, queryTermOrigins, queryTerms } from './brief-keywords.js';
 import { BRIEF_MAX_COMPACTION, renderBrief, renderBriefUnit, renderedFollowUpCount } from './brief-render.js';
+import { compileBriefExclusions, readBriefSettingsForRoot, validateExcludePattern } from './brief-settings.js';
 import { collectDeclaredSuccessors, parseDecisionEntries, scanDecisionReferences } from './decision-lineage.js';
-import { sha256Text } from './hash.js';
+import { sha256Text, stableStringify } from './hash.js';
 import { resolveLaneMarkerContext, resolveLaneSelection, validateLaneId } from './lane-marker.js';
 import { loadProjectReadModelWithDocuments } from './read-model.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -13,8 +14,12 @@ import { parseSimpleYaml } from './simple-yaml.js';
  * a memory root plus task inputs to a selection result: which memory units a
  * session should read first, packed whole into an estimated token budget,
  * with an honest status and a prioritized follow-up list. It never writes;
- * rendering lives in `brief-render.js` and persistence (lane `brief.md`) is
- * plan task A4. Contract: `architecture/platform/project-memory/session-brief.md`.
+ * rendering lives in `brief-render.js` and persistence (lane `brief.md`) in
+ * `brief-lifecycle.js`. Contract: `architecture/platform/project-memory/session-brief.md`.
+ *
+ * Paths the root's `project.yaml` `brief.exclude` names are never read
+ * (D-364): the settings are read first, invalid settings fail closed, and the
+ * scan drops excluded files before opening them.
  *
  * Relations stay evidence-typed: a doc *covers* a file it lists under
  * Involved files and *cites* a decision it mentions (mechanical); a decision
@@ -62,8 +67,11 @@ const DISTINCTIVE_MAX_DOCUMENT_SHARE = 0.02;
 /**
  * Builds a session brief selection result. Options: `rootDir` (required),
  * `task`, `files` (`repo:path`), `featureSlugs`, `claims`, `laneId`, and
- * `budget` (estimated tokens, default 6,000, minimum 800). Invalid options
- * throw; retrieval failures return status `incomplete` with a reason.
+ * `budget` (estimated tokens, default 6,000, minimum 800). `exclude` adds
+ * patterns to the root's own `brief.exclude`, and `repoAliases` maps other
+ * repo ids (`{ 'vibecompass-app': 'app' }`) onto this root's; the dual-root
+ * adapter passes both (D-364). Invalid options throw; retrieval failures,
+ * invalid brief settings included, return status `incomplete` with a reason.
  */
 export async function buildSessionBrief(options = {}) {
   const input = normalizeBriefOptions(options);
@@ -85,21 +93,36 @@ export async function buildSessionBrief(options = {}) {
     throw new Error('A brief needs task text: pass a task, or a lane with a recorded working-on summary.');
   }
 
+  // D-364: exclusions are known before any canonical document is read, and
+  // settings that cannot be trusted stop the read entirely.
+  let exclusions = null;
+  if (!retrievalError) {
+    const settings = await readBriefSettingsForRoot(input.rootDir);
+    if (settings.problems.length > 0) {
+      retrievalError = `project.yaml brief settings are invalid, so no canonical document was read (D-364): ${settings.problems.join('; ')}`;
+    } else {
+      exclusions = compileBriefExclusions(uniqueStrings([...settings.exclude, ...input.exclude]));
+    }
+  }
+
   let loaded = null;
   if (!retrievalError) {
     try {
-      loaded = await loadProjectReadModelWithDocuments(input.rootDir);
+      loaded = await loadProjectReadModelWithDocuments(input.rootDir, { exclude: (relativePath) => exclusions.matches(relativePath) });
     } catch (error) {
       retrievalError = `the read model could not be built: ${errorMessage(error)}`;
     }
   }
 
-  const overviewExists = await pathExists(path.join(input.rootDir, BRIEF_OVERVIEW_PATH));
+  const overviewExcluded = exclusions?.matches(BRIEF_OVERVIEW_PATH) ?? false;
+  const overviewExists = !overviewExcluded && (await pathExists(path.join(input.rootDir, BRIEF_OVERVIEW_PATH)));
   if (!overviewExists) {
     gaps.push({
       code: 'missing-overview',
       path: BRIEF_OVERVIEW_PATH,
-      message: `No orientation overview at \`${BRIEF_OVERVIEW_PATH}\`; whole-project orientation is not available from memory.`,
+      message: overviewExcluded
+        ? `The orientation overview \`${BRIEF_OVERVIEW_PATH}\` is excluded from briefs (project.yaml \`brief.exclude\`); whole-project orientation is not available from the brief.`
+        : `No orientation overview at \`${BRIEF_OVERVIEW_PATH}\`; whole-project orientation is not available from memory.`,
     });
   }
   if (lane && !lane.handoffExists) {
@@ -116,6 +139,8 @@ export async function buildSessionBrief(options = {}) {
     gaps,
     warnings,
     overview: { path: BRIEF_OVERVIEW_PATH, exists: overviewExists },
+    exclude: exclusions?.patterns ?? null,
+    corpusDigest: loaded ? computeBriefCorpusDigest(loaded.documents, exclusions.patterns) : null,
   };
 
   if (retrievalError) {
@@ -188,6 +213,19 @@ function normalizeBriefOptions(options) {
     throw new RangeError(`Brief budget must be a whole number of at least ${BRIEF_MIN_BUDGET} estimated tokens (got ${budget}).`);
   }
 
+  const exclude = uniqueStrings(options.exclude);
+  for (const pattern of exclude) {
+    const problem = validateExcludePattern(pattern);
+    if (problem) throw new RangeError(`Brief exclude pattern ${problem}.`);
+  }
+
+  const repoAliases = {};
+  for (const [alias, repoId] of Object.entries(options.repoAliases ?? {})) {
+    if (typeof alias === 'string' && alias.trim() && typeof repoId === 'string' && repoId.trim()) {
+      repoAliases[alias.trim()] = repoId.trim();
+    }
+  }
+
   return {
     rootDir: path.resolve(options.rootDir),
     task: typeof options.task === 'string' ? options.task.trim() : '',
@@ -196,6 +234,8 @@ function normalizeBriefOptions(options) {
     claims: uniqueStrings(options.claims),
     laneId: options.laneId ? validateLaneId(String(options.laneId)) : null,
     budget,
+    exclude,
+    repoAliases,
   };
 }
 
@@ -235,7 +275,7 @@ async function readLane(rootDir, laneId) {
     }
   }
 
-  return {
+  const lane = {
     id: laneId,
     sessionPath: relativeTo(rootDir, sessionPath),
     handoffPath: relativeTo(rootDir, handoffPath),
@@ -249,9 +289,124 @@ async function readLane(rootDir, laneId) {
     decisionSnapshot: Number.isInteger(data.decision_snapshot?.highest_decision_id)
       ? data.decision_snapshot.highest_decision_id
       : null,
+    sessionDate: data.session_date == null ? null : optionalString(String(data.session_date)),
+    sessionNumber: Number.isInteger(data.session_number) ? data.session_number : null,
     otherLanes,
     missingWorktrees,
   };
+
+  // D-364 bindings: exactly the lane scratch this brief read. The session
+  // hash covers only the fields above, so resume bookkeeping (resumed_at,
+  // resume_count) does not make a brief stale.
+  lane.bindings = {
+    session: briefShortHash({
+      id: lane.id,
+      working_on: lane.workingOn,
+      claimed_paths: lane.claims,
+      feature_slugs: lane.featureSlugs,
+      architecture_docs: lane.architectureDocs,
+      repos: lane.repos,
+      decision_snapshot: lane.decisionSnapshot,
+      missing_worktrees: lane.missingWorktrees,
+    }),
+    handoff: handoff === null ? null : briefShortHash(handoff),
+    other_lanes: briefShortHash(otherLanes),
+  };
+  return lane;
+}
+
+/**
+ * The lane identity and scratch bindings a brief for this lane would record
+ * now (D-364), read exactly as `buildSessionBrief` reads them.
+ */
+export async function readBriefLaneBindings(rootDir, laneId) {
+  const lane = await readLane(path.resolve(rootDir), validateLaneId(String(laneId)));
+  return {
+    laneId: lane.id,
+    sessionDate: lane.sessionDate,
+    sessionNumber: lane.sessionNumber,
+    bindings: lane.bindings,
+  };
+}
+
+/**
+ * Digest of the canonical corpus a brief read: every scanned document's path
+ * and content hash (project.yaml included) plus the exclusion patterns in
+ * effect. Any change can change selection, so the lane brief binds it.
+ */
+export function computeBriefCorpusDigest(documents, excludePatterns = []) {
+  return sha256Text(
+    stableStringify({
+      exclude: [...excludePatterns].sort(),
+      documents: [...documents]
+        .map((document) => [document.path, sha256Text(document.content ?? '')])
+        .sort(([left], [right]) => left.localeCompare(right)),
+    }),
+  );
+}
+
+/** First 16 hex digits of a SHA-256: enough to detect a changed input. */
+export function briefShortHash(value) {
+  const hash = typeof value === 'string' && value.startsWith('sha256:') ? value : sha256Text(typeof value === 'string' ? value : stableStringify(value));
+  return hash.slice('sha256:'.length, 'sha256:'.length + 16);
+}
+
+/**
+ * The canonical files an emitted brief drew text from, each with a short
+ * content hash: docs and notes by file, decisions by the entries shown
+ * (`decisions/x.md#D-001,D-002`, hashed over those entries only).
+ */
+export function describeBriefInputs(result) {
+  const inputs = new Map();
+  const decisionsByFile = new Map();
+  for (const unit of result.units ?? []) {
+    if ((unit.kind === 'doc' || unit.kind === 'note') && unit.path && unit.source_hash) {
+      inputs.set(unit.path, briefShortHash(unit.source_hash));
+    } else if (unit.kind === 'lineage') {
+      for (const member of unit.members) {
+        if (!member.path || !member.section_hash) continue;
+        if (!decisionsByFile.has(member.path)) decisionsByFile.set(member.path, new Map());
+        decisionsByFile.get(member.path).set(member.decision_id, member.section_hash);
+      }
+    }
+  }
+  for (const [filePath, entries] of decisionsByFile) {
+    const ids = [...entries.keys()].sort((left, right) => left - right);
+    inputs.set(`${filePath}#${ids.map(formatId).join(',')}`, briefShortHash(ids.map((id) => [id, entries.get(id)])));
+  }
+  return [...inputs.entries()].map(([key, hash]) => ({ key, hash })).sort((left, right) => left.key.localeCompare(right.key));
+}
+
+/**
+ * Current short hashes for input keys from `describeBriefInputs`, computed
+ * from scanned documents the same way; a key whose file or entry is gone (or
+ * excluded) maps to null.
+ */
+export function hashBriefInputs(documents, keys) {
+  const contentByPath = new Map(documents.map((document) => [document.path, document.content]));
+  const hashes = new Map();
+  for (const key of keys) {
+    const hashIndex = key.indexOf('#');
+    const filePath = hashIndex === -1 ? key : key.slice(0, hashIndex);
+    const content = contentByPath.get(filePath);
+    if (typeof content !== 'string') {
+      hashes.set(key, null);
+      continue;
+    }
+    if (hashIndex === -1) {
+      hashes.set(key, briefShortHash(sha256Text(content)));
+      continue;
+    }
+    const ids = key
+      .slice(hashIndex + 1)
+      .split(',')
+      .map((value) => Number(value.replace(/^D-/, '')))
+      .filter(Number.isInteger)
+      .sort((left, right) => left - right);
+    const entries = new Map(parseDecisionEntries(content).map((entry) => [entry.decision_id, sha256Text(entry.text)]));
+    hashes.set(key, ids.every((id) => entries.has(id)) ? briefShortHash(ids.map((id) => [id, entries.get(id)])) : null);
+  }
+  return hashes;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +416,7 @@ async function readLane(rootDir, laneId) {
 function selectCandidates(context, loaded, task) {
   const { readModel, documents } = loaded;
   const { input, lane } = context;
-  const aliases = buildAliasMap(readModel);
+  const aliases = buildAliasMap(readModel, input.repoAliases);
   const contentByPath = new Map(documents.map((document) => [document.path, document.content]));
   const relations = readModel.decision_lineage.relations;
   const decisionEntries = buildDecisionEntryMap(documents);
@@ -955,6 +1110,12 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
       root_dir: context.input.rootDir,
       lane_id: context.lane?.id ?? null,
       manifest_hash: selection?.readModel?.manifest_state?.manifest_hash ?? null,
+      // D-364 bindings for a persisted lane brief.
+      corpus_digest: context.corpusDigest ?? null,
+      exclude: context.exclude,
+      lane_session: context.lane ? { date: context.lane.sessionDate, number: context.lane.sessionNumber } : null,
+      lane_bindings: context.lane?.bindings ?? null,
+      repo_aliases: context.input.repoAliases,
     },
     orientation: context.overview,
     budget: {
@@ -1148,8 +1309,13 @@ function buildDecisionEntryMap(documents) {
   return map;
 }
 
-function buildAliasMap(readModel) {
+function buildAliasMap(readModel, extraAliases = {}) {
   const aliases = new Map(readModel.repo_aliases);
+  // Another root's repo ids (dual-root adapter, D-364): `vibecompass-app` → `app`.
+  for (const [alias, repoId] of Object.entries(extraAliases)) {
+    aliases.set(alias, repoId);
+    aliases.set(alias.toLowerCase(), repoId);
+  }
   for (const repo of readModel.project.repos ?? []) {
     if (typeof repo.path === 'string' && repo.path.trim()) {
       const normalized = repo.path.trim().replace(/^\.\//, '').replace(/\/+$/, '');

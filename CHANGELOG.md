@@ -54,8 +54,51 @@
   without every declared superseding or amending successor. Uncertified
   lineage wording becomes a follow-up read, never a status. The command
   writes nothing: no manifest refresh, state write, lane write, or agent-file
-  sync, so it is safe against a hand-maintained root. Lifecycle integration
-  (`brief.md` in the lane) is not part of this release.
+  sync, so it is safe against a hand-maintained root.
+- Session brief in the lane lifecycle (plan task A4, D-359, D-364):
+  `start-session` and `continue-session` write
+  `sessions/active/<lane-id>/brief.md` by default, from the lane's working-on,
+  claims, and feature slugs, after every lifecycle write succeeded and inside
+  the same lock. `continue-session` keeps a current brief and regenerates a
+  missing or stale one, and lists it under "Read next". A brief failure is a
+  warning plus, when the file can be written, an `incomplete` brief naming the
+  reason; it never fails the command, and existing lifecycle refusals fail as
+  before. `--no-brief` (start and continue) or `project.yaml`
+  `brief.enabled: false` turns generation off and leaves every other effect
+  unchanged. `vibecompass brief --write` regenerates the lane brief
+  explicitly; `vibecompass brief --check [--json]` reports whether it is
+  stale, without writing.
+- `brief.md` opens with a YAML header that binds its inputs: source root and
+  lane with the lane's session date and number, destination root and lane, a
+  digest of the canonical corpus it read, short hashes of the docs, decision
+  entries, and notes it drew text from, the lane scratch it read (`handoff.md`
+  bytes, the `session.yaml` fields it uses, the other active lanes), and the
+  repo alias map. The body is exactly what `vibecompass brief` prints for the
+  lane. Staleness is computed from the bindings, not stored: resume
+  bookkeeping (`resumed_at`, `resume_count`) never makes a brief stale.
+- `project.yaml` gains an optional `brief:` mapping (D-364): `enabled`, and
+  `exclude`, a list of root-relative globs (`*`, `**`, `?`; case-insensitive)
+  naming canonical documents every brief must never read. Excluded files are
+  dropped from the scan before they are opened, so they contribute nothing to
+  selection, ranking, citation propagation, bindings, or output. Malformed or
+  unknown `brief` settings, or an unreadable `project.yaml`, fail closed: the
+  brief reads no canonical document and is `incomplete`; scans warn with
+  `project-brief-invalid`. `loadProjectReadModel` and other consumers are
+  unaffected.
+- Dual-root source for dogfood roots (D-255, D-364): `continue-session`,
+  `brief --write`, and `brief --check` accept `--source-root <root>` (and
+  `--source-session <lane-id>`, which must equal the lane) to build the brief
+  from another memory root's matching lane — same id, session date, and
+  session number, or the brief is refused (`incomplete`, with the reason).
+  The source root is only read (no lock, manifest, lane, stamp, or agent-file
+  write) and is byte-identical afterwards; both roots' exclusions apply;
+  destination repo ids translate to the source's by matching remotes. The
+  option is never inferred: a brief built from another root is stale for a
+  run that does not name it, and that root is not read.
+- Generated `context.md`, the managed agent block, and the scratch listings
+  now tell agents to read the lane's `brief.md` before planning. The lane
+  `wip.md` template gains an optional `## Context used` section for the docs
+  and decisions the lane actually relied on.
 
 ## 0.15.0 - 2026-09-25
 
