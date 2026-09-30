@@ -11,7 +11,6 @@
  */
 
 const LIMITS = {
-  task: 300,
   description: 600,
   guidance: 450,
   decision: 650,
@@ -21,26 +20,40 @@ const LIMITS = {
   next: 350,
   handoff: 350,
   reasons: 240,
-  followUp: 170,
-  files: 4,
   watchItems: 5,
 };
 
 const EVIDENCE_NOTE =
   '_Evidence: "covers" and "cites" are mechanical (the doc lists the file or mentions the decision); "supersedes" and "amends" come only from the later decision\'s own text. The brief infers no other relation and does not decide which decision applies to this task._';
+const EVIDENCE_NOTE_SHORT = '_Evidence: covers/cites are mechanical; supersedes/amends are declared by the later decision. Nothing else is inferred._';
+
+/**
+ * Frame limits (header, status, follow-ups) per compaction level. Level 0 is
+ * normal; the engine raises the level only when the frame itself would not
+ * fit the budget, so every accepted input renders within budget. Every
+ * field is bounded at every level; units render the same at every level.
+ */
+const FRAME_LIMITS = [
+  { task: 300, file: 120, files: 4, root: 160, reason: 300, gap: 240, followUpPath: 120, followUpHeading: 60, followUpReason: 170, followUps: Infinity, evidence: EVIDENCE_NOTE },
+  { task: 160, file: 60, files: 2, root: 60, reason: 200, gap: 160, followUpPath: 100, followUpHeading: 40, followUpReason: 80, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT },
+  { task: 120, file: 50, files: 1, root: 40, reason: 160, gap: 110, followUpPath: 80, followUpHeading: 30, followUpReason: 40, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT },
+  { task: 100, file: 40, files: 1, root: 30, reason: 120, gap: 90, followUpPath: 70, followUpHeading: 24, followUpReason: 30, followUps: 6, evidence: EVIDENCE_NOTE_SHORT },
+];
+export const BRIEF_MAX_COMPACTION = FRAME_LIMITS.length - 1;
 
 export function renderBrief(result) {
+  const frame = FRAME_LIMITS[Math.min(result.render?.compaction ?? 0, BRIEF_MAX_COMPACTION)];
   const lines = ['# Session brief', ''];
-  const followUps = renderFollowUpList(result);
+  const followUps = renderFollowUpList(result, frame);
 
   if (result.status === 'incomplete') {
     lines.push('**INCOMPLETE — read these before planning:**', ...followUps, '');
   }
 
-  lines.push(`**Status: ${result.status}** — ${statusSentence(result)}`, '');
-  lines.push(...renderHeader(result), '');
+  lines.push(`**Status: ${result.status}** — ${statusSentence(result, frame)}`, '');
+  lines.push(...renderHeader(result, frame), '');
 
-  if (result.status !== 'no-match') lines.push(EVIDENCE_NOTE, '');
+  if (result.status !== 'no-match') lines.push(frame.evidence, '');
 
   const byKind = (kind) => result.units.filter((unit) => unit.kind === kind);
   const emitted = new Set();
@@ -100,7 +113,7 @@ export function renderBriefUnit(unit, options = {}) {
   }
 }
 
-function statusSentence(result) {
+function statusSentence(result, frame) {
   const omittedCount = result.omitted.length;
   switch (result.status) {
     case 'complete':
@@ -110,38 +123,47 @@ function statusSentence(result) {
     case 'no-match':
       return 'no architecture doc or decision matched this task. Nothing in memory is presented as relevant; say so in your plan, and read the orientation overview if the task needs broader context.';
     default:
-      return `${result.status_reason}.`;
+      return `${excerpt(result.status_reason, frame.reason)}.`;
   }
 }
 
-function renderHeader(result) {
+function renderHeader(result, frame) {
   const files = result.inputs.files;
   const fileText =
     files.length === 0
       ? 'none'
-      : `${files.slice(0, LIMITS.files).map((file) => `\`${file}\``).join(', ')}${files.length > LIMITS.files ? ` (+${files.length - LIMITS.files} more)` : ''}`;
+      : `${files.slice(0, frame.files).map((file) => `\`${elide(file, frame.file)}\``).join(', ')}${files.length > frame.files ? ` (+${files.length - frame.files} more)` : ''}`;
   const lines = [
-    `- Task: ${excerpt(result.task, LIMITS.task) || '(none)'}`,
+    `- Task: ${excerpt(result.task, frame.task) || '(none)'}`,
     `- Files: ${fileText}`,
-    `- Lane: ${result.source.lane_id ? `\`${result.source.lane_id}\`` : 'none'} · Root: \`${result.source.root_dir}\``,
+    `- Lane: ${result.source.lane_id ? `\`${result.source.lane_id}\`` : 'none'} · Root: \`${elide(result.source.root_dir, frame.root)}\``,
     `- Estimated size: ~${groupDigits(result.budget.estimated_tokens)} of ${groupDigits(result.budget.limit)} tokens (Unicode code points ÷ 4 over this whole brief)`,
   ];
   if (result.orientation.exists) {
     lines.push(`- Orientation: \`${result.orientation.path}\` — the whole-project overview; read it first when orienting.`);
   }
-  for (const gap of result.gaps) lines.push(`- Gap: ${gap.message}`);
+  for (const gap of result.gaps) lines.push(`- Gap: ${excerpt(gap.message, frame.gap)}`);
   return lines;
 }
 
-function renderFollowUpList(result) {
-  const shown = result.follow_ups.slice(0, result.follow_up_cap);
+function renderFollowUpList(result, frame) {
+  const shown = result.follow_ups.slice(0, Math.min(result.follow_up_cap, frame.followUps));
   const lines = shown.map((entry) => {
-    const location = `\`${entry.path}\`${entry.heading ? ` › ${entry.heading}` : ''}`;
-    return `${entry.rank}. ${location} — ${excerpt(entry.reason, LIMITS.followUp)}`;
+    const heading = entry.heading ? ` › ${excerpt(entry.heading, frame.followUpHeading)}` : '';
+    return `${entry.rank}. \`${elide(entry.path, frame.followUpPath)}\`${heading} — ${excerpt(entry.reason, frame.followUpReason)}`;
   });
   const hidden = result.follow_ups.length - shown.length;
   if (hidden > 0) lines.push(`+${hidden} more (full list in \`--json\`)`);
   return lines;
+}
+
+/** Middle-elided text (paths): keeps both ends within `limit` code points. */
+function elide(value, limit) {
+  const points = [...String(value ?? '')];
+  if (points.length <= limit) return points.join('');
+  const head = Math.ceil((limit - 1) / 3);
+  const tail = limit - 1 - head;
+  return `${points.slice(0, head).join('')}…${points.slice(points.length - tail).join('')}`;
 }
 
 function renderLane(unit) {
@@ -201,7 +223,12 @@ function describeDeclared(member) {
       relation.relation === 'supersedes' && relation.extent === 'partial'
         ? 'partially supersedes'
         : relation.relation;
-    const scope = relation.extent === 'scoped' && relation.scope ? ` (scoped: ${excerpt(relation.scope, 80)})` : '';
+    // A partial or scoped relation keeps the part it names: a structured
+    // `**Partially supersedes:** D-100 — the credit balance` may be the only
+    // place that part is stated (D-363).
+    const scope = relation.scope && (relation.extent === 'scoped' || relation.extent === 'partial')
+      ? ` (${relation.extent === 'partial' ? 'part' : 'scoped'}: ${excerpt(relation.scope, 80)})`
+      : '';
     return `${verb} ${formatId(relation.target_decision_id)}${scope}`;
   });
   return `(declared: ${[...new Set(parts)].join('; ')})`;
@@ -238,7 +265,9 @@ function renderWatchOut(unit) {
   if (unit.category === 'other-lanes') {
     const text = items
       .map((item) => {
-        const overlap = item.overlapping_claims.length > 0 ? `; claims overlapping this lane: ${item.overlapping_claims.map((claim) => `\`${claim}\``).join(', ')}` : '';
+        const shown = item.overlapping_claims.slice(0, 3).map((claim) => `\`${elide(claim, 80)}\``).join(', ');
+        const extra = item.overlapping_claims.length > 3 ? ` (+${item.overlapping_claims.length - 3} more)` : '';
+        const overlap = item.overlapping_claims.length > 0 ? `; claims overlapping this lane: ${shown}${extra}` : '';
         return `\`${item.lane_id}\` (${excerpt(item.working_on, 90) || 'no summary'}${overlap})`;
       })
       .join('; ');
@@ -249,7 +278,7 @@ function renderWatchOut(unit) {
       .map((item) => `${formatId(item.decision_id)} — ${excerpt(item.title, 90)} (\`${item.path}\`)`)
       .join('; ')}${suffix}`;
   }
-  return `- Lane bindings missing on disk: ${items.map((item) => `worktree for \`${item.repo}\` at \`${item.path}\``).join('; ')}${suffix}`;
+  return `- Lane bindings missing on disk: ${items.map((item) => `worktree for \`${item.repo}\` at \`${elide(item.path, 100)}\``).join('; ')}${suffix}`;
 }
 
 /** "- a\n- b" → "a; b": list items read inline. */

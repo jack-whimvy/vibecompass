@@ -1,7 +1,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { createKeywordIndex, queryTerms } from './brief-keywords.js';
-import { renderBrief, renderBriefUnit } from './brief-render.js';
+import { createKeywordIndex, queryTermOrigins, queryTerms } from './brief-keywords.js';
+import { BRIEF_MAX_COMPACTION, renderBrief, renderBriefUnit } from './brief-render.js';
 import { collectDeclaredSuccessors, parseDecisionEntries, scanDecisionReferences } from './decision-lineage.js';
 import { sha256Text } from './hash.js';
 import { resolveLaneMarkerContext, resolveLaneSelection, validateLaneId } from './lane-marker.js';
@@ -55,6 +55,7 @@ const CITATION_WEIGHT = 6;
 // Evidence lists and file inventories cite decisions without saying anything about them.
 const NON_PROPAGATING_SECTIONS = new Set(['Review metadata', 'Involved files']);
 const DISTINCTIVE_TERM_LIMIT = 3;
+const STRONG_TOPIC_TERMS = 3;
 const DISTINCTIVE_MAX_DOCUMENT_SHARE = 0.02;
 
 /**
@@ -385,10 +386,29 @@ function selectCandidates(context, loaded, task) {
   );
 
   const topKeyword = Math.max(0, ...[...keywordScores.values()].map((result) => result.score));
+  // Absent distinctive words alone never abstain: unfamiliar modifiers
+  // ("clearer", "sporadic") are common in real tasks, and a false no-match
+  // hides memory that exists. Abstain on them only when no single unit
+  // shares at least STRONG_TOPIC_TERMS of the task's words.
+  const strongestOverlap = Math.max(0, ...[...keywordScores.values()].map((result) => result.matched.length));
   const noMatch =
     docs.every((doc) => doc.evidenceScore === 0) &&
     namedDecisionIds.size === 0 &&
-    (terms.length === 0 || distinctiveTermsMostlyAbsent(distinctive, index) || topKeyword < MIN_KEYWORD_SCORE);
+    (terms.length === 0 ||
+      topKeyword < MIN_KEYWORD_SCORE ||
+      (distinctiveTermsMostlyAbsent(distinctive, index) && strongestOverlap < STRONG_TOPIC_TERMS));
+
+  // Task words that occur nowhere in the indexed memory are disclosed, never guessed at.
+  const absent = terms.filter((term) => index.documentFrequency(term) === 0);
+  if (absent.length > 0) {
+    const origins = queryTermOrigins(`${task} ${pathWords}`);
+    const words = absent.map((term) => origins.get(term) ?? term);
+    context.gaps.push({
+      code: 'unmatched-terms',
+      terms: absent,
+      message: `No memory unit mentions ${words.slice(0, 6).map((word) => `"${word}"`).join(', ')}${words.length > 6 ? ` (+${words.length - 6} more)` : ''}; the brief covers the rest of the task only.`,
+    });
+  }
 
   if (noMatch) {
     return { noMatch: true, terms, distinctive, docs: [], namedDecisions: [], rankedDecisions: [], notes: [], relations, decisionById, decisionEntries, readModel };
@@ -547,7 +567,7 @@ function buildUnits(context, selection) {
   const { lane, input } = context;
 
   if (lane) units.push(buildLaneUnit(lane));
-  if (selection.noMatch) return units;
+  if (selection.noMatch || selection.retrievalError) return units;
 
   // Mandatory: decisions the task names, with their declared successors.
   for (const decision of selection.namedDecisions) {
@@ -684,12 +704,15 @@ function buildLineageUnit(decision, tier, selection) {
   });
 
   const memberIds = new Set(members.map((member) => member.decision_id));
+  // Uncertified wording aimed at any member stays a follow-up read, even when
+  // its source is itself a declared successor in this unit: the unit shows
+  // bounded Decision and Impact excerpts, not the field the wording is in.
   const unknownIncoming = selection.relations.filter(
     (relation) =>
       relation.relation === 'unknown' &&
       relation.source_kind === 'decision' &&
       memberIds.has(relation.target_decision_id) &&
-      !memberIds.has(relation.source_decision_id),
+      relation.source_decision_id !== relation.target_decision_id,
   );
 
   return {
@@ -785,38 +808,56 @@ function packBrief(context, selection) {
   const units = buildUnits(context, selection);
   const budget = context.input.budget;
   const fits = (candidate) => candidate.budget.estimated_tokens <= budget;
+  const mandatoryOmitted = (candidate) => candidate.omitted.filter((unit) => unit.tier === 'mandatory').length;
 
   // Pack whole units in tier order against a unit capacity. The header,
   // status, and follow-up list take about BRIEF_RESERVE_TOKENS; rather than
-  // guess, search for the largest capacity whose whole rendered brief fits
-  // the budget, repacking from scratch each time so no emitted unit ever
-  // loses a successor it was rendered against.
-  let result = assemble(context, selection, units, budget);
-  if (!fits(result)) {
-    let best = null;
-    let low = 0;
-    let high = budget - 1;
-    while (low <= high) {
-      const middle = Math.floor((low + high) / 2);
-      const candidate = assemble(context, selection, units, middle);
-      if (fits(candidate)) {
-        best = candidate;
-        low = middle + 1;
-      } else {
-        high = middle - 1;
-      }
-    }
-    result = best ?? assemble(context, selection, units, 0);
+  // guess, binary-search the capacity against the whole rendered brief,
+  // repacking from scratch each time so no emitted unit ever loses a
+  // successor it was rendered against. Skip-and-continue packing is not
+  // monotone in capacity, so the result always fits but is not guaranteed
+  // to be the largest fitting capacity. The frame is compacted (bounded
+  // header, status, and follow-up fields) only when the normal frame leaves
+  // no room for every mandatory unit; the most compact frame with no units
+  // fits the minimum budget for any accepted input.
+  let chosen = null;
+  for (let compaction = 0; compaction <= BRIEF_MAX_COMPACTION; compaction += 1) {
+    const candidate = packAtCompaction(context, selection, units, compaction, fits);
+    if (!candidate) continue;
+    if (!chosen || mandatoryOmitted(candidate) < mandatoryOmitted(chosen)) chosen = candidate;
+    if (mandatoryOmitted(chosen) === 0) break;
   }
 
-  if (!fits(result)) {
-    throw new Error(`Brief packing could not fit the ${budget}-token budget (estimated ${result.budget.estimated_tokens}).`);
+  if (!chosen || !fits(chosen)) {
+    throw new Error(`Brief packing could not fit the ${budget}-token budget.`);
   }
-  assertLineageSafety(result, selection.relations);
-  return result;
+  assertLineageSafety(chosen, selection.relations);
+  return chosen;
 }
 
-function assemble(context, selection, units, capacity) {
+function packAtCompaction(context, selection, units, compaction, fits) {
+  const budget = context.input.budget;
+  const full = assemble(context, selection, units, budget, compaction);
+  if (fits(full)) return full;
+  let best = null;
+  let low = 0;
+  let high = budget - 1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = assemble(context, selection, units, middle, compaction);
+    if (fits(candidate)) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (best) return best;
+  const empty = assemble(context, selection, units, 0, compaction);
+  return fits(empty) ? empty : null;
+}
+
+function assemble(context, selection, units, capacity, compaction = 0) {
   const emitted = new Set();
   const included = [];
   const omitted = [];
@@ -868,13 +909,14 @@ function assemble(context, selection, units, capacity) {
     units: included,
     omitted,
     covered,
-    followUps: buildFollowUps(included, omitted),
+    followUps: buildFollowUps(selection, context, included, omitted),
+    compaction,
   });
   measureBrief(result);
   return result;
 }
 
-function baseResult(context, selection, { status, units, omitted, covered, followUps }) {
+function baseResult(context, selection, { status, units, omitted, covered, followUps, compaction = 0 }) {
   return {
     contract_version: BRIEF_CONTRACT_VERSION,
     status: status.status,
@@ -909,10 +951,14 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
     follow_up_cap: BRIEF_FOLLOW_UP_CAP,
     gaps: context.gaps,
     warnings: context.warnings,
+    render: { compaction },
   };
 }
 
 function decideStatus(selection, omitted) {
+  if (selection.retrievalError) {
+    return { status: 'incomplete', reason: `retrieval failed — ${selection.retrievalError}` };
+  }
   if (selection.noMatch) {
     return omitted.some((unit) => unit.kind === 'lane')
       ? { status: 'incomplete', reason: 'no memory matched the task, and the lane unit did not fit the budget' }
@@ -932,7 +978,7 @@ function decideStatus(selection, omitted) {
   return { status: 'complete', reason: 'every selected unit fits the budget' };
 }
 
-function buildFollowUps(included, omitted) {
+function buildFollowUps(selection, context, included, omitted) {
   const entries = [];
 
   // Required reads: omitted mandatory units — the lane handoff, then every
@@ -946,6 +992,19 @@ function buildFollowUps(included, omitted) {
     }
   }
   entries.push(...requiredDecisions.sort((left, right) => right.decision_id - left.decision_id));
+
+  // A failed retrieval can still point at the fixed entry points.
+  if (selection.retrievalError) {
+    if (context.overview.exists) {
+      entries.push({ priority: 'required', path: BRIEF_OVERVIEW_PATH, heading: null, reason: 'whole-project orientation' });
+    }
+    entries.push({
+      priority: 'required',
+      path: 'decisions/INDEX.md',
+      heading: null,
+      reason: "decision index; read each entry's Impact on prior decisions before relying on it",
+    });
+  }
 
   for (const unit of omitted.filter((candidate) => candidate.tier === 'ranked')) {
     if (unit.kind === 'doc') {
@@ -1012,43 +1071,7 @@ function lineageReads(unit, priority) {
 }
 
 function finalizeRetrievalFailure(context, reason) {
-  const units = context.lane ? [buildLaneUnit(context.lane)] : [];
-  const included = [];
-  const omitted = [];
-  let used = 0;
-  for (const unit of units) {
-    const tokens = estimateBriefTokens(renderBriefUnit(unit, { emittedDecisions: new Set() }));
-    if (used + tokens <= context.input.budget - BRIEF_RESERVE_TOKENS) {
-      used += tokens;
-      included.push({ ...unit, estimated_tokens: tokens });
-    } else {
-      omitted.push({ ...unit, estimated_tokens: tokens });
-    }
-  }
-
-  const followUps = [];
-  if (context.lane && omitted.length > 0) {
-    followUps.push({ priority: 'required', path: context.lane.handoffPath, heading: null, reason: `lane \`${context.lane.id}\` handoff` });
-  }
-  if (context.overview.exists) {
-    followUps.push({ priority: 'required', path: BRIEF_OVERVIEW_PATH, heading: null, reason: 'whole-project orientation' });
-  }
-  followUps.push({
-    priority: 'required',
-    path: 'decisions/INDEX.md',
-    heading: null,
-    reason: "decision index; read each entry's Impact on prior decisions before relying on it",
-  });
-
-  const result = baseResult(context, null, {
-    status: { status: 'incomplete', reason: `retrieval failed — ${reason}` },
-    units: included,
-    omitted,
-    covered: [],
-    followUps,
-  });
-  measureBrief(result);
-  return result;
+  return packBrief(context, { retrievalError: reason, terms: [], distinctive: [], relations: [] });
 }
 
 /**

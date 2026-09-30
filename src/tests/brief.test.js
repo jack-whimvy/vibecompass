@@ -154,7 +154,7 @@ test('a partial-supersession chain and a transitive supersede/amend chain are em
   assert.deepEqual(byRoot.get(104).members.map((member) => member.decision_id), [104, 107, 106]);
 
   const markdown = renderBrief(result);
-  assert.match(markdown, /\*\*D-103\*\* \(declared: partially supersedes D-100\)/);
+  assert.match(markdown, /\*\*D-103\*\* \(declared: partially supersedes D-100 \(part: the credit balance\)\)/);
   assert.match(markdown, /\*\*D-106\*\* \(declared: supersedes D-104\)/);
   assert.match(markdown, /\*\*D-107\*\* \(declared: amends D-106 \(scoped: tax display\)\)/);
 });
@@ -206,6 +206,74 @@ test('optional overflow yields partial with only optional units omitted', async 
   assert.ok(result.omitted.every((unit) => unit.tier === 'optional'));
   assert.ok(result.follow_ups.some((entry) => entry.priority === 'optional'));
   assert.ok(result.budget.estimated_tokens <= result.budget.limit);
+});
+
+test('strong topic matches survive unfamiliar modifiers; absent words are disclosed, not abstained on (review R1)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const clearer = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Make hosted refresh run denial messages clearer and friendlier.' });
+  assert.notEqual(clearer.status, 'no-match');
+  assert.ok(clearer.units.some((unit) => unit.id === 'doc:architecture/billing/ledger.md'));
+  const unmatched = clearer.gaps.find((gap) => gap.code === 'unmatched-terms');
+  assert.deepEqual(unmatched.terms, ['clearer', 'friendlier']);
+  assert.match(renderBrief(clearer), /^- Gap: No memory unit mentions "clearer", "friendlier"; the brief covers the rest of the task only\.$/m);
+
+  const sporadic = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Can you carefully investigate a sporadic failure in session lane selection?' });
+  assert.notEqual(sporadic.status, 'no-match');
+  assert.ok(sporadic.units.some((unit) => unit.id === 'doc:architecture/sync/lanes.md'));
+
+  const klingon = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Add Klingon subtitles and a karaoke kiosk mode.' });
+  assert.equal(klingon.status, 'no-match');
+});
+
+test('a structured-only partial supersession keeps its named part (review R2)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const decisions = path.join(rootDir, 'decisions', 'cross-cutting.md');
+  await writeFile(
+    decisions,
+    `${await readFile(decisions, 'utf8')}\n---\n\n### D-201 — Replacement policy\n**Timestamp:** 2026-01-09 10:00 UTC\n**Decision:** The replacement follows the updated policy.\n**Partially supersedes:** D-100 — the top-up packs\n**Rationale:** Fixture.\n`,
+  );
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Review D-100.' });
+  const unit = result.units.find((candidate) => candidate.kind === 'lineage' && candidate.root_decision_id === 100);
+  assert.deepEqual(unit.members.map((member) => member.decision_id), [100, 201, 103]);
+  assert.equal(unit.members[1].impact, null);
+  assert.match(renderBrief(result), /\*\*D-201\*\* \(declared: partially supersedes D-100 \(part: the top-up packs\)\)/);
+});
+
+test('uncertified wording from a declared successor stays a follow-up read (review R3)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const decisions = path.join(rootDir, 'decisions', 'cross-cutting.md');
+  await writeFile(
+    decisions,
+    `${await readFile(decisions, 'utf8')}\n---\n\n### D-200 — Updated handling\n**Timestamp:** 2026-01-09 10:00 UTC\n**Decision:** Apply the updated handling.\n**Amends:** D-100 — the monthly grant\n**Rationale:** Refines D-100's top-up rules.\n`,
+  );
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Review D-100.' });
+  const unit = result.units.find((candidate) => candidate.kind === 'lineage' && candidate.root_decision_id === 100);
+  assert.ok(unit.members.some((member) => member.decision_id === 200));
+  assert.ok(unit.unknown_incoming.some((relation) => relation.source_decision_id === 200 && relation.target_decision_id === 100));
+  const read = result.follow_ups.find((entry) => entry.priority === 'lineage' && entry.heading === 'D-200');
+  assert.match(read.reason, /uncertified lineage wording \(refines\) about D-100/);
+  assert.notEqual(result.status, 'incomplete');
+});
+
+test('every accepted input renders within budget, including retrieval failures with long inputs (review R4)', async (t) => {
+  const longTask = 'Change the credential store backend. '.repeat(8);
+  const longFiles = [1, 2, 3, 4].map((index) => `app:src/${'component-name/'.repeat(34)}${index}.ts`);
+
+  const { rootDir: broken } = await makeRoot(t);
+  await writeFile(path.join(broken, 'decisions', 'extra.md'), '### D-101 — Duplicate entry\n**Timestamp:** 2026-01-09 10:00 UTC\n**Decision:** Duplicate.\n**Rationale:** Broken on purpose.\n');
+  const failure = await buildSessionBrief({ rootDir: broken, laneId: 'eval', task: longTask, files: longFiles, budget: BRIEF_MIN_BUDGET });
+  assert.equal(failure.status, 'incomplete');
+  assert.match(failure.status_reason, /^retrieval failed/);
+  assert.ok(failure.budget.estimated_tokens <= BRIEF_MIN_BUDGET, `estimated ${failure.budget.estimated_tokens}`);
+  assert.equal(failure.budget.estimated_tokens, estimateBriefTokens(renderBrief(failure)));
+  assert.deepEqual(failure.inputs.files, longFiles, 'full inputs stay in the JSON result');
+
+  const { rootDir } = await makeRoot(t);
+  for (const budget of [BRIEF_MIN_BUDGET, 900]) {
+    const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: `${longTask} Also the Free plan credit balance, D-100, D-101, D-104, and hosted refresh metering.`, files: longFiles, budget });
+    assert.ok(result.budget.estimated_tokens <= budget, `budget ${budget}: estimated ${result.budget.estimated_tokens}`);
+    assert.equal(result.budget.estimated_tokens, estimateBriefTokens(renderBrief(result)));
+  }
 });
 
 test('no-match returns only the lane unit with no filler', async (t) => {

@@ -109,6 +109,24 @@ const EXPECTED = {
   C3: ['D:359', 'D:159', 'D:278', 'A:platform/project-memory/recall-and-plain-language-build-plan.md'],
 };
 
+// Unlabeled paraphrases run after the 12 tasks and are reported separately
+// (review pass 1, R1): `match` cases name a topic memory covers with
+// unfamiliar modifiers and must not come back `no-match`; `report` cases are
+// probes with no label.
+const EXTRA_CASES = [
+  ['R1a', 'match', 'Make hosted refresh allowance error messages clearer and friendlier.'],
+  ['R1b', 'match', 'Can you carefully investigate a sporadic failure in session lane selection?'],
+  ['P1', 'match', 'Tidy up the confusing wording in the docs-review output parser errors.'],
+  ['P2', 'match', 'Why does the MCP read tool sometimes time out so slowly?'],
+  ['P3', 'match', 'Explain the Solo plan price to a skeptical customer in simple words.'],
+  ['P4', 'match', 'Make the lane marker lookup noticeably faster and sturdier.'],
+  ['P5', 'match', 'Honestly the credential store feels flaky on Windows laptops.'],
+  ['X1', 'report', 'Add dark mode to the marketing homepage with a toggle.'],
+  ['X2', 'report', 'Send Slack notifications whenever a new decision is appended.'],
+  ['X3', 'report', 'Rewrite the vibecompass CLI in Rust for faster startup.'],
+  ['X4', 'report', 'Add SAML single sign-on for enterprise customers.'],
+];
+
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const option = (name, fallback = null) => {
@@ -163,6 +181,17 @@ for (const task of tasks) {
 }
 
 printReport(rows);
+
+console.log('');
+console.log('Paraphrase probes (unlabeled; reported separately):');
+for (const [id, expectation, taskText] of EXTRA_CASES) {
+  const root = await makeRunCopy({ id: `extra-${id}`, task: taskText, files: [] });
+  const result = await buildSessionBrief({ rootDir: root, laneId: 'eval', task: taskText });
+  const gap = result.gaps.find((entry) => entry.code === 'unmatched-terms');
+  const verdict = expectation === 'match' ? (result.status === 'no-match' ? 'FAIL (no-match)' : 'ok') : 'report';
+  const firstUnits = result.units.filter((unit) => unit.kind !== 'lane').slice(0, 3).map((unit) => unit.path ?? unit.id).join(', ');
+  console.log(`- ${id} [${expectation}] ${result.status} — ${verdict}; unmatched: ${gap ? gap.terms.join(', ') : 'none'}; first units: ${firstUnits || 'none'}`);
+}
 
 function parseTuningTasks(markdown) {
   const section = markdown.slice(markdown.indexOf('### Tuning tasks'), markdown.indexOf('## Results'));

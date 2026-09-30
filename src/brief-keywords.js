@@ -123,6 +123,17 @@ export function queryTerms(text) {
   return terms;
 }
 
+/** The first raw word behind each query term, for disclosures ("japanes" → "Japanese"). */
+export function queryTermOrigins(text) {
+  const origins = new Map();
+  for (const word of String(text ?? '').split(/[^A-Za-z0-9]+/)) {
+    if (word.length < 2 || /^\d+$/.test(word)) continue;
+    const stem = stemWord(word.toLowerCase());
+    if (!origins.has(stem)) origins.set(stem, word);
+  }
+  return origins;
+}
+
 const K1 = 1.2;
 
 /**
