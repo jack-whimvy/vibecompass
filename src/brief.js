@@ -414,10 +414,17 @@ function selectCandidates(context, loaded, task) {
     return { noMatch: true, terms, distinctive, docs: [], namedDecisions: [], rankedDecisions: [], notes: [], relations, decisionById, decisionEntries, readModel };
   }
 
+  // When the task's distinctive words are mostly unknown but some unit still
+  // shares STRONG_TOPIC_TERMS of its words, the match is kept narrow: only
+  // those strong units (or mechanical evidence) are candidates, so a weak
+  // match never fills the budget with coincidental keyword hits.
+  const narrow = distinctiveTermsMostlyAbsent(distinctive, index);
+  const strongEnough = (candidate) => !narrow || (keywordScores.get(candidate.id)?.matched.length ?? 0) >= STRONG_TOPIC_TERMS;
+
   // Docs with mechanical evidence (they cover an input file or claim, the lane
   // declares them, or they belong to a named feature) skip the relative floor.
   const selectedDocs = pickTop(
-    docs.filter((doc) => doc.evidenceScore > 0 || doc.keywordScore >= MIN_KEYWORD_SCORE),
+    docs.filter((doc) => doc.evidenceScore > 0 || (doc.keywordScore >= MIN_KEYWORD_SCORE && strongEnough(doc))),
     MAX_DOC_CANDIDATES,
     (doc) => doc.evidenceScore > 0,
   );
@@ -469,7 +476,9 @@ function selectCandidates(context, loaded, task) {
     decisions.filter(
       (decision) =>
         !namedDecisionIds.has(decision.decisionId) &&
-        (decision.keywordScore >= MIN_KEYWORD_SCORE || decision.citationBoost > 0),
+        (narrow
+          ? strongEnough(decision)
+          : decision.keywordScore >= MIN_KEYWORD_SCORE || decision.citationBoost > 0),
     ),
     MAX_DECISION_CANDIDATES,
   );
@@ -480,6 +489,7 @@ function selectCandidates(context, loaded, task) {
 
   return {
     noMatch: false,
+    narrow,
     terms,
     distinctive,
     docs: selectedDocs,
@@ -943,6 +953,7 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
     selection: {
       query_terms: selection?.terms ?? [],
       distinctive_terms: selection?.distinctive ?? [],
+      narrowed: Boolean(selection?.narrow),
     },
     units,
     omitted,

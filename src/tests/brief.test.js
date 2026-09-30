@@ -216,6 +216,11 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
   const unmatched = clearer.gaps.find((gap) => gap.code === 'unmatched-terms');
   assert.deepEqual(unmatched.terms, ['clearer', 'friendlier']);
   assert.match(renderBrief(clearer), /^- Gap: No memory unit mentions "clearer", "friendlier"; the brief covers the rest of the task only\.$/m);
+  // Mostly-unknown distinctive words keep the match narrow: every ranked unit shares at least three task words.
+  assert.equal(clearer.selection.narrowed, true);
+  for (const unit of clearer.units.filter((candidate) => candidate.tier === 'ranked')) {
+    assert.ok(unit.matched_terms.length >= 3, `${unit.id} shares only ${unit.matched_terms.join(', ')}`);
+  }
 
   const sporadic = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Can you carefully investigate a sporadic failure in session lane selection?' });
   assert.notEqual(sporadic.status, 'no-match');
