@@ -243,6 +243,9 @@ test('a narrow match keeps the top-scoring topic and lists the rest as reads (re
   assert.ok(result.units.some((unit) => unit.id === 'doc:architecture/sync/lanes.md'), 'the lanes doc is packed');
   const ranked = result.units.filter((unit) => unit.tier === 'ranked');
   assert.ok(ranked.length <= 4);
+  if (result.omitted.some((unit) => unit.omitted_reason === 'narrow-match')) {
+    assert.match(renderBrief(result), /every match is low-confidence: the top \d+ are shown for orientation/);
+  }
   for (const unit of result.omitted.filter((candidate) => candidate.omitted_reason === 'narrow-match')) {
     assert.ok(result.follow_ups.some((entry) => entry.path === (unit.path ?? unit.members?.[0]?.path)), `${unit.id} is listed as a read`);
   }

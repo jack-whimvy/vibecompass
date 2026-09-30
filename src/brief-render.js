@@ -122,7 +122,10 @@ function statusSentence(result, frame) {
     case 'partial': {
       const parts = [];
       if (overflow > 0) parts.push(`${overflow} lower-tier unit${overflow === 1 ? '' : 's'} did not fit`);
-      if (withheld > 0) parts.push(`${withheld} lower-confidence match${withheld === 1 ? '' : 'es'} ${withheld === 1 ? 'is' : 'are'} shown as reads only, because most of the task's distinctive words had no keyword match`);
+      if (withheld > 0) {
+        // Every unit in a narrow match is low-confidence, the packed ones included.
+        parts.push(`most of the task's distinctive words had no keyword match, so every match is low-confidence: the top ${result.units.filter((unit) => unit.tier === 'ranked').length} are shown for orientation and ${withheld} more ${withheld === 1 ? 'is' : 'are'} listed as reads only`);
+      }
       return `${parts.join('; ')}; see Follow-up reads.`;
     }
     case 'no-match':
