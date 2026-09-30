@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,7 @@ import { parseFrontmatter } from '../frontmatter.js';
 import { initializeProjectMemory } from '../init.js';
 
 const FIXTURE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'brief', 'root');
+const CLI_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'cli.js');
 const TASK = 'Wire the ledger denial copy for refresh runs';
 const CAN_LOCK_FILES = process.platform !== 'win32' && process.getuid?.() !== 0;
 
@@ -447,7 +449,7 @@ test('staleness is computed from the header bindings, and continue-session regen
  * but neither its id nor its remote basename, so only the adapter's
  * translation maps it.
  */
-async function makeDualRoot(t, { destinationBrief = null, mirror = (session) => session } = {}) {
+async function makeDualRoot(t, { destinationBrief = null, mirror = (session) => session, sourcePrefix = 'vibecompass-brief-src-' } = {}) {
   const destination = await makeWorkspace(t, {
     prefix: 'vibecompass-brief-dest-',
     brief: destinationBrief,
@@ -457,9 +459,13 @@ async function makeDualRoot(t, { destinationBrief = null, mirror = (session) => 
     ],
   });
   // The destination's own corpus lacks the billing docs, so a brief that
-  // shows them read the source.
+  // shows them read the source; its remaining docs use its own repo ids.
   await rm(path.join(destination.rootDir, 'architecture', 'billing'), { recursive: true });
-  const source = await makeWorkspace(t, { prefix: 'vibecompass-brief-src-' });
+  for (const docPath of ['overview/project-shape.md', 'sync/credentials.md', 'sync/lanes.md']) {
+    const full = path.join(destination.rootDir, 'architecture', docPath);
+    await writeFile(full, (await readFile(full, 'utf8')).replace(/^  - app$/gm, '  - acme-web'));
+  }
+  const source = await makeWorkspace(t, { prefix: sourcePrefix });
   await startLane(destination.workspace, destination.rootDir, {
     claims: ['acme-web:src/lib/entitlements.ts'],
     repos: ['acme-web'],
@@ -508,9 +514,11 @@ test('the dual-root adapter reads the source root read-only, translates repo ids
   // destination's own root.
   if (CAN_LOCK_FILES) await source.lock(source.rootDir);
   const own = await continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger' });
-  assert.equal(own.brief.state, 'regenerated');
+  assert.equal(own.brief.state, 'regenerated', JSON.stringify(own.brief));
   assert.match(own.brief.staleReasons[0], /the brief was built from .*, and this run reads/);
-  assert.equal((await readBriefFile(destination.rootDir)).header.source_root, destination.rootDir);
+  const rebuilt = await readBriefFile(destination.rootDir);
+  assert.equal(rebuilt.header.source_root, destination.rootDir);
+  assert.equal(rebuilt.header.generation, 'ok');
 });
 
 test('the adapter refuses a source lane that does not correspond, without failing the resume (D-364)', async (t) => {
@@ -551,6 +559,151 @@ test('the adapter applies the union of both roots\' exclusions before reading th
   const generated = await generateLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
   assert.equal(generated.state, 'failed');
   assert.match(generated.reason, /destination root are invalid, so no canonical document was read/);
+});
+
+test('the recorded repo alias map and session identity are bindings: a change makes the brief stale (review R1)', async (t) => {
+  const { destination, source } = await makeDualRoot(t);
+  const resume = () => continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger', sourceRootDir: source.rootDir });
+  const check = () => inspectLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
+  await generateLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
+  assert.match((await readBriefFile(destination.rootDir)).body, /covers lane claim `acme-web:/);
+  assert.equal((await resume()).brief.state, 'kept', 'resume bookkeeping alone keeps the brief current');
+
+  // A destination-only remote change removes the acme-web → app translation.
+  // The source corpus is unchanged, so only the alias binding can see it.
+  await writeProjectYaml(destination.rootDir, {
+    repos: [
+      { id: 'acme-web', remote: 'https://github.com/example/acme-web-v2.git' },
+      { id: 'core', remote: 'https://github.com/example/acme-core.git' },
+    ],
+    tmpBase: path.join(destination.workspace, 'lane-tmp'),
+  });
+  assert.deepEqual((await check()).reasons, ['the repo alias map changed (a destination or source repo id or remote)']);
+  const realiased = await resume();
+  assert.equal(realiased.brief.state, 'regenerated');
+  const { header, body } = await readBriefFile(destination.rootDir);
+  assert.deepEqual(header.repo_aliases, ['acme-web -> (no match)', 'core -> core']);
+  assert.doesNotMatch(body, /covers lane claim/, 'the claim no longer matches once the alias is gone');
+
+  // Session identity: renumbering both lanes (correspondence still holds)
+  // leaves every hashed field unchanged; only the identity binding sees it.
+  for (const rootDir of [destination.rootDir, source.rootDir]) {
+    const sessionPath = path.join(rootDir, 'sessions', 'active', 'ledger', 'session.yaml');
+    await writeFile(sessionPath, (await readFile(sessionPath, 'utf8')).replace(/^session_number: 1$/m, 'session_number: 2'));
+  }
+  assert.deepEqual((await check()).reasons, ['the lane session identity changed (2026-02-01-1 → 2026-02-01-2)']);
+  assert.equal((await resume()).brief.state, 'regenerated');
+  assert.equal((await readBriefFile(destination.rootDir)).header.source_session, '2026-02-01-2');
+
+  // An own-root lane with no usable identity is never current.
+  const own = await makeWorkspace(t);
+  await startLane(own.workspace, own.rootDir);
+  const ownSession = path.join(own.rootDir, 'sessions', 'active', 'ledger', 'session.yaml');
+  await writeFile(ownSession, (await readFile(ownSession, 'utf8')).replace(/^session_number: 1\n/m, ''));
+  assert.ok((await inspectLaneBrief({ rootDir: own.rootDir, laneId: 'ledger' })).reasons.includes('the lane has no usable session identity (session_date and session_number)'));
+});
+
+test('a freshness check that cannot read the source replaces the old brief with a disclosed failure (review R2)', { skip: !CAN_LOCK_FILES }, async (t) => {
+  const { destination, source } = await makeDualRoot(t);
+  const resume = () => continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger', sourceRootDir: source.rootDir });
+  await generateLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
+  assert.equal((await readBriefFile(destination.rootDir)).header.generation, 'ok');
+
+  const ledger = path.join(source.rootDir, 'architecture', 'billing', 'ledger.md');
+  await chmod(ledger, 0o000);
+  const inspection = await inspectLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
+  assert.equal(inspection.stale, true);
+  assert.match(inspection.reasons[0], /^freshness could not be checked: .*(EACCES|permission denied)/i);
+
+  const blocked = await resume();
+  assert.equal(blocked.resumeCount, 1, 'the resume still succeeds');
+  assert.equal(blocked.brief.state, 'failed');
+  assert.equal(blocked.brief.status, 'incomplete');
+  const failed = await readBriefFile(destination.rootDir);
+  assert.equal(failed.header.generation, 'failed', 'the old complete brief is replaced, not left looking usable');
+  assert.equal(failed.header.status, 'incomplete');
+  assert.match(failed.header.reason, /memory could not be read: .*(EACCES|permission denied)/i);
+  assert.match(failed.body, /^\*\*INCOMPLETE — read these before planning:\*\*/m);
+
+  await chmod(ledger, 0o644);
+  const retried = await resume();
+  assert.equal(retried.brief.state, 'regenerated');
+  assert.equal((await readBriefFile(destination.rootDir)).header.generation, 'ok');
+
+  // An unreadable source lane is refused through the same failure path.
+  const sourceSession = path.join(source.rootDir, 'sessions', 'active', 'ledger', 'session.yaml');
+  await chmod(sourceSession, 0o000);
+  t.after(() => chmod(sourceSession, 0o644).catch(() => {}));
+  const refused = await resume();
+  assert.equal(refused.brief.state, 'refused');
+  assert.match(refused.brief.reason, /the source could not be read: .*(EACCES|permission denied)/i);
+  assert.equal((await readBriefFile(destination.rootDir)).header.generation, 'failed');
+});
+
+test('explicit refresh reports unreadable memory as a failed generation; budget overflow stays a successful incomplete brief (review R3)', async (t) => {
+  // Invalid source settings under the adapter: exit 1, generation failed.
+  const { destination, source } = await makeDualRoot(t);
+  await writeProjectYaml(source.rootDir, { raw: ['brief:', '  excludes:', '    - "architecture/billing/pricing.md"'] });
+  const cli = captureIo();
+  assert.equal(await runCli(['brief', '--root', destination.rootDir, '--session', 'ledger', '--write', '--source-root', source.rootDir, '--json'], cli.io, { cwd: destination.workspace }), 1);
+  const adapterResult = JSON.parse(cli.stdout());
+  assert.equal(adapterResult.state, 'failed');
+  assert.equal(adapterResult.status, 'incomplete');
+  assert.match(adapterResult.reason, /memory could not be read: .*unknown field "brief\.excludes"/);
+  const adapterBrief = await readBriefFile(destination.rootDir);
+  assert.equal(adapterBrief.header.generation, 'failed');
+  assert.match(adapterBrief.header.reason, /unknown field "brief\.excludes"/);
+
+  // The same through the lifecycle: reported, never a failed resume.
+  const resumed = await continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger', sourceRootDir: source.rootDir });
+  assert.equal(resumed.resumeCount, 1);
+  assert.equal(resumed.brief.state, 'failed');
+
+  // Invalid settings in the lane's own root: exit 1 as well.
+  const own = await makeWorkspace(t);
+  await startLane(own.workspace, own.rootDir, { workingOn: 'Reconcile D-100, D-101, and D-104 before touching billing.' });
+  cli.reset();
+  assert.equal(await runCli(['brief', '--root', own.rootDir, '--session', 'ledger', '--write', '--budget', '800'], cli.io, { cwd: own.workspace }), 0);
+  assert.match(cli.stdout(), /^Brief: incomplete — wrote /m, 'mandatory overflow is a successful generation with required reads');
+  const overflow = await readBriefFile(own.rootDir);
+  assert.equal(overflow.header.generation, 'ok');
+  assert.equal(overflow.header.status, 'incomplete');
+  assert.match(overflow.body, /^\*\*INCOMPLETE — read these before planning:\*\*/m);
+  assert.equal((await inspectLaneBrief({ rootDir: own.rootDir, laneId: 'ledger' })).stale, false);
+
+  await writeProjectYaml(own.rootDir, { raw: ['brief:', '  exclude: "architecture/billing/ledger.md"'], tmpBase: path.join(own.workspace, 'lane-tmp') });
+  cli.reset();
+  assert.equal(await runCli(['brief', '--root', own.rootDir, '--session', 'ledger', '--write'], cli.io, { cwd: own.workspace }), 1);
+  assert.match(cli.stdout(), /^Brief: incomplete \(failed: memory could not be read: .*brief settings are invalid/m);
+  assert.equal((await readBriefFile(own.rootDir)).header.generation, 'failed');
+});
+
+test('check and retry advice keeps the root, lane, and source explicit, quoted for the shell (review S2)', { skip: !CAN_LOCK_FILES || process.platform === 'win32' }, async (t) => {
+  const { destination, source } = await makeDualRoot(t, { sourcePrefix: "vibecompass brief src o'q-" });
+  await generateLaneBrief({ rootDir: destination.rootDir, laneId: 'ledger', sourceRootDir: source.rootDir });
+  const quoted = `'${source.rootDir.replace(/'/g, `'\\''`)}'`;
+  const { content } = await readBriefFile(destination.rootDir);
+  assert.ok(content.includes(`# Check: vibecompass brief --root ${destination.rootDir} --session ledger --check --source-root ${quoted}\n`));
+  assert.ok(content.includes(`# Refresh: vibecompass brief --root ${destination.rootDir} --session ledger --write --source-root ${quoted}\n`));
+
+  // A refused source: the failure body, the warning, and the header all name the same command.
+  const sourceSession = path.join(source.rootDir, 'sessions', 'active', 'ledger', 'session.yaml');
+  await chmod(sourceSession, 0o000);
+  t.after(() => chmod(sourceSession, 0o644).catch(() => {}));
+  const resumed = await continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger', sourceRootDir: source.rootDir });
+  const retry = `vibecompass brief --root ${destination.rootDir} --session ledger --write --source-root ${quoted}`;
+  assert.ok(resumed.warnings.some((warning) => warning.includes(retry)), 'the lifecycle warning names the explicit retry');
+  const failed = await readBriefFile(destination.rootDir);
+  assert.ok(failed.body.includes(`Retry once the cause is fixed: \`${retry}\``));
+
+  // The advice survives a real shell: it reaches the same lane and source.
+  await chmod(sourceSession, 0o644);
+  const command = retry.replace(/^vibecompass /, `'${process.execPath}' '${CLI_PATH}' `);
+  const output = await new Promise((resolve, reject) => {
+    execFile('/bin/sh', ['-c', command], { cwd: os.tmpdir() }, (error, stdout, stderr) => (error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve(stdout)));
+  });
+  assert.match(output, /^Brief: \S+ — wrote .* from .*vibecompass brief src o'q-/m);
+  assert.equal((await readBriefFile(destination.rootDir)).header.source_root, source.rootDir);
 });
 
 // ---------------------------------------------------------------------------

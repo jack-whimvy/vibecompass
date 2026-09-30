@@ -42,15 +42,22 @@ export function laneBriefPath(rootDir, laneId) {
  * Generates and writes the lane's `brief.md` under the destination root's
  * memory-root lock. The brief reads `sourceRootDir` when given (the dual-root
  * adapter, after the lane-correspondence check), otherwise the lane's own
- * root. A refused correspondence or a failed build still writes an
- * `incomplete` brief naming the reason, and is returned as `refused` or
- * `failed`; only errors that prevent writing the file throw.
+ * root. A refused or unresolvable source, a build error, and memory that
+ * could not be read still write an `incomplete` brief whose header says
+ * `generation: "failed"` with the reason, returned as `refused` or `failed`.
+ * A brief that is incomplete only because mandatory units overflowed the
+ * budget is a successful generation (`written`). Only errors that prevent
+ * writing the file throw.
  */
 export async function generateLaneBrief(options = {}) {
   const destinationRoot = path.resolve(requireString(options.rootDir, 'generateLaneBrief requires rootDir.'));
   const laneId = validateLaneId(requireString(options.laneId, 'generateLaneBrief requires laneId.'));
   const budget = options.budget ?? BRIEF_DEFAULT_BUDGET;
   const build = options.buildBrief ?? buildSessionBrief;
+  if (options.sourceSessionId && !options.sourceRootDir) {
+    throw new Error('--source-session requires --source-root; without a source root the brief reads the lane\'s own root.');
+  }
+  const requestedSource = options.sourceRootDir ? path.resolve(options.sourceRootDir) : null;
 
   return withMemoryRootLock(destinationRoot, 'brief', async () => {
     const briefPath = laneBriefPath(destinationRoot, laneId);
@@ -59,18 +66,35 @@ export async function generateLaneBrief(options = {}) {
     }
 
     const generatedAt = formatLocalDateTime(options.now ?? new Date());
-    const frame = { destinationRoot, laneId, generatedAt, budget };
-    const source = await resolveBriefSource({
-      destinationRoot,
-      laneId,
-      sourceRootDir: options.sourceRootDir,
-      sourceSessionId: options.sourceSessionId,
-    });
+    const frame = { destinationRoot, laneId, generatedAt, budget, requestedSource };
+    let source;
+    try {
+      source = await resolveBriefSource({
+        destinationRoot,
+        laneId,
+        sourceRootDir: requestedSource ?? undefined,
+        sourceSessionId: options.sourceSessionId,
+      });
+    } catch (error) {
+      // A source that cannot even be read (for example an unreadable lane
+      // session.yaml) is refused like a non-corresponding one.
+      source = {
+        adapter: Boolean(requestedSource),
+        rootDir: requestedSource ?? destinationRoot,
+        laneId,
+        repoAliases: {},
+        aliasPairs: [],
+        refusal: `the source could not be read: ${errorMessage(error)}`,
+      };
+    }
+
+    const failed = async (state, reason, warning) => {
+      await writeLaneBriefFile(briefPath, renderFailedLaneBrief({ ...frame, source, reason }));
+      return { state, status: 'incomplete', reason, path: briefPath, source: describeSource(source), warnings: [warning] };
+    };
 
     if (source.refusal) {
-      const reason = `the dual-root source was refused: ${source.refusal}`;
-      await writeLaneBriefFile(briefPath, renderFailedLaneBrief({ ...frame, source, reason }));
-      return { state: 'refused', status: 'incomplete', reason, path: briefPath, source: describeSource(source), warnings: [`Session brief refused (D-364): ${source.refusal}`] };
+      return failed('refused', `the dual-root source was refused: ${source.refusal}`, `Session brief refused (D-364): ${source.refusal}. Fix it, then run: ${briefCommand(frame, 'write')}`);
     }
 
     // The adapter reads another root, so the destination's exclusions apply
@@ -81,8 +105,7 @@ export async function generateLaneBrief(options = {}) {
       const destinationSettings = await readBriefSettingsForRoot(destinationRoot);
       if (destinationSettings.problems.length > 0) {
         const reason = `project.yaml brief settings in the destination root are invalid, so no canonical document was read (D-364): ${destinationSettings.problems.join('; ')}`;
-        await writeLaneBriefFile(briefPath, renderFailedLaneBrief({ ...frame, source, reason }));
-        return { state: 'failed', status: 'incomplete', reason, path: briefPath, source: describeSource(source), warnings: [`Session brief incomplete: ${reason}`] };
+        return failed('failed', reason, `Session brief incomplete: ${reason}`);
       }
       extraExclude = destinationSettings.exclude;
     }
@@ -98,8 +121,23 @@ export async function generateLaneBrief(options = {}) {
       });
     } catch (error) {
       const reason = `the brief engine failed: ${errorMessage(error)}`;
-      await writeLaneBriefFile(briefPath, renderFailedLaneBrief({ ...frame, source, reason }));
-      return { state: 'failed', status: 'incomplete', reason, path: briefPath, source: describeSource(source), warnings: [`Session brief incomplete: ${reason}`] };
+      return failed('failed', reason, `Session brief incomplete: ${reason}. Retry with: ${briefCommand(frame, 'write')}`);
+    }
+
+    // The engine reports unreadable memory (invalid settings included) as a
+    // returned result, not a throw: that is a failed generation, although
+    // its body still lists the reads to make.
+    if (result.retrieval_error) {
+      const reason = `memory could not be read: ${result.retrieval_error}`;
+      await writeLaneBriefFile(briefPath, renderLaneBriefDocument({ ...frame, source, result, failure: reason }));
+      return {
+        state: 'failed',
+        status: result.status,
+        reason,
+        path: briefPath,
+        source: describeSource(source),
+        warnings: [`Session brief incomplete: ${reason}. Retry with: ${briefCommand(frame, 'write')}`],
+      };
     }
 
     await writeLaneBriefFile(briefPath, renderLaneBriefDocument({ ...frame, source, result }));
@@ -118,7 +156,8 @@ export async function generateLaneBrief(options = {}) {
  * Read-only freshness check of a lane's `brief.md` against its header
  * bindings (D-364). The expected source is the one this call names
  * (`sourceRootDir`, else the lane's own root); a brief recorded against any
- * other root is stale, and that recorded root is never read.
+ * other root is stale, and that recorded root is never read. A check that
+ * cannot read what it needs reports the brief stale, never current.
  */
 export async function inspectLaneBrief(options = {}) {
   const destinationRoot = path.resolve(requireString(options.rootDir, 'inspectLaneBrief requires rootDir.'));
@@ -148,45 +187,53 @@ export async function inspectLaneBrief(options = {}) {
     return stale([`the last generation did not complete${header.reason ? `: ${header.reason}` : ''}`]);
   }
 
-  const source = await resolveBriefSource({
-    destinationRoot,
-    laneId,
-    sourceRootDir: options.sourceRootDir,
-    sourceSessionId: options.sourceSessionId,
-  });
+  try {
+    return stale(await compareBindings({ header, destinationRoot, laneId, sourceRootDir: options.sourceRootDir, sourceSessionId: options.sourceSessionId }));
+  } catch (error) {
+    return stale([`freshness could not be checked: ${errorMessage(error)}`]);
+  }
+}
+
+async function compareBindings({ header, destinationRoot, laneId, sourceRootDir, sourceSessionId }) {
+  const source = await resolveBriefSource({ destinationRoot, laneId, sourceRootDir, sourceSessionId });
   if (source.refusal) {
-    return stale([`the dual-root source is refused: ${source.refusal}`]);
+    return [`the dual-root source is refused: ${source.refusal}`];
+  }
+  if (!(await sameDirectory(header.source_root, source.rootDir))) {
+    // Never read the recorded root: only the root this call names is read.
+    return [`the brief was built from ${header.source_root ?? 'an unrecorded root'}, and this run reads ${source.rootDir}`];
+  }
+  if (header.source_lane !== source.laneId || header.destination_lane !== laneId || !(await sameDirectory(header.destination_root, destinationRoot))) {
+    return ['the brief is bound to a different lane or destination root'];
   }
 
   const reasons = [];
-  if (!(await sameDirectory(header.source_root, source.rootDir))) {
-    // Never read the recorded root: only the root this call names is read.
-    return stale([`the brief was built from ${header.source_root ?? 'an unrecorded root'}, and this run reads ${source.rootDir}`]);
-  }
-  if (header.source_lane !== source.laneId || header.destination_lane !== laneId || !(await sameDirectory(header.destination_root, destinationRoot))) {
-    return stale(['the brief is bound to a different lane or destination root']);
+  // The alias map comes from both roots' project.yaml; the destination's is
+  // not part of the source corpus, so it is compared directly.
+  const recordedAliases = Array.isArray(header.repo_aliases) ? header.repo_aliases.map(String) : [];
+  if (JSON.stringify(recordedAliases) !== JSON.stringify(source.aliasPairs.map(formatAliasPair))) {
+    reasons.push('the repo alias map changed (a destination or source repo id or remote)');
   }
 
   const sourceSettings = await readBriefSettingsForRoot(source.rootDir);
   const destinationSettings = source.adapter ? await readBriefSettingsForRoot(destinationRoot) : { exclude: [], problems: [] };
   const problems = [...sourceSettings.problems, ...destinationSettings.problems];
   if (problems.length > 0) {
-    return stale([`brief settings are invalid, so freshness cannot be checked without reading excluded paths: ${problems.join('; ')}`]);
+    return [...reasons, `brief settings are invalid, so freshness cannot be checked without reading excluded paths: ${problems.join('; ')}`];
   }
   const exclusions = compileBriefExclusions(uniqueStrings([...sourceSettings.exclude, ...destinationSettings.exclude]));
 
-  let lane = null;
-  try {
-    lane = await readBriefLaneBindings(source.rootDir, source.laneId);
-  } catch (error) {
-    reasons.push(`the lane could not be read: ${errorMessage(error)}`);
+  const lane = await readBriefLaneBindings(source.rootDir, source.laneId);
+  const identity = lane.sessionDate && Number.isInteger(lane.sessionNumber) ? `${lane.sessionDate}-${lane.sessionNumber}` : null;
+  if (!identity) {
+    reasons.push('the lane has no usable session identity (session_date and session_number)');
+  } else if (header.source_session !== identity) {
+    reasons.push(`the lane session identity changed (${header.source_session ?? 'none'} → ${identity})`);
   }
   const recordedLane = header.lane_bindings && typeof header.lane_bindings === 'object' ? header.lane_bindings : {};
-  if (lane) {
-    if (recordedLane.session !== lane.bindings.session) reasons.push('session.yaml changed (working-on, claims, features, architecture docs, repos, snapshot, or worktrees)');
-    if (recordedLane.handoff !== encodeOptionalHash(lane.bindings.handoff)) reasons.push('handoff.md changed');
-    if (recordedLane.other_lanes !== lane.bindings.other_lanes) reasons.push('the other active lanes changed');
-  }
+  if (recordedLane.session !== lane.bindings.session) reasons.push('session.yaml changed (working-on, claims, features, architecture docs, repos, snapshot, or worktrees)');
+  if (recordedLane.handoff !== encodeOptionalHash(lane.bindings.handoff)) reasons.push('handoff.md changed');
+  if (recordedLane.other_lanes !== lane.bindings.other_lanes) reasons.push('the other active lanes changed');
 
   const scan = await scanProjectMemory(source.rootDir, { exclude: (relativePath) => exclusions.matches(relativePath) });
   const recordedInputs = parseInputLines(header.inputs);
@@ -200,8 +247,7 @@ export async function inspectLaneBrief(options = {}) {
   } else if (header.corpus_digest !== computeBriefCorpusDigest(scan.documents, exclusions.patterns) && changed.length === 0) {
     reasons.push('other canonical memory changed (docs, decisions, notes, or project.yaml), so selection may differ');
   }
-
-  return stale(reasons);
+  return reasons;
 }
 
 /**
@@ -209,10 +255,16 @@ export async function inspectLaneBrief(options = {}) {
  * throws: a brief failure becomes a warning (and, where possible, an
  * `incomplete` brief), so it cannot overturn an otherwise successful start or
  * resume (D-359). `continue-session` keeps a current brief and regenerates a
- * missing or stale one.
+ * missing or stale one; a freshness check that fails counts as stale, so the
+ * old brief is replaced by one that discloses the failure.
  */
 export async function refreshLaneBriefForLifecycle(options = {}) {
   const trigger = options.trigger === 'continue' ? 'continue' : 'start';
+  const commandFrame = {
+    destinationRoot: typeof options.rootDir === 'string' ? path.resolve(options.rootDir) : '<root>',
+    laneId: options.laneId ?? '<lane-id>',
+    requestedSource: options.sourceRootDir ? path.resolve(options.sourceRootDir) : null,
+  };
   let briefPath = null;
   try {
     const rootDir = path.resolve(requireString(options.rootDir, 'The lifecycle brief requires rootDir.'));
@@ -229,7 +281,11 @@ export async function refreshLaneBriefForLifecycle(options = {}) {
 
     let previous = null;
     if (trigger === 'continue') {
-      previous = await inspectLaneBrief({ rootDir, laneId, sourceRootDir: options.sourceRootDir, sourceSessionId: options.sourceSessionId });
+      try {
+        previous = await inspectLaneBrief({ rootDir, laneId, sourceRootDir: options.sourceRootDir, sourceSessionId: options.sourceSessionId });
+      } catch (error) {
+        previous = { exists: true, stale: true, reasons: [`freshness could not be checked: ${errorMessage(error)}`] };
+      }
       if (previous.exists && !previous.stale) {
         return { state: 'kept', status: previous.status, generatedAt: previous.generatedAt, path: briefPath, warnings: [] };
       }
@@ -255,7 +311,7 @@ export async function refreshLaneBriefForLifecycle(options = {}) {
       reason: message,
       path: briefPath,
       warnings: [
-        `Session brief not written: ${message}. The ${trigger}-session result is unaffected; retry with \`vibecompass brief --session ${options.laneId ?? '<lane-id>'} --write\` (D-364).`,
+        `Session brief not written: ${message}. The ${trigger}-session result is unaffected; retry with: ${briefCommand(commandFrame, 'write')} (D-364).`,
       ],
     };
   }
@@ -315,21 +371,21 @@ export async function resolveBriefSource({ destinationRoot, laneId, sourceRootDi
 // brief.md rendering
 // ---------------------------------------------------------------------------
 
-function renderLaneBriefDocument({ destinationRoot, laneId, generatedAt, budget, source, result }) {
+function renderLaneBriefDocument({ destinationRoot, laneId, generatedAt, budget, source, result, failure = null }) {
   const inputs = describeBriefInputs(result);
   const shown = inputs.slice(0, inputs.length > MAX_HEADER_INPUTS ? MAX_HEADER_INPUTS - 1 : MAX_HEADER_INPUTS);
   const folded = inputs.slice(shown.length);
   const lane = result.source.lane_bindings;
   const session = result.source.lane_session;
 
-  const header = [
-    ...headerPreamble(),
-    'generation: "ok"',
+  const fields = [
+    `generation: ${quote(failure ? 'failed' : 'ok')}`,
     `status: ${quote(result.status)}`,
+    ...(failure ? [`reason: ${quote(boundReason(failure))}`] : []),
     `budget: ${budget}`,
     `source_root: ${quote(source.rootDir)}`,
     `source_lane: ${quote(source.laneId)}`,
-    `source_session: ${quote(session?.date && session?.number ? `${session.date}-${session.number}` : 'unknown')}`,
+    `source_session: ${quote(session?.date && Number.isInteger(session?.number) ? `${session.date}-${session.number}` : 'unknown')}`,
     `destination_root: ${quote(destinationRoot)}`,
     `destination_lane: ${quote(laneId)}`,
     `corpus_digest: ${quote(result.source.corpus_digest ?? 'none')}`,
@@ -338,19 +394,19 @@ function renderLaneBriefDocument({ destinationRoot, laneId, generatedAt, budget,
     `  session: ${quote(lane?.session ?? 'none')}`,
     `  handoff: ${quote(encodeOptionalHash(lane?.handoff ?? null))}`,
     `  other_lanes: ${quote(lane?.other_lanes ?? 'none')}`,
-    ...renderList('repo_aliases', source.aliasPairs.map((pair) => `${pair.destination} -> ${pair.source ?? '(no match)'}`)),
+    ...renderList('repo_aliases', source.aliasPairs.map(formatAliasPair)),
     ...renderList('inputs', [
       ...shown.map((input) => `${input.hash} ${input.key}`),
       ...(folded.length > 0 ? [`+${folded.length} more inputs (covered by corpus_digest)`] : []),
     ]),
   ];
-  return assembleBriefDocument(header, generatedAt, renderBrief(result));
+  return assembleBriefDocument(commandsFor(destinationRoot, laneId, source), generatedAt, fields, renderBrief(result));
 }
 
 function renderFailedLaneBrief({ destinationRoot, laneId, generatedAt, source, reason }) {
   const rootNote = source.rootDir === destinationRoot ? '' : ` (paths are relative to \`${source.rootDir}\`)`;
-  const header = [
-    ...headerPreamble(),
+  const commands = commandsFor(destinationRoot, laneId, source);
+  const fields = [
     'generation: "failed"',
     'status: "incomplete"',
     `reason: ${quote(boundReason(reason))}`,
@@ -369,29 +425,26 @@ function renderFailedLaneBrief({ destinationRoot, laneId, generatedAt, source, r
     `- \`${BRIEF_OVERVIEW_PATH}\` — whole-project orientation`,
     "- `decisions/INDEX.md` — decision index; read each entry's Impact on prior decisions before relying on it",
     '',
-    `Retry with \`vibecompass brief --session ${laneId} --write\` once the cause is fixed.`,
+    `Retry once the cause is fixed: \`${commands.write}\``,
     '',
   ].join('\n');
-  return assembleBriefDocument(header, generatedAt, body);
+  return assembleBriefDocument(commands, generatedAt, fields, body);
 }
 
-function headerPreamble() {
-  return [
-    '# Generated session brief (D-357, D-359, D-364); do not edit. It is stale once any binding below changes.',
-    '# Check with `vibecompass brief --check`; refresh with `vibecompass brief --write`.',
-    `brief_format: ${LANE_BRIEF_FORMAT}`,
-    `contract_version: ${BRIEF_CONTRACT_VERSION}`,
-  ];
+/** Check and refresh commands that keep this brief's root, lane, and source explicit. */
+function commandsFor(destinationRoot, laneId, source) {
+  const frame = { destinationRoot, laneId, requestedSource: source.adapter ? source.rootDir : null };
+  return { check: briefCommand(frame, 'check'), write: briefCommand(frame, 'write') };
 }
 
-function assembleBriefDocument(header, generatedAt, body) {
-  const [comment1, comment2, format, contract, ...fields] = header;
+function assembleBriefDocument(commands, generatedAt, fields, body) {
   const lines = [
     '---',
-    comment1,
-    comment2,
-    format,
-    contract,
+    '# Generated session brief (D-357, D-359, D-364); do not edit. It is stale once any binding below changes.',
+    `# Check: ${commands.check}`,
+    `# Refresh: ${commands.write}`,
+    `brief_format: ${LANE_BRIEF_FORMAT}`,
+    `contract_version: ${BRIEF_CONTRACT_VERSION}`,
     `generated_at: ${quote(generatedAt)}`,
     `generated_by: ${quote(PACKAGE_VERSION)}`,
     ...fields,
@@ -472,6 +525,32 @@ function normalizeRemote(remote) {
     .replace(/^([^/:]+):(?!\d)/, '$1/')
     .replace(/\.git\/?$/, '')
     .replace(/\/+$/, '');
+}
+
+/**
+ * A `vibecompass brief` command for this lane with its root, lane, and (when
+ * one was named) source root spelled out, so following the advice never
+ * falls back to another root or fails lane selection.
+ */
+function briefCommand({ destinationRoot, laneId, requestedSource }, action) {
+  return [
+    'vibecompass brief',
+    '--root',
+    shellQuote(destinationRoot),
+    '--session',
+    shellQuote(laneId),
+    `--${action}`,
+    ...(requestedSource ? ['--source-root', shellQuote(requestedSource)] : []),
+  ].join(' ');
+}
+
+function shellQuote(value) {
+  const text = String(value);
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(text) ? text : `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+function formatAliasPair(pair) {
+  return `${pair.destination} -> ${pair.source ?? '(no match)'}`;
 }
 
 function describeSource(source) {

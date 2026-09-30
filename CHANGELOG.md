@@ -73,9 +73,15 @@
   digest of the canonical corpus it read, short hashes of the docs, decision
   entries, and notes it drew text from, the lane scratch it read (`handoff.md`
   bytes, the `session.yaml` fields it uses, the other active lanes), and the
-  repo alias map. The body is exactly what `vibecompass brief` prints for the
-  lane. Staleness is computed from the bindings, not stored: resume
-  bookkeeping (`resumed_at`, `resume_count`) never makes a brief stale.
+  repo alias map, plus ready-to-run check and refresh commands that keep the
+  root, lane, and source explicit. The body is exactly what
+  `vibecompass brief` prints for the lane. Staleness is computed from the
+  bindings, not stored: any hash, the session identity, or the alias map
+  differs, or the check cannot read what it needs; resume bookkeeping
+  (`resumed_at`, `resume_count`) never makes a brief stale. Memory that
+  cannot be read (invalid settings included) is a failed generation
+  (`generation: "failed"`; `brief --write` exits 1), while mandatory units
+  overflowing the budget is a successful `incomplete` brief.
 - `project.yaml` gains an optional `brief:` mapping (D-364): `enabled`, and
   `exclude`, a list of root-relative globs (`*`, `**`, `?`; case-insensitive)
   naming canonical documents every brief must never read. Excluded files are

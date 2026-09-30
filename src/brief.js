@@ -1099,6 +1099,9 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
     contract_version: BRIEF_CONTRACT_VERSION,
     status: status.status,
     status_reason: status.reason,
+    // Set when memory could not be read (the brief is `incomplete` for that
+    // reason); null for every brief built from memory, overflow included.
+    retrieval_error: selection?.retrievalError ?? null,
     task: context.input.task,
     inputs: {
       files: context.input.files,
