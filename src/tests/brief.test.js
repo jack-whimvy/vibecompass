@@ -215,12 +215,10 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
   assert.ok(clearer.units.some((unit) => unit.id === 'doc:architecture/billing/ledger.md'));
   const unmatched = clearer.gaps.find((gap) => gap.code === 'unmatched-terms');
   assert.deepEqual(unmatched.terms, ['clearer', 'friendlier']);
-  assert.match(renderBrief(clearer), /^- Gap: No memory unit mentions "clearer", "friendlier"; units below matched other task words only\.$/m);
-  // Mostly-unknown distinctive words keep the match narrow: every ranked unit shares at least three task words.
+  assert.match(renderBrief(clearer), /^- Gap: No keyword match for "clearer", "friendlier" in the fields the brief searches \(titles, Description, Retrieval guidance, Decision text\); other text may mention them\.$/m);
+  // Mostly-unknown distinctive words keep the match narrow: few units are packed, the rest are reads.
   assert.equal(clearer.selection.narrowed, true);
-  for (const unit of clearer.units.filter((candidate) => candidate.tier === 'ranked')) {
-    assert.ok(unit.matched_terms.length >= 3, `${unit.id} shares only ${unit.matched_terms.join(', ')}`);
-  }
+  assert.ok(clearer.units.filter((candidate) => candidate.tier === 'ranked').length <= 4);
 
   const sporadic = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Can you carefully investigate a sporadic failure in session lane selection?' });
   assert.notEqual(sporadic.status, 'no-match');
@@ -228,7 +226,35 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
 
   const klingon = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Add Klingon subtitles and a karaoke kiosk mode.' });
   assert.equal(klingon.status, 'no-match');
-  assert.match(renderBrief(klingon), /^- Gap: No memory unit mentions "Klingon", "subtitles", "karaoke", "kiosk", "mode"\.$/m);
+  assert.match(renderBrief(klingon), /^- Gap: No keyword match for "Klingon", "subtitles", "karaoke", "kiosk", "mode" in the fields the brief searches/m);
+});
+
+test('a narrow match keeps the top-scoring topic and lists the rest as reads (review R5)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  // An incidental decision shares three task words in its body; the real
+  // topic (the lanes doc) shares two, in its title and guidance.
+  await writeFile(
+    path.join(rootDir, 'decisions', 'incidental.md'),
+    '### D-300 — Credential cache\n**Timestamp:** 2026-01-10 10:00 UTC\n**Decision:** The credential cache makes the lookup and backend selection faster on repeat use.\n**Rationale:** Fixture.\n',
+  );
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Make the lane selection lookup noticeably faster and sturdier.' });
+  assert.notEqual(result.status, 'no-match');
+  assert.equal(result.selection.narrowed, true);
+  assert.ok(result.units.some((unit) => unit.id === 'doc:architecture/sync/lanes.md'), 'the lanes doc is packed');
+  const ranked = result.units.filter((unit) => unit.tier === 'ranked');
+  assert.ok(ranked.length <= 4);
+  for (const unit of result.omitted.filter((candidate) => candidate.omitted_reason === 'narrow-match')) {
+    assert.ok(result.follow_ups.some((entry) => entry.path === (unit.path ?? unit.members?.[0]?.path)), `${unit.id} is listed as a read`);
+  }
+});
+
+test('the unmatched-words gap reports the search, not absence from memory (review R6)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Explain D-106 tax display.' });
+  const markdown = renderBrief(result);
+  assert.match(markdown, /\*\*D-107\*\* \(declared: amends D-106 \(scoped: tax display\)\)/);
+  assert.doesNotMatch(markdown, /No memory unit mentions/);
+  assert.match(markdown, /^- Gap: No keyword match for "Explain", "display" in the fields the brief searches \(titles, Description, Retrieval guidance, Decision text\); other text may mention them\.$/m);
 });
 
 test('a structured-only partial supersession keeps its named part (review R2)', async (t) => {

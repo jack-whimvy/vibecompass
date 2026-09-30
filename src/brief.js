@@ -1,7 +1,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createKeywordIndex, queryTermOrigins, queryTerms } from './brief-keywords.js';
-import { BRIEF_MAX_COMPACTION, renderBrief, renderBriefUnit } from './brief-render.js';
+import { BRIEF_MAX_COMPACTION, renderBrief, renderBriefUnit, renderedFollowUpCount } from './brief-render.js';
 import { collectDeclaredSuccessors, parseDecisionEntries, scanDecisionReferences } from './decision-lineage.js';
 import { sha256Text } from './hash.js';
 import { resolveLaneMarkerContext, resolveLaneSelection, validateLaneId } from './lane-marker.js';
@@ -56,6 +56,7 @@ const CITATION_WEIGHT = 6;
 const NON_PROPAGATING_SECTIONS = new Set(['Review metadata', 'Involved files']);
 const DISTINCTIVE_TERM_LIMIT = 3;
 const STRONG_TOPIC_TERMS = 3;
+const NARROW_PACKED_UNITS = 4;
 const DISTINCTIVE_MAX_DOCUMENT_SHARE = 0.02;
 
 /**
@@ -130,6 +131,7 @@ export async function buildSessionBrief(options = {}) {
  * itself prints that number: iterate to the fixed point.
  */
 function measureBrief(result) {
+  result.render.follow_ups_shown = renderedFollowUpCount(result);
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const estimate = estimateBriefTokens(renderBrief(result));
     if (estimate === result.budget.estimated_tokens) return;
@@ -398,7 +400,7 @@ function selectCandidates(context, loaded, task) {
       topKeyword < MIN_KEYWORD_SCORE ||
       (distinctiveTermsMostlyAbsent(distinctive, index) && strongestOverlap < STRONG_TOPIC_TERMS));
 
-  // Task words that occur nowhere in the indexed memory are disclosed, never guessed at.
+  // Task words with no keyword match in the searched fields are disclosed, never guessed at.
   const absent = terms.filter((term) => index.documentFrequency(term) === 0);
   if (absent.length > 0) {
     const origins = queryTermOrigins(`${task} ${pathWords}`);
@@ -406,9 +408,10 @@ function selectCandidates(context, loaded, task) {
     context.gaps.push({
       code: 'unmatched-terms',
       terms: absent,
-      // Names the unknown words without asserting that the units shown bear
-      // on the task: they matched other words only.
-      message: `No memory unit mentions ${words.slice(0, 6).map((word) => `"${word}"`).join(', ')}${words.length > 6 ? ` (+${words.length - 6} more)` : ''}${noMatch ? '.' : '; units below matched other task words only.'}`,
+      // Reports the search, not absence from memory: the index covers titles,
+      // Description, Retrieval guidance, and Decision text only, and the
+      // units shown matched other task words.
+      message: `No keyword match for ${words.slice(0, 6).map((word) => `"${word}"`).join(', ')}${words.length > 6 ? ` (+${words.length - 6} more)` : ''} in the fields the brief searches (titles, Description, Retrieval guidance, Decision text); other text may mention them.`,
     });
   }
 
@@ -416,17 +419,21 @@ function selectCandidates(context, loaded, task) {
     return { noMatch: true, terms, distinctive, docs: [], namedDecisions: [], rankedDecisions: [], notes: [], relations, decisionById, decisionEntries, readModel };
   }
 
-  // When the task's distinctive words are mostly unknown but some unit still
-  // shares STRONG_TOPIC_TERMS of its words, the match is kept narrow: only
-  // those strong units (or mechanical evidence) are candidates, so a weak
-  // match never fills the budget with coincidental keyword hits.
-  const narrow = distinctiveTermsMostlyAbsent(distinctive, index);
-  const strongEnough = (candidate) => !narrow || (keywordScores.get(candidate.id)?.matched.length ?? 0) >= STRONG_TOPIC_TERMS;
+  // When the task's distinctive words are mostly unknown and nothing but
+  // keywords selected the memory, confidence is low: the match is kept
+  // narrow. Candidates are chosen and ranked as usual; only the top
+  // NARROW_PACKED_UNITS ranked units are packed and the rest are listed as
+  // follow-up reads, so the top-scoring topic is never dropped for a raw
+  // overlap count and a weak match does not fill the budget.
+  const narrow =
+    distinctiveTermsMostlyAbsent(distinctive, index) &&
+    docs.every((doc) => doc.evidenceScore === 0) &&
+    namedDecisionIds.size === 0;
 
   // Docs with mechanical evidence (they cover an input file or claim, the lane
   // declares them, or they belong to a named feature) skip the relative floor.
   const selectedDocs = pickTop(
-    docs.filter((doc) => doc.evidenceScore > 0 || (doc.keywordScore >= MIN_KEYWORD_SCORE && strongEnough(doc))),
+    docs.filter((doc) => doc.evidenceScore > 0 || doc.keywordScore >= MIN_KEYWORD_SCORE),
     MAX_DOC_CANDIDATES,
     (doc) => doc.evidenceScore > 0,
   );
@@ -478,9 +485,7 @@ function selectCandidates(context, loaded, task) {
     decisions.filter(
       (decision) =>
         !namedDecisionIds.has(decision.decisionId) &&
-        (narrow
-          ? strongEnough(decision)
-          : decision.keywordScore >= MIN_KEYWORD_SCORE || decision.citationBoost > 0),
+        (decision.keywordScore >= MIN_KEYWORD_SCORE || decision.citationBoost > 0),
     ),
     MAX_DECISION_CANDIDATES,
   );
@@ -600,7 +605,8 @@ function buildUnits(context, selection) {
     })),
   ].sort((left, right) => right.relative - left.relative || left.unit.id.localeCompare(right.unit.id));
   for (const [index, entry] of ranked.entries()) {
-    units.push({ ...entry.unit, rank: index + 1 });
+    const withheld = selection.narrow && index >= NARROW_PACKED_UNITS;
+    units.push({ ...entry.unit, rank: index + 1, ...(withheld ? { withheld: true } : {}) });
   }
 
   for (const note of selection.notes) units.push(buildNoteUnit(note));
@@ -876,9 +882,14 @@ function assemble(context, selection, units, capacity, compaction = 0) {
   const covered = [];
   let used = 0;
 
-  for (const { companions = [], ...unit } of units) {
+  for (const { companions = [], withheld = false, ...unit } of units) {
     if (unit.kind === 'lineage' && unit.members.every((member) => emitted.has(member.decision_id))) {
       covered.push(unit.id);
+      continue;
+    }
+    if (withheld) {
+      const tokens = estimateBriefTokens(renderBriefUnit(unit, { emittedDecisions: emitted }));
+      omitted.push({ ...unit, estimated_tokens: tokens, omitted_reason: 'narrow-match' });
       continue;
     }
 
@@ -910,7 +921,7 @@ function assemble(context, selection, units, capacity, compaction = 0) {
         ...unit,
         estimated_tokens: tokens,
         ...(group.length > 1 ? { companion_ids: group.slice(1).map((member) => member.id) } : {}),
-        ...(companionsTooHeavy ? { omitted_reason: 'mandatory companions exceed the per-doc share of the budget' } : {}),
+        omitted_reason: companionsTooHeavy ? 'companions-exceed-allowance' : 'budget',
       });
     }
   }
@@ -964,7 +975,7 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
     follow_up_cap: BRIEF_FOLLOW_UP_CAP,
     gaps: context.gaps,
     warnings: context.warnings,
-    render: { compaction },
+    render: { compaction, follow_ups_shown: 0 },
   };
 }
 
@@ -986,7 +997,11 @@ function decideStatus(selection, omitted) {
     };
   }
   if (omitted.length > 0) {
-    return { status: 'partial', reason: `${plural(omitted.length, 'ranked or optional unit')} did not fit the budget` };
+    const withheld = omitted.filter((unit) => unit.omitted_reason === 'narrow-match').length;
+    const parts = [];
+    if (omitted.length > withheld) parts.push(`${plural(omitted.length - withheld, 'ranked or optional unit')} did not fit the budget`);
+    if (withheld > 0) parts.push(`${plural(withheld, 'lower-confidence match', 'lower-confidence matches')} listed as reads only (narrow match)`);
+    return { status: 'partial', reason: parts.join('; ') };
   }
   return { status: 'complete', reason: 'every selected unit fits the budget' };
 }
@@ -1020,10 +1035,11 @@ function buildFollowUps(selection, context, included, omitted) {
   }
 
   for (const unit of omitted.filter((candidate) => candidate.tier === 'ranked')) {
+    const prefix = unit.omitted_reason === 'narrow-match' ? 'narrow match, read only: ' : '';
     if (unit.kind === 'doc') {
-      entries.push({ priority: 'ranked', path: unit.path, heading: null, reason: shortReason(unit.reasons[0] ?? 'ranked doc') });
+      entries.push({ priority: 'ranked', path: unit.path, heading: null, reason: shortReason(`${prefix}${unit.reasons[0] ?? 'ranked doc'}`) });
     } else {
-      entries.push(...lineageReads(unit, 'ranked'));
+      entries.push(...lineageReads(unit, 'ranked', prefix));
     }
   }
 
@@ -1068,7 +1084,7 @@ function buildFollowUps(selection, context, included, omitted) {
   });
 }
 
-function lineageReads(unit, priority) {
+function lineageReads(unit, priority, prefix = '') {
   return [...unit.members]
     .sort((left, right) => right.decision_id - left.decision_id)
     .map((member) => ({
@@ -1078,7 +1094,7 @@ function lineageReads(unit, priority) {
       heading: formatId(member.decision_id),
       reason:
         member.role === 'root'
-          ? shortReason(unit.reasons[0] ? `${unit.tier}: ${unit.reasons[0]}` : `${unit.tier} decision`)
+          ? shortReason(`${prefix}${unit.reasons[0] ? `${unit.tier}: ${unit.reasons[0]}` : `${unit.tier} decision`}`)
           : `declared successor of ${formatId(unit.root_decision_id)} (${member.successor_relations.join(', ')})`,
     }));
 }
@@ -1355,8 +1371,8 @@ function shortReason(value) {
   return points.length <= 110 ? text : `${points.slice(0, 109).join('')}…`;
 }
 
-function plural(count, noun) {
-  return `${count} ${noun}${count === 1 ? '' : 's'}`;
+function plural(count, noun, pluralNoun = `${noun}s`) {
+  return `${count} ${count === 1 ? noun : pluralNoun}`;
 }
 
 function round(value) {

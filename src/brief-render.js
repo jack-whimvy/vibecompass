@@ -114,12 +114,17 @@ export function renderBriefUnit(unit, options = {}) {
 }
 
 function statusSentence(result, frame) {
-  const omittedCount = result.omitted.length;
+  const withheld = result.omitted.filter((unit) => unit.omitted_reason === 'narrow-match').length;
+  const overflow = result.omitted.length - withheld;
   switch (result.status) {
     case 'complete':
       return 'every selected unit fits the budget.';
-    case 'partial':
-      return `${omittedCount} lower-tier unit${omittedCount === 1 ? '' : 's'} did not fit; ${omittedCount === 1 ? 'it is' : 'they are'} listed under Follow-up reads.`;
+    case 'partial': {
+      const parts = [];
+      if (overflow > 0) parts.push(`${overflow} lower-tier unit${overflow === 1 ? '' : 's'} did not fit`);
+      if (withheld > 0) parts.push(`${withheld} lower-confidence match${withheld === 1 ? '' : 'es'} ${withheld === 1 ? 'is' : 'are'} shown as reads only, because most of the task's distinctive words had no keyword match`);
+      return `${parts.join('; ')}; see Follow-up reads.`;
+    }
     case 'no-match':
       return 'no architecture doc or decision matched this task. Nothing in memory is presented as relevant; say so in your plan, and read the orientation overview if the task needs broader context.';
     default:
@@ -143,17 +148,30 @@ function renderHeader(result, frame) {
     lines.push(`- Orientation: \`${result.orientation.path}\` — the whole-project overview; read it first when orienting.`);
   }
   for (const gap of result.gaps) lines.push(`- Gap: ${excerpt(gap.message, frame.gap)}`);
+  const headerElided =
+    files.slice(0, frame.files).some((file) => elide(file, frame.file) !== file) || elide(result.source.root_dir, frame.root) !== result.source.root_dir;
+  if (headerElided) lines.push('- Shortened values (…) are exact in `--json` (`inputs`, `source`).');
   return lines;
 }
 
+/** How many follow-up reads the rendered brief lists (the cap, tightened by the frame level). */
+export function renderedFollowUpCount(result) {
+  const frame = FRAME_LIMITS[Math.min(result.render?.compaction ?? 0, BRIEF_MAX_COMPACTION)];
+  return Math.min(result.follow_ups.length, result.follow_up_cap, frame.followUps);
+}
+
 function renderFollowUpList(result, frame) {
-  const shown = result.follow_ups.slice(0, Math.min(result.follow_up_cap, frame.followUps));
+  const shown = result.follow_ups.slice(0, renderedFollowUpCount(result));
+  let elided = false;
   const lines = shown.map((entry) => {
     const heading = entry.heading ? ` › ${excerpt(entry.heading, frame.followUpHeading)}` : '';
-    return `${entry.rank}. \`${elide(entry.path, frame.followUpPath)}\`${heading} — ${excerpt(entry.reason, frame.followUpReason)}`;
+    const shownPath = elide(entry.path, frame.followUpPath);
+    if (shownPath !== entry.path) elided = true;
+    return `${entry.rank}. \`${shownPath}\`${heading} — ${excerpt(entry.reason, frame.followUpReason)}`;
   });
   const hidden = result.follow_ups.length - shown.length;
   if (hidden > 0) lines.push(`+${hidden} more (full list in \`--json\`)`);
+  if (elided) lines.push('_Paths shortened with … are exact in `--json` (`follow_ups[].path`)._');
   return lines;
 }
 

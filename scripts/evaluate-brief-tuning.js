@@ -110,21 +110,23 @@ const EXPECTED = {
 };
 
 // Unlabeled paraphrases run after the 12 tasks and are reported separately
-// (review pass 1, R1): `match` cases name a topic memory covers with
-// unfamiliar modifiers and must not come back `no-match`; `report` cases are
-// probes with no label.
+// (review passes 1 and 2). `match` cases name a topic memory covers, phrased
+// with unfamiliar modifiers: each must not come back `no-match` AND must
+// surface at least one of the builder-expected sources (A: doc, D: decision)
+// as a unit or rendered follow-up read. These expectations are the builder's
+// judgment, not evaluation labels. `report` cases are unlabeled probes.
 const EXTRA_CASES = [
-  ['R1a', 'match', 'Make hosted refresh allowance error messages clearer and friendlier.'],
-  ['R1b', 'match', 'Can you carefully investigate a sporadic failure in session lane selection?'],
-  ['P1', 'match', 'Tidy up the confusing wording in the docs-review output parser errors.'],
-  ['P2', 'match', 'Why does the MCP read tool sometimes time out so slowly?'],
-  ['P3', 'match', 'Explain the Solo plan price to a skeptical customer in simple words.'],
-  ['P4', 'match', 'Make the lane marker lookup noticeably faster and sturdier.'],
-  ['P5', 'match', 'Honestly the credential store feels flaky on Windows laptops.'],
-  ['X1', 'report', 'Add dark mode to the marketing homepage with a toggle.'],
-  ['X2', 'report', 'Send Slack notifications whenever a new decision is appended.'],
-  ['X3', 'report', 'Rewrite the vibecompass CLI in Rust for faster startup.'],
-  ['X4', 'report', 'Add SAML single sign-on for enterprise customers.'],
+  ['R1a', 'match', 'Make hosted refresh allowance error messages clearer and friendlier.', ['A:platform/billing/entitlements-and-usage-ledger.md', 'A:platform/billing/subscription-offer-and-ledger.md', 'D:318']],
+  ['R1b', 'match', 'Can you carefully investigate a sporadic failure in session lane selection?', ['D:277', 'D:353', 'A:platform/project-memory/multi-session-lanes.md']],
+  ['P1', 'match', 'Tidy up the confusing wording in the docs-review output parser errors.', ['A:platform/project-memory/docs-review-output-contract.md']],
+  ['P2', 'match', 'Why does the MCP read tool sometimes time out so slowly?', ['A:mcp-server/context-delivery/read-tools.md', 'A:mcp-server/context-delivery/resilience.md']],
+  ['P3', 'match', 'Explain the Solo plan price to a skeptical customer in simple words.', ['D:318', 'A:platform/billing/subscription-offer-and-ledger.md', 'A:platform/billing/subscription-build-plan.md']],
+  ['P4', 'match', 'Make the lane marker lookup noticeably faster and sturdier.', ['D:280', 'A:platform/project-memory/multi-session-lanes.md']],
+  ['P5', 'match', 'Honestly the credential store feels flaky on Windows laptops.', ['D:355', 'A:platform/project-memory/sync-credentials.md']],
+  ['X1', 'report', 'Add dark mode to the marketing homepage with a toggle.', []],
+  ['X2', 'report', 'Send Slack notifications whenever a new decision is appended.', []],
+  ['X3', 'report', 'Rewrite the vibecompass CLI in Rust for faster startup.', []],
+  ['X4', 'report', 'Add SAML single sign-on for enterprise customers.', []],
 ];
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -184,13 +186,21 @@ printReport(rows);
 
 console.log('');
 console.log('Paraphrase probes (unlabeled; reported separately):');
-for (const [id, expectation, taskText] of EXTRA_CASES) {
+for (const [id, expectation, taskText, expected] of EXTRA_CASES) {
   const root = await makeRunCopy({ id: `extra-${id}`, task: taskText, files: [] });
   const result = await buildSessionBrief({ rootDir: root, laneId: 'eval', task: taskText });
   const gap = result.gaps.find((entry) => entry.code === 'unmatched-terms');
-  const verdict = expectation === 'match' ? (result.status === 'no-match' ? 'FAIL (no-match)' : 'ok') : 'report';
+  const found = expected.map((passage) => ({ passage, where: locate(result, passage) })).filter((entry) => entry.where !== 'missing');
+  const verdict =
+    expectation !== 'match'
+      ? 'report'
+      : result.status === 'no-match'
+        ? 'FAIL (no-match)'
+        : found.length === 0
+          ? 'FAIL (expected source missing)'
+          : `ok (${found.map((entry) => `${entry.passage.replace(/^A:.*\//, '').replace(/^D:/, 'D-')} ${entry.where}`).join(', ')})`;
   const firstUnits = result.units.filter((unit) => unit.kind !== 'lane').slice(0, 3).map((unit) => unit.path ?? unit.id).join(', ');
-  console.log(`- ${id} [${expectation}] ${result.status} — ${verdict}; unmatched: ${gap ? gap.terms.join(', ') : 'none'}; first units: ${firstUnits || 'none'}`);
+  console.log(`- ${id} [${expectation}] ${result.status}${result.selection.narrowed ? ' (narrow)' : ''} — ${verdict}; unmatched: ${gap ? gap.terms.join(', ') : 'none'}; first units: ${firstUnits || 'none'}`);
 }
 
 function parseTuningTasks(markdown) {
@@ -225,7 +235,7 @@ async function makeRunCopy(task) {
 
 function locate(result, passage) {
   const [kind, value] = passage.split(':');
-  const shown = result.follow_ups.slice(0, result.follow_up_cap);
+  const shown = result.follow_ups.slice(0, result.render?.follow_ups_shown ?? result.follow_up_cap);
   if (kind === 'A') {
     const docPath = `architecture/${value}`;
     if (result.units.some((unit) => unit.kind === 'doc' && unit.path === docPath)) return 'included';
