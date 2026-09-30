@@ -406,7 +406,9 @@ function selectCandidates(context, loaded, task) {
     context.gaps.push({
       code: 'unmatched-terms',
       terms: absent,
-      message: `No memory unit mentions ${words.slice(0, 6).map((word) => `"${word}"`).join(', ')}${words.length > 6 ? ` (+${words.length - 6} more)` : ''}; the brief covers the rest of the task only.`,
+      // Names the unknown words without asserting that the units shown bear
+      // on the task: they matched other words only.
+      message: `No memory unit mentions ${words.slice(0, 6).map((word) => `"${word}"`).join(', ')}${words.length > 6 ? ` (+${words.length - 6} more)` : ''}${noMatch ? '.' : '; units below matched other task words only.'}`,
     });
   }
 

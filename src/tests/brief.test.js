@@ -215,7 +215,7 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
   assert.ok(clearer.units.some((unit) => unit.id === 'doc:architecture/billing/ledger.md'));
   const unmatched = clearer.gaps.find((gap) => gap.code === 'unmatched-terms');
   assert.deepEqual(unmatched.terms, ['clearer', 'friendlier']);
-  assert.match(renderBrief(clearer), /^- Gap: No memory unit mentions "clearer", "friendlier"; the brief covers the rest of the task only\.$/m);
+  assert.match(renderBrief(clearer), /^- Gap: No memory unit mentions "clearer", "friendlier"; units below matched other task words only\.$/m);
   // Mostly-unknown distinctive words keep the match narrow: every ranked unit shares at least three task words.
   assert.equal(clearer.selection.narrowed, true);
   for (const unit of clearer.units.filter((candidate) => candidate.tier === 'ranked')) {
@@ -228,6 +228,7 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
 
   const klingon = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Add Klingon subtitles and a karaoke kiosk mode.' });
   assert.equal(klingon.status, 'no-match');
+  assert.match(renderBrief(klingon), /^- Gap: No memory unit mentions "Klingon", "subtitles", "karaoke", "kiosk", "mode"\.$/m);
 });
 
 test('a structured-only partial supersession keeps its named part (review R2)', async (t) => {
