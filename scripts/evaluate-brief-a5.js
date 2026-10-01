@@ -302,9 +302,12 @@ async function auditTranscript(stdout, root) {
   const result = events.find((event) => event.type === 'result');
   const toolUses = [];
   let resultChars = 0;
+  let turn = -1;
   for (const event of events) {
     if (event.type === 'assistant') {
-      for (const block of event.message.content) if (block.type === 'tool_use') toolUses.push({ name: block.name, input: block.input });
+      const blocks = event.message.content.filter((block) => block.type === 'tool_use');
+      if (blocks.length > 0 && event.message.id !== toolUses.at(-1)?.message) turn += 1;
+      for (const block of blocks) toolUses.push({ name: block.name, input: block.input, message: event.message.id, turn });
     } else if (event.type === 'user') {
       for (const block of event.message.content ?? []) {
         if (block?.type !== 'tool_result') continue;
@@ -324,6 +327,8 @@ async function auditTranscript(stdout, root) {
     }
     if (/recall-evaluation/i.test(JSON.stringify(use.input))) violations.push(`${use.name} names an evaluation file`);
   }
+  const order = await auditStartupOrder(toolUses, realRoot);
+  violations.push(...order.deviations);
   if (!['Read', 'Grep', 'Glob'].includes(init?.tools?.[0]) || init.tools.some((tool) => !['Read', 'Grep', 'Glob'].includes(tool))) violations.push(`unexpected tools ${init?.tools?.join(',')}`);
   if (init?.model !== MODEL) violations.push(`model ${init?.model}`);
   if ((result?.permission_denials ?? []).length > 0) violations.push(`${result.permission_denials.length} permission denials`);
@@ -335,6 +340,7 @@ async function auditTranscript(stdout, root) {
     tool_calls: toolUses.length,
     tool_calls_by_name: toolUses.reduce((counts, use) => ({ ...counts, [use.name]: (counts[use.name] ?? 0) + 1 }), {}),
     reads,
+    startup_reads: order.firstReads,
     tool_result_chars: resultChars,
     tool_result_tokens_est: Math.ceil(resultChars / 4),
     duration_ms: result?.duration_ms ?? null,
@@ -351,6 +357,40 @@ async function auditTranscript(stdout, root) {
     report: result?.result ?? '',
     violations,
   };
+}
+
+/**
+ * Startup read order (recall-evaluation.md › Baseline protocol): the turn in
+ * which each startup file is first read. Reads issued in the same turn are
+ * unordered; a prescribed file first read in a later turn than one that should
+ * follow it is a deviation, and so is a startup file never read.
+ */
+async function auditStartupOrder(toolUses, realRoot) {
+  const notes = (await readdir(path.join(realRoot, 'sessions')))
+    .map((name) => ({ name, match: name.match(/^(\d{4}-\d{2}-\d{2})-(\d+)-.*\.md$/) }))
+    .filter((entry) => entry.match)
+    .sort((left, right) => left.match[1].localeCompare(right.match[1]) || Number(left.match[2]) - Number(right.match[2]));
+  const latest = `sessions/${notes.at(-1).name}`;
+  const prescribed = ['CLAUDE.md', 'project.yaml', latest, 'sessions/active/index.yaml', 'sessions/active/eval/wip.md', 'sessions/active/eval/handoff.md', 'sessions/active/eval/brief.md'];
+  const exists = await Promise.all(prescribed.map((file) => readFile(path.join(realRoot, file)).then(() => true, () => false)));
+  const expected = prescribed.filter((_, index) => exists[index]);
+  const firstTurn = {};
+  for (const use of toolUses) {
+    if (use.name !== 'Read' || !use.input?.file_path) continue;
+    const relative = path.relative(realRoot, await safeRealpath(use.input.file_path));
+    if (expected.includes(relative) && firstTurn[relative] === undefined) firstTurn[relative] = use.turn;
+  }
+  const deviations = [];
+  const missing = expected.filter((file) => firstTurn[file] === undefined);
+  if (missing.length > 0) deviations.push(`startup files never read: ${missing.join(', ')}`);
+  const late = [];
+  expected.forEach((file, index) => {
+    for (const later of expected.slice(index + 1)) {
+      if (firstTurn[file] !== undefined && firstTurn[later] !== undefined && firstTurn[later] < firstTurn[file]) late.push(`${path.basename(later)} before ${file === latest ? 'the latest note' : path.basename(file)}`);
+    }
+  });
+  if (late.length > 0) deviations.push(`startup order: ${late.join('; ')}`);
+  return { firstReads: Object.fromEntries(expected.map((file) => [file === latest ? 'latest-note' : file, firstTurn[file] ?? null])), deviations };
 }
 
 // ------------------------------------------------------------------ grade
@@ -537,6 +577,8 @@ async function score() {
     ...parseLabels(await readFile(path.join(outDir, 'labels', 'recall-evaluation.md'), 'utf8')),
     ...parseLabels(await readFile(path.join(outDir, 'labels', 'recall-evaluation-heldout.md'), 'utf8')),
   ];
+  // Adjudications override individual grader verdicts; the raw grades stay untouched in grading/*.json.
+  const adjudications = await readAdjudications();
   const rows = [];
   for (const task of manifest.tasks) {
     const label = labels.find((entry) => entry.id === task.id);
@@ -549,12 +591,18 @@ async function score() {
       const name = Object.entries(reportGrade.order).find(([, value]) => value === arm)[0];
       const graded = reportGrade.graded[name];
       const clauseMap = gradedClauseMap(label, graded.clauses);
+      const applied = adjudications.filter((entry) => entry.task === task.id && entry.arm === arm);
+      for (const entry of applied) {
+        const key = `${entry.item}:${entry.clause}`;
+        clauseMap.set(key, { ...(clauseMap.get(key) ?? { item: entry.item, clause: entry.clause }), stated: entry.stated, attributed: entry.attributed, evidence: entry.evidence ?? '', adjudicated: entry.reason });
+      }
       const missingClauses = label.clauses.filter((clause) => !clauseMap.has(`${clause.item}:${clause.clause}`)).map((clause) => `${clause.item}:${clause.clause}`);
       arms[arm] = {
         run: entry.id,
         metrics: { ...metrics, report: undefined },
         clauses: label.clauses.map((clause) => ({ ...clause, ...(clauseMap.get(`${clause.item}:${clause.clause}`) ?? { stated: false, attributed: false, evidence: '' }) })),
         missing_clauses: missingClauses,
+        adjudications: applied,
         items: scoreItems(label, clauseMap),
         forbidden: graded.forbidden,
         report_violations: graded.forbidden.filter((entry) => entry.violated).map((entry) => entry.id),
@@ -782,6 +830,15 @@ async function safeRealpath(target) {
     return await realpath(target);
   } catch {
     return path.resolve(target);
+  }
+}
+
+async function readAdjudications() {
+  try {
+    return JSON.parse(await readFile(path.join(outDir, 'grading', 'adjudications.json'), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
   }
 }
 
