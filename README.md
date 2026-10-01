@@ -263,8 +263,10 @@ maintenance tied to the current lane.
 task should start from, and packs them into a short markdown brief with a
 `complete`, `partial`, `incomplete`, or `no-match` status and a list of
 follow-up reads. It runs locally and deterministically: no network, no model,
-no account. Decisions always appear together with any decision that replaces
-or amends them, and the brief never claims that a decision governs your task.
+no account. A decision always appears together with any later decision whose
+own text explicitly declares that it replaces or amends it, and the brief never
+claims that a decision governs your task. It cannot spot a replacement that is
+only implied, so read the follow-up list too.
 
 The brief in a session lane is an experiment you turn on (D-368):
 
@@ -280,11 +282,12 @@ planning. Without it, nothing changes, and
 `vibecompass brief --session <lane-id> --write` still briefs one lane on
 request. `brief.exclude` lists files no brief may read.
 
-The brief is opt-in because, in the project's own evaluation, agents with a
-brief found about as much of the relevant memory as agents without one, and
-added no false claims. But they missed some facts the others found, once after
-the brief left out the key document. Treat a brief as a starting point, not
-the whole answer.
+The brief is opt-in because of the project's own evaluation, which did not
+fully follow its protocol. Agents with a brief found about as much of the
+relevant memory as agents without one, and made none of the specific false
+authority claims the evaluation checked for. But they missed nine facts the
+others found, in one case after the brief left out the key document. Treat a
+brief as a starting point, not the whole answer.
 
 ## Hosted Sync
 

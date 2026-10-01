@@ -2,9 +2,11 @@
 
 ## 0.16.0 - 2026-09-30
 
-The session brief ships as an opt-in experiment (D-368). The baseline-versus-brief
-evaluation met its recall targets and safety gates but not its no-regression target,
-so `start-session` and `continue-session` write a lane brief only when
+The session brief ships as an opt-in experiment (D-368). In a baseline-versus-brief
+evaluation that did not fully follow its own protocol, the brief arm met the numerical
+recall targets and made none of the labeled forbidden authority claims, but lost nine
+facts that agents without a brief found. That does not support turning it on by
+default, so `start-session` and `continue-session` write a lane brief only when
 `project.yaml` sets `brief.enabled: true`. `vibecompass brief` works on request
 either way.
 

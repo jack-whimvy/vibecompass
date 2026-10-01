@@ -3326,7 +3326,7 @@ function usageText() {
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
     '  --json                               Print the resume result (lane, paths, runtime, other lanes, brief, warnings) as JSON',
-    '  --no-brief                           Leave the lane brief as it is (default: keep a current brief, regenerate a missing or stale one)',
+    '  --no-brief                           Leave the lane brief as it is; with project.yaml brief.enabled: true (opt-in, D-368) resume keeps a current brief and regenerates a missing or stale one',
     '  --source-root <path>                 D-255 dual-root dogfood: build the brief from this memory root\'s matching lane (same id, session date, and number) and write it only into this lane; the source root is only read',
     '  --source-session <lane-id>           With --source-root: the source lane id, which must equal the resumed lane',
     '',
