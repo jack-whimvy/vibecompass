@@ -274,9 +274,12 @@ export async function refreshLaneBriefForLifecycle(options = {}) {
     if (options.disabled === true) {
       return { state: 'off', reason: '--no-brief', path: briefPath, warnings: [] };
     }
+    // Opt-in (D-368): only an explicit `brief.enabled: true` generates. Invalid
+    // settings still go on to fail closed as a disclosed incomplete brief.
     const settings = await readBriefSettingsForRoot(rootDir);
-    if (settings.problems.length === 0 && settings.enabled === false) {
-      return { state: 'off', reason: 'project.yaml brief.enabled: false', path: briefPath, warnings: [] };
+    if (settings.problems.length === 0 && settings.enabled !== true) {
+      const reason = settings.enabledDeclared ? 'project.yaml brief.enabled: false' : 'opt-in; project.yaml does not set brief.enabled: true';
+      return { state: 'off', reason, path: briefPath, warnings: [] };
     }
 
     let previous = null;

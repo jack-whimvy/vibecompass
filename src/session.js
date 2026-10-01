@@ -399,7 +399,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
   });
-  // D-359/D-364: the default-on lane brief is written only after every
+  // D-359/D-364/D-368: the opt-in lane brief is written only after every
   // lifecycle write succeeded, still inside the memory-root lock; it never
   // throws, so a brief failure cannot overturn the start.
   const brief = await refreshLaneBriefForLifecycle({

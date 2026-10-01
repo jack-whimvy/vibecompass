@@ -3,9 +3,9 @@ import path from 'node:path';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 /**
- * `project.yaml` `brief:` settings (D-364): `enabled` turns default lifecycle
- * generation off, and `exclude` names canonical documents the session brief
- * must never read. Exclusion fails closed: a malformed or unknown setting is a
+ * `project.yaml` `brief:` settings (D-364, D-368): `enabled: true` opts a root
+ * into lifecycle generation (it is off by default), and `exclude` names
+ * canonical documents the session brief must never read. Exclusion fails closed: a malformed or unknown setting is a
  * problem that stops the brief from reading any canonical document, because a
  * silent fallback would expose exactly the files the setting exists to hide.
  */
@@ -18,7 +18,7 @@ const UNSUPPORTED_GLOB_CHARACTERS = /[[\]{}\\]/;
  * settings plus `problems`; any problem means the settings must not be used.
  */
 export function validateBriefSettings(value) {
-  const settings = { enabled: true, exclude: [], problems: [] };
+  const settings = { enabled: false, enabledDeclared: false, exclude: [], problems: [] };
   if (value === undefined || value === null) {
     return settings;
   }
@@ -37,6 +37,7 @@ export function validateBriefSettings(value) {
   if (value.enabled !== undefined) {
     if (typeof value.enabled === 'boolean') {
       settings.enabled = value.enabled;
+      settings.enabledDeclared = true;
     } else {
       settings.problems.push('"brief.enabled" must be true or false');
     }
@@ -124,7 +125,8 @@ export async function readBriefSettingsForRoot(rootDir) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
-      enabled: true,
+      enabled: false,
+      enabledDeclared: false,
       exclude: [],
       problems: [`project.yaml could not be read (${message.replace(/\s+/g, ' ').slice(0, 200)})`],
       repos: [],

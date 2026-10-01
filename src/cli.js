@@ -3297,7 +3297,7 @@ function usageText() {
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
-    '  --no-brief                           Skip the default lane brief (sessions/active/<lane-id>/brief.md; D-359, D-364); project.yaml brief.enabled: false turns it off for every lane',
+    '  --no-brief                           Skip the lane brief for this command (sessions/active/<lane-id>/brief.md; D-359, D-364); lifecycle commands write it only when project.yaml sets brief.enabled: true (opt-in, D-368)',
     '',
     'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',

@@ -2076,6 +2076,9 @@ test('runCli supports continue-session (text and --json) and list-sessions --jso
     assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'lane-a', '--working-on', 'Lane A.', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
     assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'lane-b', '--working-on', 'Lane B.', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
     assert.match(stderr.join(''), /Warning: 1 lane is already active \(lane-a\)/);
+    // The lifecycle brief is opt-in (D-368): an init'd root starts with it off.
+    assert.match(stdout.join(''), /^Brief: off \(opt-in; project\.yaml does not set brief\.enabled: true\)$/m);
+    await writeFile(path.join(rootDir, 'project.yaml'), `${await readFile(path.join(rootDir, 'project.yaml'), 'utf8')}brief:\n  enabled: true\n`);
 
     await assert.rejects(
       runCli(['continue-session', '--root', rootDir], io, { cwd: tempDir }),

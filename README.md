@@ -143,15 +143,16 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # start-session --id <existing-lane> fails closed and points at continue-session.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
 
-# Session brief in the lane (D-359, D-364): start-session and continue-session
-# write sessions/active/<lane-id>/brief.md by default — the memory the lane's
-# task should start from, with a YAML header binding the inputs it read.
-# continue-session keeps a current brief and regenerates a stale one; a brief
-# failure is a warning, never a failed start or resume. --no-brief or
-# project.yaml `brief: { enabled: false }` turns it off; `brief.exclude` lists
-# root-relative globs no brief may read.
+# Session brief in the lane (D-359, D-364), opt-in (D-368): with
+# project.yaml `brief: { enabled: true }`, start-session and continue-session
+# write sessions/active/<lane-id>/brief.md — the memory the lane's task should
+# start from, with a YAML header binding the inputs it read. continue-session
+# keeps a current brief and regenerates a stale one; a brief failure is a
+# warning, never a failed start or resume. Without the setting nothing is
+# written, and --no-brief skips it for one command. brief --write briefs any
+# lane on request; `brief.exclude` lists root-relative globs no brief may read.
+npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --write   # write or regenerate it
 npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --check   # current or stale, and why
-npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --write   # regenerate it
 
 # Optional git binding for a lane (D-281): create/reuse a branch in each bound
 # repo; --worktree provisions per-repo worktrees under
@@ -255,6 +256,35 @@ workflow files, updating handoffs, and applying reviewed changes. Use
 `docs review` for the broad baseline and scoped deepening work; use
 `docs update` / `vibecompass docs-update` for ordinary session-delta
 maintenance tied to the current lane.
+
+## Session Brief (opt-in)
+
+`vibecompass brief` picks the architecture docs, decisions, and session notes a
+task should start from, and packs them into a short markdown brief with a
+`complete`, `partial`, `incomplete`, or `no-match` status and a list of
+follow-up reads. It runs locally and deterministically: no network, no model,
+no account. Decisions always appear together with any decision that replaces
+or amends them, and the brief never claims that a decision governs your task.
+
+The brief in a session lane is an experiment you turn on (D-368):
+
+```yaml
+# .compass/project.yaml
+brief:
+  enabled: true
+```
+
+With it on, `start-session` and `continue-session` write
+`sessions/active/<lane-id>/brief.md`, and your AI tool reads it before
+planning. Without it, nothing changes, and
+`vibecompass brief --session <lane-id> --write` still briefs one lane on
+request. `brief.exclude` lists files no brief may read.
+
+The brief is opt-in because, in the project's own evaluation, agents with a
+brief found about as much of the relevant memory as agents without one, and
+added no false claims. But they missed some facts the others found, once after
+the brief left out the key document. Treat a brief as a starting point, not
+the whole answer.
 
 ## Hosted Sync
 

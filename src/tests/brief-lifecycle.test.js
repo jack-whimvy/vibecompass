@@ -24,7 +24,9 @@ const CAN_LOCK_FILES = process.platform !== 'win32' && process.getuid?.() !== 0;
  * file or directory unreadable for the rest of the test (restored before
  * cleanup), so a read of it fails loudly.
  */
-async function makeWorkspace(t, { prefix = 'vibecompass-brief-life-', brief = null, repos = null, laneTmp = true } = {}) {
+// Workspaces opt into the lifecycle brief (`brief.enabled: true`, D-368) unless
+// a test passes its own `brief` settings, or `brief: null` for no block at all.
+async function makeWorkspace(t, { prefix = 'vibecompass-brief-life-', brief = { enabled: true }, repos = null, laneTmp = true } = {}) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), prefix));
   const locked = [];
   t.after(async () => {
@@ -182,8 +184,10 @@ test('brief.exclude globs: validation and matching (D-364)', () => {
   assert.ok(!exclusions.matches('sessions/nested/2026-01-01-eval.md'), '* stays within one segment');
   assert.ok(!exclusions.matches('architecture/platform/recall-evaluation.md.bak'));
 
-  assert.deepEqual(validateBriefSettings(undefined), { enabled: true, exclude: [], problems: [] });
-  assert.deepEqual(validateBriefSettings({ enabled: false, exclude: ['a.md', 'a.md'] }), { enabled: false, exclude: ['a.md'], problems: [] });
+  assert.deepEqual(validateBriefSettings(undefined), { enabled: false, enabledDeclared: false, exclude: [], problems: [] }, 'the lifecycle brief is opt-in (D-368)');
+  assert.deepEqual(validateBriefSettings({ exclude: ['a.md'] }), { enabled: false, enabledDeclared: false, exclude: ['a.md'], problems: [] });
+  assert.deepEqual(validateBriefSettings({ enabled: true }), { enabled: true, enabledDeclared: true, exclude: [], problems: [] });
+  assert.deepEqual(validateBriefSettings({ enabled: false, exclude: ['a.md', 'a.md'] }), { enabled: false, enabledDeclared: true, exclude: ['a.md'], problems: [] });
   assert.match(validateBriefSettings({ exclude: 'a.md' }).problems[0], /must be a list/);
   assert.match(validateBriefSettings({ excludes: ['a.md'] }).problems[0], /unknown field "brief\.excludes"/, 'a misspelled field fails closed instead of silently excluding nothing');
   assert.match(validateBriefSettings({ enabled: 'no' }).problems[0], /true or false/);
@@ -195,7 +199,7 @@ test('an excluded document is never opened and contributes nothing to selection,
   const inputs = { task: 'quuxlabel ledger denial copy for refresh runs', files: ['app:src/lib/entitlements.ts'] };
 
   // Excluded: both files present but unreadable.
-  const excluded = await makeWorkspace(t, { brief: { exclude }, laneTmp: false });
+  const excluded = await makeWorkspace(t, { brief: { enabled: true, exclude }, laneTmp: false });
   await writeFile(path.join(excluded.rootDir, 'architecture', 'billing', 'eval-set.md'), EXCLUDED_DOC);
   await writeFile(path.join(excluded.rootDir, 'decisions', 'eval.md'), EXCLUDED_DECISIONS);
   if (CAN_LOCK_FILES) {
@@ -203,7 +207,7 @@ test('an excluded document is never opened and contributes nothing to selection,
     await excluded.lock(path.join(excluded.rootDir, 'decisions', 'eval.md'));
   }
   // Absent: the same settings, and the files do not exist at all.
-  const absent = await makeWorkspace(t, { brief: { exclude }, laneTmp: false });
+  const absent = await makeWorkspace(t, { brief: { enabled: true, exclude }, laneTmp: false });
   // Included: the same files, readable, with no exclusion.
   const included = await makeWorkspace(t);
   await writeFile(path.join(included.rootDir, 'architecture', 'billing', 'eval-set.md'), EXCLUDED_DOC);
@@ -284,7 +288,7 @@ test('invalid brief settings fail closed: no canonical document is read, and sca
 // Lifecycle generation
 // ---------------------------------------------------------------------------
 
-test('start-session writes brief.md by default: lane-derived inputs, header bindings, and the printed brief as its body (D-364)', async (t) => {
+test('start-session writes brief.md on an opted-in root: lane-derived inputs, header bindings, and the printed brief as its body (D-364, D-368)', async (t) => {
   const { workspace, rootDir } = await makeWorkspace(t);
   const started = await startLane(workspace, rootDir, { claims: ['app:src/lib/entitlements.ts'], repos: ['app'] });
   assert.equal(started.brief.state, 'written');
@@ -310,7 +314,25 @@ test('start-session writes brief.md by default: lane-derived inputs, header bind
   assert.match(body, /covers lane claim `app:src\/lib\/entitlements\.ts`/);
 });
 
-test('--no-brief and brief.enabled: false leave the lifecycle exactly as before (D-364)', async (t) => {
+test('the lifecycle brief is opt-in; --no-brief and brief.enabled: false keep it off and leave the lifecycle exactly as before (D-364, D-368)', async (t) => {
+  // No `brief:` block: lifecycle generation is off by default (D-368).
+  const unset = await makeWorkspace(t, { brief: null });
+  const startedUnset = await startLane(unset.workspace, unset.rootDir);
+  assert.deepEqual(startedUnset.brief, { state: 'off', reason: 'opt-in; project.yaml does not set brief.enabled: true', path: laneBriefPath(unset.rootDir, 'ledger'), warnings: [] });
+  assert.equal(startedUnset.warnings.some((warning) => /Session brief/.test(warning)), false);
+  assert.deepEqual((await readdir(path.join(unset.rootDir, 'sessions', 'active', 'ledger'))).sort(), ['handoff.md', 'session.yaml', 'wip.md']);
+  const resumedUnset = await continueProjectSession({ cwd: unset.workspace, rootDir: unset.rootDir, sessionId: 'ledger' });
+  assert.equal(resumedUnset.brief.state, 'off');
+  await assert.rejects(stat(laneBriefPath(unset.rootDir, 'ledger')), { code: 'ENOENT' });
+  // A brief written on request is left in place, never regenerated, while generation is off.
+  const unsetCli = captureIo();
+  assert.equal(await runCli(['brief', '--root', unset.rootDir, '--session', 'ledger', '--write'], unsetCli.io, { cwd: unset.workspace }), 0);
+  const requested = await readFile(laneBriefPath(unset.rootDir, 'ledger'), 'utf8');
+  await writeFile(path.join(unset.rootDir, 'sessions', 'active', 'ledger', 'handoff.md'), '# Handoff\n\nChanged.\n');
+  assert.equal((await continueProjectSession({ cwd: unset.workspace, rootDir: unset.rootDir, sessionId: 'ledger' })).brief.state, 'off');
+  assert.equal(await readFile(laneBriefPath(unset.rootDir, 'ledger'), 'utf8'), requested);
+  assert.equal((await inspectLaneBrief({ rootDir: unset.rootDir, laneId: 'ledger' })).stale, true, 'brief --check still reports it stale');
+
   const flag = await makeWorkspace(t);
   const started = await startLane(flag.workspace, flag.rootDir, { extra: { brief: false } });
   assert.deepEqual(started.brief, { state: 'off', reason: '--no-brief', path: laneBriefPath(flag.rootDir, 'ledger'), warnings: [] });
@@ -422,7 +444,7 @@ test('staleness is computed from the header bindings, and continue-session regen
   await resume();
 
   // project.yaml brief settings are canonical input too.
-  await writeProjectYaml(rootDir, { brief: { exclude: ['architecture/sync/**'] }, tmpBase: path.join(workspace, 'lane-tmp') });
+  await writeProjectYaml(rootDir, { brief: { enabled: true, exclude: ['architecture/sync/**'] }, tmpBase: path.join(workspace, 'lane-tmp') });
   assert.equal((await check()).stale, true);
   await resume();
 
@@ -449,7 +471,7 @@ test('staleness is computed from the header bindings, and continue-session regen
  * but neither its id nor its remote basename, so only the adapter's
  * translation maps it.
  */
-async function makeDualRoot(t, { destinationBrief = null, mirror = (session) => session, sourcePrefix = 'vibecompass-brief-src-' } = {}) {
+async function makeDualRoot(t, { destinationBrief = { enabled: true }, mirror = (session) => session, sourcePrefix = 'vibecompass-brief-src-' } = {}) {
   const destination = await makeWorkspace(t, {
     prefix: 'vibecompass-brief-dest-',
     brief: destinationBrief,
@@ -545,7 +567,7 @@ test('the adapter refuses a source lane that does not correspond, without failin
 });
 
 test('the adapter applies the union of both roots\' exclusions before reading the source (D-364)', async (t) => {
-  const { destination, source } = await makeDualRoot(t, { destinationBrief: { exclude: ['architecture/billing/pricing.md'] } });
+  const { destination, source } = await makeDualRoot(t, { destinationBrief: { enabled: true, exclude: ['architecture/billing/pricing.md'] } });
   if (CAN_LOCK_FILES) await source.lock(path.join(source.rootDir, 'architecture', 'billing', 'pricing.md'));
   const resumed = await continueProjectSession({ cwd: destination.workspace, rootDir: destination.rootDir, sessionId: 'ledger', sourceRootDir: source.rootDir });
   assert.equal(resumed.brief.state, 'written');
@@ -572,6 +594,7 @@ test('the recorded repo alias map and session identity are bindings: a change ma
   // A destination-only remote change removes the acme-web → app translation.
   // The source corpus is unchanged, so only the alias binding can see it.
   await writeProjectYaml(destination.rootDir, {
+    brief: { enabled: true },
     repos: [
       { id: 'acme-web', remote: 'https://github.com/example/acme-web-v2.git' },
       { id: 'core', remote: 'https://github.com/example/acme-core.git' },

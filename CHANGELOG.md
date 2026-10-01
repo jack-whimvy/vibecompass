@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 - 2026-09-30
+
+The session brief ships as an opt-in experiment (D-368). The baseline-versus-brief
+evaluation met its recall targets and safety gates but not its no-regression target,
+so `start-session` and `continue-session` write a lane brief only when
+`project.yaml` sets `brief.enabled: true`. `vibecompass brief` works on request
+either way.
 
 - Read model: architecture components now carry `retrieval_guidance` (the
   `## Retrieval guidance` section) and `retrieval_scope` (the "Retrieval
@@ -55,19 +61,21 @@
   lineage wording becomes a follow-up read, never a status. The command
   writes nothing: no manifest refresh, state write, lane write, or agent-file
   sync, so it is safe against a hand-maintained root.
-- Session brief in the lane lifecycle (plan task A4, D-359, D-364):
-  `start-session` and `continue-session` write
-  `sessions/active/<lane-id>/brief.md` by default, from the lane's working-on,
+- Session brief in the lane lifecycle (plan task A4, D-359, D-364, D-368),
+  opt-in: when `project.yaml` sets `brief.enabled: true`, `start-session` and
+  `continue-session` write `sessions/active/<lane-id>/brief.md` from the lane's working-on,
   claims, and feature slugs, after every lifecycle write succeeded and inside
   the same lock. `continue-session` keeps a current brief and regenerates a
   missing or stale one, and lists it under "Read next". A brief failure is a
   warning plus, when the file can be written, an `incomplete` brief naming the
   reason; it never fails the command, and existing lifecycle refusals fail as
-  before. `--no-brief` (start and continue) or `project.yaml`
-  `brief.enabled: false` turns generation off and leaves every other effect
-  unchanged. `vibecompass brief --write` regenerates the lane brief
-  explicitly; `vibecompass brief --check [--json]` reports whether it is
-  stale, without writing.
+  before. Without the setting (or with `brief.enabled: false`), lifecycle
+  commands print `Brief: off (…)`, write no brief, and leave a brief already
+  in the lane untouched; `--no-brief` (start and continue) skips generation
+  for one command on a root that opted in. Every other lifecycle effect is
+  unchanged. `vibecompass brief --write` writes or regenerates the lane brief
+  on request whatever the setting; `vibecompass brief --check [--json]`
+  reports whether it is stale, without writing.
 - `brief.md` opens with a YAML header that binds its inputs: source root and
   lane with the lane's session date and number, destination root and lane, a
   digest of the canonical corpus it read, short hashes of the docs, decision
@@ -82,8 +90,9 @@
   cannot be read (invalid settings included) is a failed generation
   (`generation: "failed"`; `brief --write` exits 1), while mandatory units
   overflowing the budget is a successful `incomplete` brief.
-- `project.yaml` gains an optional `brief:` mapping (D-364): `enabled`, and
-  `exclude`, a list of root-relative globs (`*`, `**`, `?`; case-insensitive)
+- `project.yaml` gains an optional `brief:` mapping (D-364): `enabled`
+  (default `false`; `true` opts the root into lifecycle generation, D-368),
+  and `exclude`, a list of root-relative globs (`*`, `**`, `?`; case-insensitive)
   naming canonical documents every brief must never read. Excluded files are
   dropped from the scan before they are opened, so they contribute nothing to
   selection, ranking, citation propagation, bindings, or output. Malformed or
@@ -102,7 +111,8 @@
   option is never inferred: a brief built from another root is stale for a
   run that does not name it, and that root is not read.
 - Generated `context.md`, the managed agent block, and the scratch listings
-  now tell agents to read the lane's `brief.md` before planning. The lane
+  now tell agents to read the lane's `brief.md`, when present, before planning,
+  and describe lifecycle generation as opt-in. The lane
   `wip.md` template gains an optional `## Context used` section for the docs
   and decisions the lane actually relied on.
 
