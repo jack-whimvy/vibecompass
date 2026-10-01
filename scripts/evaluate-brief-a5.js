@@ -76,12 +76,6 @@ const outDir = option('--out') ? path.resolve(option('--out')) : null;
 const concurrency = Number(option('--concurrency', '4'));
 const only = option('--only') ? new Set(option('--only').split(',')) : null;
 
-const commands = { prepare, run, grade, score };
-if (!commands[command] || !outDir) {
-  console.error('Usage: node scripts/evaluate-brief-a5.js <prepare|run|grade|score> --out <dir> [...]');
-  process.exit(2);
-}
-await commands[command]();
 
 // ---------------------------------------------------------------- prepare
 
@@ -786,3 +780,11 @@ function median(values) {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.floor(sorted.length / 2)];
 }
+
+// Dispatch last, so every module-level constant above is initialized.
+const commands = { prepare, run, grade, score };
+if (!commands[command] || !outDir) {
+  console.error('Usage: node scripts/evaluate-brief-a5.js <prepare|run|grade|score> --out <dir> [...]');
+  process.exit(2);
+}
+await commands[command]();
