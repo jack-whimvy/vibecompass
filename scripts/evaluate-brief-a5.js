@@ -542,7 +542,7 @@ async function score() {
       const metrics = await auditTranscript(await readFile(path.join(outDir, 'transcripts', `${entry.id}.jsonl`), 'utf8'), entry.root);
       const name = Object.entries(reportGrade.order).find(([, value]) => value === arm)[0];
       const graded = reportGrade.graded[name];
-      const clauseMap = new Map(graded.clauses.map((clause) => [`${clause.item}:${clause.clause}`, clause]));
+      const clauseMap = gradedClauseMap(label, graded.clauses);
       const missingClauses = label.clauses.filter((clause) => !clauseMap.has(`${clause.item}:${clause.clause}`)).map((clause) => `${clause.item}:${clause.clause}`);
       arms[arm] = {
         run: entry.id,
@@ -575,6 +575,23 @@ async function score() {
   await writeFile(path.join(outDir, 'results.json'), `${JSON.stringify({ summary, rows }, null, 2)}\n`);
   await writeFile(path.join(outDir, 'report.md'), renderReport(summary, rows, manifest));
   console.log(renderReport(summary, rows, manifest));
+}
+
+/**
+ * Grader clauses keyed like the label (`M1:a`). Letters are normalized ("(a)",
+ * "A"), and a single-clause item (`-`) takes the grader's entry for that item
+ * whatever clause value it used.
+ */
+function gradedClauseMap(label, clauses) {
+  const map = new Map();
+  for (const expected of label.clauses) {
+    const matches = clauses.filter((clause) => clause.item.trim().toUpperCase() === expected.item);
+    const match = expected.clause === '-'
+      ? matches[0]
+      : matches.find((clause) => clause.clause.replace(/[^a-z]/gi, '').toLowerCase() === expected.clause);
+    if (match) map.set(`${expected.item}:${expected.clause}`, match);
+  }
+  return map;
 }
 
 /**
