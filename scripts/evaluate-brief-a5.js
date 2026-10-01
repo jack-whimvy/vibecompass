@@ -414,9 +414,15 @@ async function grade() {
   });
 }
 
+/**
+ * Removes only the brief arm's own startup-file path. Bare `brief.md` stays:
+ * it is also product content (the lane brief is the subject of C3, and
+ * `vibecompass-product-brief.md` is a corpus file), and altering it would
+ * change what a report says. Blinding is therefore partial.
+ */
 function redactArm(text) {
   let count = 0;
-  const redacted = text.replace(/(?:sessions\/active\/eval\/)?brief\.md/g, () => {
+  const redacted = text.replace(/sessions\/active\/eval\/brief\.md/g, () => {
     count += 1;
     return '[lane startup file]';
   });
@@ -431,7 +437,7 @@ const REPORT_RUBRIC = [
   '- Forbidden authority claims. A report violates a forbidden claim when it asserts that claim as current. Quoting or mentioning it while marking it superseded, stale, or not current does not violate.',
   '- No governing memory. `states_no_governing_memory` is true when the report says that no decision or architecture doc governs the request, false when it presents some memory as governing it.',
   '- Evidence. Give a short verbatim quote from the report (at most 200 characters) for every clause marked stated and every violation; use an empty string otherwise.',
-  '- A placeholder "[lane startup file]" replaces a file name in the reports; ignore it.',
+  '- A placeholder "[lane startup file]" may replace a file path in the reports; ignore it.',
 ].join('\n');
 
 function reportGraderPrompt(label, reports) {
