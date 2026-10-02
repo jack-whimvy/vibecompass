@@ -66,7 +66,24 @@ const SUFFIX_RULES = [
   ['s', '', 3],
 ];
 
+// Common abbreviations meet their long forms after stemming, at index and
+// query time alike: "organizations" and "org" both become "org".
+const CANONICAL_STEMS = new Map([
+  ['organiz', 'org'],
+  ['repository', 'repo'],
+  ['configurat', 'config'],
+  ['databas', 'db'],
+  ['environ', 'env'],
+  ['documentat', 'doc'],
+  ['authenticat', 'auth'],
+]);
+
 export function stemWord(word) {
+  const stem = stemRaw(word);
+  return CANONICAL_STEMS.get(stem) ?? stem;
+}
+
+function stemRaw(word) {
   const lower = word.toLowerCase();
   if (IRREGULAR.has(lower)) return IRREGULAR.get(lower);
   if (lower.length <= 3 || lower.endsWith('ss') || lower.endsWith('us') || lower.endsWith('is')) {
@@ -89,6 +106,47 @@ export function stemWord(word) {
     stem = stem.slice(0, -1);
   }
   return stem;
+}
+
+// Words that say how a user feels about a topic ("clearer", "flaky",
+// "noticeably", "honestly") or what kind of work they want ("investigate",
+// "failure", "bug") rather than what the topic is. They still count for
+// keyword scoring; they are never a task's distinctive topic words, so they
+// alone cannot make a brief abstain.
+const NON_TOPICAL_WORDS = new Set(
+  (
+    'actual annoying awful awkward bad basic beautiful better best big brittle broken buggy careful clean clear clever clumsy clunky ' +
+    'complete confus confusing constant curious decent difficult dumb easy elegant entire ever extreme fast feel fine flaky fragile frank ' +
+    'frequent friendly frustrating full general glitchy good great happy hard heavy helpful honest hopeful huge ideal important ' +
+    'intermittent intuitive janky laggy large light little lovely main maybe messy minor modern mostly much nice noisy noticeable obvious ' +
+    'occasional odd often overall painful perhaps pleasant polished poor possible pretty probable quick quiet quite random rare real ' +
+    'rather reliable responsive rough seem serious simple skeptical slight slow sluggish small smart smooth snappy solid somehow ' +
+    'sometime sometimes somewhat sporadic strange stupid sturdy subtle super terrible thorough tidy tiny total ugly unclear unfriendly ' +
+    'unhappy unpleasant unreliable unstable usable useful useless usual verbose very weird worried worse worst ' +
+    // Kinds of work and trouble.
+    'behave behavior behaviour bug check crash debug diagnose error explain fail failure figure fix handle help idea improve ' +
+    'improvement incorrect investigate issue missing problem question refactor regression repair tweak understand verify wrong'
+  ).split(' '),
+);
+
+/**
+ * True for a word that only evaluates, hedges, intensifies, or names a kind of
+ * work (comparatives, -ly adverbs, and -s/-ed/-ing forms included).
+ */
+export function isNonTopicalWord(word) {
+  const lower = String(word).toLowerCase();
+  const forms = new Set([lower]);
+  for (const [suffix, replacement] of [
+    ['iest', 'y'], ['ier', 'y'], ['est', ''], ['er', ''], ['ily', 'y'], ['ably', 'able'], ['ibly', 'ible'], ['ly', ''],
+    ['ing', ''], ['ing', 'e'], ['ed', ''], ['ed', 'e'], ['es', ''], ['s', ''],
+  ]) {
+    if (lower.endsWith(suffix) && lower.length - suffix.length >= 3) forms.add(lower.slice(0, lower.length - suffix.length) + replacement);
+  }
+  for (const form of [...forms]) {
+    if (/(.)\1$/.test(form)) forms.add(form.slice(0, -1)); // "bigger" → "bigg" → "big"
+    if (form.endsWith('i')) forms.add(`${form.slice(0, -1)}y`);
+  }
+  return [...forms].some((form) => NON_TOPICAL_WORDS.has(form));
 }
 
 /** Raw lowercase word tokens: letters and digits, split on everything else. */

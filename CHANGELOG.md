@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+Session brief retrieval and framing fixes (recall plan A7). The lane brief stays
+opt-in (D-368) until a conforming evaluation supports default-on.
+
+- Selection: a decision is also matched on the sentences in architecture docs
+  that cite it (the overview included; Review metadata and Involved files
+  excluded), so a doc's own words reach a decision whose entry uses different
+  ones. A doc shares the keyword relevance of the decisions it cites, so a doc
+  whose Description misses the task's words is still reached through the
+  decisions it describes. Common abbreviations meet their long forms
+  (organization/org, repository/repo, configuration/config, database/db,
+  environment/env, documentation/doc, authentication/auth).
+- No-match: evaluative words ("clearer", "flaky", "noticeably") and
+  kind-of-work words ("investigate", "failure", "bug") never count as a task's
+  distinctive topic words. When the distinctive topic words are mostly unknown
+  to memory and only keywords matched, the status is `no-match` with up to four
+  nearby reads (paths that share other task words, never presented as
+  relevant). This replaces the narrow `partial` match.
+- Framing: a brief with units says it is a starting point of cut excerpts that
+  can miss the doc a task depends on, and names up to six of the task's words
+  to search for beyond it (`selection.search_terms` in `--json`).
+- Lane `brief.md` format 2: `exclude` and `repo_aliases` show at most four
+  entries, bound by `exclude_digest` and `repo_aliases_digest`, so staleness
+  checks stay complete as settings and repos grow; a header comment says the
+  token budget covers the body only. Format 1 briefs read as stale and are
+  regenerated on resume.
+- `--json` contract version 2: `selection.narrowed` is replaced by
+  `selection.topic_absent` and `selection.search_terms`; follow-ups gain the
+  `nearby` priority.
+
 ## 0.16.0 - 2026-09-30
 
 The session brief ships as an opt-in experiment (D-368). In a baseline-versus-brief

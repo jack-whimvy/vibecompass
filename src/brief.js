@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { createKeywordIndex, queryTermOrigins, queryTerms } from './brief-keywords.js';
+import { createKeywordIndex, isNonTopicalWord, queryTermOrigins, queryTerms } from './brief-keywords.js';
 import { BRIEF_MAX_COMPACTION, renderBrief, renderBriefUnit, renderedFollowUpCount } from './brief-render.js';
 import { compileBriefExclusions, readBriefSettingsForRoot, validateExcludePattern } from './brief-settings.js';
 import { collectDeclaredSuccessors, parseDecisionEntries, scanDecisionReferences } from './decision-lineage.js';
@@ -28,7 +28,7 @@ import { parseSimpleYaml } from './simple-yaml.js';
  * doc, file, or task, or that one is currently valid.
  */
 
-export const BRIEF_CONTRACT_VERSION = 1;
+export const BRIEF_CONTRACT_VERSION = 2;
 export const BRIEF_DEFAULT_BUDGET = 6000;
 export const BRIEF_MIN_BUDGET = 800;
 export const BRIEF_RESERVE_TOKENS = 600;
@@ -41,7 +41,12 @@ const DOC_FIELDS = {
   title: { weight: 3, b: 0.3 },
   body: { weight: 1, b: 0.75 },
   guidance: { weight: 1.5, b: 0.75 },
+  // Decisions only: the sentences around each mention of the decision in an
+  // architecture doc (anchor text). Docs describe a decision in their own
+  // words, which are often the words a task uses.
+  anchor: { weight: 1, b: 0.5 },
 };
+const REVERSE_CITATION_WEIGHT = 4;
 const MAX_DOC_CANDIDATES = 10;
 const MAX_DECISION_CANDIDATES = 14;
 // A doc whose mandatory companions would take more than a quarter of the
@@ -60,8 +65,8 @@ const CITATION_WEIGHT = 6;
 // Evidence lists and file inventories cite decisions without saying anything about them.
 const NON_PROPAGATING_SECTIONS = new Set(['Review metadata', 'Involved files']);
 const DISTINCTIVE_TERM_LIMIT = 3;
-const STRONG_TOPIC_TERMS = 3;
-const NARROW_PACKED_UNITS = 4;
+const NEARBY_READS = 4;
+const SEARCH_TERM_LIMIT = 6;
 const DISTINCTIVE_MAX_DOCUMENT_SHARE = 0.02;
 
 /**
@@ -454,6 +459,7 @@ function selectCandidates(context, loaded, task) {
       entry: decisionEntries.get(decision.decision_id),
     }));
 
+  const anchors = buildDecisionAnchors(documents, new Set(decisions.map((decision) => decision.decisionId)));
   const index = createKeywordIndex(DOC_FIELDS, [
     ...docs.map((doc) => ({
       id: doc.id,
@@ -461,11 +467,12 @@ function selectCandidates(context, loaded, task) {
         title: `${doc.component} ${doc.feature} ${doc.domain} ${path.basename(doc.path, '.md')}`,
         body: doc.description ?? '',
         guidance: [doc.retrievalGuidance, doc.retrievalScope].filter(Boolean).join('\n'),
+        anchor: '',
       },
     })),
     ...decisions.map((decision) => ({
       id: decision.id,
-      fields: { title: decision.title, body: decision.entry.fields.Decision ?? '', guidance: '' },
+      fields: { title: decision.title, body: decision.entry.fields.Decision ?? '', guidance: '', anchor: anchors.get(decision.decisionId) ?? '' },
     })),
   ]);
 
@@ -475,7 +482,18 @@ function selectCandidates(context, loaded, task) {
   const pathWords = [...input.files, ...input.claims, ...(lane?.claims ?? [])].map(pathTopicText).join(' ');
   const terms = uniqueStrings([...queryTerms(task), ...queryTerms(pathWords)]).filter((term) => !projectTerms.has(term));
   const keywordScores = new Map(index.score(terms).map((result) => [result.id, result]));
-  const distinctive = pickDistinctiveTerms(terms, index);
+  const origins = queryTermOrigins(`${task} ${pathWords}`);
+  // Evaluative and kind-of-work words ("clearer", "flaky", "investigate",
+  // "failure") say how the user feels or what they want done, not what the
+  // topic is, so they are never distinctive topic words.
+  const topicTerms = terms.filter((term) => !isNonTopicalWord(origins.get(term) ?? term));
+  const distinctive = pickDistinctiveTerms(topicTerms, index);
+  // The task's key words to search beyond the brief, rarest in the index first.
+  const searchTerms = uniqueStrings(
+    [...topicTerms]
+      .sort((left, right) => index.documentFrequency(left) - index.documentFrequency(right) || left.localeCompare(right))
+      .map((term) => (origins.get(term) ?? term).toLowerCase()),
+  ).slice(0, SEARCH_TERM_LIMIT);
 
   // Mechanical evidence from the inputs: files and claims through the
   // file-owner index, lane-declared architecture docs, feature slugs.
@@ -535,6 +553,34 @@ function selectCandidates(context, loaded, task) {
     doc.score = evidence + doc.keywordScore;
   }
 
+  // Reverse propagation: a doc shares the keyword relevance of the decisions
+  // it cites (outside evidence sections), diluted by how many it cites. A doc
+  // whose Description misses the task's words is still reached through the
+  // decisions it describes.
+  const keywordDecisions = decisions
+    .map((decision) => ({ decision, score: keywordScores.get(decision.id)?.score ?? 0 }))
+    .filter((entry) => entry.score >= MIN_KEYWORD_SCORE);
+  const topDecisionKeyword = Math.max(0, ...keywordDecisions.map((entry) => entry.score));
+  const decisionKeyword = new Map(
+    keywordDecisions
+      .filter((entry) => entry.score >= topDecisionKeyword * RELATIVE_SCORE_FLOOR)
+      .map((entry) => [entry.decision.decisionId, entry.score / topDecisionKeyword]),
+  );
+  const citesByDoc = new Map();
+  for (const relation of relations) {
+    if (relation.relation !== 'cites' || !relation.target_exists) continue;
+    if (NON_PROPAGATING_SECTIONS.has(String(relation.source_section ?? '').split(' > ')[0])) continue;
+    if (!citesByDoc.has(relation.source_path)) citesByDoc.set(relation.source_path, new Set());
+    citesByDoc.get(relation.source_path).add(relation.target_decision_id);
+  }
+  for (const doc of docs) {
+    const cited = [...(citesByDoc.get(doc.path) ?? [])];
+    const matched = cited.filter((id) => decisionKeyword.has(id)).sort((left, right) => decisionKeyword.get(right) - decisionKeyword.get(left) || left - right);
+    doc.reverseBoost = matched.length > 0 ? (REVERSE_CITATION_WEIGHT * matched.reduce((sum, id) => sum + decisionKeyword.get(id), 0)) / Math.sqrt(cited.length) : 0;
+    doc.reverseCited = matched;
+    doc.score += doc.reverseBoost;
+  }
+
   const decisionById = new Map(decisions.map((decision) => [decision.decisionId, decision]));
   const namedDecisionIds = new Set(
     scanDecisionReferences(task)
@@ -543,22 +589,19 @@ function selectCandidates(context, loaded, task) {
   );
 
   const topKeyword = Math.max(0, ...[...keywordScores.values()].map((result) => result.score));
-  // Absent distinctive words alone never abstain: unfamiliar modifiers
-  // ("clearer", "sporadic") are common in real tasks, and a false no-match
-  // hides memory that exists. Abstain on them only when no single unit
-  // shares at least STRONG_TOPIC_TERMS of the task's words.
-  const strongestOverlap = Math.max(0, ...[...keywordScores.values()].map((result) => result.matched.length));
-  const noMatch =
-    docs.every((doc) => doc.evidenceScore === 0) &&
-    namedDecisionIds.size === 0 &&
-    (terms.length === 0 ||
-      topKeyword < MIN_KEYWORD_SCORE ||
-      (distinctiveTermsMostlyAbsent(distinctive, index) && strongestOverlap < STRONG_TOPIC_TERMS));
+  // No-match when only keywords selected memory and either nothing clears the
+  // keyword floor or the task's distinctive topic words are mostly unknown to
+  // the index (evaluative and kind-of-work words never count, so "clearer" or
+  // "investigate" alone cannot abstain). With an unknown topic the best keyword matches become
+  // nearby reads, never units: a misjudged topic still points at the memory
+  // that shares the task's other words, and nothing is presented as relevant.
+  const keywordsOnly = docs.every((doc) => doc.evidenceScore === 0) && namedDecisionIds.size === 0;
+  const topicAbsent = distinctiveTermsMostlyAbsent(distinctive, index);
+  const noMatch = keywordsOnly && (terms.length === 0 || topKeyword < MIN_KEYWORD_SCORE || topicAbsent);
 
   // Task words with no keyword match in the searched fields are disclosed, never guessed at.
   const absent = terms.filter((term) => index.documentFrequency(term) === 0);
   if (absent.length > 0) {
-    const origins = queryTermOrigins(`${task} ${pathWords}`);
     const words = absent.map((term) => origins.get(term) ?? term);
     context.gaps.push({
       code: 'unmatched-terms',
@@ -571,24 +614,17 @@ function selectCandidates(context, loaded, task) {
   }
 
   if (noMatch) {
-    return { noMatch: true, terms, distinctive, docs: [], namedDecisions: [], rankedDecisions: [], notes: [], relations, decisionById, decisionEntries, readModel };
+    const nearby = (topicAbsent && topKeyword >= MIN_KEYWORD_SCORE ? pickNearby(docs, decisions, keywordScores) : []).map((entry) => ({
+      ...entry,
+      matched: entry.matched.map((term) => (origins.get(term) ?? term).toLowerCase()),
+    }));
+    return { noMatch: true, topicAbsent, nearby, terms, distinctive, searchTerms, docs: [], namedDecisions: [], rankedDecisions: [], notes: [], relations, decisionById, decisionEntries, readModel };
   }
-
-  // When the task's distinctive words are mostly unknown and nothing but
-  // keywords selected the memory, confidence is low: the match is kept
-  // narrow. Candidates are chosen and ranked as usual; only the top
-  // NARROW_PACKED_UNITS ranked units are packed and the rest are listed as
-  // follow-up reads, so the top-scoring topic is never dropped for a raw
-  // overlap count and a weak match does not fill the budget.
-  const narrow =
-    distinctiveTermsMostlyAbsent(distinctive, index) &&
-    docs.every((doc) => doc.evidenceScore === 0) &&
-    namedDecisionIds.size === 0;
 
   // Docs with mechanical evidence (they cover an input file or claim, the lane
   // declares them, or they belong to a named feature) skip the relative floor.
   const selectedDocs = pickTop(
-    docs.filter((doc) => doc.evidenceScore > 0 || doc.keywordScore >= MIN_KEYWORD_SCORE),
+    docs.filter((doc) => doc.evidenceScore > 0 || doc.keywordScore + doc.reverseBoost >= MIN_KEYWORD_SCORE),
     MAX_DOC_CANDIDATES,
     (doc) => doc.evidenceScore > 0,
   );
@@ -647,12 +683,15 @@ function selectCandidates(context, loaded, task) {
 
   for (const doc of selectedDocs) {
     if (doc.matchedTerms.length > 0) doc.reasons.push(`keywords: ${doc.matchedTerms.join(', ')}`);
+    if (doc.reverseCited.length > 0) doc.reasons.push(`cites keyword-matched ${doc.reverseCited.slice(0, 4).map(formatId).join(', ')}${doc.reverseCited.length > 4 ? ` (+${doc.reverseCited.length - 4} more)` : ''}`);
   }
 
   return {
     noMatch: false,
-    narrow,
+    topicAbsent: false,
+    nearby: [],
     terms,
+    searchTerms,
     distinctive,
     docs: selectedDocs,
     namedDecisions,
@@ -681,6 +720,29 @@ function pickDistinctiveTerms(terms, index) {
     .filter((term) => index.documentFrequency(term) <= Math.max(1, index.count * DISTINCTIVE_MAX_DOCUMENT_SHARE))
     .sort((left, right) => index.documentFrequency(left) - index.documentFrequency(right) || left.localeCompare(right))
     .slice(0, limit);
+}
+
+/**
+ * Nearby reads for a no-match brief whose topic words are unknown: the best
+ * keyword matches among docs and decisions, interleaved by score relative to
+ * the top of their kind. Paths and matched words only — never units.
+ */
+function pickNearby(docs, decisions, keywordScores) {
+  const docEntries = docs
+    .filter((doc) => doc.keywordScore + doc.reverseBoost >= MIN_KEYWORD_SCORE)
+    .map((doc) => ({ id: doc.id, score: doc.keywordScore + doc.reverseBoost, path: doc.path, heading: null, matched: doc.matchedTerms }));
+  const decisionEntries = decisions
+    .map((decision) => ({ decision, keyword: keywordScores.get(decision.id) }))
+    .filter((entry) => (entry.keyword?.score ?? 0) >= MIN_KEYWORD_SCORE)
+    .map(({ decision, keyword }) => ({ id: decision.id, score: keyword.score, path: decision.path, heading: formatId(decision.decisionId), matched: keyword.matched }));
+  const relative = (entries) => {
+    const top = Math.max(0, ...entries.map((entry) => entry.score));
+    return entries.map((entry) => ({ ...entry, relative: top > 0 ? entry.score / top : 0 }));
+  };
+  return [...relative(docEntries), ...relative(decisionEntries)]
+    .sort((left, right) => right.relative - left.relative || right.score - left.score || left.id.localeCompare(right.id))
+    .slice(0, NEARBY_READS)
+    .map(({ path: entryPath, heading, matched }) => ({ path: entryPath, heading, matched }));
 }
 
 function pickTop(candidates, limit, bypassFloor = () => false) {
@@ -760,8 +822,7 @@ function buildUnits(context, selection) {
     })),
   ].sort((left, right) => right.relative - left.relative || left.unit.id.localeCompare(right.unit.id));
   for (const [index, entry] of ranked.entries()) {
-    const withheld = selection.narrow && index >= NARROW_PACKED_UNITS;
-    units.push({ ...entry.unit, rank: index + 1, ...(withheld ? { withheld: true } : {}) });
+    units.push({ ...entry.unit, rank: index + 1 });
   }
 
   for (const note of selection.notes) units.push(buildNoteUnit(note));
@@ -1037,14 +1098,9 @@ function assemble(context, selection, units, capacity, compaction = 0) {
   const covered = [];
   let used = 0;
 
-  for (const { companions = [], withheld = false, ...unit } of units) {
+  for (const { companions = [], ...unit } of units) {
     if (unit.kind === 'lineage' && unit.members.every((member) => emitted.has(member.decision_id))) {
       covered.push(unit.id);
-      continue;
-    }
-    if (withheld) {
-      const tokens = estimateBriefTokens(renderBriefUnit(unit, { emittedDecisions: emitted }));
-      omitted.push({ ...unit, estimated_tokens: tokens, omitted_reason: 'narrow-match' });
       continue;
     }
 
@@ -1130,7 +1186,8 @@ function baseResult(context, selection, { status, units, omitted, covered, follo
     selection: {
       query_terms: selection?.terms ?? [],
       distinctive_terms: selection?.distinctive ?? [],
-      narrowed: Boolean(selection?.narrow),
+      topic_absent: Boolean(selection?.topicAbsent),
+      search_terms: selection?.searchTerms ?? [],
     },
     units,
     omitted,
@@ -1148,8 +1205,11 @@ function decideStatus(selection, omitted) {
     return { status: 'incomplete', reason: `retrieval failed — ${selection.retrievalError}` };
   }
   if (selection.noMatch) {
-    return omitted.some((unit) => unit.kind === 'lane')
-      ? { status: 'incomplete', reason: 'no memory matched the task, and the lane unit did not fit the budget' }
+    if (omitted.some((unit) => unit.kind === 'lane')) {
+      return { status: 'incomplete', reason: 'no memory matched the task, and the lane unit did not fit the budget' };
+    }
+    return selection.topicAbsent
+      ? { status: 'no-match', reason: "no architecture doc or decision matched the task's distinctive words" }
       : { status: 'no-match', reason: 'no architecture doc or decision matched the task' };
   }
 
@@ -1161,11 +1221,7 @@ function decideStatus(selection, omitted) {
     };
   }
   if (omitted.length > 0) {
-    const withheld = omitted.filter((unit) => unit.omitted_reason === 'narrow-match').length;
-    const parts = [];
-    if (omitted.length > withheld) parts.push(`${plural(omitted.length - withheld, 'ranked or optional unit')} did not fit the budget`);
-    if (withheld > 0) parts.push(`${plural(withheld, 'lower-confidence match', 'lower-confidence matches')} listed as reads only (narrow match)`);
-    return { status: 'partial', reason: parts.join('; ') };
+    return { status: 'partial', reason: `${plural(omitted.length, 'ranked or optional unit')} did not fit the budget` };
   }
   return { status: 'complete', reason: 'every selected unit fits the budget' };
 }
@@ -1199,12 +1255,21 @@ function buildFollowUps(selection, context, included, omitted) {
   }
 
   for (const unit of omitted.filter((candidate) => candidate.tier === 'ranked')) {
-    const prefix = unit.omitted_reason === 'narrow-match' ? 'narrow match, read only: ' : '';
     if (unit.kind === 'doc') {
-      entries.push({ priority: 'ranked', path: unit.path, heading: null, reason: shortReason(`${prefix}${unit.reasons[0] ?? 'ranked doc'}`) });
+      entries.push({ priority: 'ranked', path: unit.path, heading: null, reason: shortReason(unit.reasons[0] ?? 'ranked doc') });
     } else {
-      entries.push(...lineageReads(unit, 'ranked', prefix));
+      entries.push(...lineageReads(unit, 'ranked'));
     }
+  }
+
+  // No-match with an unknown topic: the closest keyword matches, as reads.
+  for (const entry of selection.nearby ?? []) {
+    entries.push({
+      priority: 'nearby',
+      path: entry.path,
+      heading: entry.heading,
+      reason: shortReason(`shares other task words (${entry.matched.join(', ')}); not presented as relevant`),
+    });
   }
 
   // Uncertified lineage wording aimed at an emitted decision: a read, never
@@ -1248,7 +1313,7 @@ function buildFollowUps(selection, context, included, omitted) {
   });
 }
 
-function lineageReads(unit, priority, prefix = '') {
+function lineageReads(unit, priority) {
   return [...unit.members]
     .sort((left, right) => right.decision_id - left.decision_id)
     .map((member) => ({
@@ -1258,13 +1323,13 @@ function lineageReads(unit, priority, prefix = '') {
       heading: formatId(member.decision_id),
       reason:
         member.role === 'root'
-          ? shortReason(`${prefix}${unit.reasons[0] ? `${unit.tier}: ${unit.reasons[0]}` : `${unit.tier} decision`}`)
+          ? shortReason(unit.reasons[0] ? `${unit.tier}: ${unit.reasons[0]}` : `${unit.tier} decision`)
           : `declared successor of ${formatId(unit.root_decision_id)} (${member.successor_relations.join(', ')})`,
     }));
 }
 
 function finalizeRetrievalFailure(context, reason) {
-  return packBrief(context, { retrievalError: reason, terms: [], distinctive: [], relations: [] });
+  return packBrief(context, { retrievalError: reason, terms: [], distinctive: [], relations: [], nearby: [] });
 }
 
 /**
@@ -1289,6 +1354,76 @@ function assertLineageSafety(result, relations) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Anchor text per decision: each sentence of an architecture doc (the
+ * overview included) that mentions the decision, outside fenced code and the
+ * evidence sections (Review metadata, Involved files). Identical sentences
+ * count once per decision.
+ */
+function buildDecisionAnchors(documents, decisionIds) {
+  const anchors = new Map();
+  for (const document of documents) {
+    if (document.kind !== 'architecture' || typeof document.content !== 'string') continue;
+    for (const block of markdownBlocks(document.content)) {
+      if (NON_PROPAGATING_SECTIONS.has(block.section)) continue;
+      const { refs } = scanDecisionReferences(block.text);
+      for (const ref of refs) {
+        if (!decisionIds.has(ref.id)) continue;
+        const sentence = sentenceAround(block.text, ref.start, ref.end);
+        if (!anchors.has(ref.id)) anchors.set(ref.id, new Set());
+        anchors.get(ref.id).add(sentence);
+      }
+    }
+  }
+  return new Map([...anchors].map(([id, sentences]) => [id, [...sentences].join('\n')]));
+}
+
+/** Paragraphs, list items, and table rows of a markdown body with their level-2 section, fence-aware. */
+function markdownBlocks(content) {
+  const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
+  const blocks = [];
+  let section = null;
+  let fence = null;
+  let current = null;
+  const flush = () => {
+    if (current && current.lines.length > 0) blocks.push({ section, text: current.lines.join(' ') });
+    current = null;
+  };
+  for (const line of body.split(/\r?\n/)) {
+    const marker = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (marker) {
+      flush();
+      if (!fence) fence = marker[1][0];
+      else if (marker[1][0] === fence) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      flush();
+      if (heading[1].length <= 2) section = heading[2];
+      continue;
+    }
+    if (line.trim() === '') {
+      flush();
+      continue;
+    }
+    if (/^\s*(?:[-*+]|\d+\.)\s+/.test(line) || /^\s*\|/.test(line)) flush();
+    if (!current) current = { lines: [] };
+    current.lines.push(line.trim());
+  }
+  flush();
+  return blocks;
+}
+
+/** The sentence of `text` containing [start, end): bounded by ". ", "? ", "! ", or the block edges. */
+function sentenceAround(text, start, end) {
+  const before = text.slice(0, start);
+  const boundary = Math.max(before.lastIndexOf('. '), before.lastIndexOf('? '), before.lastIndexOf('! '));
+  const after = text.slice(end).search(/[.?!](?:\s|$)/);
+  return text.slice(boundary === -1 ? 0 : boundary + 2, after === -1 ? text.length : end + after + 1).trim();
+}
 
 function buildDecisionEntryMap(documents) {
   const map = new Map();

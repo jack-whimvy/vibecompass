@@ -208,17 +208,16 @@ test('optional overflow yields partial with only optional units omitted', async 
   assert.ok(result.budget.estimated_tokens <= result.budget.limit);
 });
 
-test('strong topic matches survive unfamiliar modifiers; absent words are disclosed, not abstained on (review R1)', async (t) => {
+test('evaluative words never stand for the topic: modifier-only gaps match normally and are disclosed (review R1, A7)', async (t) => {
   const { rootDir } = await makeRoot(t);
   const clearer = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Make hosted refresh run denial messages clearer and friendlier.' });
   assert.notEqual(clearer.status, 'no-match');
+  assert.equal(clearer.selection.topic_absent, false);
   assert.ok(clearer.units.some((unit) => unit.id === 'doc:architecture/billing/ledger.md'));
   const unmatched = clearer.gaps.find((gap) => gap.code === 'unmatched-terms');
   assert.deepEqual(unmatched.terms, ['clearer', 'friendlier']);
   assert.match(renderBrief(clearer), /^- Gap: No keyword match for "clearer", "friendlier" in the fields the brief searches \(titles, Description, Retrieval guidance, Decision text\); other text may mention them\.$/m);
-  // Mostly-unknown distinctive words keep the match narrow: few units are packed, the rest are reads.
-  assert.equal(clearer.selection.narrowed, true);
-  assert.ok(clearer.units.filter((candidate) => candidate.tier === 'ranked').length <= 4);
+  assert.ok(!clearer.selection.search_terms.includes('clearer'), 'evaluative words are not suggested as search terms');
 
   const sporadic = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Can you carefully investigate a sporadic failure in session lane selection?' });
   assert.notEqual(sporadic.status, 'no-match');
@@ -229,7 +228,7 @@ test('strong topic matches survive unfamiliar modifiers; absent words are disclo
   assert.match(renderBrief(klingon), /^- Gap: No keyword match for "Klingon", "subtitles", "karaoke", "kiosk", "mode" in the fields the brief searches/m);
 });
 
-test('a narrow match keeps the top-scoring topic and lists the rest as reads (review R5)', async (t) => {
+test('the top-scoring topic survives an incidental decision that shares more task words (review R5)', async (t) => {
   const { rootDir } = await makeRoot(t);
   // An incidental decision shares three task words in its body; the real
   // topic (the lanes doc) shares two, in its title and guidance.
@@ -239,16 +238,82 @@ test('a narrow match keeps the top-scoring topic and lists the rest as reads (re
   );
   const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Make the lane selection lookup noticeably faster and sturdier.' });
   assert.notEqual(result.status, 'no-match');
-  assert.equal(result.selection.narrowed, true);
-  assert.ok(result.units.some((unit) => unit.id === 'doc:architecture/sync/lanes.md'), 'the lanes doc is packed');
+  assert.equal(result.selection.topic_absent, false);
   const ranked = result.units.filter((unit) => unit.tier === 'ranked');
-  assert.ok(ranked.length <= 4);
-  if (result.omitted.some((unit) => unit.omitted_reason === 'narrow-match')) {
-    assert.match(renderBrief(result), /every match is low-confidence: the top \d+ are shown for orientation/);
+  assert.equal(ranked[0]?.id, 'doc:architecture/sync/lanes.md', 'the lanes doc ranks first');
+});
+
+test('an unknown topic is no-match with nearby reads only: paths, never units, never relevant (A7)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Mirror every hosted refresh run denial into Zendesk tickets for Jira triage.' });
+  assert.equal(result.status, 'no-match');
+  assert.equal(result.selection.topic_absent, true);
+  assert.deepEqual(result.units.map((unit) => unit.kind), ['lane']);
+  assert.ok(result.follow_ups.length > 0 && result.follow_ups.length <= 4);
+  assert.ok(result.follow_ups.every((entry) => entry.priority === 'nearby' && /^shares other task words \(.+\); not presented as relevant$/.test(entry.reason)));
+  assert.ok(result.follow_ups.some((entry) => entry.path === 'architecture/billing/ledger.md'), 'the closest doc is pointed at');
+  assert.ok(result.follow_ups.every((entry) => !/\b(?:refresh|denial)\b/.test(entry.reason) || /refresh|denial/.test(entry.reason)), 'matched words read as task words');
+  const markdown = renderBrief(result);
+  assert.match(markdown, /^## Nearby memory \(shares task words only\)$/m);
+  assert.match(markdown, /\*\*Status: no-match\*\* — no architecture doc or decision matched this task's distinctive words\. Nothing in memory is presented as relevant\./);
+  assert.match(markdown, /check them and search memory for (?:`[a-z]+`, )*`jira`/);
+  for (const word of ['jira', 'tickets', 'zendesk']) assert.ok(result.selection.search_terms.includes(word), `${word} is suggested`);
+  assert.doesNotMatch(markdown, /## Decisions|## Architecture docs|## Session notes|## Follow-up reads/);
+  assert.equal(result.budget.estimated_tokens, estimateBriefTokens(markdown));
+});
+
+test('anchor text: a decision is reached through the doc sentences that cite it, outside evidence sections (A7)', async (t) => {
+  async function rootWith(t, sentenceSection) {
+    const { rootDir } = await makeRoot(t);
+    await writeFile(
+      path.join(rootDir, 'decisions', 'cross-cutting.md'),
+      `${await readFile(path.join(rootDir, 'decisions', 'cross-cutting.md'), 'utf8')}\n---\n\n### D-110 — Shared installation rule\n**Timestamp:** 2026-01-09 10:00 UTC\n**Decision:** Every selected source must share one App installation.\n**Rationale:** Fixture.\n`,
+    );
+    const overview = path.join(rootDir, 'architecture', 'overview', 'project-shape.md');
+    const sentence = 'Hosted projects can combine repositories from several organizations only when D-110 holds.';
+    const text = await readFile(overview, 'utf8');
+    await writeFile(
+      overview,
+      sentenceSection === 'Details'
+        ? text.replace('## Details\n', `## Details\n${sentence}\n\n`)
+        : text.replace('- Evidence: `core:project.yaml`', `- Evidence: \`core:project.yaml\`. ${sentence}`),
+    );
+    await writeFile(
+      path.join(rootDir, 'architecture', 'sync', 'installations.md'),
+      '---\ndomain: Sync\nfeature: Installations\ncomponent: Installation Handshake\nstatus: In progress\nrepos:\n  - app\n---\n\n## Description\nNotes on the handshake with the App.\n\n## Details\nImplements D-110 for onboarding.\n\n## Involved files\n- `app:src/lib/install.ts`\n',
+    );
+    return buildSessionBrief({ rootDir, laneId: 'eval', task: 'Combine repositories from two organizations in one hosted project.' });
   }
-  for (const unit of result.omitted.filter((candidate) => candidate.omitted_reason === 'narrow-match')) {
-    assert.ok(result.follow_ups.some((entry) => entry.path === (unit.path ?? unit.members?.[0]?.path)), `${unit.id} is listed as a read`);
-  }
+  const has = (result, id) => result.units.some((unit) => unit.id === id);
+
+  const anchored = await rootWith(t, 'Details');
+  assert.ok(has(anchored, 'lineage:D-110'), 'D-110 is reached through the overview sentence that cites it');
+  // Reverse propagation: the handshake doc never names the task's words but cites D-110.
+  const handshake = anchored.units.find((unit) => unit.id === 'doc:architecture/sync/installations.md');
+  assert.ok(handshake, 'a doc citing a keyword-matched decision is selected');
+  assert.match(handshake.reasons.join(' '), /cites keyword-matched D-110/);
+
+  // The same sentence in Review metadata is an evidence list, not anchor text.
+  const evidenceOnly = await rootWith(t, 'Review metadata');
+  assert.ok(!has(evidenceOnly, 'lineage:D-110'));
+  assert.ok(!has(evidenceOnly, 'doc:architecture/sync/installations.md'));
+});
+
+test('abbreviations meet their long forms (A7)', () => {
+  assert.equal(stemWord('organizations'), stemWord('org'));
+  assert.equal(stemWord('repositories'), stemWord('repos'));
+  assert.equal(stemWord('configuration'), stemWord('config'));
+});
+
+test('the brief frames itself as a starting point and names the task terms to search (A7)', async (t) => {
+  const { rootDir } = await makeRoot(t);
+  const result = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Rewrite the message a user sees when a hosted refresh run is refused.' });
+  assert.ok(result.selection.search_terms.length > 0 && result.selection.search_terms.length <= 6);
+  const markdown = renderBrief(result);
+  assert.match(markdown, /^\*\*Use this brief as a starting point, not the whole context\.\*\* It shows cut excerpts chosen by keyword and citation matching, so it can miss the doc this task depends on\. Read the full source behind any fact you rely on, and search memory beyond this list for `[^`]+`(?:, `[^`]+`)*\.$/m);
+  const tight = await buildSessionBrief({ rootDir, laneId: 'eval', task: 'Rewrite the message a user sees when a hosted refresh run is refused.', budget: BRIEF_MIN_BUDGET });
+  assert.ok(tight.budget.estimated_tokens <= BRIEF_MIN_BUDGET);
+  assert.match(renderBrief(tight), /\*\*(?:Use this brief as a starting point|Starting point only)/);
 });
 
 test('the unmatched-words gap reports the search, not absence from memory (review R6)', async (t) => {

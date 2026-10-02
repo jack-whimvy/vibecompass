@@ -27,6 +27,13 @@ const EVIDENCE_NOTE =
   '_Evidence: "covers" and "cites" are mechanical (the doc lists the file or mentions the decision); "supersedes" and "amends" come only from the later decision\'s own text. The brief infers no other relation and does not decide which decision applies to this task._';
 const EVIDENCE_NOTE_SHORT = '_Evidence: covers/cites are mechanical; supersedes/amends are declared by the later decision. Nothing else is inferred._';
 
+// Framing (A7): A5 found agents that stopped searching where the brief
+// stopped. The brief says what it is — a keyword- and citation-selected
+// starting point of cut excerpts — and names the task's key terms to search.
+const USE_NOTE =
+  "**Use this brief as a starting point, not the whole context.** It shows cut excerpts chosen by keyword and citation matching, so it can miss the doc this task depends on. Read the full source behind any fact you rely on, and search memory beyond this list";
+const USE_NOTE_SHORT = '**Starting point only:** excerpts are cut and selection can miss key docs; read full sources and search beyond this list';
+
 /**
  * Frame limits (header, status, follow-ups) per compaction level. Level 0 is
  * normal; the engine raises the level only when the frame itself would not
@@ -34,10 +41,10 @@ const EVIDENCE_NOTE_SHORT = '_Evidence: covers/cites are mechanical; supersedes/
  * field is bounded at every level; units render the same at every level.
  */
 const FRAME_LIMITS = [
-  { task: 300, file: 120, files: 4, root: 160, reason: 300, gap: 240, followUpPath: 120, followUpHeading: 60, followUpReason: 170, followUps: Infinity, evidence: EVIDENCE_NOTE },
-  { task: 160, file: 60, files: 2, root: 60, reason: 200, gap: 160, followUpPath: 100, followUpHeading: 40, followUpReason: 80, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT },
-  { task: 120, file: 50, files: 1, root: 40, reason: 160, gap: 110, followUpPath: 80, followUpHeading: 30, followUpReason: 40, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT },
-  { task: 100, file: 40, files: 1, root: 30, reason: 120, gap: 90, followUpPath: 70, followUpHeading: 24, followUpReason: 30, followUps: 6, evidence: EVIDENCE_NOTE_SHORT },
+  { task: 300, file: 120, files: 4, root: 160, reason: 300, gap: 240, followUpPath: 120, followUpHeading: 60, followUpReason: 170, followUps: Infinity, evidence: EVIDENCE_NOTE, use: USE_NOTE, searchTerms: 6, searchTerm: 40 },
+  { task: 160, file: 60, files: 2, root: 60, reason: 200, gap: 160, followUpPath: 100, followUpHeading: 40, followUpReason: 80, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT, use: USE_NOTE_SHORT, searchTerms: 4, searchTerm: 30 },
+  { task: 120, file: 50, files: 1, root: 40, reason: 160, gap: 110, followUpPath: 80, followUpHeading: 30, followUpReason: 40, followUps: Infinity, evidence: EVIDENCE_NOTE_SHORT, use: USE_NOTE_SHORT, searchTerms: 3, searchTerm: 24 },
+  { task: 100, file: 40, files: 1, root: 30, reason: 120, gap: 90, followUpPath: 70, followUpHeading: 24, followUpReason: 30, followUps: 6, evidence: EVIDENCE_NOTE_SHORT, use: USE_NOTE_SHORT, searchTerms: 2, searchTerm: 20 },
 ];
 export const BRIEF_MAX_COMPACTION = FRAME_LIMITS.length - 1;
 
@@ -53,7 +60,7 @@ export function renderBrief(result) {
   lines.push(`**Status: ${result.status}** — ${statusSentence(result, frame)}`, '');
   lines.push(...renderHeader(result, frame), '');
 
-  if (result.status !== 'no-match') lines.push(frame.evidence, '');
+  if (result.status !== 'no-match') lines.push(`${frame.use}${searchSuffix(result, frame)}`, '', frame.evidence, '');
 
   const byKind = (kind) => result.units.filter((unit) => unit.kind === kind);
   const emitted = new Set();
@@ -89,7 +96,7 @@ export function renderBrief(result) {
   }
 
   if (result.status !== 'incomplete' && followUps.length > 0) {
-    lines.push('## Follow-up reads', '', ...followUps, '');
+    lines.push(result.status === 'no-match' ? '## Nearby memory (shares task words only)' : '## Follow-up reads', '', ...followUps, '');
   }
 
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
@@ -114,25 +121,29 @@ export function renderBriefUnit(unit, options = {}) {
 }
 
 function statusSentence(result, frame) {
-  const withheld = result.omitted.filter((unit) => unit.omitted_reason === 'narrow-match').length;
-  const overflow = result.omitted.length - withheld;
   switch (result.status) {
     case 'complete':
       return 'every selected unit fits the budget.';
     case 'partial': {
-      const parts = [];
-      if (overflow > 0) parts.push(`${overflow} lower-tier unit${overflow === 1 ? '' : 's'} did not fit`);
-      if (withheld > 0) {
-        // Every unit in a narrow match is low-confidence, the packed ones included.
-        parts.push(`most of the task's distinctive words had no keyword match, so every match is low-confidence: the top ${result.units.filter((unit) => unit.tier === 'ranked').length} are shown for orientation and ${withheld} more ${withheld === 1 ? 'is' : 'are'} listed as reads only`);
-      }
-      return `${parts.join('; ')}; see Follow-up reads.`;
+      const overflow = result.omitted.length;
+      return `${overflow} lower-tier unit${overflow === 1 ? '' : 's'} did not fit; see Follow-up reads.`;
     }
     case 'no-match':
-      return 'no architecture doc or decision matched this task. Nothing in memory is presented as relevant; say so in your plan, and read the orientation overview if the task needs broader context.';
+      if (result.follow_ups.length > 0) {
+        // Topic words unknown to the index: nearby reads share other task words.
+        return `no architecture doc or decision matched this task's distinctive words. Nothing in memory is presented as relevant. The nearby reads below share only other task words: check them${searchSuffix(result, frame, ' and search memory')} before concluding that nothing applies, and say in your plan what, if anything, applies.`;
+      }
+      return `no architecture doc or decision matched this task. Nothing in memory is presented as relevant${searchSuffix(result, frame, '; search memory')} before concluding that nothing applies, say so in your plan, and read the orientation overview if the task needs broader context.`;
     default:
       return `${excerpt(result.status_reason, frame.reason)}.`;
   }
+}
+
+/** " for: `a`, `b`" — the task's key terms to search (rarest first), bounded by the frame. */
+function searchSuffix(result, frame, lead = '') {
+  const terms = (result.selection?.search_terms ?? []).slice(0, frame.searchTerms).map((term) => `\`${excerpt(term, frame.searchTerm)}\``);
+  if (terms.length === 0) return lead ? `${lead}` : '.';
+  return `${lead} for ${terms.join(', ')}${lead ? '' : '.'}`;
 }
 
 function renderHeader(result, frame) {

@@ -3,7 +3,13 @@
 // canonical memory at architecture/platform/project-memory/recall-evaluation.md).
 // Development tool; not shipped in the npm package.
 //
-//   node scripts/evaluate-brief-tuning.js --corpus <dir> --labels <recall-evaluation.md> --out <dir> [--warm-runs 10]
+//   node scripts/evaluate-brief-tuning.js --corpus <dir> --labels <recall-evaluation.md> --out <dir> [--warm-runs 10] [--label-version v2|v1]
+//
+// --label-version (default v2) picks the grading key: v1 is the A3 key over
+// recall-eval-corpus-v1; v2 applies the reviewer-confirmed revisions in
+// recall-evaluation.md › Corpus v2 tuning-label re-verification (A7) for
+// recall-eval-corpus-v2 (T3, C1, and C3 change; F2's changes add no doc or
+// decision source).
 //
 // <corpus> is a read-only export of the frozen corpus with both evaluation
 // files and sessions/active/ removed, for example:
@@ -109,6 +115,39 @@ const EXPECTED = {
   C3: ['D:359', 'D:159', 'D:278', 'A:platform/project-memory/recall-and-plain-language-build-plan.md'],
 };
 
+// Corpus v2 revisions (A7): per task, the items and expected passages that
+// replace the v1 key above; tasks not listed keep their v1 entries.
+const SUPPORT_V2 = {
+  T3: {
+    M1: ['D:238', 'A:platform/project-memory/hosted-schema.md'],
+    M2: ['D:239', 'D:291', 'A:platform/project-memory/hosted-schema.md', 'A:platform/project-memory/hosted-docs-review.md'],
+    M3: ['D:240', 'A:platform/project-memory/hosted-schema.md', 'A:platform/project-memory/hosted-docs-review.md'],
+    M4: ['D:243', 'A:platform/project-memory/hosted-schema.md'],
+    M5: ['A:platform/project-memory/hosted-schema.md', 'A:dashboard/project-management/frontend.md', 'A:platform/project-memory/recall-and-plain-language-build-plan.md'],
+  },
+  C1: {
+    M1: ['D:361', 'D:298', 'D:299', 'D:366', 'A:platform/billing/entitlements-and-usage-ledger.md', 'A:platform/project-memory/plain-language-views.md', 'A:platform/project-memory/recall-and-plain-language-build-plan.md'],
+    M2: ['D:361'],
+    M3: ['D:361', 'D:366', 'A:platform/project-memory/plain-language-views.md', 'A:platform/billing/entitlements-and-usage-ledger.md'],
+    M4: ['D:360', 'D:367', 'A:platform/project-memory/plain-language-views.md'],
+    M5: ['D:357', 'D:360', 'D:361'],
+    M6: ['A:platform/infrastructure/ci-cd.md'],
+    M7: ['A:platform/project-memory/plain-language-views.md', 'A:platform/project-memory/recall-and-plain-language-build-plan.md'],
+  },
+  C3: {
+    M1: ['D:359', 'A:platform/project-memory/session-brief.md'],
+    M2: ['D:359', 'D:368', 'A:platform/project-memory/recall-and-plain-language-build-plan.md', 'A:platform/project-memory/session-brief.md'],
+    M3: ['A:platform/project-memory/recall-and-plain-language-build-plan.md', 'D:159', 'A:platform/project-memory/session-brief.md'],
+    M4: ['D:278', 'D:359', 'D:364', 'A:platform/project-memory/session-brief.md'],
+    M5: ['A:platform/project-memory/recall-and-plain-language-build-plan.md', 'A:mcp-server/context-delivery/read-tools.md'],
+  },
+};
+const EXPECTED_V2 = {
+  T3: ['A:platform/project-memory/hosted-schema.md', 'D:238', 'D:239', 'D:240', 'D:243'],
+  C1: ['D:361', 'D:366', 'D:360', 'D:357', 'D:298', 'D:299', 'A:platform/project-memory/plain-language-views.md', 'A:platform/billing/entitlements-and-usage-ledger.md', 'A:platform/project-memory/recall-and-plain-language-build-plan.md', 'A:platform/infrastructure/ci-cd.md'],
+  C3: ['D:359', 'D:368', 'D:159', 'D:278', 'A:platform/project-memory/recall-and-plain-language-build-plan.md', 'A:platform/project-memory/session-brief.md'],
+};
+
 // Unlabeled paraphrases run after the 12 tasks and are reported separately
 // (review passes 1 and 2). `match` cases name a topic memory covers, phrased
 // with unfamiliar modifiers: each must not come back `no-match` AND must
@@ -139,6 +178,13 @@ const corpus = option('--corpus');
 const labelsPath = option('--labels');
 const outDir = option('--out');
 const warmRuns = Number(option('--warm-runs', '10'));
+const labelVersion = option('--label-version', 'v2');
+if (!['v1', 'v2'].includes(labelVersion)) {
+  console.error('--label-version must be v1 or v2');
+  process.exit(2);
+}
+const supportKey = labelVersion === 'v2' ? { ...SUPPORT, ...SUPPORT_V2 } : SUPPORT;
+const expectedKey = labelVersion === 'v2' ? { ...EXPECTED, ...EXPECTED_V2 } : EXPECTED;
 if (!corpus || !labelsPath || !outDir || /heldout/i.test(labelsPath)) {
   console.error('Usage: node scripts/evaluate-brief-tuning.js --corpus <dir> --labels <recall-evaluation.md> --out <dir> [--warm-runs 10]');
   process.exit(2);
@@ -183,6 +229,33 @@ for (const task of tasks) {
 }
 
 printReport(rows);
+await writeFile(
+  path.join(outDir, 'results.json'),
+  `${JSON.stringify(
+    {
+      label_version: labelVersion,
+      tasks: rows.map((row) => ({
+        id: row.task.id,
+        status: row.result.status,
+        topic_absent: row.result.selection.topic_absent,
+        coverage_any: row.coverageAny ?? null,
+        coverage_included: row.coverageIncluded ?? null,
+        items: row.items ?? null,
+        no_match_correct: row.noMatchCorrect ?? null,
+        expected: row.expected ?? null,
+        estimated_tokens: row.result.budget.estimated_tokens,
+        units: row.result.units.length,
+        omitted: row.result.omitted.length,
+        follow_ups: row.result.follow_ups.length,
+        cold_ms: Math.round(row.coldMs),
+        warm_p50_ms: Math.round(row.warmP50),
+        safe_overflow: row.safe,
+      })),
+    },
+    null,
+    2,
+  )}\n`,
+);
 
 console.log('');
 console.log('Paraphrase probes (unlabeled; reported separately):');
@@ -200,7 +273,7 @@ for (const [id, expectation, taskText, expected] of EXTRA_CASES) {
           ? 'FAIL (expected source missing)'
           : `ok (${found.map((entry) => `${entry.passage.replace(/^A:.*\//, '').replace(/^D:/, 'D-')} ${entry.where}`).join(', ')})`;
   const firstUnits = result.units.filter((unit) => unit.kind !== 'lane').slice(0, 3).map((unit) => unit.path ?? unit.id).join(', ');
-  console.log(`- ${id} [${expectation}] ${result.status}${result.selection.narrowed ? ' (narrow)' : ''} — ${verdict}; unmatched: ${gap ? gap.terms.join(', ') : 'none'}; first units: ${firstUnits || 'none'}`);
+  console.log(`- ${id} [${expectation}] ${result.status}${result.selection.topic_absent ? ' (topic absent)' : ''} — ${verdict}; unmatched: ${gap ? gap.terms.join(', ') : 'none'}; first units: ${firstUnits || 'none'}`);
 }
 
 function parseTuningTasks(markdown) {
@@ -252,7 +325,7 @@ function grade(id, result) {
   if (id.startsWith('N')) {
     return { noMatchCorrect: result.status === 'no-match' && result.units.every((unit) => unit.kind === 'lane'), safe };
   }
-  const items = Object.entries(SUPPORT[id]).map(([item, passages]) => {
+  const items = Object.entries(supportKey[id]).map(([item, passages]) => {
     const where = passages.map((passage) => locate(result, passage));
     return { item, any: where.some((entry) => entry !== 'missing'), included: where.includes('included') };
   });
@@ -261,7 +334,7 @@ function grade(id, result) {
     coverageAny: items.filter((entry) => entry.any).length / items.length,
     coverageIncluded: items.filter((entry) => entry.included).length / items.length,
     items,
-    expected: EXPECTED[id].map((passage) => ({ passage, where: locate(result, passage) })),
+    expected: expectedKey[id].map((passage) => ({ passage, where: locate(result, passage) })),
   };
 }
 

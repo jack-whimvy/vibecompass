@@ -4,6 +4,7 @@ import {
   BRIEF_CONTRACT_VERSION,
   BRIEF_DEFAULT_BUDGET,
   BRIEF_OVERVIEW_PATH,
+  briefShortHash,
   buildSessionBrief,
   computeBriefCorpusDigest,
   describeBriefInputs,
@@ -30,8 +31,11 @@ import { PACKAGE_VERSION } from './version.js';
  */
 
 export const LANE_BRIEF_FILENAME = 'brief.md';
-export const LANE_BRIEF_FORMAT = 1;
+export const LANE_BRIEF_FORMAT = 2;
 const MAX_HEADER_INPUTS = 24;
+// Lists that grow with settings and repos show at most this many entries; a
+// digest of the whole list is the binding, so staleness checks stay complete.
+const MAX_HEADER_LIST = 4;
 const MAX_REASON_LENGTH = 400;
 
 export function laneBriefPath(rootDir, laneId) {
@@ -210,8 +214,7 @@ async function compareBindings({ header, destinationRoot, laneId, sourceRootDir,
   const reasons = [];
   // The alias map comes from both roots' project.yaml; the destination's is
   // not part of the source corpus, so it is compared directly.
-  const recordedAliases = Array.isArray(header.repo_aliases) ? header.repo_aliases.map(String) : [];
-  if (JSON.stringify(recordedAliases) !== JSON.stringify(source.aliasPairs.map(formatAliasPair))) {
+  if (header.repo_aliases_digest !== headerListDigest(source.aliasPairs.map(formatAliasPair))) {
     reasons.push('the repo alias map changed (a destination or source repo id or remote)');
   }
 
@@ -222,6 +225,9 @@ async function compareBindings({ header, destinationRoot, laneId, sourceRootDir,
     return [...reasons, `brief settings are invalid, so freshness cannot be checked without reading excluded paths: ${problems.join('; ')}`];
   }
   const exclusions = compileBriefExclusions(uniqueStrings([...sourceSettings.exclude, ...destinationSettings.exclude]));
+  if (header.exclude_digest !== headerListDigest(exclusions.patterns)) {
+    reasons.push('the brief exclusions changed (project.yaml brief.exclude)');
+  }
 
   const lane = await readBriefLaneBindings(source.rootDir, source.laneId);
   const identity = lane.sessionDate && Number.isInteger(lane.sessionNumber) ? `${lane.sessionDate}-${lane.sessionNumber}` : null;
@@ -392,12 +398,14 @@ function renderLaneBriefDocument({ destinationRoot, laneId, generatedAt, budget,
     `destination_root: ${quote(destinationRoot)}`,
     `destination_lane: ${quote(laneId)}`,
     `corpus_digest: ${quote(result.source.corpus_digest ?? 'none')}`,
-    ...renderList('exclude', result.source.exclude ?? []),
+    `exclude_digest: ${quote(headerListDigest(result.source.exclude ?? []))}`,
+    ...renderBoundedList('exclude', result.source.exclude ?? [], 'exclude_digest'),
     'lane_bindings:',
     `  session: ${quote(lane?.session ?? 'none')}`,
     `  handoff: ${quote(encodeOptionalHash(lane?.handoff ?? null))}`,
     `  other_lanes: ${quote(lane?.other_lanes ?? 'none')}`,
-    ...renderList('repo_aliases', source.aliasPairs.map(formatAliasPair)),
+    `repo_aliases_digest: ${quote(headerListDigest(source.aliasPairs.map(formatAliasPair)))}`,
+    ...renderBoundedList('repo_aliases', source.aliasPairs.map(formatAliasPair), 'repo_aliases_digest'),
     ...renderList('inputs', [
       ...shown.map((input) => `${input.hash} ${input.key}`),
       ...(folded.length > 0 ? [`+${folded.length} more inputs (covered by corpus_digest)`] : []),
@@ -444,6 +452,7 @@ function assembleBriefDocument(commands, generatedAt, fields, body) {
   const lines = [
     '---',
     '# Generated session brief (D-357, D-359, D-364); do not edit. It is stale once any binding below changes.',
+    '# The token budget covers the brief body below this header; the header is metadata outside it.',
     `# Check: ${commands.check}`,
     `# Refresh: ${commands.write}`,
     `brief_format: ${LANE_BRIEF_FORMAT}`,
@@ -464,6 +473,18 @@ function assembleBriefDocument(commands, generatedAt, fields, body) {
 function renderList(key, values) {
   if (values.length === 0) return [`${key}: []`];
   return [`${key}:`, ...values.map((value) => `  - ${quote(value)}`)];
+}
+
+/** At most MAX_HEADER_LIST entries, then "+N more"; the named digest binds the whole list. */
+function renderBoundedList(key, values, digestKey) {
+  if (values.length <= MAX_HEADER_LIST) return renderList(key, values);
+  const shown = values.slice(0, MAX_HEADER_LIST - 1);
+  return renderList(key, [...shown, `+${values.length - shown.length} more (bound by ${digestKey})`]);
+}
+
+/** Order-insensitive short digest of a header list (sorted values). */
+function headerListDigest(values) {
+  return briefShortHash([...values].map(String).sort());
 }
 
 function parseInputLines(values) {

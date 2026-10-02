@@ -266,7 +266,9 @@ follow-up reads. It runs locally and deterministically: no network, no model,
 no account. A decision always appears together with any later decision whose
 own text explicitly declares that it replaces or amends it, and the brief never
 claims that a decision governs your task. It cannot spot a replacement that is
-only implied, so read the follow-up list too.
+only implied, so read the follow-up list too. When the task's distinctive words
+match nothing in memory, the status is `no-match`, with at most four nearby
+reads that share the task's other words.
 
 The brief in a session lane is an experiment you turn on (D-368):
 

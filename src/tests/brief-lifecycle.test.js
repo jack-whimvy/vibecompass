@@ -88,6 +88,10 @@ async function startLane(workspace, rootDir, options = {}) {
   });
 }
 
+function content(file) {
+  return file.content;
+}
+
 async function readBriefFile(rootDir, laneId = 'ledger') {
   const content = await readFile(laneBriefPath(rootDir, laneId), 'utf8');
   const { data, body } = parseFrontmatter(content);
@@ -296,7 +300,7 @@ test('start-session writes brief.md on an opted-in root: lane-derived inputs, he
 
   const { header, body } = await readBriefFile(rootDir);
   assert.equal(body, renderBrief(await buildSessionBrief({ rootDir, laneId: 'ledger' })), 'the body is exactly what `vibecompass brief` prints for the lane');
-  assert.equal(header.brief_format, 1);
+  assert.equal(header.brief_format, 2);
   assert.equal(header.generation, 'ok');
   assert.equal(header.status, started.brief.status);
   assert.equal(header.source_root, rootDir);
@@ -308,6 +312,9 @@ test('start-session writes brief.md on an opted-in root: lane-derived inputs, he
   assert.match(header.lane_bindings.session, /^[0-9a-f]{16}$/);
   assert.match(header.lane_bindings.handoff, /^[0-9a-f]{16}$/);
   assert.deepEqual(header.repo_aliases, ['app -> app', 'core -> core']);
+  assert.match(header.repo_aliases_digest, /^[0-9a-f]{16}$/);
+  assert.match(header.exclude_digest, /^[0-9a-f]{16}$/);
+  assert.match(content(await readBriefFile(rootDir)), /^# The token budget covers the brief body below this header; the header is metadata outside it\.$/m);
   assert.ok(header.inputs.some((line) => /^[0-9a-f]{16} architecture\/billing\/ledger\.md$/.test(line)), 'the lane claim selected the covering doc');
   assert.ok(header.inputs.some((line) => /^[0-9a-f]{16} decisions\/cross-cutting\.md#D-\d{3}/.test(line)), 'decisions bind per entry');
   assert.match(body, /Task: Wire the ledger denial copy for refresh runs/);
@@ -446,6 +453,7 @@ test('staleness is computed from the header bindings, and continue-session regen
   // project.yaml brief settings are canonical input too.
   await writeProjectYaml(rootDir, { brief: { enabled: true, exclude: ['architecture/sync/**'] }, tmpBase: path.join(workspace, 'lane-tmp') });
   assert.equal((await check()).stale, true);
+  assert.ok((await check()).reasons.includes('the brief exclusions changed (project.yaml brief.exclude)'));
   await resume();
 
   // Another lane opening changes this lane's watch-outs.
@@ -454,10 +462,33 @@ test('staleness is computed from the header bindings, and continue-session regen
 
   // A hand-edited or foreign header is stale, never trusted.
   const briefFile = laneBriefPath(rootDir, 'ledger');
-  await writeFile(briefFile, (await readFile(briefFile, 'utf8')).replace('brief_format: 1', 'brief_format: 99'));
+  await writeFile(briefFile, (await readFile(briefFile, 'utf8')).replace('brief_format: 2', 'brief_format: 99'));
   assert.match((await check()).reasons[0], /another format/);
   await writeFile(briefFile, '# no header\n');
   assert.match((await check()).reasons[0], /header is missing or unreadable/);
+});
+
+test('header lists that grow with settings and repos are bounded; their digests keep staleness complete (A7)', async (t) => {
+  const exclude = ['notes/a.md', 'notes/b.md', 'notes/c.md', 'notes/d.md', 'notes/e.md', 'notes/f.md'];
+  const repos = ['app', 'core', 'docs', 'mcp', 'web', 'cli'].map((id) => ({ id, remote: `https://github.com/example/acme-${id}.git` }));
+  const { workspace, rootDir } = await makeWorkspace(t, { brief: { enabled: true, exclude }, repos });
+  await startLane(workspace, rootDir);
+  const check = () => inspectLaneBrief({ rootDir, laneId: 'ledger' });
+  const { header } = await readBriefFile(rootDir);
+  assert.deepEqual(header.exclude, ['notes/a.md', 'notes/b.md', 'notes/c.md', '+3 more (bound by exclude_digest)']);
+  assert.equal(header.repo_aliases.length, 4);
+  assert.equal(header.repo_aliases.at(-1), '+3 more (bound by repo_aliases_digest)');
+  assert.deepEqual((await check()).reasons, []);
+
+  // A pattern the header no longer prints still binds the brief.
+  await writeProjectYaml(rootDir, { brief: { enabled: true, exclude: [...exclude.slice(0, 5), 'notes/g.md'] }, repos, tmpBase: path.join(workspace, 'lane-tmp') });
+  assert.ok((await check()).reasons.includes('the brief exclusions changed (project.yaml brief.exclude)'));
+  await writeProjectYaml(rootDir, { brief: { enabled: true, exclude }, repos, tmpBase: path.join(workspace, 'lane-tmp') });
+  assert.deepEqual((await check()).reasons, []);
+
+  // So does a repo the header folded away.
+  await writeProjectYaml(rootDir, { brief: { enabled: true, exclude }, repos: [...repos.slice(0, 5), { id: 'tools', remote: 'https://github.com/example/acme-tools.git' }], tmpBase: path.join(workspace, 'lane-tmp') });
+  assert.ok((await check()).reasons.includes('the repo alias map changed (a destination or source repo id or remote)'));
 });
 
 // ---------------------------------------------------------------------------
