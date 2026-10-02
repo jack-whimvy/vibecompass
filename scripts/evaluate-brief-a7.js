@@ -8,7 +8,8 @@
 //   node scripts/evaluate-brief-a7.js run     --out <dir> [--concurrency 4] [--only r001,r002]
 //   node scripts/evaluate-brief-a7.js grade   --out <dir> [--concurrency 4] [--only F1,T2]
 //   node scripts/evaluate-brief-a7.js score   --out <dir>
-//   node scripts/evaluate-brief-a7.js smoke   --corpus <dir> --labels <dir> --out <dir> --task <id> [--cap 3]
+//   node scripts/evaluate-brief-a7.js smoke   --corpus <dir> --labels <dir> --out <dir> --task <id> [--cap 3] [--stated-cap 24]
+//   node scripts/evaluate-brief-a7.js describe   (template version and sha256, cap, flags; for the pre-registration)
 //
 // What A7 changes from A5 (scripts/evaluate-brief-a5.js):
 // - Startup order is enforced by construction: the harness reads the
@@ -347,7 +348,7 @@ async function run() {
     const prompt = await readFile(path.join(outDir, 'prompts', `${entry.id}.txt`), 'utf8');
     if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
     const outcome = await runAgent(prompt, entry.root, path.join(outDir, 'transcripts', entry.id), manifest.tool_call_cap);
-    const metrics = await auditRun(outDir, entry, manifest.tool_call_cap);
+    const metrics = await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version);
     console.log(`${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${outcome.stopped ? ' (stopped at the cap; report turn)' : ''}, ${Math.round((metrics.duration_ms ?? 0) / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, VIOLATIONS: ${metrics.violations.join('; ')}` : ''}`);
   });
 }
@@ -421,7 +422,7 @@ function renderResearchTranscript(events, cap) {
 }
 
 /** Tool calls, tokens read, wall time, cost, the final report, and confinement checks for one run. */
-async function auditRun(dir, entry, cap) {
+async function auditRun(dir, entry, cap, expectedVersion = null) {
   const base = path.join(dir, 'transcripts', entry.id);
   const research = parseEvents(await readFile(`${base}.jsonl`, 'utf8'));
   const reportEvents = await readFile(`${base}.report.jsonl`, 'utf8').then(parseEvents, () => null);
@@ -446,6 +447,9 @@ async function auditRun(dir, entry, cap) {
   }
   if (!init || init.tools?.some((tool) => !['Read', 'Grep', 'Glob'].includes(tool)) || !init.tools?.length) violations.push(`unexpected tools ${init?.tools?.join(',')}`);
   if (init?.model !== MODEL) violations.push(`model ${init?.model}`);
+  if (expectedVersion && !String(expectedVersion).startsWith(String(init?.claude_code_version))) violations.push(`Claude Code ${init?.claude_code_version}, prepared with ${expectedVersion}`);
+  if ((init?.mcp_servers ?? []).length > 0) violations.push(`MCP servers ${JSON.stringify(init.mcp_servers)}`);
+  if (init && init.permissionMode !== 'dontAsk') violations.push(`permission mode ${init.permissionMode}`);
   if ((researchResult?.permission_denials ?? []).length > 0) violations.push(`${researchResult.permission_denials.length} permission denials`);
   const resultChars = counted.reduce((sum, use) => sum + [...(results.get(use.id) ?? '')].length, 0);
   let report = '';
@@ -577,7 +581,7 @@ async function grade() {
       const reports = {};
       for (const arm of ['baseline', 'brief']) {
         const entry = manifest.runs.find((candidate) => candidate.task === task.id && candidate.arm === arm && candidate.replicate === replicate);
-        reports[arm] = (await auditRun(outDir, entry, manifest.tool_call_cap)).report;
+        reports[arm] = (await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version)).report;
       }
       const swap = Number.parseInt(sha256(`a7-blind:${task.id}:${replicate}`).slice(0, 2), 16) % 2 === 1;
       const firstOrder = swap ? { P: 'brief', Q: 'baseline' } : { P: 'baseline', Q: 'brief' };
@@ -602,7 +606,7 @@ async function grade() {
       const reports = {};
       for (const arm of ['baseline', 'brief']) {
         const entry = manifest.runs.find((candidate) => candidate.task === task.id && candidate.arm === arm && candidate.replicate === replicate);
-        reports[arm] = (await auditRun(outDir, entry, manifest.tool_call_cap)).report;
+        reports[arm] = (await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version)).report;
       }
       const swap = Number.parseInt(sha256(`a7-tiebreak:${task.id}:${replicate}`).slice(0, 2), 16) % 2 === 1;
       tiebreaks.push(reportJob(task, label, replicate, 'g3', swap ? { P: 'brief', Q: 'baseline' } : { P: 'baseline', Q: 'brief' }, reports));
@@ -824,7 +828,7 @@ async function score() {
       for (const grade of grades.filter(Boolean)) costs.graders += grade.cost_usd ?? 0;
       for (const arm of ['baseline', 'brief']) {
         const entry = manifest.runs.find((candidate) => candidate.task === task.id && candidate.arm === arm && candidate.replicate === replicate);
-        const metrics = await auditRun(outDir, entry, manifest.tool_call_cap);
+        const metrics = await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version);
         costs.runs += metrics.cost_usd ?? 0;
         const [first, second, third] = grades.map((grade) => (grade ? armVerdicts(label, grade, arm) : null));
         // Agreement between the two independent first-pass graders.
@@ -1199,8 +1203,32 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+function describe() {
+  console.log(
+    JSON.stringify(
+      {
+        prompt_template_version: PROMPT_TEMPLATE_VERSION,
+        prompt_template_sha256: sha256(`${PROMPT_TEMPLATE}\n${REPORT_TURN_TEMPLATE}`),
+        model: MODEL,
+        effort: EFFORT,
+        tool_call_cap: TOOL_CALL_CAP,
+        default_replicates: DEFAULT_REPLICATES,
+        agent_args: [...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM],
+        report_turn_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM],
+        grader_args: [...CLAUDE_ARGS, ...NO_TOOLS, '--output-format', 'json', '--json-schema', '<schema>'],
+      },
+      null,
+      2,
+    ),
+  );
+}
+
 // Dispatch last, so every module-level constant above is initialized.
-const commands = { prepare, run, grade, score, smoke };
+const commands = { prepare, run, grade, score, smoke, describe };
+if (command === 'describe') {
+  describe();
+  process.exit(0);
+}
 if (!commands[command] || !outDir) {
   console.error('Usage: node scripts/evaluate-brief-a7.js <prepare|run|grade|score|smoke> --out <dir> [...]');
   process.exit(2);
