@@ -392,3 +392,113 @@ test('a grader session that errors or used another model never yields a grade (r
     assert.ok(invalid.problems.some((problem) => (mode === 'error' ? /did not complete \(error_max_turns, is_error\)/ : /model usage \["claude-haiku-4-5"\]/).test(problem)), invalid.problems.join(' | '));
   }
 });
+
+// --------------------------------------------------------- pass 4
+
+test('missing, empty, or partial run metadata never disables transcript verification; recovery rebuilds it from the ledger (review pass 4, R8)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  await harness.run(ctx);
+  await harness.grade(ctx);
+  await harness.screen(ctx);
+  assert.equal((await harness.score(ctx)).go, true);
+
+  const metaFile = path.join(ctx.dir, 'transcripts', 'r001.meta.json');
+  const transcript = path.join(ctx.dir, 'transcripts', 'r001.jsonl');
+  const metaText = await readFile(metaFile, 'utf8');
+  const transcriptText = await readFile(transcript, 'utf8');
+  const findings = async () => (await harness.score(ctx)).gates.conformance.findings.join(' | ');
+
+  await rm(metaFile);
+  assert.match(await findings(), /run metadata is missing or does not match the ledger for the research session/);
+  // Changed research evidence (a tool result) with the metadata gone: the ledger still catches it.
+  await writeFile(transcript, transcriptText.replace('read 1', 'read nothing useful'));
+  assert.match(await findings(), /research transcript differs from the ledger record/);
+  await writeFile(transcript, transcriptText);
+
+  await writeFile(metaFile, '{}');
+  assert.match(await findings(), /run metadata is missing or does not match the ledger/);
+  const partial = JSON.parse(metaText);
+  delete partial.research_sha256;
+  await writeFile(metaFile, JSON.stringify(partial));
+  assert.match(await findings(), /run metadata is missing or does not match the ledger/);
+
+  // `run` rebuilds missing metadata from the ledger and the attempt stream, without a new paid attempt.
+  await rm(metaFile);
+  const attemptsBefore = await harness.attemptsOf(ctx.dir, 'run:r001');
+  await harness.run(ctx);
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), attemptsBefore, 'nothing is re-run');
+  assert.equal(JSON.parse(await readFile(metaFile, 'utf8')).recovered, true);
+  assert.equal((await harness.score(ctx)).go, true);
+});
+
+test('a stopped run whose report turn the cap cannot fund stays pending, then resumes without repeating research (review pass 4, R10)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  process.env.MOCK_CALLS = '25';
+  const tight = await harness.run({ ...ctx, cap: 1.51, concurrency: 1, only: new Set(['r001']) });
+  assert.deepEqual(tight.skipped, ['r001 (report turn pending)']);
+  process.exitCode = 0;
+  const metaFile = path.join(ctx.dir, 'transcripts', 'r001.meta.json');
+  assert.equal(JSON.parse(await readFile(metaFile, 'utf8')).state, 'report-pending');
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), 1);
+  assert.equal(await harness.attemptsOf(ctx.dir, 'report:r001'), 0, 'no report session started past the cap');
+
+  await harness.run({ ...ctx, cap: 10, concurrency: 1, only: new Set(['r001']) });
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), 1, 'research is not repeated');
+  assert.equal(await harness.attemptsOf(ctx.dir, 'report:r001'), 1);
+  const meta = JSON.parse(await readFile(metaFile, 'utf8'));
+  assert.equal(meta.state, 'complete');
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const audit = await harness.auditRun(ctx.dir, manifest.runs[0], manifest.tool_call_cap, manifest);
+  assert.deepEqual(audit.violations, []);
+  assert.equal(audit.stopped_at_cap, true);
+  assert.equal(audit.tool_calls, 24);
+});
+
+test('the split guard uses final task means: a stage-1 dip that confirmation runs recover passes (review pass 4, R11 parity control)', async (t) => {
+  const { harness } = await loadHarness(t);
+  // 15 two-item positive tasks (9 tuning, 6 held-out). Three tuning tasks have
+  // baseline [1, 1, 1] and brief [1, 1, 0.5] in stage 1, and perfect
+  // confirmation runs; everything else is perfect. Same case as the
+  // simulation's --self-test.
+  const run = (items) => ({ items, recall: items.filter(Boolean).length === items.length ? 1 : 0.5 });
+  const full = run([true, true]);
+  const half = run([true, false]);
+  const row = (id, split, base, brief) => ({
+    id,
+    split,
+    positive: true,
+    replicates: base.length,
+    recall: Object.fromEntries([['baseline', base], ['brief', brief]].map(([arm, runs]) => [arm, { mean: runs.reduce((sum, entry) => sum + entry.recall, 0) / runs.length, min: Math.min(...runs.map((entry) => entry.recall)), max: Math.max(...runs.map((entry) => entry.recall)), per_run: runs.map((entry) => entry.recall) }])),
+    clause_counts: [0, 1].map((index) => ({ clause: `M${index + 1}`, n: base.length, baseline: base.filter((entry) => entry.items[index]).length, brief: brief.filter((entry) => entry.items[index]).length })),
+    runs: { baseline: base.map(() => ({ metrics: { violations: [], stopped_at_cap: false }, forbidden: [] })), brief: brief.map(() => ({ metrics: { violations: [], stopped_at_cap: false }, forbidden: [] })) },
+    weakened: [],
+    gained: [],
+    baseline_unstable: [],
+    brief_violations: [],
+    brief_presents_governing: false,
+  });
+  const ids = [...Array.from({ length: 9 }, (_, index) => [`T${index}`, 'tuning']), ...Array.from({ length: 6 }, (_, index) => [`H${index}`, 'held-out'])];
+  const stage1Rows = ids.map(([id, split], index) => row(id, split, [full, full, full], index < 3 ? [full, full, half] : [full, full, full]));
+  const finalRows = ids.map(([id, split], index) => (index < 3 ? row(id, split, [full, full, full, full, full, full], [full, full, half, full, full, full]) : stage1Rows[index]));
+  const stage1 = harness.screenRows(stage1Rows);
+  assert.deepEqual(stage1.flagged.map((entry) => entry.id), ['T0', 'T1', 'T2']);
+  const manifest = {
+    stage1_replicates: 3,
+    briefs: Object.fromEntries(ids.map(([id]) => [id, { status: 'complete', safe_overflow: [], body_matches_json: true, replicates: [{ normalized_sha256: 'x' }] }])),
+    latency: { warm_p50_max_ms: 200, cold_max_ms: 400 },
+    preflight: { pass: true },
+    pre_run_gates: { pass: true, failures: [] },
+    package_dirty: false,
+  };
+  const spend = { total: 0, by_kind: {}, attempts: 0, estimated: [], unresolved: [], reserved_unresolved: 0 };
+  const summary = harness.summarize(finalRows, manifest, {}, spend, stage1);
+  assert.equal(Math.round(summary.gates.no_regression.split_drops.tuning * 1e6) / 1e6, 0.027778, 'final tuning drop');
+  assert.deepEqual(summary.gates.no_regression.confirmed_losses, []);
+  assert.equal(summary.gates.no_regression.pass, true);
+  assert.equal(summary.go, true);
+  // The stage-1 means alone would have breached the guard.
+  const stage1Drop = stage1Rows.slice(0, 9).reduce((sum, entry) => sum + entry.recall.baseline.mean - entry.recall.brief.mean, 0) / 9;
+  assert.ok(stage1Drop > 0.05);
+});

@@ -23,8 +23,10 @@ Variants (assumptions the results depend on):
 
 Rules: the first pre-registered clause rule (baseline 3/3, brief at most 1/3),
 that rule plus 2/3 -> 0/3, and the adopted two-stage rule (stage-1 screen, three
-more replicates for flagged tasks, confirmation, split guard), with the
-thresholds of the harness's REGRESSION constant.
+more replicates for flagged tasks, confirmation, and the split guard on final
+task means), with the thresholds of the harness's REGRESSION constant. `gate`
+mirrors the harness's scorer; `--self-test` runs a deterministic parity control
+that also runs before every simulation.
 
 Effects on the brief arm: none (false-alarm rate), one clause collapsing to 0.1,
 a T3-like collapse of four clauses in one task, and every clause 0.10 lower.
@@ -79,31 +81,69 @@ def task_stats(runs_base, runs_brief, shape):
     return drop, counts
 
 
+def gate(stage1, stage2, shapes):
+    """The adopted two-stage gate, as the harness scores it (screenRows,
+    confirmedLoss, summarize). stage1[t] = (baseline runs, brief runs), three
+    each; stage2[t] = three more per arm for a flagged task, else None. A run is
+    (recall, clause states). Split drops use each task's final means: six
+    replicates for a confirmed-run task, three otherwise."""
+    flagged, final_drops = [], []
+    for t, (b, r) in enumerate(stage1):
+        drop, counts = task_stats(b, r, shapes[t])
+        if drop > REGRESSION["screen_task_drop"] + 1e-9 or any(cb >= 2 and cb - cr >= 2 for cb, cr in counts):
+            flagged.append(t)
+    systematic = len(flagged) > REGRESSION["max_flagged"]
+    confirmed = False
+    for t, (b, r) in enumerate(stage1):
+        if not systematic and t in flagged and stage2[t] is not None:
+            b, r = b + stage2[t][0], r + stage2[t][1]
+            drop, counts = task_stats(b, r, shapes[t])
+            if drop > REGRESSION["confirm_task_drop"] + 1e-9 or any(cb >= REGRESSION["confirm_baseline_min"] and cr <= REGRESSION["confirm_brief_max"] for cb, cr in counts):
+                confirmed = True
+        else:
+            drop, _ = task_stats(b, r, shapes[t])
+        final_drops.append(drop)
+    split = statistics.fmean(final_drops[:9]) > REGRESSION["split_drop"] + 1e-9 or statistics.fmean(final_drops[9:]) > REGRESSION["split_drop"] + 1e-9
+    return {"fails": split or systematic or confirmed, "flagged": flagged, "systematic": systematic, "confirmed": confirmed, "split": split}
+
+
 def evaluate(rng, base, brief, variant):
     shapes = [[len(item) for item in task] for task in base]
     stage1 = [([one_run(rng, base[t], variant) for _ in range(3)], [one_run(rng, brief[t], variant) for _ in range(3)]) for t in range(len(base))]
     first_rule = first_rule_plus = False
-    flagged, drops = [], []
     for t, (b, r) in enumerate(stage1):
-        drop, counts = task_stats(b, r, shapes[t])
-        drops.append(drop)
+        _, counts = task_stats(b, r, shapes[t])
         if any(cb == 3 and cr <= 1 for cb, cr in counts):
             first_rule = True
         if any((cb == 3 and cr <= 1) or (cb == 2 and cr == 0) for cb, cr in counts):
             first_rule_plus = True
-        if drop > REGRESSION["screen_task_drop"] + 1e-9 or any(cb >= 2 and cb - cr >= 2 for cb, cr in counts):
-            flagged.append(t)
-    split = statistics.fmean(drops[:9]) > REGRESSION["split_drop"] + 1e-9 or statistics.fmean(drops[9:]) > REGRESSION["split_drop"] + 1e-9
-    systematic = len(flagged) > REGRESSION["max_flagged"]
-    confirmed = False
-    if not systematic:
-        for t in flagged:
-            b = stage1[t][0] + [one_run(rng, base[t], variant) for _ in range(3)]
-            r = stage1[t][1] + [one_run(rng, brief[t], variant) for _ in range(3)]
-            drop, counts = task_stats(b, r, shapes[t])
-            if drop > REGRESSION["confirm_task_drop"] + 1e-9 or any(cb >= REGRESSION["confirm_baseline_min"] and cr <= REGRESSION["confirm_brief_max"] for cb, cr in counts):
-                confirmed = True
-    return {"first_rule": first_rule, "first_rule_plus_2to0": first_rule_plus, "two_stage": split or systematic or confirmed, "extra_runs": 0 if systematic else 6 * len(flagged)}
+    screened = gate(stage1, [None] * len(base), shapes)
+    stage2 = [None] * len(base)
+    if not screened["systematic"]:
+        for t in screened["flagged"]:
+            stage2[t] = ([one_run(rng, base[t], variant) for _ in range(3)], [one_run(rng, brief[t], variant) for _ in range(3)])
+    outcome = gate(stage1, stage2, shapes)
+    return {"first_rule": first_rule, "first_rule_plus_2to0": first_rule_plus, "two_stage": outcome["fails"], "extra_runs": 0 if outcome["systematic"] else 6 * len(outcome["flagged"])}
+
+
+def self_test():
+    """Deterministic parity control (reviewer pass 4, R11): 15 two-item positive
+    tasks; three tuning tasks have baseline recall [1, 1, 1] and brief [1, 1, 0.5]
+    in stage 1 and perfect confirmation runs; everything else is perfect. The
+    stage-1 tuning drop (0.056) exceeds the split guard, but the final drop
+    (0.028) does not, and no loss is confirmed: the gate passes, as the
+    harness's scorer decides (src/tests/evaluate-brief-a7.test.js)."""
+    perfect = (1.0, [[True], [True]])
+    half = (0.5, [[True], [False]])
+    shapes = [[1, 1]] * 15
+    stage1 = [([perfect] * 3, [perfect, perfect, half] if t < 3 else [perfect] * 3) for t in range(15)]
+    stage2 = [([perfect] * 3, [perfect] * 3) if t < 3 else None for t in range(15)]
+    screened = gate(stage1, [None] * 15, shapes)
+    assert screened["flagged"] == [0, 1, 2], screened
+    assert screened["split"], "the stage-1 split drop alone would fail"
+    outcome = gate(stage1, stage2, shapes)
+    assert not outcome["confirmed"] and not outcome["split"] and not outcome["fails"], outcome
+    print("self-test: parity control passes (stage-1 split would fail; final split and confirmation pass)")
 
 
 def collapse_one(rng, brief):
@@ -149,7 +189,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20261002)
+    parser.add_argument("--self-test", action="store_true", help="run only the deterministic parity control")
     args = parser.parse_args()
+    self_test()
+    if args.self_test:
+        return
     print(f"trials per cell {args.trials}; base seed {args.seed}")
     print("| Distribution | Variant | Effect on brief arm | First rule fails | + 2/3->0/3 fails | Two-stage fails | Extra runs (mean) |")
     print("|---|---|---|---|---|---|---|")

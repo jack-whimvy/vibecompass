@@ -460,62 +460,85 @@ export async function run(ctx) {
   if (!manifest.pre_run_gates.pass) throw new Error(`Pre-run gates failed; the outcome is no-go and no run starts:\n- ${manifest.pre_run_gates.failures.join('\n- ')}`);
   const cap = requireCap(ctx);
   await mkdir(path.join(dir, 'transcripts'), { recursive: true });
+  // Every paid session — research or report turn — starts only within the cap.
+  const guard = async (reserve) => (await ledgerSpend(dir)).total + reserve <= cap;
   const pending = [];
   for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
-    if (!(await exists(path.join(dir, 'transcripts', `${entry.id}.meta.json`)))) pending.push(entry);
+    const base = path.join(dir, 'transcripts', entry.id);
+    let meta = await readMeta(base);
+    // A run whose research the ledger records as finished is never run again;
+    // missing metadata is rebuilt from the ledger and the attempt streams.
+    if (!meta && (await finishedAttempts(dir, `run:${entry.id}`)).length > 0) meta = await recoverMeta(dir, entry, manifest.tool_call_cap);
+    if (meta?.state !== 'complete') pending.push(entry);
   }
   const skipped = [];
   await pool(pending, ctx.concurrency ?? 4, async (entry) => {
-    if ((await ledgerSpend(dir)).total + RUN_RESERVE_USD > cap) {
-      skipped.push(entry.id);
-      return;
-    }
     const treeProblems = await verifyRunTree(entry);
     if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
     if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-    await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id });
+    const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard });
+    if (meta.state !== 'complete') {
+      skipped.push(`${entry.id}${meta.state === 'report-pending' ? ' (report turn pending)' : ''}`);
+      return;
+    }
     const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest);
     log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${metrics.stopped_at_cap ? ' (stopped at the cap; report turn)' : ''}, ${Math.round(metrics.duration_ms / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, VIOLATIONS: ${metrics.violations.join('; ')}` : ''}`);
   });
   const spend = await ledgerSpend(dir);
   log(ctx, `Spent so far: $${spend.total.toFixed(2)} of the $${cap} cap${spend.unresolved.length > 0 ? ` (includes $${spend.reserved_unresolved.toFixed(2)} reserved for ${spend.unresolved.length} attempt(s) of unknown cost)` : ''}.`);
   if (skipped.length > 0) {
-    log(ctx, `Stopped at the cost cap: ${skipped.length} run(s) not started (${skipped.join(', ')}). Resume with a cap the founder approves.`);
+    log(ctx, `Stopped at the cost cap: ${skipped.length} run(s) not finished (${skipped.join(', ')}). Resume with a cap the founder approves.`);
     process.exitCode = 3;
   }
   return { skipped };
 }
 
 /**
- * One evaluated run. The research session streams; the harness stops it once
- * tool call cap + 1 appears. A run with more than `cap` calls in its stream is
- * stopped whether or not the kill landed first, and its report comes from a
- * fresh session with no tools, given the transcript up to the boundary. With
+ * One evaluated run, in two steps that each start only when `guard(reserve)`
+ * allows. Research streams; the harness stops it once tool call cap + 1
+ * appears. A run with more than `cap` calls in its stream is stopped whether
+ * or not the kill landed first; its state is then `report-pending` until a
+ * fresh session with no tools writes the report from the transcript up to the
+ * boundary. A pending report resumes later without repeating research. With
  * `ledgerDir`, every session is a ledger attempt whose stream is written to
  * its own file as it arrives.
  */
-export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase) } = {}) {
-  const started = Date.now();
-  const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile) =>
-    spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile }),
-  );
-  const stopped = research.killed || collectToolUses(research.events).length > cap;
-  const meta = {
-    killed: research.killed,
-    stopped,
-    research_attempt: research.attempt,
-    research_sha256: research.sha256,
-    research_wall_ms: Date.now() - started,
-    report_attempt: null,
-    report_sha256: null,
-    report_wall_ms: null,
-    report_prompt_sha256: null,
-  };
-  await writeFile(`${transcriptBase}.jsonl`, research.stdout);
-  if (research.stderr.trim()) await writeFile(`${transcriptBase}.stderr`, research.stderr);
-  if (stopped) {
-    const reportPrompt = renderReportTurn(prompt, research.events, cap);
+export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true } = {}) {
+  let meta = await readMeta(transcriptBase);
+  if (meta?.state === 'complete') return meta;
+  let researchEvents;
+  if (meta?.state === 'report-pending') {
+    const researchText = await readFile(`${transcriptBase}.jsonl`, 'utf8');
+    if (sha256(researchText) !== meta.research_sha256) throw new Error(`${runId}: the research transcript changed while its report turn was pending.`);
+    researchEvents = parseEvents(researchText);
+  } else {
+    if (!(await guard(RUN_RESERVE_USD))) return { state: 'not-started' };
+    const started = Date.now();
+    const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile) =>
+      spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile }),
+    );
+    researchEvents = research.events;
+    const stopped = research.killed || collectToolUses(research.events).length > cap;
+    meta = {
+      state: stopped ? 'report-pending' : 'complete',
+      killed: research.killed,
+      stopped,
+      research_attempt: research.attempt,
+      research_sha256: research.sha256,
+      research_wall_ms: Date.now() - started,
+      report_attempt: null,
+      report_sha256: null,
+      report_wall_ms: null,
+      report_prompt_sha256: null,
+    };
+    await writeFile(`${transcriptBase}.jsonl`, research.stdout);
+    if (research.stderr.trim()) await writeFile(`${transcriptBase}.stderr`, research.stderr);
+    await writeMeta(transcriptBase, meta);
+  }
+  if (meta.state === 'report-pending') {
+    if (!(await guard(RUN_RESERVE_USD))) return meta;
+    const reportPrompt = renderReportTurn(prompt, researchEvents, cap);
     meta.report_prompt_sha256 = sha256(reportPrompt);
     await writeFile(`${transcriptBase}.report-prompt.txt`, reportPrompt);
     const reportStarted = Date.now();
@@ -525,10 +548,60 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     meta.report_attempt = report.attempt;
     meta.report_sha256 = report.sha256;
     meta.report_wall_ms = Date.now() - reportStarted;
+    meta.state = 'complete';
     await writeFile(`${transcriptBase}.report.jsonl`, report.stdout);
     if (report.stderr.trim()) await writeFile(`${transcriptBase}.report.stderr`, report.stderr);
+    await writeMeta(transcriptBase, meta);
   }
+  return meta;
+}
+
+async function readMeta(transcriptBase) {
+  return readFile(`${transcriptBase}.meta.json`, 'utf8').then(JSON.parse, () => null);
+}
+
+async function writeMeta(transcriptBase, meta) {
   await writeFile(`${transcriptBase}.meta.json`, `${JSON.stringify(meta, null, 2)}\n`);
+}
+
+/** Finished ledger attempts for a job, each with its start record (file, attempt). */
+async function finishedAttempts(dir, job) {
+  const ledger = await readLedger(dir);
+  const starts = new Map(ledger.filter((record) => record.event === 'start' && record.job === job).map((record) => [record.call, record]));
+  return ledger.filter((record) => record.event === 'finish' && starts.has(record.call)).map((finish) => ({ ...starts.get(finish.call), finish }));
+}
+
+/**
+ * Rebuilds a run's metadata from the ledger when it is missing (for example
+ * after an interruption between a session's finish and the metadata write).
+ * The transcripts are copied from the immutable attempt streams, whose hashes
+ * the ledger holds; nothing is re-run.
+ */
+async function recoverMeta(dir, entry, cap) {
+  const base = path.join(dir, 'transcripts', entry.id);
+  const restore = async (job, target) => {
+    const attempts = await finishedAttempts(dir, job);
+    if (attempts.length === 0) return null;
+    if (attempts.length > 1) throw new Error(`${entry.id}: ${attempts.length} finished attempts for ${job}; refusing to choose one.`);
+    const [attempt] = attempts;
+    const text = await readFile(attempt.file, 'utf8');
+    if (sha256(text) !== attempt.finish.stream_sha256) throw new Error(`${entry.id}: the attempt stream for ${job} does not match the ledger.`);
+    await writeFile(target, text);
+    return { attempt: attempt.attempt, sha256: attempt.finish.stream_sha256, text };
+  };
+  const research = await restore(`run:${entry.id}`, `${base}.jsonl`);
+  const stopped = collectToolUses(parseEvents(research.text)).length > cap;
+  const report = stopped ? await restore(`report:${entry.id}`, `${base}.report.jsonl`) : null;
+  const meta = {
+    state: !stopped || report ? 'complete' : 'report-pending',
+    recovered: true,
+    stopped,
+    research_attempt: research.attempt,
+    research_sha256: research.sha256,
+    report_attempt: report?.attempt ?? null,
+    report_sha256: report?.sha256 ?? null,
+  };
+  await writeMeta(base, meta);
   return meta;
 }
 
@@ -655,17 +728,31 @@ export async function auditRun(dir, entry, cap, manifest = null) {
   const results = collectToolResults(research);
   const violations = [];
 
-  // Artifact integrity: the transcripts are the ones the run wrote (and the ledger recorded).
-  if (meta.research_sha256 && sha256(researchText) !== meta.research_sha256) violations.push('research transcript changed since the run');
-  if (meta.report_sha256 && sha256(reportText ?? '') !== meta.report_sha256) violations.push('report-turn transcript changed since the run');
+  // Artifact integrity. With a ledger, the expected transcripts come from it —
+  // the single finished attempt of each session and its immutable stream —
+  // never from the metadata alone; missing or partial metadata is a finding,
+  // not a reason to skip verification.
   const ledger = await readLedger(dir);
   if (ledger.length > 0) {
-    for (const [kind, job, attempt, hash] of [['research', `run:${entry.id}`, meta.research_attempt, meta.research_sha256], ['report', `report:${entry.id}`, meta.report_attempt, meta.report_sha256]]) {
-      if (!attempt) continue;
-      const finish = ledger.find((record) => record.event === 'finish' && record.call === `${job}#${attempt}`);
-      if (!finish || finish.stream_sha256 !== hash) violations.push(`${kind} transcript is not the one recorded in the ledger`);
-    }
+    const expect = async (kind, job, current, metaAttempt, metaHash) => {
+      const attempts = await finishedAttempts(dir, job);
+      if (attempts.length !== 1) return [`${attempts.length} finished ${kind} attempts in the ledger`];
+      const [attempt] = attempts;
+      const out = [];
+      if (current === null || sha256(current) !== attempt.finish.stream_sha256) out.push(`${kind} transcript differs from the ledger record`);
+      const streamed = await readFile(attempt.file, 'utf8').catch(() => null);
+      if (streamed === null || sha256(streamed) !== attempt.finish.stream_sha256) out.push(`${kind} attempt stream is missing or differs from the ledger record`);
+      if (metaAttempt !== attempt.attempt || metaHash !== attempt.finish.stream_sha256) out.push(`run metadata is missing or does not match the ledger for the ${kind} session`);
+      return out;
+    };
+    violations.push(...(await expect('research', `run:${entry.id}`, researchText, meta.research_attempt, meta.research_sha256)));
+    if (stopped) violations.push(...(await expect('report-turn', `report:${entry.id}`, reportText, meta.report_attempt, meta.report_sha256)));
+    else if ((await finishedAttempts(dir, `report:${entry.id}`)).length > 0) violations.push('report turn recorded for a run that was not stopped');
+  } else {
+    if (!meta.research_sha256 || sha256(researchText) !== meta.research_sha256) violations.push('research transcript has no matching run metadata');
+    if (stopped && (!meta.report_sha256 || sha256(reportText ?? '') !== meta.report_sha256)) violations.push('report-turn transcript has no matching run metadata');
   }
+  if (meta.state !== undefined && meta.state !== 'complete') violations.push(`run state is ${meta.state}`);
   if (entry.prompt_sha256) {
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
     if (prompt === null || sha256(prompt) !== entry.prompt_sha256) violations.push('prompt changed since prepare');
