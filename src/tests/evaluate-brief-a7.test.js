@@ -63,8 +63,10 @@ process.stdin.on('end', () => {
   }
   const calls = Number(env.MOCK_CALLS ?? 1);
   const events = [init(['Glob', 'Grep', 'Read'])];
+  const custom = env.MOCK_TOOL_INPUTS ? JSON.parse(env.MOCK_TOOL_INPUTS) : [];
   for (let index = 1; index <= calls; index += 1) {
-    events.push({ type: 'assistant', message: { id: 'm' + index, content: [{ type: 'tool_use', id: 'c' + index, name: 'Read', input: { file_path: 'CLAUDE.md' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0, output_tokens: 5 } } });
+    const use = custom[index - 1] ?? { name: 'Read', input: { file_path: 'CLAUDE.md' } };
+    events.push({ type: 'assistant', message: { id: 'm' + index, content: [{ type: 'tool_use', id: 'c' + index, name: use.name, input: use.input }], usage: { input_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0, output_tokens: 5 } } });
     events.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'c' + index, content: 'read ' + index }] } });
   }
   events.push({ type: 'result', subtype: 'success', is_error: false, result: 'REPORT ' + (env.MOCK_REPORT ?? 'ok'), total_cost_usd: 0.3, modelUsage: usage });
@@ -592,4 +594,46 @@ test('corpus symlinks are verified by their link text and copied verbatim; chang
   await rm(corpusLink);
   await symlink('../../../outside', corpusLink);
   await assert.rejects(() => prepareAgain('escaping'), /corpus symlink \.agent\/skills\/postgres points outside the corpus/);
+});
+
+// --------------------------------------------------------- pre-run amendment 2
+
+test('a Grep that only excludes the evaluation files is counted, not a deviation; any other mention still is (A7 pre-run amendment 2)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  // Inputs from the aborted Phase 2 attempt's r001 (F1 baseline #1); its fourth repeats the second's glob.
+  const observed = [
+    { pattern: 'entitlements\\.ts|billing/errors\\.ts', output_mode: 'content', glob: '!**/recall-evaluation*' },
+    { pattern: 'allowance_exhausted', output_mode: 'content', glob: '!**/{recall-evaluation*,research/*.json}', '-n': true },
+    { pattern: '(?i)denial', path: 'architecture', output_mode: 'content', '-n': true, glob: '!**/{recall-evaluation*,research/*.json}' },
+  ];
+  for (const input of observed) assert.equal(harness.isEvaluationExclusion({ name: 'Grep', input }), true, JSON.stringify(input));
+  assert.equal(harness.isEvaluationExclusion({ name: 'Grep', input: { pattern: 'x', glob: '*.md !recall-evaluation*' } }), true);
+  const deviations = [
+    { name: 'Grep', input: { pattern: 'recall-evaluation' } },
+    { name: 'Grep', input: { pattern: 'x', glob: '**/recall-evaluation*' } },
+    { name: 'Grep', input: { pattern: 'x', glob: '*.md,!recall-evaluation*' } },
+    { name: 'Grep', input: { pattern: 'x', glob: '!**/recall-evaluation* recall-evaluation-heldout-v2.md' } },
+    { name: 'Grep', input: { pattern: 'x', path: 'architecture/platform/project-memory/recall-evaluation.md', glob: '!**/recall-evaluation*' } },
+    { name: 'Glob', input: { pattern: '!**/recall-evaluation*' } },
+    { name: 'Read', input: { file_path: 'architecture/platform/project-memory/recall-evaluation-heldout-v2.md' } },
+  ];
+  for (const use of deviations) assert.equal(harness.isEvaluationExclusion(use), false, JSON.stringify(use));
+
+  // End to end: the exclusion run audits clean and is counted; a positive glob is a deviation.
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  process.env.MOCK_CALLS = '2';
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Grep', input: observed[1] }]);
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Grep', input: { pattern: 'x', glob: '**/recall-evaluation*' } }]);
+  await harness.run({ ...ctx, only: new Set(['r002']) });
+  delete process.env.MOCK_TOOL_INPUTS;
+  delete process.env.MOCK_CALLS;
+  const audit = (id) => harness.auditRun(ctx.dir, manifest.runs.find((entry) => entry.id === id), manifest.tool_call_cap, manifest);
+  const excluded = await audit('r001');
+  assert.deepEqual(excluded.violations, []);
+  assert.equal(excluded.evaluation_exclusions, 1);
+  const positive = await audit('r002');
+  assert.deepEqual(positive.violations, ['Grep names an evaluation file']);
+  assert.equal(positive.evaluation_exclusions, 0);
 });

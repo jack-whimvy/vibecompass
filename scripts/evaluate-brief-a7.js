@@ -795,6 +795,7 @@ export async function auditRun(dir, entry, cap, manifest = null) {
   }
 
   const reads = [];
+  let evaluationExclusions = 0;
   for (const use of counted) {
     const target = use.input?.file_path ?? use.input?.path ?? null;
     if (target) {
@@ -802,7 +803,10 @@ export async function auditRun(dir, entry, cap, manifest = null) {
       if (use.name === 'Read') reads.push(path.relative(realRoot, resolved));
       if (resolved !== realRoot && !resolved.startsWith(`${realRoot}${path.sep}`)) violations.push(`${use.name} outside the run copy: ${target}`);
     }
-    if (/recall-evaluation/i.test(JSON.stringify(use.input))) violations.push(`${use.name} names an evaluation file`);
+    if (EVALUATION_NAME.test(JSON.stringify(use.input))) {
+      if (isEvaluationExclusion(use)) evaluationExclusions += 1;
+      else violations.push(`${use.name} names an evaluation file`);
+    }
   }
   violations.push(...sessionProblems(research, { label: 'research', tools: RESEARCH_TOOLS, version, requireResult: !stopped }));
   const excessIds = new Set(calls.filter((use) => boundary && !boundary.allowed.has(use.id)).map((use) => use.id));
@@ -842,8 +846,27 @@ export async function auditRun(dir, entry, cap, manifest = null) {
     cost_usd: (researchCost ?? 0) + (reportResult?.total_cost_usd ?? 0) || null,
     cost_estimated: !researchResult,
     report,
+    evaluation_exclusions: evaluationExclusions,
     violations,
   };
+}
+
+const EVALUATION_NAME = /recall-evaluation/i;
+
+/**
+ * A7 pre-run amendment 2: a Grep whose only mention of an evaluation file is
+ * a negated glob (such as `!recall-evaluation*`, alone or in a brace list)
+ * excludes those files from its search; it is counted, not a deviation. Any
+ * other input naming one — a path, a search pattern, a positive or mixed
+ * glob, or another tool — remains a deviation. Globs are split on whitespace
+ * only, so a token that does not itself start with `!` counts as positive.
+ */
+export function isEvaluationExclusion(use) {
+  if (use?.name !== 'Grep' || typeof use.input?.glob !== 'string') return false;
+  const { glob, ...rest } = use.input;
+  if (EVALUATION_NAME.test(JSON.stringify(rest))) return false;
+  const naming = glob.trim().split(/\s+/).filter((token) => EVALUATION_NAME.test(token));
+  return naming.length > 0 && naming.every((token) => token.startsWith('!'));
 }
 
 /** The run copy must still hash to its prepared digest. */
@@ -1698,6 +1721,8 @@ export function summarize(rows, manifest, agreement, spend, stage1) {
     brief_no_match_status: Object.fromEntries(noMatchRows.map((row) => [row.id, row.brief.status])),
     grader_agreement: Object.fromEntries(Object.entries(agreement).map(([key, pairs]) => [key, agreementStats(pairs)])),
     stopped_at_cap: Object.fromEntries(['baseline', 'brief'].map((arm) => [arm, rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => entry.metrics.stopped_at_cap).length, 0)])),
+    // Amendment 2: Grep calls that excluded the evaluation files (not deviations), and the runs that made them.
+    evaluation_exclusions: Object.fromEntries(['baseline', 'brief'].map((arm) => [arm, { calls: rows.reduce((sum, row) => sum + row.runs[arm].reduce((runs, entry) => runs + (entry.metrics.evaluation_exclusions ?? 0), 0), 0), runs: rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => (entry.metrics.evaluation_exclusions ?? 0) > 0).length, 0) }])),
     cost_usd: { total: spend.total, by_kind: spend.by_kind, attempts: spend.attempts, estimated: spend.estimated.length, unresolved: spend.unresolved, reserved_unresolved: spend.reserved_unresolved },
     gates,
     go: Object.values(gates).filter((gate) => gate && typeof gate === 'object' && 'pass' in gate).every((gate) => gate.pass),
