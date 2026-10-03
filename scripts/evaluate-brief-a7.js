@@ -87,7 +87,7 @@ const PROMPT_TEMPLATE = [
   '',
   '{startup}',
   '',
-  `Rules: this root is your only source — no code repositories, network, or web. File paths in the task are context for choosing memory, not files to open. Read-only. You may make at most ${TOOL_CALL_CAP} tool calls; every tool invocation counts as one call. The harness enforces this: when you make call ${TOOL_CALL_CAP + 1}, your session is stopped and that call's result is never shown to you; you then write the report from what you have read. Your final message is the context report.`,
+  `Rules: this root is your only source — no code repositories, network, or web. File paths in the task are context for choosing memory, not files to open. Read-only. You may make at most ${TOOL_CALL_CAP} tool calls; every tool invocation counts as one call. The harness enforces this: when you make call ${TOOL_CALL_CAP + 1}, it stops your session and discards everything from that call on, and you then write the report, without tools, from your first ${TOOL_CALL_CAP} calls and their results. Your final message is the context report.`,
 ].join('\n');
 
 const REPORT_TURN_TEMPLATE = [
@@ -725,7 +725,8 @@ async function smoke() {
   const root = await makeRunCopy(corpus, path.join(outDir, 'runs', 'smoke'), task);
   const prompt = renderPrompt(task, await readStartupFiles(root, 'baseline'))
     .replaceAll(`at most ${TOOL_CALL_CAP} tool calls`, `at most ${statedCap} tool calls`)
-    .replaceAll(`when you make call ${TOOL_CALL_CAP + 1}`, `when you make call ${statedCap + 1}`);
+    .replaceAll(`when you make call ${TOOL_CALL_CAP + 1}`, `when you make call ${statedCap + 1}`)
+    .replaceAll(`from your first ${TOOL_CALL_CAP} calls`, `from your first ${statedCap} calls`);
   await writeFile(path.join(outDir, 'prompts', 'smoke.txt'), prompt);
   const outcome = await runAgent(prompt, root, path.join(outDir, 'transcripts', 'smoke'), cap);
   const metrics = await auditRun(outDir, { id: 'smoke', root }, cap);
