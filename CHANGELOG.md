@@ -1,9 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 - 2026-10-03
 
 Session brief retrieval and framing fixes (recall plan A7). The lane brief stays
-opt-in (D-368) until a conforming evaluation supports default-on.
+opt-in (D-368). The re-evaluation meant to decide default-on stopped at a protocol
+deviation before any run was graded, so it gives no evidence either way. These
+fixes target misses from the earlier evaluation and were checked on its tuning
+tasks with briefs alone, not in an agent evaluation.
+
+**Breaking for `vibecompass brief --json` consumers:** contract version 2 removes
+`selection.narrowed` (see below). Other commands and the read model are unchanged.
 
 - Selection: a decision is also matched on the sentences in architecture docs
   that cite it (the overview included; Review metadata and Involved files

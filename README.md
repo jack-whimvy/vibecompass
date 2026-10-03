@@ -288,8 +288,10 @@ The brief is opt-in because of the project's own evaluation, which did not
 fully follow its protocol. Agents with a brief found about as much of the
 relevant memory as agents without one, and made none of the specific false
 authority claims the evaluation checked for. But they missed nine facts the
-others found, in one case after the brief left out the key document. Treat a
-brief as a starting point, not the whole answer.
+others found, in one case after the brief left out the key document. A second
+evaluation, after retrieval fixes, stopped at a protocol deviation before any
+grading, so turning the brief on by default still waits for a conforming one.
+Treat a brief as a starting point, not the whole answer.
 
 ## Hosted Sync
 
