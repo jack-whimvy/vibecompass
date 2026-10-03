@@ -1,10 +1,11 @@
 // Offline checks for the A7 evaluation harness (scripts/evaluate-brief-a7.js):
-// no model calls. A mock `claude` child stands in for the CLI, and grading
-// artifacts are synthetic.
+// no model calls. A mock `claude` child stands in for the CLI — research
+// sessions, report turns, and graders — and the whole pipeline runs against a
+// tiny tagged corpus.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -14,32 +15,60 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.resolve(here, '..', '..');
 const FIXTURE_ROOT = path.join(here, 'fixtures', 'brief', 'root');
 
-// The mock child: research sessions emit a coalesced stream with an allowed
-// call, an excess call with its result, and later text; a no-tools report
-// turn emits a report. It waits on stdin so the harness's kill can land.
+// The mock CLI. Modes come from its arguments; failure switches from env:
+// MOCK_SCENARIO=excess (research stream with an excess call), MOCK_CALLS=N,
+// MOCK_REPORT_TURN=bad, MOCK_GRADER=invalid|error|wrongmodel.
 const MOCK = `#!/usr/bin/env node
 const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('2.1.288 (Claude Code)'); process.exit(0); }
 const toolsIndex = args.indexOf('--tools');
-const reportTurn = toolsIndex !== -1 && args[toolsIndex + 1] === '';
-const init = (tools) => ({ type: 'system', subtype: 'init', model: 'claude-opus-5-5', tools, permissionMode: 'dontAsk', mcp_servers: [], claude_code_version: '2.1.288' });
+const noTools = toolsIndex !== -1 && args[toolsIndex + 1] === '';
+const grader = args.includes('--json-schema');
+const env = process.env;
+const init = (tools, overrides = {}) => ({ type: 'system', subtype: 'init', session_id: 's-' + Math.random().toString(16).slice(2), model: 'claude-opus-5-5', tools, permissionMode: 'dontAsk', mcp_servers: [], claude_code_version: '2.1.288', ...overrides });
+const usage = { 'claude-opus-5-5': { costUSD: 0.1 } };
 const out = (events) => process.stdout.write(events.map((event) => JSON.stringify(event)).join('\\n') + '\\n');
 let input = '';
 process.stdin.on('data', (chunk) => { input += chunk; });
 process.stdin.on('end', () => {
-  if (reportTurn) {
-    out([init([]), { type: 'result', subtype: 'success', is_error: false, result: 'REPORT from the transcript', total_cost_usd: 0.1, duration_ms: 5 }]);
+  if (grader) {
+    const keysLine = input.match(/^Checklist keys \\(.*?\\): (.*)$/m);
+    const keys = keysLine && !keysLine[1].startsWith('none') ? keysLine[1].split(', ') : [];
+    const forbiddenLine = input.match(/^Forbidden claims \\(once each(?:, for each report)?\\): (.*)$/m);
+    let forbidden = forbiddenLine ? forbiddenLine[1].split(', ') : [];
+    if (env.MOCK_GRADER === 'invalid') forbidden = forbidden.slice(0, -1);
+    const side = { clauses: keys.map((key) => ({ key, stated: true, attributed: true, evidence: '' })), forbidden: forbidden.map((id) => ({ id, violated: false, evidence: '', reasoning: '' })), states_no_governing_memory: keys.length === 0, notes: '' };
+    const structured = input.includes('\\nReport P:\\n') ? { P: side, Q: side } : { forbidden: side.forbidden, presents_governing_memory_for_no_match: false, closest_call: '', notes: '' };
+    const error = env.MOCK_GRADER === 'error';
+    out([init(['StructuredOutput']), { type: 'result', subtype: error ? 'error_max_turns' : 'success', is_error: error, structured_output: structured, total_cost_usd: 0.1, modelUsage: env.MOCK_GRADER === 'wrongmodel' ? { 'claude-haiku-4-5': { costUSD: 0.1 } } : usage }]);
     return;
   }
-  out([
-    init(['Glob', 'Grep', 'Read']),
-    { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'CLAUDE.md' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 1000, cache_read_input_tokens: 0, output_tokens: 10 } } },
-    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ALLOWED-RESULT' }] } },
-    { type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: 'PRE-BOUNDARY note' }, { type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'project.yaml' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000, output_tokens: 10 } } },
-    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't2', content: 'SECRET-EXCESS-RESULT' }] } },
-    { type: 'assistant', message: { id: 'm3', content: [{ type: 'text', text: 'POSTCAP text using SECRET-EXCESS-RESULT' }], usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000, output_tokens: 10 } } },
-    { type: 'result', subtype: 'success', is_error: false, result: 'RESEARCH SESSION REPORT', total_cost_usd: 0.2, duration_ms: 5 },
-  ]);
-  setTimeout(() => {}, 2000);
+  if (noTools) {
+    const bad = env.MOCK_REPORT_TURN === 'bad';
+    out([init([], bad ? { model: 'claude-haiku-4-5', claude_code_version: '0.0.0', permissionMode: 'default', mcp_servers: [{ name: 'x' }] } : {}), { type: 'result', subtype: 'success', is_error: false, result: 'REPORT from the transcript', total_cost_usd: 0.1, modelUsage: usage }]);
+    return;
+  }
+  if (env.MOCK_SCENARIO === 'excess') {
+    out([
+      init(['Glob', 'Grep', 'Read']),
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'CLAUDE.md' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 1000, cache_read_input_tokens: 0, output_tokens: 10 } } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ALLOWED-RESULT' }] } },
+      { type: 'assistant', message: { id: 'm2', content: [{ type: 'text', text: 'PRE-BOUNDARY note' }, { type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'project.yaml' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000, output_tokens: 10 } } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't2', content: 'SECRET-EXCESS-RESULT' }] } },
+      { type: 'assistant', message: { id: 'm3', content: [{ type: 'text', text: 'POSTCAP text using SECRET-EXCESS-RESULT' }], usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000, output_tokens: 10 } } },
+      { type: 'result', subtype: 'success', is_error: false, result: 'RESEARCH SESSION REPORT', total_cost_usd: 0.2, modelUsage: usage },
+    ]);
+    setTimeout(() => {}, 1500);
+    return;
+  }
+  const calls = Number(env.MOCK_CALLS ?? 1);
+  const events = [init(['Glob', 'Grep', 'Read'])];
+  for (let index = 1; index <= calls; index += 1) {
+    events.push({ type: 'assistant', message: { id: 'm' + index, content: [{ type: 'tool_use', id: 'c' + index, name: 'Read', input: { file_path: 'CLAUDE.md' } }], usage: { input_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0, output_tokens: 5 } } });
+    events.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'c' + index, content: 'read ' + index }] } });
+  }
+  events.push({ type: 'result', subtype: 'success', is_error: false, result: 'REPORT ' + (env.MOCK_REPORT ?? 'ok'), total_cost_usd: 0.3, modelUsage: usage });
+  out(events);
 });
 `;
 
@@ -50,7 +79,8 @@ async function loadHarness(t) {
   await writeFile(mock, MOCK);
   await chmod(mock, 0o755);
   process.env.A7_CLAUDE_BIN = mock;
-  const harness = await import(`../../scripts/evaluate-brief-a7.js?mock=${Date.now()}`);
+  for (const key of ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT']) delete process.env[key];
+  const harness = await import(`../../scripts/evaluate-brief-a7.js?mock=${Date.now()}-${Math.random()}`);
   return { harness, dir };
 }
 
@@ -75,38 +105,34 @@ test('replicate briefs from different run roots are identical once only location
   assert.notEqual(files[0].text, files[1].text, 'raw files differ by their roots');
   const normalized = files.map((file) => harness.normalizeRunLocation(file.text, file.root));
   assert.equal(normalized[0], normalized[1]);
-  // A substantive difference still shows.
-  assert.notEqual(harness.normalizeRunLocation(files[0].text.replace('Run ledger', 'Run journal'), files[0].root), normalized[1]);
+  assert.notEqual(harness.normalizeRunLocation(files[0].text.replace('Run ledger', 'Run journal'), files[0].root), normalized[1], 'a substantive difference still shows');
 });
 
 // --------------------------------------------------------------- R3
 
 test('a stopped run replays only up to the boundary; excess results and later text never reach the report turn (review R3)', async (t) => {
   const { harness, dir } = await loadHarness(t);
+  process.env.MOCK_SCENARIO = 'excess';
   const root = path.join(dir, 'runs', 'r001');
   await mkdir(root, { recursive: true });
   await mkdir(path.join(dir, 'transcripts'), { recursive: true });
   await mkdir(path.join(dir, 'prompts'), { recursive: true });
-  const prompt = 'PROMPT';
-  await writeFile(path.join(dir, 'prompts', 'r001.txt'), prompt);
-  const meta = await harness.runAgent(prompt, root, path.join(dir, 'transcripts', 'r001'), 1);
+  await writeFile(path.join(dir, 'prompts', 'r001.txt'), 'PROMPT');
+  const meta = await harness.runAgent('PROMPT', root, path.join(dir, 'transcripts', 'r001'), 1);
   assert.equal(meta.stopped, true);
 
   const reportPrompt = await readFile(path.join(dir, 'transcripts', 'r001.report-prompt.txt'), 'utf8');
   assert.match(reportPrompt, /ALLOWED-RESULT/);
-  assert.match(reportPrompt, /PRE-BOUNDARY note/, 'text before the excess call in the same message is kept');
-  assert.doesNotMatch(reportPrompt, /SECRET-EXCESS-RESULT/);
-  assert.doesNotMatch(reportPrompt, /POSTCAP/);
+  assert.match(reportPrompt, /PRE-BOUNDARY note/, 'text before the excess tool-use block is kept');
+  assert.doesNotMatch(reportPrompt, /SECRET-EXCESS-RESULT|POSTCAP/);
 
-  const metrics = await harness.auditRun(dir, { id: 'r001', root }, 1, '2.1.288 (Claude Code)');
+  const metrics = await harness.auditRun(dir, { id: 'r001', root }, 1, { claude_version: '2.1.288 (Claude Code)' });
   assert.deepEqual(metrics.violations, []);
-  assert.equal(metrics.stopped_at_cap, true);
   assert.equal(metrics.tool_calls, 1);
   assert.equal(metrics.calls_issued, 2);
-  assert.equal(metrics.excess_results_observed, 1, 'the excess result is recorded as observed in the discarded stream');
-  assert.equal(metrics.report, 'REPORT from the transcript', 'the report is the report turn, never the research session');
+  assert.equal(metrics.excess_results_observed, 1);
+  assert.equal(metrics.report, 'REPORT from the transcript');
 
-  // A report prompt that is not the boundary-truncated replay is a violation.
   await writeFile(path.join(dir, 'transcripts', 'r001.report-prompt.txt'), `${reportPrompt}\nSECRET-EXCESS-RESULT`);
   assert.ok((await harness.auditRun(dir, { id: 'r001', root }, 1)).violations.some((entry) => /boundary-truncated replay/.test(entry)));
 });
@@ -117,14 +143,30 @@ test('the boundary falls inside a message that holds both allowed and excess cal
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'a' }, { type: 'text', text: 'between' }, { type: 'tool_use', id: 'b' }, { type: 'text', text: 'after' }] } },
     { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'a', content: 'A-RESULT' }, { type: 'tool_result', tool_use_id: 'b', content: 'B-RESULT' }] } },
   ];
-  const boundary = harness.findBoundary(events, 1);
-  assert.equal(boundary.event, 0);
-  assert.equal(boundary.block, 2);
+  assert.deepEqual([harness.findBoundary(events, 1).event, harness.findBoundary(events, 1).block], [0, 2]);
   const transcript = harness.renderResearchTranscript(events, 1);
   assert.match(transcript, /A-RESULT/);
   assert.match(transcript, /between/);
   assert.doesNotMatch(transcript, /B-RESULT|after/);
   assert.equal(harness.findBoundary(events, 2), null);
+});
+
+// --------------------------------------------------------------- R9
+
+test('every session is checked: a report turn with another model, version, permission mode, or MCP server is a violation (review R9)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  process.env.MOCK_SCENARIO = 'excess';
+  process.env.MOCK_REPORT_TURN = 'bad';
+  const root = path.join(dir, 'runs', 'r001');
+  await mkdir(root, { recursive: true });
+  await mkdir(path.join(dir, 'transcripts'), { recursive: true });
+  await harness.runAgent('PROMPT', root, path.join(dir, 'transcripts', 'r001'), 1);
+  const { violations } = await harness.auditRun(dir, { id: 'r001', root }, 1, { claude_version: '2.1.288 (Claude Code)' });
+  for (const expected of [/report turn: model claude-haiku-4-5/, /report turn: Claude Code 0\.0\.0/, /report turn: permission mode default/, /report turn: MCP servers/]) {
+    assert.ok(violations.some((entry) => expected.test(entry)), `${expected} in ${violations.join(' | ')}`);
+  }
+  assert.equal(harness.parseVersion('2.1.288 (Claude Code)'), '2.1.288');
+  assert.equal(harness.parseVersion('2.1'), null, 'a version prefix is not a version');
 });
 
 // --------------------------------------------------------------- R2
@@ -144,44 +186,56 @@ test('grades must cover the checklist exactly: missing, duplicate, unexpected, a
   const { harness } = await loadHarness(t);
   const valid = { P: reportSide(['M1(a)']), Q: reportSide([]) };
   assert.deepEqual(harness.validateReportGrade(LABEL, valid), []);
-
   const missingX = structuredClone(valid);
   missingX.P.forbidden = missingX.P.forbidden.filter((entry) => entry.id !== 'X2');
   assert.ok(harness.validateReportGrade(LABEL, missingX).some((problem) => /P forbidden: missing X2/.test(problem)));
-
   const duplicate = structuredClone(valid);
   duplicate.Q.clauses.push({ key: 'M2', stated: true, attributed: true, evidence: '' });
   assert.ok(harness.validateReportGrade(LABEL, duplicate).some((problem) => /Q clauses: duplicate M2/.test(problem)));
-
   const unexpected = structuredClone(valid);
   unexpected.P.clauses[0].key = 'M1';
   assert.ok(harness.validateReportGrade(LABEL, unexpected).some((problem) => /unexpected M1\b/.test(problem)));
-
   assert.ok(harness.validateReportGrade(LABEL, { P: { clauses: 'x' } }).length > 0);
   assert.ok(harness.validateBriefGrade(LABEL, { forbidden: [{ id: 'X1', violated: false }], presents_governing_memory_for_no_match: false }).some((problem) => /missing X2/.test(problem)));
   assert.throws(() => harness.armVerdicts(LABEL, { task: 'F1', replicate: 1, grader: 'g1', order: { P: 'baseline', Q: 'brief' }, graded: missingX }, 'baseline'), /invalid report grade/);
 });
 
-test('a split verdict without a tie-break refuses to score, for reports and briefs alike (review R2)', async (t) => {
+test('a split verdict needs a tie-break, for report clauses and for the brief governing verdict (review R2)', async (t) => {
   const { harness } = await loadHarness(t);
   const grade = (stated, grader) => ({ task: 'F1', replicate: 1, grader, order: { P: 'baseline', Q: 'brief' }, graded: { P: reportSide(stated), Q: reportSide(stated) } });
   const first = harness.armVerdicts(LABEL, grade(['M1(a)'], 'g1'), 'brief');
   const second = harness.armVerdicts(LABEL, grade([], 'g2'), 'brief');
   assert.throws(() => harness.majority([first, second], LABEL), /no tie-break/);
-  const third = harness.armVerdicts(LABEL, grade(['M1(a)'], 'g3'), 'brief');
-  assert.equal(harness.majority([first, second, third], LABEL).clauses['M1:a'].stated, true);
-
+  assert.equal(harness.majority([first, second, harness.armVerdicts(LABEL, grade(['M1(a)'], 'g3'), 'brief')], LABEL).clauses['M1:a'].stated, true);
   const brief = (violated, governing, grader) => ({ task: 'F1', grader, graded: { forbidden: ['X1', 'X2'].map((id) => ({ id, violated: violated.includes(id), evidence: '', reasoning: '' })), presents_governing_memory_for_no_match: governing, closest_call: '', notes: '' } });
   assert.deepEqual(harness.briefDisagreements(LABEL, brief(['X1'], false, 'g1'), brief([], false, 'g2')), ['X1']);
-  assert.deepEqual(harness.briefDisagreements(LABEL, brief([], true, 'g1'), brief([], false, 'g2')), ['governing'], 'the governing-memory verdict needs a tie-break too');
+  assert.deepEqual(harness.briefDisagreements(LABEL, brief([], true, 'g1'), brief([], false, 'g2')), ['governing']);
 });
 
-// ------------------------------------------------- synthetic evaluation
+// --------------------------------------------------------------- R6
+
+test('the pre-registered screen flags baseline-majority clause drops of two and task drops; confirmation needs six replicates (review R6)', async (t) => {
+  const { harness } = await loadHarness(t);
+  const row = (clauseCounts, baseline = 0.9, brief = 0.9, n = 3) => ({ id: 'T', positive: true, replicates: n, recall: { baseline: { mean: baseline }, brief: { mean: brief } }, clause_counts: clauseCounts.map(([b, r], index) => ({ clause: `M${index + 1}`, n, baseline: b, brief: r })) });
+  assert.equal(harness.screenRows([row([[2, 0]])]).flagged.length, 1, '2/3 → 0/3 is flagged');
+  assert.equal(harness.screenRows([row([[3, 1]])]).flagged.length, 1);
+  assert.equal(harness.screenRows([row([[3, 2]])]).flagged.length, 0, 'a one-replicate drop is reported as weakened, not flagged');
+  assert.equal(harness.screenRows([row([[1, 0]])]).flagged.length, 0);
+  assert.equal(harness.screenRows([row([], 0.933, 0.8)]).flagged.length, 0);
+  assert.equal(harness.screenRows([row([], 0.95, 0.75)]).flagged.length, 1);
+  assert.equal(harness.screenRows(Array.from({ length: 6 }, () => row([[3, 0]]))).systematic, true);
+  assert.deepEqual(harness.confirmedLoss(row([[5, 2]], 0.9, 0.85, 6)), []);
+  assert.equal(harness.confirmedLoss(row([[5, 1]], 0.9, 0.85, 6)).length, 1);
+  assert.equal(harness.confirmedLoss(row([], 0.95, 0.75, 6)).length, 1);
+});
+
+// ------------------------------------------------- end-to-end pipeline
 
 const TUNING_LABELS = `### Tuning tasks
 
 #### F1 — file-scoped · tuning
-- **Task:** Do F1.
+- **Task:** Rewrite the message a user sees when a hosted refresh run is refused.
+- **Files:** \`app:src/lib/entitlements.ts\`
 - **Must-have facts:**
   - M1 (a) One; (b) two.
   - M2 Single.
@@ -191,7 +245,7 @@ const TUNING_LABELS = `### Tuning tasks
 - **Tags:** —
 
 #### N1 — no-match · tuning
-- **Task:** Do N1.
+- **Task:** Add Klingon subtitles and a karaoke kiosk mode.
 - **Forbidden authority claims:**
   - X1 Bad.
 - **Tags:** no-match
@@ -204,8 +258,8 @@ None.
 
 ## Results
 `;
-const HELDOUT_LABELS = `#### F5 — file-scoped · held-out
-- **Task:** Do F5.
+const HELDOUT_LABELS = `#### F5 — task-only · held-out
+- **Task:** Change the Free plan credit balance and the Solo plan price.
 - **Must-have facts:**
   - M1 Single.
 - **Forbidden authority claims:**
@@ -213,134 +267,128 @@ const HELDOUT_LABELS = `#### F5 — file-scoped · held-out
 - **Tags:** —
 `;
 
-/** A complete synthetic evaluation directory: labels, manifest, transcripts, and agreeing grades. */
-async function syntheticEval(dir, { statedBy = () => true, replicates = 3 } = {}) {
-  await mkdir(path.join(dir, 'labels'), { recursive: true });
-  await mkdir(path.join(dir, 'transcripts'), { recursive: true });
-  await mkdir(path.join(dir, 'grading'), { recursive: true });
-  await writeFile(path.join(dir, 'labels', 'recall-evaluation.md'), TUNING_LABELS);
-  await writeFile(path.join(dir, 'labels', 'recall-evaluation-heldout-v2.md'), HELDOUT_LABELS);
-  const root = path.join(dir, 'root');
-  await mkdir(root, { recursive: true });
-  const tasks = [
-    { id: 'F1', split: 'tuning', keys: ['M1(a)', 'M1(b)', 'M2'], forbidden: ['X1', 'X2'] },
-    { id: 'N1', split: 'tuning', keys: [], forbidden: ['X1'] },
-    { id: 'F5', split: 'held-out', keys: ['M1'], forbidden: ['X1'] },
-  ];
-  const runs = [];
-  for (const task of tasks) {
-    for (let replicate = 1; replicate <= replicates; replicate += 1) {
-      for (const arm of ['baseline', 'brief']) {
-        const id = `r${String(runs.length + 1).padStart(3, '0')}`;
-        runs.push({ id, task: task.id, arm, replicate, stage: replicate > 3 ? 2 : 1, root });
-        const events = [
-          { type: 'system', subtype: 'init', model: 'claude-opus-5-5', tools: ['Glob', 'Grep', 'Read'], permissionMode: 'dontAsk', mcp_servers: [], claude_code_version: '2.1.288' },
-          { type: 'result', subtype: 'success', is_error: false, result: `report ${id}`, total_cost_usd: 0.5, duration_ms: 1000 },
-        ];
-        await writeFile(path.join(dir, 'transcripts', `${id}.jsonl`), events.map((event) => JSON.stringify(event)).join('\n'));
-        await writeFile(path.join(dir, 'transcripts', `${id}.meta.json`), '{"stopped": false}');
-      }
-      for (const grader of ['g1', 'g2']) {
-        const side = (arm) => ({
-          clauses: task.keys.map((key) => ({ key, stated: statedBy(task.id, arm, replicate, key), attributed: true, evidence: '' })),
-          forbidden: task.forbidden.map((id) => ({ id, violated: false, evidence: '', reasoning: '' })),
-          states_no_governing_memory: task.keys.length === 0,
-          notes: '',
-        });
-        await writeFile(path.join(dir, 'grading', `${task.id}-r${replicate}-reports-${grader}.json`), JSON.stringify({ task: task.id, replicate, grader, order: { P: 'baseline', Q: 'brief' }, cost_usd: 0.2, graded: { P: side('baseline'), Q: side('brief') } }));
-      }
-    }
-    for (const grader of ['g1', 'g2']) {
-      await writeFile(path.join(dir, 'grading', `${task.id}-brief-${grader}.json`), JSON.stringify({ task: task.id, grader, cost_usd: 0.1, graded: { forbidden: task.forbidden.map((id) => ({ id, violated: false, evidence: '', reasoning: '' })), presents_governing_memory_for_no_match: false, closest_call: '', notes: '' } }));
-    }
-  }
-  const brief = (status) => ({ status, topic_absent: false, safe_overflow: [], body_matches_json: true, body_tokens: 100, whole_file_tokens: 150, replicates: [{ run: 'r002', normalized_sha256: 'same' }, { run: 'r004', normalized_sha256: 'same' }] });
-  return {
-    tasks: tasks.map(({ id, split }) => ({ id, split, task: `Do ${id}.`, files: [] })),
-    runs,
-    briefs: { F1: brief('partial'), N1: brief('no-match'), F5: brief('complete') },
-    tool_call_cap: 24,
-    claude_version: '2.1.288 (Claude Code)',
-    heldout_sha256: sha256(HELDOUT_LABELS),
-    stage1_replicates: 3,
-    latency: { warm_p50_max_ms: 200, cold_max_ms: 400 },
-    preflight: { pass: true },
-    pre_run_gates: { pass: true, failures: [] },
-    package_dirty: false,
-  };
+/** A tagged docs repo, its corpus export, label copies, and a prepared evaluation directory. */
+async function prepared(harness, dir) {
+  const repo = path.join(dir, 'docs');
+  await cp(FIXTURE_ROOT, repo, { recursive: true });
+  await writeFile(path.join(repo, 'CLAUDE.md'), '# Acme Widgets\n');
+  await mkdir(path.join(repo, 'architecture', 'platform', 'project-memory'), { recursive: true });
+  await writeFile(path.join(repo, 'architecture', 'platform', 'project-memory', 'recall-evaluation.md'), TUNING_LABELS);
+  const git = (...args) => spawnSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' });
+  for (const args of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'corpus'], ['tag', 'recall-eval-corpus-v2']]) assert.equal(git(...args).status, 0);
+  const corpus = path.join(dir, 'corpus');
+  await cp(FIXTURE_ROOT, corpus, { recursive: true });
+  await writeFile(path.join(corpus, 'CLAUDE.md'), '# Acme Widgets\n');
+  const labelsDir = path.join(dir, 'labels-in');
+  await mkdir(labelsDir, { recursive: true });
+  await writeFile(path.join(labelsDir, 'recall-evaluation.md'), TUNING_LABELS);
+  await writeFile(path.join(labelsDir, 'recall-evaluation-heldout-v2.md'), HELDOUT_LABELS);
+  const ctx = { dir: path.join(dir, 'eval'), cap: 100, concurrency: 4, quiet: true, identity: () => ({ package_commit: 'test', package_dirty: '', package_src_tree: 'test' }) };
+  const opts = { corpus, docsRepo: repo, labelsDir, heldoutSha: sha256(HELDOUT_LABELS), warmRuns: 1, expectTasks: 3 };
+  await harness.prepare(ctx, opts);
+  return { ctx, opts };
 }
 
-async function scoreSynthetic(harness, dir, manifest) {
-  const all = await harness.collectRows(manifest, { stage: null, dir });
-  const stage1 = harness.screenRows((await harness.collectRows(manifest, { stage: 1, dir })).rows);
-  return harness.summarize(all.rows, manifest, all.agreement, all.costs, stage1);
-}
-
-test('scoring refuses incomplete grading: a missing tie-break or a missing grade is never a negative verdict (review R2)', async (t) => {
+test('the pipeline scores complete, verified evidence; changed inputs, stale grades, and reused directories stop it (review R8)', async (t) => {
   const { harness, dir } = await loadHarness(t);
-  const manifest = await syntheticEval(dir);
-  assert.equal((await scoreSynthetic(harness, dir, manifest)).go, true, 'complete, agreeing grades score');
+  const { ctx, opts } = await prepared(harness, dir);
+  await harness.run(ctx);
+  await harness.grade(ctx);
+  await harness.screen(ctx);
+  const summary = await harness.score(ctx);
+  assert.equal(summary.go, true, JSON.stringify(summary.gates));
+  // 18 runs at $0.30 and 24 grader calls at $0.10, all from the ledger.
+  assert.equal(Math.round(summary.cost_usd.total * 100) / 100, 7.8);
+  assert.equal(summary.cost_usd.attempts, 42);
 
-  // A split brief verdict with no g3 stops scoring instead of reading as "no violation".
-  const g2 = path.join(dir, 'grading', 'F1-brief-g2.json');
-  const record = JSON.parse(await readFile(g2, 'utf8'));
-  record.graded.forbidden[0].violated = true;
-  await writeFile(g2, JSON.stringify(record));
-  await assert.rejects(() => harness.collectRows(manifest, { stage: null, dir }), /grading is incomplete: F1-brief-g3 is missing/);
+  await assert.rejects(() => harness.prepare(ctx, opts), /Refusing to prepare/);
 
-  // With the tie-break, the majority decides.
-  await writeFile(path.join(dir, 'grading', 'F1-brief-g3.json'), JSON.stringify({ ...record, grader: 'g3' }));
-  const summary = await scoreSynthetic(harness, dir, manifest);
-  assert.equal(summary.gates.brief_forbidden_claims.pass, false);
-  assert.equal(summary.go, false);
+  // A report changed after grading: its grades no longer match their inputs.
+  const transcript = path.join(ctx.dir, 'transcripts', 'r001.jsonl');
+  const original = await readFile(transcript, 'utf8');
+  await writeFile(transcript, original.replace('REPORT ok', 'I have no relevant facts to report.'));
+  await assert.rejects(() => harness.score(ctx), /graded a different input|transcript changed/);
+  await writeFile(transcript, original);
 
-  await rm(path.join(dir, 'grading', 'F5-r2-reports-g1.json'));
-  await assert.rejects(() => harness.collectRows(manifest, { stage: null, dir }), /F5-r2-reports-g1 is missing/);
+  // A prepared memory file changed in a run copy.
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const ledgerDoc = path.join(manifest.runs[0].root, 'architecture', 'billing', 'ledger.md');
+  const doc = await readFile(ledgerDoc, 'utf8');
+  await writeFile(ledgerDoc, `${doc}\nTampered.\n`);
+  await assert.rejects(() => harness.score(ctx), /Run copies changed since prepare/);
+  await writeFile(ledgerDoc, doc);
+
+  // A cached grade whose verdicts were edited.
+  const gradeFile = path.join(ctx.dir, 'grading', 'F1-r1-reports-g1.json');
+  const gradeText = await readFile(gradeFile, 'utf8');
+  const edited = JSON.parse(gradeText);
+  edited.graded.Q.clauses[0].stated = false;
+  await writeFile(gradeFile, JSON.stringify(edited));
+  await assert.rejects(() => harness.score(ctx), /recorded verdicts differ from the session output/);
+  await writeFile(gradeFile, gradeText);
+
+  // The graded brief file, and the manifest itself.
+  const briefFile = path.join(ctx.dir, 'briefs', 'F1.md');
+  const briefText = await readFile(briefFile, 'utf8');
+  await writeFile(briefFile, `${briefText}\n`);
+  await assert.rejects(() => harness.score(ctx), /briefs\/F1\.md changed since prepare/);
+  await writeFile(briefFile, briefText);
+  const manifestText = await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8');
+  await writeFile(path.join(ctx.dir, 'manifest.json'), manifestText.replace('"package_dirty": false', '"package_dirty": false '));
+  await assert.rejects(() => harness.score(ctx), /manifest\.json differs/);
+  await writeFile(path.join(ctx.dir, 'manifest.json'), manifestText);
+
+  assert.equal((await harness.score(ctx)).go, true, 'restored evidence scores again');
 });
 
-test('recorded preflight failures gate go: dirty source, a body that differs from --json, or replicate briefs that differ (review R4)', async (t) => {
+test('every paid attempt stays in the ledger across resumes; the attempt limit and the spend never reset (review R7)', async (t) => {
   const { harness, dir } = await loadHarness(t);
-  const manifest = await syntheticEval(dir);
-  assert.equal((await scoreSynthetic(harness, dir, manifest)).go, true);
-  for (const [name, mutate] of [
-    ['dirty', (copy) => { copy.package_dirty = true; }],
-    ['body', (copy) => { copy.briefs.F1.body_matches_json = false; }],
-    ['replicates', (copy) => { copy.briefs.F5.replicates[1].normalized_sha256 = 'other'; }],
-    ['pre-run', (copy) => { copy.pre_run_gates = { pass: false, failures: ['latency'] }; }],
-  ]) {
-    const copy = structuredClone(manifest);
-    mutate(copy);
-    assert.equal((await scoreSynthetic(harness, dir, copy)).go, false, `${name} must block go`);
+  const { ctx } = await prepared(harness, dir);
+  await harness.run({ ...ctx, only: new Set(['r013', 'r014', 'r015', 'r016', 'r017', 'r018']) });
+  const ranOnce = await harness.ledgerSpend(ctx.dir);
+  assert.equal(Math.round(ranOnce.total * 100) / 100, 1.8);
+
+  // Invalid grades: each job tries three times, then stops; a resume makes no new call.
+  process.env.MOCK_GRADER = 'invalid';
+  const gradeF5 = { ...ctx, only: new Set(['F5']) };
+  await assert.rejects(() => harness.grade(gradeF5), /no valid grade after 3 attempts/);
+  const afterFirst = await harness.readLedger(ctx.dir);
+  await assert.rejects(() => harness.grade(gradeF5), /no valid grade after 3 attempts/);
+  assert.equal((await harness.readLedger(ctx.dir)).length, afterFirst.length, 'a resume starts no new attempt');
+  assert.equal(await harness.attemptsOf(ctx.dir, 'grade:F5-brief-g1'), 3);
+  const files = await readdir(path.join(ctx.dir, 'grading'));
+  for (const attempt of [1, 2, 3]) {
+    assert.ok(files.includes(`F5-brief-g1.attempt-${attempt}.stdout.jsonl`), `attempt ${attempt} stream kept`);
+    assert.ok(files.includes(`F5-brief-g1.attempt-${attempt}.invalid.json`), `attempt ${attempt} kept as invalid`);
   }
+  assert.ok(!files.includes('F5-brief-g1.json'), 'no invalid grade is ever saved as the grade');
+  // 8 F5 grading jobs × 3 attempts at $0.10, plus the six runs.
+  const spend = await harness.ledgerSpend(ctx.dir);
+  assert.equal(Math.round(spend.by_kind.grader * 100) / 100, 2.4);
+  assert.equal(Math.round(spend.total * 100) / 100, 4.2);
+
+  // An attempt interrupted before it recorded anything holds its reserve.
+  await appendFile(path.join(ctx.dir, 'ledger.jsonl'), `${JSON.stringify({ event: 'start', call: 'run:r001#1', kind: 'research', job: 'run:r001', attempt: 1, reserve_usd: 1.5, file: path.join(ctx.dir, 'transcripts', 'missing.jsonl') })}\n`);
+  const interrupted = await harness.ledgerSpend(ctx.dir);
+  assert.deepEqual(interrupted.unresolved, ['run:r001#1']);
+  assert.equal(Math.round(interrupted.total * 100) / 100, 5.7);
+
+  // The cap counts it: with $6 approved, no further run starts.
+  delete process.env.MOCK_GRADER;
+  const capped = await harness.run({ ...ctx, cap: 6, only: new Set(['r001', 'r002']) });
+  assert.deepEqual(capped.skipped.sort(), ['r001', 'r002']);
+  process.exitCode = 0;
 });
 
-// --------------------------------------------------------------- R6
-
-test('the pre-registered screen flags baseline-majority clause drops of two and task drops; confirmation needs six replicates (review R6)', async (t) => {
-  const { harness } = await loadHarness(t);
-  const row = (clauseCounts, baseline = 0.9, brief = 0.9, n = 3) => ({ id: 'T', positive: true, replicates: n, recall: { baseline: { mean: baseline }, brief: { mean: brief } }, clause_counts: clauseCounts.map(([b, r], index) => ({ clause: `M${index + 1}`, n, baseline: b, brief: r })) });
-  assert.equal(harness.screenRows([row([[2, 0]])]).flagged.length, 1, '2/3 → 0/3 is flagged (the reviewer\'s case)');
-  assert.equal(harness.screenRows([row([[3, 1]])]).flagged.length, 1);
-  assert.equal(harness.screenRows([row([[3, 2]])]).flagged.length, 0, 'a one-replicate drop is reported as weakened, not flagged');
-  assert.equal(harness.screenRows([row([[1, 0]])]).flagged.length, 0);
-  assert.equal(harness.screenRows([row([], 0.933, 0.8)]).flagged.length, 0, 'a 0.133 task drop alone stays under the 0.15 screen');
-  assert.equal(harness.screenRows([row([], 0.95, 0.75)]).flagged.length, 1);
-  assert.equal(harness.screenRows(Array.from({ length: 6 }, () => row([[3, 0]]))).systematic, true, 'more than five flagged tasks is systematic');
-
-  assert.deepEqual(harness.confirmedLoss(row([[5, 2]], 0.9, 0.85, 6)), []);
-  assert.equal(harness.confirmedLoss(row([[5, 1]], 0.9, 0.85, 6)).length, 1);
-  assert.equal(harness.confirmedLoss(row([], 0.95, 0.75, 6)).length, 1);
-});
-
-test('confirmed losses and split drops fail no-regression in the summary', async (t) => {
+test('a grader session that errors or used another model never yields a grade (review R9)', async (t) => {
   const { harness, dir } = await loadHarness(t);
-  // F1 M2: baseline states it in all six replicates, the brief arm never.
-  const statedBy = (taskId, arm, replicate, key) => !(taskId === 'F1' && key === 'M2' && arm === 'brief');
-  const manifest = await syntheticEval(dir, { statedBy, replicates: 6 });
-  const all = await harness.collectRows(manifest, { stage: null, dir });
-  const stage1 = harness.screenRows((await harness.collectRows(manifest, { stage: 1, dir })).rows);
-  assert.deepEqual(stage1.flagged.map((entry) => entry.id), ['F1']);
-  const summary = harness.summarize(all.rows, manifest, all.agreement, all.costs, stage1);
-  assert.equal(summary.gates.no_regression.pass, false);
-  assert.equal(summary.gates.no_regression.confirmed_losses[0].id, 'F1');
+  const { ctx } = await prepared(harness, dir);
+  await harness.run(ctx);
+  for (const mode of ['error', 'wrongmodel']) {
+    process.env.MOCK_GRADER = mode;
+    const only = { ...ctx, only: new Set([mode === 'error' ? 'F5' : 'N1']) };
+    await assert.rejects(() => harness.grade(only), /no valid grade after 3 attempts/);
+    const invalid = JSON.parse(await readFile(path.join(ctx.dir, 'grading', `${mode === 'error' ? 'F5' : 'N1'}-brief-g1.attempt-1.invalid.json`), 'utf8'));
+    assert.ok(invalid.problems.some((problem) => (mode === 'error' ? /did not complete \(error_max_turns, is_error\)/ : /model usage \["claude-haiku-4-5"\]/).test(problem)), invalid.problems.join(' | '));
+  }
 });

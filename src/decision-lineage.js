@@ -1476,7 +1476,8 @@ export function findFencedRanges(text) {
     offset += line.length + 1;
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (fence) {
-      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line)) {
+      // A closing fence holds only the opener's character, so ```~~~ never closes.
+      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length && (fence.char === '`' ? /^ {0,3}`+\s*$/ : /^ {0,3}~+\s*$/).test(line)) {
         ranges.push([fence.start, Math.min(offset - 1, text.length)]);
         fence = null;
       }

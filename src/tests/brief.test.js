@@ -315,6 +315,8 @@ test('nested code fences: a shorter inner fence never closes the outer one, so e
     longerOuter: '````md\n```\nnot a closing fence\n```\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n````',
     // ~~~ outer with a ``` line inside: a different character never closes it.
     otherChar: '~~~\n```\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n~~~',
+    // Mixed delimiters never close a fence.
+    mixedDelimiters: '```\n```~~~\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n```',
     // A fence-like line with trailing text is not a closing fence.
     notClosing: '```\n``` not a fence\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n```',
   };

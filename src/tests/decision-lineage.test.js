@@ -18,6 +18,7 @@ import {
   loadProjectReadModel,
   scanDecisionReferences,
 } from '../index.js';
+import { findFencedRanges } from '../decision-lineage.js';
 import { initializeProjectMemory } from '../init.js';
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/decision-lineage');
@@ -826,4 +827,14 @@ test('buildDecisionLineageModel marks unresolved targets and counts every relati
     [999, false],
   ]);
   assert.deepEqual(model.diagnostics.map((diagnostic) => diagnostic.code), ['unresolved-decision-reference']);
+});
+
+test('fenced ranges close only on the opener\'s own character, never on mixed delimiters (A7 review S6)', () => {
+  const text = ['```', '```~~~', 'inside', '```', 'outside', '~~~~', '~~~', 'still inside', '~~~~', 'after'].join('\n');
+  const ranges = findFencedRanges(text);
+  const inside = (word) => ranges.some(([start, end]) => text.indexOf(word) >= start && text.indexOf(word) < end);
+  assert.ok(inside('inside'), 'a ```~~~ line does not close a backtick fence');
+  assert.ok(!inside('outside'));
+  assert.ok(inside('still inside'), 'a shorter tilde fence does not close a longer one');
+  assert.ok(!inside('after'));
 });

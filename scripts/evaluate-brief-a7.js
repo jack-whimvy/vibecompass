@@ -21,9 +21,9 @@
 // - The tool-call allowance is enforced at the report: the harness counts
 //   tool calls in the live stream and stops the research session once call
 //   TOOL_CALL_CAP + 1 appears. The harness only observes the stream, so that
-//   session may already have run the call; everything from the event that
-//   issued it onward is discarded. A stopped run's report is written by a
-//   fresh session with no tools, from the transcript up to that boundary, so
+//   session may already have run the call; everything from the excess
+//   tool-use block onward is discarded. A stopped run's report is written by
+//   a fresh session with no tools, from the transcript up to that boundary, so
 //   no result beyond the cap reaches the session that writes the report.
 // - Run-to-run noise: three replicates per task × arm (stage 1), and three
 //   more for tasks the pre-registered screen flags (stage 2).
@@ -31,21 +31,27 @@
 //   second sees the reports in reversed order); every disagreement goes to a
 //   third grader, and the majority stands. Grades must cover the label's
 //   checklist exactly; incomplete grading stops scoring.
-// - Preflight and identity: preparation stops on any integrity failure, and
-//   every later stage checks the frozen package, harness, labels, and corpus.
+// - Integrity: preparation stops on any integrity failure; every later stage
+//   checks the frozen package, harness, labels, manifest, run copies, briefs,
+//   prompts, and transcripts; every grade is bound to its exact inputs and its
+//   own session record; every paid call is in an append-only spend ledger.
 //
 // Isolation is A5's: headless Claude Code (`claude -p`) with --safe-mode,
 // --restricted, Read/Grep/Glob only, --strict-mcp-config, --permission-mode
 // dontAsk, --no-session-persistence; cwd = the run copy; no CLAUDE.md
 // auto-discovery, memory, MCP, hooks, settings, network, or command tools.
+// Every session — research, report turn, and grader — is checked for the
+// model, the recorded Claude Code version, the permission mode, no MCP
+// server, its tool set, and success.
 //
 // Label isolation: `prepare`, `confirm`, and `run` read only each task's Task
 // and Files lines. Only `grade`, `screen`, and `score` read labels, and only
 // graders see them.
 
 import { createHash } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSessionBrief, estimateBriefTokens } from '../src/brief.js';
@@ -65,10 +71,14 @@ const CORPUS_TAG = 'recall-eval-corpus-v2';
 const CORPUS_EXCLUDED = (file) => /^architecture\/platform\/project-memory\/recall-evaluation[^/]*\.md$/.test(file) || file.startsWith('sessions/active/');
 const LABEL_FILES = ['recall-evaluation.md', 'recall-evaluation-heldout-v2.md'];
 const LANE_FILES = ['sessions/active/index.yaml', 'sessions/active/eval/session.yaml', 'sessions/active/eval/wip.md', 'sessions/active/eval/handoff.md'];
-// Reserves the cost cap holds back before starting another job.
-const RUN_RESERVE_USD = 1.5;
-const GRADE_RESERVE_USD = 0.5;
-const MAX_GRADE_ATTEMPTS = 3;
+// Reserves the cost cap holds back before starting a paid call, and the cost
+// counted for an attempt whose cost cannot be established.
+export const RUN_RESERVE_USD = 1.5;
+export const GRADE_RESERVE_USD = 0.5;
+export const MAX_GRADE_ATTEMPTS = 3;
+const RESEARCH_TOOLS = ['Glob', 'Grep', 'Read'];
+// --json-schema runs the built-in structured-output tool even with --tools "".
+const GRADER_TOOLS = ['StructuredOutput'];
 
 // Pre-registered no-regression thresholds (recall-evaluation.md › A7 protocol).
 export const REGRESSION = Object.freeze({
@@ -119,46 +129,39 @@ const CLAUDE_BIN = process.env.A7_CLAUDE_BIN ?? 'claude';
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const harnessPath = fileURLToPath(import.meta.url);
-const [command, ...args] = process.argv.slice(2);
-const option = (name, fallback = null) => {
-  const index = args.indexOf(name);
-  return index === -1 ? fallback : args[index + 1];
-};
-const outDir = option('--out') ? path.resolve(option('--out')) : null;
-const concurrency = Number(option('--concurrency', '4'));
-const only = option('--only') ? new Set(option('--only').split(',')) : null;
 
 // ---------------------------------------------------------------- prepare
 
-async function prepare() {
-  const corpus = path.resolve(requireOption('--corpus'));
-  const docsRepo = path.resolve(requireOption('--docs-repo'));
-  const labelsDir = path.resolve(requireOption('--labels'));
-  const heldoutSha = requireOption('--heldout-sha256');
-  const warmRuns = Number(option('--warm-runs', '10'));
+/**
+ * Prepares stage 1 in an empty or new directory. `opts`: corpus, docsRepo,
+ * labelsDir, heldoutSha, warmRuns, expectTasks (20 for A7).
+ */
+export async function prepare(ctx, opts) {
+  const { dir } = ctx;
+  if (await nonEmptyDirectory(dir)) throw new Error(`Refusing to prepare into ${dir}: it already holds files. Use a new, empty directory for each evaluation.`);
+  const corpus = path.resolve(opts.corpus);
   const failures = [];
 
-  // Frozen inputs: package, harness, labels, corpus.
-  const identity = packageIdentity();
+  const identity = (ctx.identity ?? packageIdentity)();
   if (identity.package_dirty) failures.push(`package src/ or scripts/ has uncommitted changes: ${identity.package_dirty}`);
-  await mkdir(path.join(outDir, 'labels'), { recursive: true });
+  await mkdir(path.join(dir, 'labels'), { recursive: true });
   const labelHashes = {};
   for (const file of LABEL_FILES) {
-    await copyFile(path.join(labelsDir, file), path.join(outDir, 'labels', file));
-    labelHashes[file] = sha256(await readFile(path.join(outDir, 'labels', file), 'utf8'));
+    await copyFile(path.join(opts.labelsDir, file), path.join(dir, 'labels', file));
+    labelHashes[file] = sha256(await readFile(path.join(dir, 'labels', file), 'utf8'));
   }
-  if (labelHashes['recall-evaluation-heldout-v2.md'] !== heldoutSha) failures.push('recall-evaluation-heldout-v2.md does not match --heldout-sha256; the held-out set changed since its handback');
-  failures.push(...(await verifyCorpus(corpus, docsRepo)));
+  if (labelHashes['recall-evaluation-heldout-v2.md'] !== opts.heldoutSha) failures.push('recall-evaluation-heldout-v2.md does not match --heldout-sha256; the held-out set changed since its handback');
+  failures.push(...(await verifyCorpus(corpus, path.resolve(opts.docsRepo))));
 
-  const labelsText = Object.fromEntries(await Promise.all(LABEL_FILES.map(async (file) => [file, await readFile(path.join(outDir, 'labels', file), 'utf8')])));
+  const labelsText = Object.fromEntries(await Promise.all(LABEL_FILES.map(async (file) => [file, await readFile(path.join(dir, 'labels', file), 'utf8')])));
   const tasks = [...parseTasks(labelsText['recall-evaluation.md'], 'tuning'), ...parseTasks(labelsText['recall-evaluation-heldout-v2.md'], 'held-out')];
-  if (tasks.length !== 20) failures.push(`expected 20 tasks (12 tuning, 8 held-out), found ${tasks.length}`);
+  const expectTasks = opts.expectTasks ?? 20;
+  if (tasks.length !== expectTasks) failures.push(`expected ${expectTasks} tasks, found ${tasks.length}`);
   for (const task of tasks) if (!task.task) failures.push(`${task.id}: no task text`);
   if (failures.length > 0) throw new Error(`Preflight failed; nothing prepared:\n- ${failures.join('\n- ')}`);
 
-  await rm(path.join(outDir, 'runs'), { recursive: true, force: true });
-  await mkdir(path.join(outDir, 'briefs'), { recursive: true });
-  await mkdir(path.join(outDir, 'prompts'), { recursive: true });
+  await mkdir(path.join(dir, 'briefs'), { recursive: true });
+  await mkdir(path.join(dir, 'prompts'), { recursive: true });
   const relations = (await loadProjectReadModel(corpus)).decision_lineage.relations;
   const corpusHashes = await hashTree(corpus);
 
@@ -168,9 +171,9 @@ async function prepare() {
     for (let replicate = 1; replicate <= STAGE1_REPLICATES; replicate += 1) runs.push(...armPair(runs, task, taskIndex, replicate, 1));
   });
   const briefs = {};
-  for (const entry of runs) failures.push(...(await prepareRun(entry, tasks, corpus, corpusHashes, relations, briefs)));
+  for (const entry of runs) failures.push(...(await prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs)));
 
-  const latency = await measureLatency(corpus, tasks, warmRuns);
+  const latency = await measureLatency(dir, corpus, tasks, opts.warmRuns ?? 10);
   // Pre-run gates (A7 protocol): a failure here is the outcome — no-go — and no paid run starts.
   const preRunGateFailures = [
     ...Object.entries(briefs).flatMap(([id, brief]) => brief.safe_overflow.map((problem) => `${id}: ${problem}`)),
@@ -180,6 +183,7 @@ async function prepare() {
   if (failures.length > 0) throw new Error(`Preflight failed; nothing prepared:\n- ${failures.join('\n- ')}`);
 
   const claudeVersion = spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8' }).stdout.trim();
+  if (!parseVersion(claudeVersion)) throw new Error(`cannot read the Claude Code version (got "${claudeVersion}")`);
   const manifest = {
     prepared_at: new Date().toISOString(),
     ...identity,
@@ -188,7 +192,7 @@ async function prepare() {
     claude_version: claudeVersion,
     harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM].join(' ')}), cwd = run copy, prompt on stdin, stopped when tool call ${TOOL_CALL_CAP + 1} appears`,
     report_turn_harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, '--tools', '""', ...STREAM].join(' ')}), cwd = run copy, prompt on stdin`,
-    grader_harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, '--tools', '""', '--output-format', 'json', '--json-schema', '<schema>'].join(' ')}), empty cwd, prompt on stdin`,
+    grader_harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, '--tools', '""', ...STREAM, '--json-schema', '<schema>'].join(' ')}), empty cwd, prompt on stdin`,
     model: MODEL,
     effort: EFFORT,
     tool_call_cap: TOOL_CALL_CAP,
@@ -201,7 +205,7 @@ async function prepare() {
     corpus_tag: CORPUS_TAG,
     corpus_sha256: treeDigest(corpusHashes),
     label_sha256: labelHashes,
-    heldout_sha256: heldoutSha,
+    heldout_sha256: opts.heldoutSha,
     tasks: tasks.map(({ id, split, task, files }) => ({ id, split, task, files })),
     runs,
     briefs,
@@ -209,13 +213,14 @@ async function prepare() {
     preflight: { pass: true },
     pre_run_gates: { pass: preRunGateFailures.length === 0, failures: preRunGateFailures },
   };
-  await writeManifest(manifest);
-  console.log(`Prepared ${runs.length} stage-1 runs (${tasks.length} tasks × 2 arms × ${STAGE1_REPLICATES}) in ${outDir}; package ${manifest.package_commit}`);
+  await writeManifest(dir, manifest, 'prepare');
+  log(ctx, `Prepared ${runs.length} stage-1 runs (${tasks.length} tasks × 2 arms × ${STAGE1_REPLICATES}) in ${dir}; package ${manifest.package_commit}`);
   for (const [id, brief] of Object.entries(briefs)) {
-    console.log(`- ${id}: ${brief.status}${brief.topic_absent ? ' (topic absent)' : ''}; body ${brief.body_tokens} / whole file ${brief.whole_file_tokens} est. tokens; safe overflow ${brief.safe_overflow.length === 0 ? 'yes' : brief.safe_overflow.join('; ')}`);
+    log(ctx, `- ${id}: ${brief.status}${brief.topic_absent ? ' (topic absent)' : ''}; body ${brief.body_tokens} / whole file ${brief.whole_file_tokens} est. tokens; safe overflow ${brief.safe_overflow.length === 0 ? 'yes' : brief.safe_overflow.join('; ')}`);
   }
-  console.log(`Latency: cold CLI first ${latency.cold_first_ms} ms, max ${latency.cold_max_ms} ms; warm p50 max ${latency.warm_p50_max_ms} ms`);
-  if (!manifest.pre_run_gates.pass) console.log(`PRE-RUN GATES FAILED — the outcome is no-go and \`run\` will refuse:\n- ${preRunGateFailures.join('\n- ')}`);
+  log(ctx, `Latency: cold CLI first ${latency.cold_first_ms} ms, max ${latency.cold_max_ms} ms; warm p50 max ${latency.warm_p50_max_ms} ms`);
+  if (!manifest.pre_run_gates.pass) log(ctx, `PRE-RUN GATES FAILED — the outcome is no-go and \`run\` will refuse:\n- ${preRunGateFailures.join('\n- ')}`);
+  return manifest;
 }
 
 function armPair(existing, task, taskIndex, replicate, stage) {
@@ -223,11 +228,11 @@ function armPair(existing, task, taskIndex, replicate, stage) {
   return arms.map((arm, index) => ({ id: `r${String(existing.length + index + 1).padStart(3, '0')}`, task: task.id, arm, replicate, stage }));
 }
 
-/** Builds one run copy, its brief (brief arm), and its prompt; returns preflight failures. */
-async function prepareRun(entry, tasks, corpus, corpusHashes, relations, briefs) {
+/** Builds one run copy, its brief (brief arm), and its prompt, and records their identities; returns preflight failures. */
+async function prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs) {
   const failures = [];
   const task = tasks.find((candidate) => candidate.id === entry.task);
-  const root = await makeRunCopy(corpus, path.join(outDir, 'runs', entry.id), task);
+  const root = await makeRunCopy(corpus, path.join(dir, 'runs', entry.id), task);
   entry.root = root;
 
   if (entry.arm === 'brief') {
@@ -235,10 +240,11 @@ async function prepareRun(entry, tasks, corpus, corpusHashes, relations, briefs)
     if (!brief.summary.body_matches_json) failures.push(`${entry.id} (${task.id}): brief body differs from --json markdown`);
     const normalized = normalizeRunLocation(brief.file, root, await realpath(root));
     const replicateIdentity = { run: entry.id, file_sha256: sha256(brief.file), normalized_sha256: sha256(normalized) };
+    entry.brief_sha256 = replicateIdentity.file_sha256;
     if (!briefs[task.id]) {
-      await writeFile(path.join(outDir, 'briefs', `${task.id}.md`), brief.file);
-      await writeFile(path.join(outDir, 'briefs', `${task.id}.json`), `${JSON.stringify(brief.result, null, 2)}\n`);
-      briefs[task.id] = { ...brief.summary, replicates: [replicateIdentity] };
+      await writeFile(path.join(dir, 'briefs', `${task.id}.md`), brief.file);
+      await writeFile(path.join(dir, 'briefs', `${task.id}.json`), `${JSON.stringify(brief.result, null, 2)}\n`);
+      briefs[task.id] = { ...brief.summary, graded_file_sha256: sha256(brief.file), replicates: [replicateIdentity] };
     } else {
       briefs[task.id].replicates.push(replicateIdentity);
       if (briefs[task.id].replicates[0].normalized_sha256 !== replicateIdentity.normalized_sha256) {
@@ -251,7 +257,7 @@ async function prepareRun(entry, tasks, corpus, corpusHashes, relations, briefs)
   const prompt = renderPrompt(task, startup);
   entry.startup_files = startup.map((file) => ({ path: file.path, sha256: sha256(file.content) }));
   entry.prompt_sha256 = sha256(prompt);
-  await writeFile(path.join(outDir, 'prompts', `${entry.id}.txt`), prompt);
+  await writeFile(path.join(dir, 'prompts', `${entry.id}.txt`), prompt);
 
   // The copy must equal the corpus byte for byte, plus the eval lane (and brief.md).
   const expectedExtra = new Set([...LANE_FILES, ...(entry.arm === 'brief' ? ['sessions/active/eval/brief.md'] : [])]);
@@ -261,6 +267,8 @@ async function prepareRun(entry, tasks, corpus, corpusHashes, relations, briefs)
     if (corpusHashes.get(file) !== hash) failures.push(`${entry.id}: run copy file ${file} ${corpusHashes.has(file) ? 'differs from' : 'is not in'} the corpus`);
   }
   for (const file of [...corpusHashes.keys(), ...expectedExtra]) if (!copyHashes.has(file)) failures.push(`${entry.id}: run copy is missing ${file}`);
+  // Every later stage re-hashes the copy against this digest.
+  entry.tree_sha256 = treeDigest(copyHashes);
   return failures;
 }
 
@@ -388,10 +396,10 @@ async function verifyCorpus(corpus, docsRepo) {
 }
 
 /** Cold: a fresh CLI process per task. Warm: the engine in-process, p50 of N runs after one warm-up. */
-async function measureLatency(corpus, tasks, warmRuns) {
+async function measureLatency(dir, corpus, tasks, warmRuns) {
   const perTask = [];
   for (const task of tasks) {
-    const root = await makeRunCopy(corpus, path.join(outDir, 'runs', `latency-${task.id}`), task);
+    const root = await makeRunCopy(corpus, path.join(dir, 'latency', task.id), task);
     const started = process.hrtime.bigint();
     const child = spawnSync('node', ['src/cli.js', 'brief', '--root', root, '--session', 'eval', '--json'], { cwd: packageDir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const coldMs = Number(process.hrtime.bigint() - started) / 1e6;
@@ -403,9 +411,9 @@ async function measureLatency(corpus, tasks, warmRuns) {
       if (attempt > 0) warm.push(Number(process.hrtime.bigint() - warmStart) / 1e6);
     }
     warm.sort((left, right) => left - right);
-    perTask.push({ id: task.id, cold_ms: Math.round(coldMs), warm_p50_ms: Math.round(warm[Math.floor(warm.length / 2)]) });
-    await rm(root, { recursive: true, force: true });
+    perTask.push({ id: task.id, cold_ms: Math.round(coldMs), warm_p50_ms: Math.round(warm[Math.floor(warm.length / 2)] ?? 0) });
   }
+  await rm(path.join(dir, 'latency'), { recursive: true, force: true });
   return {
     method: `cold = fresh node process running \`brief --session eval --json\`; warm = buildSessionBrief in-process (read-model load included), p50 of ${warmRuns} runs after one warm-up; OS file cache not flushed`,
     per_task: perTask,
@@ -445,55 +453,77 @@ export function safeOverflow(result, relations) {
 
 // -------------------------------------------------------------------- run
 
-async function run() {
-  const manifest = await readManifest();
-  await assertFrozenIdentity(manifest);
+export async function run(ctx) {
+  const { dir } = ctx;
+  const manifest = await readManifest(dir);
+  await assertFrozenIdentity(ctx, manifest);
   if (!manifest.pre_run_gates.pass) throw new Error(`Pre-run gates failed; the outcome is no-go and no run starts:\n- ${manifest.pre_run_gates.failures.join('\n- ')}`);
-  const cap = requireCostCap();
-  await mkdir(path.join(outDir, 'transcripts'), { recursive: true });
+  const cap = requireCap(ctx);
+  await mkdir(path.join(dir, 'transcripts'), { recursive: true });
   const pending = [];
-  for (const entry of manifest.runs.filter((candidate) => !only || only.has(candidate.id))) {
-    if (!(await exists(path.join(outDir, 'transcripts', `${entry.id}.meta.json`)))) pending.push(entry);
+  for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
+    if (!(await exists(path.join(dir, 'transcripts', `${entry.id}.meta.json`)))) pending.push(entry);
   }
   const skipped = [];
-  await pool(pending, concurrency, async (entry) => {
-    if ((await spentSoFar(manifest)) + RUN_RESERVE_USD > cap) {
+  await pool(pending, ctx.concurrency ?? 4, async (entry) => {
+    if ((await ledgerSpend(dir)).total + RUN_RESERVE_USD > cap) {
       skipped.push(entry.id);
       return;
     }
-    const prompt = await readFile(path.join(outDir, 'prompts', `${entry.id}.txt`), 'utf8');
+    const treeProblems = await verifyRunTree(entry);
+    if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
+    const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
     if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-    await runAgent(prompt, entry.root, path.join(outDir, 'transcripts', entry.id), manifest.tool_call_cap);
-    const metrics = await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version);
-    console.log(`${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${metrics.stopped_at_cap ? ' (stopped at the cap; report turn)' : ''}, ${Math.round(metrics.duration_ms / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, VIOLATIONS: ${metrics.violations.join('; ')}` : ''}`);
+    await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id });
+    const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest);
+    log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${metrics.stopped_at_cap ? ' (stopped at the cap; report turn)' : ''}, ${Math.round(metrics.duration_ms / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, VIOLATIONS: ${metrics.violations.join('; ')}` : ''}`);
   });
-  console.log(`Spent so far: $${(await spentSoFar(manifest)).toFixed(2)} of the $${cap} cap.`);
+  const spend = await ledgerSpend(dir);
+  log(ctx, `Spent so far: $${spend.total.toFixed(2)} of the $${cap} cap${spend.unresolved.length > 0 ? ` (includes $${spend.reserved_unresolved.toFixed(2)} reserved for ${spend.unresolved.length} attempt(s) of unknown cost)` : ''}.`);
   if (skipped.length > 0) {
-    console.log(`Stopped at the cost cap: ${skipped.length} run(s) not started (${skipped.join(', ')}). Resume with a cap the founder approves.`);
+    log(ctx, `Stopped at the cost cap: ${skipped.length} run(s) not started (${skipped.join(', ')}). Resume with a cap the founder approves.`);
     process.exitCode = 3;
   }
+  return { skipped };
 }
 
 /**
  * One evaluated run. The research session streams; the harness stops it once
  * tool call cap + 1 appears. A run with more than `cap` calls in its stream is
  * stopped whether or not the kill landed first, and its report comes from a
- * fresh session with no tools, given the transcript up to the boundary.
+ * fresh session with no tools, given the transcript up to the boundary. With
+ * `ledgerDir`, every session is a ledger attempt whose stream is written to
+ * its own file as it arrives.
  */
-export async function runAgent(prompt, cwd, transcriptBase, cap) {
+export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase) } = {}) {
   const started = Date.now();
-  const research = await spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap);
-  const events = parseEvents(research.stdout);
-  const stopped = research.stopped || collectToolUses(events).length > cap;
-  const meta = { killed: research.stopped, stopped, research_wall_ms: Date.now() - started, report_wall_ms: null, report_prompt_sha256: null };
+  const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile) =>
+    spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile }),
+  );
+  const stopped = research.killed || collectToolUses(research.events).length > cap;
+  const meta = {
+    killed: research.killed,
+    stopped,
+    research_attempt: research.attempt,
+    research_sha256: research.sha256,
+    research_wall_ms: Date.now() - started,
+    report_attempt: null,
+    report_sha256: null,
+    report_wall_ms: null,
+    report_prompt_sha256: null,
+  };
   await writeFile(`${transcriptBase}.jsonl`, research.stdout);
   if (research.stderr.trim()) await writeFile(`${transcriptBase}.stderr`, research.stderr);
   if (stopped) {
-    const reportPrompt = renderReportTurn(prompt, events, cap);
+    const reportPrompt = renderReportTurn(prompt, research.events, cap);
     meta.report_prompt_sha256 = sha256(reportPrompt);
     await writeFile(`${transcriptBase}.report-prompt.txt`, reportPrompt);
     const reportStarted = Date.now();
-    const report = await spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM], reportPrompt, cwd, 0);
+    const report = await paidCall(ledgerDir, 'report', `report:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.report.attempt-${attempt}.jsonl`, (streamFile) =>
+      spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM], reportPrompt, cwd, 0, { streamFile }),
+    );
+    meta.report_attempt = report.attempt;
+    meta.report_sha256 = report.sha256;
     meta.report_wall_ms = Date.now() - reportStarted;
     await writeFile(`${transcriptBase}.report.jsonl`, report.stdout);
     if (report.stderr.trim()) await writeFile(`${transcriptBase}.report.stderr`, report.stderr);
@@ -528,10 +558,10 @@ export function findBoundary(events, cap) {
 
 /**
  * The agent's text, its first `cap` tool calls, and their delivered results,
- * truncated at the boundary: assistant content from the excess call onward is
- * dropped (it may already reflect a result beyond the cap), as is every result
- * of an excess call. Results of allowed calls delivered after the boundary are
- * kept: they answer calls issued within the allowance.
+ * truncated at the boundary: assistant content from the excess tool-use block
+ * onward is dropped (it may already reflect a result beyond the cap), as is
+ * every result of an excess call. Results of allowed calls delivered after the
+ * boundary are kept: they answer calls issued within the allowance.
  */
 export function renderResearchTranscript(events, cap) {
   const boundary = findBoundary(events, cap);
@@ -562,9 +592,35 @@ export function renderResearchTranscript(events, cap) {
   return parts.join('\n\n');
 }
 
+/**
+ * The checks every session must pass: an init event with the model, the
+ * recorded Claude Code version (exact), permission mode dontAsk, no MCP
+ * server, and exactly the expected tools; and, when a result is required, a
+ * successful result with no permission denial whose model usage is only the
+ * evaluation model.
+ */
+export function sessionProblems(events, { label, tools, version, requireResult }) {
+  const problems = [];
+  const init = events.find((event) => event.type === 'system' && event.subtype === 'init');
+  const result = [...events].reverse().find((event) => event.type === 'result') ?? null;
+  if (!init) return [`${label}: no init event`];
+  if (init.model !== MODEL) problems.push(`${label}: model ${init.model}`);
+  if (version && init.claude_code_version !== version) problems.push(`${label}: Claude Code ${init.claude_code_version}, prepared with ${version}`);
+  if (init.permissionMode !== 'dontAsk') problems.push(`${label}: permission mode ${init.permissionMode}`);
+  if ((init.mcp_servers ?? []).length > 0) problems.push(`${label}: MCP servers ${JSON.stringify(init.mcp_servers)}`);
+  if (JSON.stringify([...(init.tools ?? [])].sort()) !== JSON.stringify([...tools].sort())) problems.push(`${label}: tools ${JSON.stringify(init.tools)}, expected ${JSON.stringify(tools)}`);
+  if (requireResult) {
+    if (!result || result.is_error || result.subtype !== 'success') problems.push(`${label}: did not complete (${result?.subtype ?? 'no result'}${result?.is_error ? ', is_error' : ''})`);
+    const models = Object.keys(result?.modelUsage ?? {});
+    if (models.length !== 1 || models[0] !== MODEL) problems.push(`${label}: model usage ${JSON.stringify(models)}`);
+  }
+  if ((result?.permission_denials ?? []).length > 0) problems.push(`${label}: ${result.permission_denials.length} permission denials`);
+  return problems;
+}
+
 // Effective list prices per token, fitted exactly to A5's 32 run results
-// (claude-opus-5-5): used only to estimate a stopped session, which emits no
-// result event and so no total_cost_usd.
+// (claude-opus-5-5): used only to estimate a session that emitted no
+// total_cost_usd (stopped or interrupted).
 const PRICE = { input_tokens: 8e-6, cache_creation_input_tokens: 8e-6, cache_read_input_tokens: 0.2e-6, output_tokens: 20e-6 };
 
 /** Usage summed over a stream's assistant messages (one count per message id). */
@@ -580,14 +636,16 @@ function estimateCost(usage) {
   return usage ? Object.entries(PRICE).reduce((sum, [key, price]) => sum + (usage[key] ?? 0) * price, 0) : null;
 }
 
-/** Tool calls, tokens read, wall time, cost, the final report, the boundary audit, and confinement checks for one run. */
-export async function auditRun(dir, entry, cap, expectedVersion = null) {
+/** Tool calls, tokens read, wall time, cost, the final report, the boundary audit, artifact integrity, and session checks for one run. */
+export async function auditRun(dir, entry, cap, manifest = null) {
   const base = path.join(dir, 'transcripts', entry.id);
-  const research = parseEvents(await readFile(`${base}.jsonl`, 'utf8'));
-  const reportEvents = await readFile(`${base}.report.jsonl`, 'utf8').then(parseEvents, () => null);
+  const researchText = await readFile(`${base}.jsonl`, 'utf8');
+  const research = parseEvents(researchText);
+  const reportText = await readFile(`${base}.report.jsonl`, 'utf8').catch(() => null);
+  const reportEvents = reportText === null ? null : parseEvents(reportText);
   const meta = await readFile(`${base}.meta.json`, 'utf8').then(JSON.parse, () => ({}));
+  const version = manifest ? parseVersion(manifest.claude_version) : null;
   const realRoot = await realpath(entry.root);
-  const init = research.find((event) => event.type === 'system' && event.subtype === 'init');
   const researchResult = research.find((event) => event.type === 'result') ?? null;
   const reportResult = reportEvents?.find((event) => event.type === 'result') ?? null;
   const calls = collectToolUses(research);
@@ -596,6 +654,23 @@ export async function auditRun(dir, entry, cap, expectedVersion = null) {
   const counted = calls.filter((use) => !boundary || boundary.allowed.has(use.id));
   const results = collectToolResults(research);
   const violations = [];
+
+  // Artifact integrity: the transcripts are the ones the run wrote (and the ledger recorded).
+  if (meta.research_sha256 && sha256(researchText) !== meta.research_sha256) violations.push('research transcript changed since the run');
+  if (meta.report_sha256 && sha256(reportText ?? '') !== meta.report_sha256) violations.push('report-turn transcript changed since the run');
+  const ledger = await readLedger(dir);
+  if (ledger.length > 0) {
+    for (const [kind, job, attempt, hash] of [['research', `run:${entry.id}`, meta.research_attempt, meta.research_sha256], ['report', `report:${entry.id}`, meta.report_attempt, meta.report_sha256]]) {
+      if (!attempt) continue;
+      const finish = ledger.find((record) => record.event === 'finish' && record.call === `${job}#${attempt}`);
+      if (!finish || finish.stream_sha256 !== hash) violations.push(`${kind} transcript is not the one recorded in the ledger`);
+    }
+  }
+  if (entry.prompt_sha256) {
+    const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
+    if (prompt === null || sha256(prompt) !== entry.prompt_sha256) violations.push('prompt changed since prepare');
+  }
+
   const reads = [];
   for (const use of counted) {
     const target = use.input?.file_path ?? use.input?.path ?? null;
@@ -606,12 +681,7 @@ export async function auditRun(dir, entry, cap, expectedVersion = null) {
     }
     if (/recall-evaluation/i.test(JSON.stringify(use.input))) violations.push(`${use.name} names an evaluation file`);
   }
-  if (!init || init.tools?.some((tool) => !['Read', 'Grep', 'Glob'].includes(tool)) || !init.tools?.length) violations.push(`unexpected tools ${init?.tools?.join(',')}`);
-  if (init?.model !== MODEL) violations.push(`model ${init?.model}`);
-  if (expectedVersion && !String(expectedVersion).startsWith(String(init?.claude_code_version))) violations.push(`Claude Code ${init?.claude_code_version}, prepared with ${expectedVersion}`);
-  if ((init?.mcp_servers ?? []).length > 0) violations.push(`MCP servers ${JSON.stringify(init.mcp_servers)}`);
-  if (init && init.permissionMode !== 'dontAsk') violations.push(`permission mode ${init.permissionMode}`);
-  if ((researchResult?.permission_denials ?? []).length > 0) violations.push(`${researchResult.permission_denials.length} permission denials`);
+  violations.push(...sessionProblems(research, { label: 'research', tools: RESEARCH_TOOLS, version, requireResult: !stopped }));
   const excessIds = new Set(calls.filter((use) => boundary && !boundary.allowed.has(use.id)).map((use) => use.id));
   const resultChars = counted.reduce((sum, use) => sum + [...(results.get(use.id) ?? '')].length, 0);
   let report = '';
@@ -621,20 +691,19 @@ export async function auditRun(dir, entry, cap, expectedVersion = null) {
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
     // The report turn's input must be exactly the boundary-truncated replay of the saved stream.
     if (!reportPrompt || prompt === null || reportPrompt !== renderReportTurn(prompt, research, cap)) violations.push('report-turn prompt is not the boundary-truncated replay of the research stream');
-    const reportInit = reportEvents?.find((event) => event.type === 'system' && event.subtype === 'init');
-    if (!reportResult || reportResult.is_error || reportResult.subtype !== 'success') violations.push(`report turn did not complete (${reportResult?.subtype ?? 'no result'})`);
-    if (reportInit && (reportInit.tools ?? []).length > 0) violations.push(`report turn had tools ${reportInit.tools.join(',')}`);
-    if (collectToolUses(reportEvents ?? []).length > 0) violations.push('report turn used tools');
+    if (!reportEvents) violations.push('stopped run has no report turn');
+    else {
+      violations.push(...sessionProblems(reportEvents, { label: 'report turn', tools: [], version, requireResult: true }));
+      if (collectToolUses(reportEvents).length > 0) violations.push('report turn used tools');
+    }
     report = reportResult?.result ?? '';
   } else {
-    if (!researchResult || researchResult.is_error || researchResult.subtype !== 'success') violations.push(`run did not complete (${researchResult?.subtype ?? 'no result'})`);
     report = researchResult?.result ?? '';
   }
   const researchUsage = researchResult?.usage ?? streamUsage(research);
   const researchCost = researchResult?.total_cost_usd ?? estimateCost(researchUsage);
   return {
-    model: init?.model ?? null,
-    tools: init?.tools ?? [],
+    model: research.find((event) => event.type === 'system')?.model ?? null,
     tool_calls: counted.length,
     stopped_at_cap: stopped,
     calls_issued: calls.length,
@@ -652,6 +721,12 @@ export async function auditRun(dir, entry, cap, expectedVersion = null) {
     report,
     violations,
   };
+}
+
+/** The run copy must still hash to its prepared digest. */
+async function verifyRunTree(entry) {
+  if (!entry.tree_sha256) return ['no prepared tree digest'];
+  return treeDigest(await hashTree(entry.root)) === entry.tree_sha256 ? [] : ['run copy changed since prepare'];
 }
 
 export function parseEvents(stdout) {
@@ -703,6 +778,86 @@ function sumUsage(usages) {
   return Object.fromEntries(keys.map((key) => [key, present.reduce((sum, usage) => sum + (usage[key] ?? 0), 0)]));
 }
 
+// ----------------------------------------------------------------- ledger
+
+/**
+ * The spend ledger (append-only, `ledger.jsonl`): one `start` record before
+ * every paid call — its job, attempt number (counted across invocations), and
+ * the file its stream is written to as it arrives — and one `finish` record
+ * with its cost and stream hash. Manifest writes are recorded too.
+ */
+export async function readLedger(dir) {
+  const text = await readFile(path.join(dir, 'ledger.jsonl'), 'utf8').catch(() => '');
+  return text
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function appendLedger(dir, record) {
+  await appendFile(path.join(dir, 'ledger.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`);
+}
+
+/** Attempts already started for a job, across every invocation. */
+export async function attemptsOf(dir, job) {
+  return (await readLedger(dir)).filter((record) => record.event === 'start' && record.job === job).length;
+}
+
+/**
+ * One paid session as a ledger attempt. Without a ledger (unit use) the
+ * attempt is 1 and nothing is recorded.
+ */
+async function paidCall(ledgerDir, kind, job, reserve, fileFor, invoke) {
+  const attempt = ledgerDir ? (await attemptsOf(ledgerDir, job)) + 1 : 1;
+  const file = fileFor(attempt);
+  const call = `${job}#${attempt}`;
+  if (ledgerDir) await appendLedger(ledgerDir, { event: 'start', call, kind, job, attempt, reserve_usd: reserve, file });
+  const output = await invoke(file);
+  const events = parseEvents(output.stdout);
+  const result = [...events].reverse().find((event) => event.type === 'result');
+  const reported = typeof result?.total_cost_usd === 'number' ? result.total_cost_usd : null;
+  const estimated = reported === null ? estimateCost(streamUsage(events)) : null;
+  const cost = reported ?? (estimated && estimated > 0 ? estimated : null);
+  const hash = sha256(output.stdout);
+  if (ledgerDir) {
+    await appendLedger(ledgerDir, { event: 'finish', call, cost_usd: cost, cost_source: reported !== null ? 'reported' : cost !== null ? 'estimated' : 'unknown', stream_sha256: hash });
+  }
+  return { ...output, events, attempt, call, file, sha256: hash, killed: output.stopped, cost };
+}
+
+/**
+ * Spend from the ledger alone — the one source for the cap and the report.
+ * An attempt counts its reported cost, else its cost estimated from the usage
+ * in its stream file (stopped or interrupted sessions), else its reserve,
+ * listed as unresolved. Nothing counts as zero for lack of a number.
+ */
+export async function ledgerSpend(dir) {
+  const entries = await readLedger(dir);
+  const finishes = new Map(entries.filter((record) => record.event === 'finish').map((record) => [record.call, record]));
+  const spend = { total: 0, by_kind: { research: 0, report: 0, grader: 0 }, attempts: 0, estimated: [], unresolved: [], reserved_unresolved: 0 };
+  for (const start of entries.filter((record) => record.event === 'start')) {
+    spend.attempts += 1;
+    const finish = finishes.get(start.call);
+    let cost = typeof finish?.cost_usd === 'number' ? finish.cost_usd : null;
+    if (finish?.cost_source === 'estimated') spend.estimated.push(start.call);
+    if (cost === null) {
+      const streamed = start.file ? await readFile(start.file, 'utf8').catch(() => '') : '';
+      const estimate = estimateCost(streamUsage(parseEvents(streamed)));
+      if (estimate && estimate > 0) {
+        cost = estimate;
+        spend.estimated.push(start.call);
+      } else {
+        cost = start.reserve_usd;
+        spend.unresolved.push(start.call);
+        spend.reserved_unresolved += start.reserve_usd;
+      }
+    }
+    spend.total += cost;
+    spend.by_kind[start.kind] = (spend.by_kind[start.kind] ?? 0) + cost;
+  }
+  return spend;
+}
+
 // ------------------------------------------------------------------ smoke
 
 /**
@@ -710,84 +865,92 @@ function sumUsage(usages) {
  * with a tiny cap, to show the stop and the report turn work. Results are not
  * evaluation data and are never graded.
  */
-async function smoke() {
-  const corpus = path.resolve(requireOption('--corpus'));
-  const labelsDir = path.resolve(requireOption('--labels'));
-  const cap = Number(option('--cap', '3'));
-  // --stated-cap tells the agent a larger allowance than the harness enforces,
-  // so the stop and the report turn are exercised.
-  const statedCap = Number(option('--stated-cap', String(cap)));
-  const taskId = requireOption('--task');
-  const task = parseTasks(await readFile(path.join(labelsDir, 'recall-evaluation.md'), 'utf8'), 'tuning').find((entry) => entry.id === taskId);
-  if (!task) throw new Error(`smoke: no tuning task ${taskId}.`);
-  await mkdir(path.join(outDir, 'transcripts'), { recursive: true });
-  await mkdir(path.join(outDir, 'prompts'), { recursive: true });
-  const root = await makeRunCopy(corpus, path.join(outDir, 'runs', 'smoke'), task);
+async function smoke(ctx, opts) {
+  const { dir } = ctx;
+  const task = parseTasks(await readFile(path.join(opts.labelsDir, 'recall-evaluation.md'), 'utf8'), 'tuning').find((entry) => entry.id === opts.task);
+  if (!task) throw new Error(`smoke: no tuning task ${opts.task}.`);
+  await mkdir(path.join(dir, 'transcripts'), { recursive: true });
+  await mkdir(path.join(dir, 'prompts'), { recursive: true });
+  const root = await makeRunCopy(path.resolve(opts.corpus), path.join(dir, 'runs', 'smoke'), task);
   const prompt = renderPrompt(task, await readStartupFiles(root, 'baseline'))
-    .replaceAll(`at most ${TOOL_CALL_CAP} tool calls`, `at most ${statedCap} tool calls`)
-    .replaceAll(`when you make call ${TOOL_CALL_CAP + 1}`, `when you make call ${statedCap + 1}`)
-    .replaceAll(`from your first ${TOOL_CALL_CAP} calls`, `from your first ${statedCap} calls`);
-  await writeFile(path.join(outDir, 'prompts', 'smoke.txt'), prompt);
-  const outcome = await runAgent(prompt, root, path.join(outDir, 'transcripts', 'smoke'), cap);
-  const metrics = await auditRun(outDir, { id: 'smoke', root }, cap);
-  console.log(JSON.stringify({ ...outcome, ...metrics, report: `${metrics.report.slice(0, 400)}…` }, null, 2));
+    .replaceAll(`at most ${TOOL_CALL_CAP} tool calls`, `at most ${opts.statedCap} tool calls`)
+    .replaceAll(`when you make call ${TOOL_CALL_CAP + 1}`, `when you make call ${opts.statedCap + 1}`)
+    .replaceAll(`from your first ${TOOL_CALL_CAP} calls`, `from your first ${opts.statedCap} calls`);
+  await writeFile(path.join(dir, 'prompts', 'smoke.txt'), prompt);
+  const outcome = await runAgent(prompt, root, path.join(dir, 'transcripts', 'smoke'), opts.cap, { ledgerDir: dir, runId: 'smoke' });
+  const metrics = await auditRun(dir, { id: 'smoke', root }, opts.cap);
+  log(ctx, JSON.stringify({ ...outcome, ...metrics, report: `${metrics.report.slice(0, 400)}…` }, null, 2));
 }
 
 // ------------------------------------------------------------------ grade
 
-async function grade() {
-  const manifest = await readManifest();
-  await assertFrozenIdentity(manifest);
-  const cap = requireCostCap();
-  const labels = await loadLabels(path.join(outDir, 'labels'), manifest);
-  const gradingDir = path.join(outDir, 'grading');
-  const workDir = path.join(gradingDir, 'empty-cwd');
-  await mkdir(workDir, { recursive: true });
-  const reportsFor = async (taskId, replicate) => {
-    const reports = {};
-    for (const arm of ['baseline', 'brief']) {
-      const entry = manifest.runs.find((candidate) => candidate.task === taskId && candidate.arm === arm && candidate.replicate === replicate);
-      reports[arm] = (await auditRun(outDir, entry, manifest.tool_call_cap, manifest.claude_version)).report;
-    }
-    return reports;
-  };
+export async function grade(ctx) {
+  const { dir } = ctx;
+  const manifest = await readManifest(dir);
+  await assertFrozenIdentity(ctx, manifest);
+  const cap = requireCap(ctx);
+  const labels = await loadLabels(dir, manifest);
+  const gradingDir = path.join(dir, 'grading');
+  await mkdir(path.join(gradingDir, 'empty-cwd'), { recursive: true });
+  const tasks = manifest.tasks.filter((candidate) => !ctx.only || ctx.only.has(candidate.id));
 
   // Pass 1: two independent graders per report pair and per brief.
   const jobs = [];
-  for (const task of manifest.tasks.filter((candidate) => !only || only.has(candidate.id))) {
+  for (const task of tasks) {
     const label = labels.get(task.id);
     if (!label) throw new Error(`${task.id}: no label block.`);
     for (const replicate of replicatesOf(manifest, task.id)) {
-      const reports = await reportsFor(task.id, replicate);
-      const firstOrder = blindOrder(`a7-blind:${task.id}:${replicate}`);
-      jobs.push(reportJob(task, label, replicate, 'g1', firstOrder, reports), reportJob(task, label, replicate, 'g2', { P: firstOrder.Q, Q: firstOrder.P }, reports));
+      const reportJobs = reportJobsFor(task, label, replicate, await reportsFor(dir, manifest, task.id, replicate));
+      jobs.push(reportJobs.g1, reportJobs.g2);
     }
-    const brief = await readFile(path.join(outDir, 'briefs', `${task.id}.md`), 'utf8');
-    for (const grader of ['g1', 'g2']) jobs.push({ kind: 'brief', name: `${task.id}-brief-${grader}`, task, label, grader, prompt: briefGraderPrompt(label, brief) });
+    const briefJobs = briefJobsFor(task, label, await readFile(path.join(dir, 'briefs', `${task.id}.md`), 'utf8'));
+    jobs.push(briefJobs.g1, briefJobs.g2);
   }
-  await runGraders(jobs, gradingDir, workDir, cap, manifest);
+  const first = await runGraders(ctx, jobs, manifest, cap);
 
   // Pass 2: a third grader wherever the first two disagree on any verdict.
   const tiebreaks = [];
-  for (const task of manifest.tasks.filter((candidate) => !only || only.has(candidate.id))) {
-    const label = labels.get(task.id);
-    for (const replicate of replicatesOf(manifest, task.id)) {
-      const pair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(gradingDir, `${task.id}-r${replicate}-reports-${grader}`)));
-      if (reportDisagreements(label, ...pair).length === 0) continue;
-      tiebreaks.push(reportJob(task, label, replicate, 'g3', blindOrder(`a7-tiebreak:${task.id}:${replicate}`), await reportsFor(task.id, replicate)));
-    }
-    const pair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(gradingDir, `${task.id}-brief-${grader}`)));
-    if (briefDisagreements(label, ...pair).length > 0) {
-      const brief = await readFile(path.join(outDir, 'briefs', `${task.id}.md`), 'utf8');
-      tiebreaks.push({ kind: 'brief', name: `${task.id}-brief-g3`, task, label, grader: 'g3', prompt: briefGraderPrompt(label, brief) });
+  if (first.skipped.length === 0) {
+    for (const task of tasks) {
+      const label = labels.get(task.id);
+      for (const replicate of replicatesOf(manifest, task.id)) {
+        const reportJobs = reportJobsFor(task, label, replicate, await reportsFor(dir, manifest, task.id, replicate));
+        const pair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(dir, reportJobs[grader], manifest)));
+        if (reportDisagreements(label, ...pair).length > 0) tiebreaks.push(reportJobs.g3);
+      }
+      const briefJobs = briefJobsFor(task, label, await readFile(path.join(dir, 'briefs', `${task.id}.md`), 'utf8'));
+      const pair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(dir, briefJobs[grader], manifest)));
+      if (briefDisagreements(label, ...pair).length > 0) tiebreaks.push(briefJobs.g3);
     }
   }
-  await runGraders(tiebreaks, gradingDir, workDir, cap, manifest);
-  console.log(`graded: ${jobs.length} first-pass jobs, ${tiebreaks.length} tie-breaks; spent so far $${(await spentSoFar(manifest)).toFixed(2)} of the $${cap} cap`);
+  const second = await runGraders(ctx, tiebreaks, manifest, cap);
+  const spend = await ledgerSpend(dir);
+  log(ctx, `graded: ${jobs.length} first-pass jobs, ${tiebreaks.length} tie-breaks; spent so far $${spend.total.toFixed(2)} of the $${cap} cap`);
+  return { skipped: [...first.skipped, ...second.skipped], tiebreaks: tiebreaks.length };
+}
+
+async function reportsFor(dir, manifest, taskId, replicate) {
+  const reports = {};
+  for (const arm of ['baseline', 'brief']) {
+    const entry = manifest.runs.find((candidate) => candidate.task === taskId && candidate.arm === arm && candidate.replicate === replicate);
+    reports[arm] = (await auditRun(dir, entry, manifest.tool_call_cap, manifest)).report;
+  }
+  return reports;
 }
 
 function blindOrder(seed) {
   return Number.parseInt(sha256(seed).slice(0, 2), 16) % 2 === 1 ? { P: 'brief', Q: 'baseline' } : { P: 'baseline', Q: 'brief' };
+}
+
+/** The three report-grading jobs for one pair, with their deterministic orders. */
+export function reportJobsFor(task, label, replicate, reports) {
+  const firstOrder = blindOrder(`a7-blind:${task.id}:${replicate}`);
+  const orders = { g1: firstOrder, g2: { P: firstOrder.Q, Q: firstOrder.P }, g3: blindOrder(`a7-tiebreak:${task.id}:${replicate}`) };
+  return Object.fromEntries(Object.entries(orders).map(([grader, order]) => [grader, reportJob(task, label, replicate, grader, order, reports)]));
+}
+
+export function briefJobsFor(task, label, brief) {
+  return Object.fromEntries(['g1', 'g2', 'g3'].map((grader) => [grader, { kind: 'brief', name: `${task.id}-brief-${grader}`, task, label, grader, prompt: briefGraderPrompt(label, brief), schema: briefSchema(label) }]));
 }
 
 function reportJob(task, label, replicate, grader, order, reports) {
@@ -799,46 +962,124 @@ function reportJob(task, label, replicate, grader, order, reports) {
       return [name, text];
     }),
   );
-  return { kind: 'reports', name: `${task.id}-r${replicate}-reports-${grader}`, task, label, replicate, grader, order, redactions, prompt: reportGraderPrompt(label, redacted) };
+  return { kind: 'reports', name: `${task.id}-r${replicate}-reports-${grader}`, task, label, replicate, grader, order, redactions, prompt: reportGraderPrompt(label, redacted), schema: reportSchema(label) };
 }
 
-/** Runs grader jobs; a grade that does not cover the checklist exactly is kept as invalid and retried, then the job fails. */
-async function runGraders(jobs, gradingDir, workDir, cap, manifest) {
+/**
+ * Runs grader jobs. A cached grade is reused only when it is bound to this
+ * job's exact inputs and its own valid session record; otherwise the stage
+ * stops. Attempts are counted across invocations (MAX_GRADE_ATTEMPTS in all),
+ * every attempt's stream is kept under its own number, and an invalid grade
+ * is kept but never scored.
+ */
+async function runGraders(ctx, jobs, manifest, cap) {
+  const { dir } = ctx;
+  const gradingDir = path.join(dir, 'grading');
+  const workDir = path.join(gradingDir, 'empty-cwd');
   const skipped = [];
-  await pool(jobs, concurrency, async (job) => {
+  await pool(jobs, ctx.concurrency ?? 4, async (job) => {
     const target = path.join(gradingDir, `${job.name}.json`);
-    if (await exists(target)) return; // resumable: a valid grade is never regraded
+    if (await exists(target)) {
+      const problems = await gradeProblems(dir, JSON.parse(await readFile(target, 'utf8')), job, manifest);
+      if (problems.length > 0) throw new Error(`${job.name}: the saved grade does not match its inputs or its session (${problems.join('; ')}); refusing to reuse it.`);
+      return;
+    }
     await writeFile(path.join(gradingDir, `${job.name}.prompt.txt`), job.prompt);
-    const schema = job.kind === 'reports' ? reportSchema(job.label) : briefSchema(job.label);
-    for (let attempt = 1; attempt <= MAX_GRADE_ATTEMPTS; attempt += 1) {
-      if ((await spentSoFar(manifest)) + GRADE_RESERVE_USD > cap) {
+    for (;;) {
+      if ((await attemptsOf(dir, `grade:${job.name}`)) >= MAX_GRADE_ATTEMPTS) throw new Error(`${job.name}: no valid grade after ${MAX_GRADE_ATTEMPTS} attempts; grading is incomplete.`);
+      if ((await ledgerSpend(dir)).total + GRADE_RESERVE_USD > cap) {
         skipped.push(job.name);
         return;
       }
-      const output = await spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, '--output-format', 'json', '--json-schema', JSON.stringify(schema)], job.prompt, workDir, Infinity);
-      let parsed = null;
-      try {
-        parsed = JSON.parse(output.stdout);
-      } catch {
-        parsed = null;
-      }
-      const graded = parsed?.structured_output ?? null;
-      const problems = graded ? (job.kind === 'reports' ? validateReportGrade(job.label, graded) : validateBriefGrade(job.label, graded)) : ['no structured output'];
-      const record = { task: job.task.id, kind: job.kind, replicate: job.replicate ?? null, grader: job.grader, order: job.order ?? null, redactions: job.redactions ?? null, model: Object.keys(parsed?.modelUsage ?? {}), duration_ms: parsed?.duration_ms ?? null, cost_usd: parsed?.total_cost_usd ?? null, attempt, graded };
+      const call = await paidCall(dir, 'grader', `grade:${job.name}`, GRADE_RESERVE_USD, (attempt) => path.join(gradingDir, `${job.name}.attempt-${attempt}.stdout.jsonl`), (streamFile) =>
+        spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', JSON.stringify(job.schema)], job.prompt, workDir, Infinity, { streamFile }),
+      );
+      const result = [...call.events].reverse().find((event) => event.type === 'result');
+      const graded = result?.structured_output ?? null;
+      const record = gradeRecord(job, call, graded);
+      const problems = [
+        ...sessionProblems(call.events, { label: 'grader', tools: GRADER_TOOLS, version: parseVersion(manifest.claude_version), requireResult: true }),
+        ...(graded ? (job.kind === 'reports' ? validateReportGrade(job.label, graded) : validateBriefGrade(job.label, graded)) : ['no structured output']),
+      ];
       if (problems.length === 0) {
-        await writeFile(target, `${JSON.stringify(record, null, 2)}\n`);
-        console.log(`graded ${job.name} (attempt ${attempt}, ${parsed.duration_ms} ms)`);
+        await writeFile(target, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+        log(ctx, `graded ${job.name} (attempt ${call.attempt})`);
         return;
       }
-      // Invalid grades are kept for the record (and their cost counts) but never scored.
-      await writeFile(path.join(gradingDir, `${job.name}.invalid-${attempt}.json`), `${JSON.stringify({ ...record, problems, raw: output.stdout.slice(0, 4000) }, null, 2)}\n`);
+      await writeFile(path.join(gradingDir, `${job.name}.attempt-${call.attempt}.invalid.json`), `${JSON.stringify({ ...record, problems }, null, 2)}\n`, { flag: 'wx' });
     }
-    throw new Error(`${job.name}: no valid grade after ${MAX_GRADE_ATTEMPTS} attempts; grading is incomplete.`);
   });
   if (skipped.length > 0) {
-    console.log(`Stopped at the cost cap: ${skipped.length} grading job(s) not started. Resume with a cap the founder approves.`);
+    log(ctx, `Stopped at the cost cap: ${skipped.length} grading job(s) not started. Resume with a cap the founder approves.`);
     process.exitCode = 3;
   }
+  return { skipped };
+}
+
+/** A grade bound to its exact inputs (prompt, schema, arm order) and to its session record (stream file and ledger attempt). */
+function gradeRecord(job, call, graded) {
+  const init = call.events.find((event) => event.type === 'system' && event.subtype === 'init') ?? {};
+  const result = [...call.events].reverse().find((event) => event.type === 'result') ?? {};
+  return {
+    task: job.task.id,
+    kind: job.kind,
+    replicate: job.replicate ?? null,
+    grader: job.grader,
+    order: job.order ?? null,
+    redactions: job.redactions ?? null,
+    attempt: call.attempt,
+    call: call.call,
+    prompt_sha256: sha256(job.prompt),
+    schema_sha256: sha256(JSON.stringify(job.schema)),
+    stream_file: path.basename(call.file),
+    stream_sha256: call.sha256,
+    provenance: {
+      session_id: init.session_id ?? null,
+      model: init.model ?? null,
+      claude_code_version: init.claude_code_version ?? null,
+      permission_mode: init.permissionMode ?? null,
+      tools: init.tools ?? null,
+      mcp_servers: init.mcp_servers ?? null,
+      result_subtype: result.subtype ?? null,
+      is_error: result.is_error ?? null,
+      model_usage: Object.keys(result.modelUsage ?? {}),
+    },
+    cost_usd: call.cost,
+    graded,
+  };
+}
+
+/**
+ * Why a saved grade cannot be used for `job`: its inputs differ (prompt,
+ * schema, order), its stream file is missing or changed, its session fails
+ * the session checks, its structured output differs from the record, the
+ * ledger does not hold its attempt, or its verdicts do not cover the checklist.
+ */
+export async function gradeProblems(dir, record, job, manifest) {
+  const problems = [];
+  if (record.prompt_sha256 !== sha256(job.prompt)) problems.push('graded a different input (stale grade)');
+  if (record.schema_sha256 !== sha256(JSON.stringify(job.schema))) problems.push('graded under a different schema');
+  if (job.order && JSON.stringify(record.order) !== JSON.stringify(job.order)) problems.push('arm order differs');
+  const stream = record.stream_file ? await readFile(path.join(dir, 'grading', record.stream_file), 'utf8').catch(() => null) : null;
+  if (stream === null) return [...problems, 'session stream is missing'];
+  if (sha256(stream) !== record.stream_sha256) problems.push('session stream changed');
+  const events = parseEvents(stream);
+  problems.push(...sessionProblems(events, { label: 'grader', tools: GRADER_TOOLS, version: parseVersion(manifest.claude_version), requireResult: true }));
+  const output = [...events].reverse().find((event) => event.type === 'result')?.structured_output ?? null;
+  if (JSON.stringify(output) !== JSON.stringify(record.graded)) problems.push('recorded verdicts differ from the session output');
+  const finish = (await readLedger(dir)).find((entry) => entry.event === 'finish' && entry.call === record.call);
+  if (!finish || finish.stream_sha256 !== record.stream_sha256) problems.push('the ledger does not record this attempt');
+  problems.push(...(job.kind === 'reports' ? validateReportGrade(job.label, record.graded) : validateBriefGrade(job.label, record.graded)));
+  return problems;
+}
+
+/** The saved grade for `job`, verified; scoring stops on a missing or unusable grade. */
+async function requireGrade(dir, job, manifest) {
+  const record = await readFile(path.join(dir, 'grading', `${job.name}.json`), 'utf8').then(JSON.parse, () => null);
+  if (!record) throw new Error(`grading is incomplete: ${job.name} is missing (run \`grade\`).`);
+  const problems = await gradeProblems(dir, record, job, manifest);
+  if (problems.length > 0) throw new Error(`${job.name}: ${problems.join('; ')}`);
+  return record;
 }
 
 /** Display keys of a label's checklist: `M1(a)` for a lettered clause, `M3` for a single-clause item. */
@@ -1062,13 +1303,14 @@ function forbiddenSchema(label) {
 // ---------------------------------------------------- screen and confirm
 
 /** Stage 1 screen: score stage-1 replicates and write which tasks need confirmation runs. */
-async function screen() {
-  const manifest = await readManifest();
-  await assertFrozenIdentity(manifest);
-  const { rows } = await collectRows(manifest, { stage: 1 });
+export async function screen(ctx) {
+  const manifest = await readManifest(ctx.dir);
+  await assertFrozenIdentity(ctx, manifest);
+  const { rows } = await collectRows(ctx.dir, manifest, { stage: 1 });
   const result = screenRows(rows);
-  await writeFile(path.join(outDir, 'screen.json'), `${JSON.stringify(result, null, 2)}\n`);
-  console.log(JSON.stringify(result, null, 2));
+  await writeFile(path.join(ctx.dir, 'screen.json'), `${JSON.stringify(result, null, 2)}\n`);
+  log(ctx, JSON.stringify(result, null, 2));
+  return result;
 }
 
 /**
@@ -1092,71 +1334,81 @@ export function screenRows(rows) {
 }
 
 /** Stage 2: replicates 4–6 for the flagged tasks, prepared and checked exactly as stage 1. */
-async function confirm() {
-  const manifest = await readManifest();
-  await assertFrozenIdentity(manifest);
-  const screened = JSON.parse(await readFile(path.join(outDir, 'screen.json'), 'utf8'));
+export async function confirm(ctx) {
+  const { dir } = ctx;
+  const manifest = await readManifest(dir);
+  await assertFrozenIdentity(ctx, manifest);
+  const screened = JSON.parse(await readFile(path.join(dir, 'screen.json'), 'utf8'));
+  const current = screenRows((await collectRows(dir, manifest, { stage: 1 })).rows);
+  if (JSON.stringify(screened) !== JSON.stringify(current)) throw new Error('screen.json does not match the stage-1 grades; rerun `screen`.');
   if (screened.systematic) {
-    console.log(`${screened.flagged.length} tasks flagged (more than ${REGRESSION.maxFlagged}): a systematic regression. No confirmation runs; score directly.`);
-    return;
+    log(ctx, `${screened.flagged.length} tasks flagged (more than ${REGRESSION.maxFlagged}): a systematic regression. No confirmation runs; score directly.`);
+    return { added: 0 };
   }
   if (manifest.runs.some((entry) => entry.stage === 2)) throw new Error('confirmation runs are already prepared.');
   const relations = (await loadProjectReadModel(manifest.corpus)).decision_lineage.relations;
   const corpusHashes = await hashTree(manifest.corpus);
   if (treeDigest(corpusHashes) !== manifest.corpus_sha256) throw new Error('the corpus changed since prepare.');
   const failures = [];
+  const added = [];
   for (const { id } of screened.flagged) {
     const task = manifest.tasks.find((candidate) => candidate.id === id);
     const taskIndex = manifest.tasks.indexOf(task);
     for (let replicate = STAGE1_REPLICATES + 1; replicate <= STAGE1_REPLICATES + STAGE2_REPLICATES; replicate += 1) {
       for (const entry of armPair(manifest.runs, task, taskIndex, replicate, 2)) {
         manifest.runs.push(entry);
-        failures.push(...(await prepareRun(entry, manifest.tasks, manifest.corpus, corpusHashes, relations, manifest.briefs)));
+        added.push(entry);
+        failures.push(...(await prepareRun(dir, entry, manifest.tasks, manifest.corpus, corpusHashes, relations, manifest.briefs)));
       }
     }
   }
   if (failures.length > 0) throw new Error(`Confirmation preflight failed; nothing added:\n- ${failures.join('\n- ')}`);
-  await writeManifest(manifest);
-  console.log(`Prepared ${screened.flagged.length * STAGE2_REPLICATES * 2} confirmation runs for ${screened.flagged.map((entry) => entry.id).join(', ') || 'no task'}.`);
+  await writeManifest(dir, manifest, 'confirm');
+  log(ctx, `Prepared ${added.length} confirmation runs for ${screened.flagged.map((entry) => entry.id).join(', ') || 'no task'}.`);
+  return { added: added.length };
 }
 
 // ------------------------------------------------------------------ score
 
-async function score() {
-  const manifest = await readManifest();
-  await assertFrozenIdentity(manifest);
-  const { rows, agreement, costs } = await collectRows(manifest, { stage: null });
-  const screened = await readFile(path.join(outDir, 'screen.json'), 'utf8').then(JSON.parse, () => null);
-  const stage1 = screenRows((await collectRows(manifest, { stage: 1 })).rows);
+export async function score(ctx) {
+  const { dir } = ctx;
+  const manifest = await readManifest(dir);
+  await assertFrozenIdentity(ctx, manifest);
+  // Every run copy must still match its prepared digest.
+  const treeFailures = [];
+  for (const entry of manifest.runs) for (const problem of await verifyRunTree(entry)) treeFailures.push(`${entry.id}: ${problem}`);
+  if (treeFailures.length > 0) throw new Error(`Run copies changed since prepare:\n- ${treeFailures.join('\n- ')}`);
+  const { rows, agreement } = await collectRows(dir, manifest, { stage: null });
+  const screened = await readFile(path.join(dir, 'screen.json'), 'utf8').then(JSON.parse, () => null);
+  const stage1 = screenRows((await collectRows(dir, manifest, { stage: 1 })).rows);
   if (!screened || JSON.stringify(screened) !== JSON.stringify(stage1)) throw new Error('screen.json is missing or does not match the stage-1 grades; run `screen` (and `confirm`, `run`, `grade`) first.');
   for (const { id } of stage1.systematic ? [] : stage1.flagged) {
     if (replicatesOf(manifest, id).length < STAGE1_REPLICATES + STAGE2_REPLICATES) throw new Error(`${id} is flagged but its confirmation runs are missing.`);
   }
-  const summary = summarize(rows, manifest, agreement, costs, stage1);
-  await writeFile(path.join(outDir, 'results.json'), `${JSON.stringify({ summary, rows }, null, 2)}\n`);
-  await writeFile(path.join(outDir, 'report.md'), renderReport(summary, rows, manifest));
-  console.log(renderReport(summary, rows, manifest));
+  const summary = summarize(rows, manifest, agreement, await ledgerSpend(dir), stage1);
+  await writeFile(path.join(dir, 'results.json'), `${JSON.stringify({ summary, rows }, null, 2)}\n`);
+  await writeFile(path.join(dir, 'report.md'), renderReport(summary, rows, manifest));
+  log(ctx, renderReport(summary, rows, manifest));
+  return summary;
 }
 
-/** Rows per task from complete grading; throws on any missing, invalid, or unresolved grade. */
-export async function collectRows(manifest, { stage, dir = outDir }) {
-  const labels = await loadLabels(path.join(dir, 'labels'), manifest);
-  const gradingDir = path.join(dir, 'grading');
+/** Rows per task from complete, verified grading; throws on any missing, unusable, or unresolved grade. */
+export async function collectRows(dir, manifest, { stage }) {
+  const labels = await loadLabels(dir, manifest);
   const rows = [];
   const agreement = { clause_stated: [], forbidden: [], no_governing: [], brief_forbidden: [], brief_governing: [] };
-  const costs = { runs: 0, graders: 0 };
   for (const task of manifest.tasks) {
     const label = labels.get(task.id);
     const replicates = replicatesOf(manifest, task.id).filter((replicate) => stage !== 1 || replicate <= STAGE1_REPLICATES);
     const runs = { baseline: [], brief: [] };
     for (const replicate of replicates) {
-      const [first, second] = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(gradingDir, `${task.id}-r${replicate}-reports-${grader}`)));
-      const third = reportDisagreements(label, first, second).length > 0 ? await requireGrade(gradingDir, `${task.id}-r${replicate}-reports-g3`) : null;
-      for (const grade of [first, second, third].filter(Boolean)) costs.graders += grade.cost_usd ?? 0;
+      const reports = await reportsFor(dir, manifest, task.id, replicate);
+      const jobs = reportJobsFor(task, label, replicate, reports);
+      const [first, second] = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(dir, jobs[grader], manifest)));
+      const third = reportDisagreements(label, first, second).length > 0 ? await requireGrade(dir, jobs.g3, manifest) : null;
       for (const arm of ['baseline', 'brief']) {
         const entry = manifest.runs.find((candidate) => candidate.task === task.id && candidate.arm === arm && candidate.replicate === replicate);
-        const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest.claude_version);
-        costs.runs += metrics.cost_usd ?? 0;
+        const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest);
         const verdicts = [first, second, third].filter(Boolean).map((grade) => armVerdicts(label, grade, arm));
         for (const key of Object.keys(verdicts[0].clauses)) agreement.clause_stated.push([verdicts[0].clauses[key].stated, verdicts[1].clauses[key].stated]);
         for (const id of label.forbidden) agreement.forbidden.push([verdicts[0].forbidden[id], verdicts[1].forbidden[id]]);
@@ -1165,10 +1417,10 @@ export async function collectRows(manifest, { stage, dir = outDir }) {
         runs[arm].push({ run: entry.id, replicate, metrics: { ...metrics, report: undefined }, ...decided, items: scoreItems(label, decided.clauses) });
       }
     }
-    const briefPair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(gradingDir, `${task.id}-brief-${grader}`)));
-    const briefThird = briefDisagreements(label, ...briefPair).length > 0 ? await requireGrade(gradingDir, `${task.id}-brief-g3`) : null;
+    const briefJobs = briefJobsFor(task, label, await readFile(path.join(dir, 'briefs', `${task.id}.md`), 'utf8'));
+    const briefPair = await Promise.all(['g1', 'g2'].map((grader) => requireGrade(dir, briefJobs[grader], manifest)));
+    const briefThird = briefDisagreements(label, ...briefPair).length > 0 ? await requireGrade(dir, briefJobs.g3, manifest) : null;
     const briefGrades = [...briefPair, ...(briefThird ? [briefThird] : [])];
-    for (const grade of briefGrades) costs.graders += grade.cost_usd ?? 0;
     const briefSets = briefGrades.map((grade) => briefVerdicts(label, grade));
     for (const id of label.forbidden) agreement.brief_forbidden.push([briefSets[0].forbidden[id], briefSets[1].forbidden[id]]);
     agreement.brief_governing.push([briefSets[0].governing, briefSets[1].governing]);
@@ -1206,13 +1458,7 @@ export async function collectRows(manifest, { stage, dir = outDir }) {
       brief_grades: briefGrades.map((grade) => grade.graded),
     });
   }
-  return { rows, agreement, costs };
-}
-
-async function requireGrade(gradingDir, name) {
-  const grade = await readGrade(gradingDir, name).catch(() => null);
-  if (!grade) throw new Error(`grading is incomplete: ${name} is missing (run \`grade\`).`);
-  return grade;
+  return { rows, agreement };
 }
 
 /** Strict majority; with two verdicts they must agree, or a third verdict was required. */
@@ -1271,7 +1517,7 @@ export function confirmedLoss(row) {
   return reasons;
 }
 
-export function summarize(rows, manifest, agreement, costs, stage1) {
+export function summarize(rows, manifest, agreement, spend, stage1) {
   const splits = { tuning: rows.filter((row) => row.positive && row.split === 'tuning'), heldout: rows.filter((row) => row.positive && row.split !== 'tuning') };
   const recall = {};
   for (const [split, subset] of Object.entries(splits)) {
@@ -1329,7 +1575,7 @@ export function summarize(rows, manifest, agreement, costs, stage1) {
     brief_no_match_status: Object.fromEntries(noMatchRows.map((row) => [row.id, row.brief.status])),
     grader_agreement: Object.fromEntries(Object.entries(agreement).map(([key, pairs]) => [key, agreementStats(pairs)])),
     stopped_at_cap: Object.fromEntries(['baseline', 'brief'].map((arm) => [arm, rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => entry.metrics.stopped_at_cap).length, 0)])),
-    cost_usd: { runs: costs.runs, graders: costs.graders, total: costs.runs + costs.graders },
+    cost_usd: { total: spend.total, by_kind: spend.by_kind, attempts: spend.attempts, estimated: spend.estimated.length, unresolved: spend.unresolved, reserved_unresolved: spend.reserved_unresolved },
     gates,
     go: Object.values(gates).filter((gate) => gate && typeof gate === 'object' && 'pass' in gate).every((gate) => gate.pass),
   };
@@ -1367,12 +1613,12 @@ function renderReport(summary, rows, manifest) {
   }
   lines.push(`- No-match: ${JSON.stringify(summary.no_match)}; brief statuses ${JSON.stringify(summary.brief_no_match_status)}`);
   lines.push(`- Grader agreement: ${JSON.stringify(summary.grader_agreement)}`);
-  lines.push(`- Stopped at the cap: ${JSON.stringify(summary.stopped_at_cap)}; cost ${JSON.stringify(summary.cost_usd)}`);
+  lines.push(`- Stopped at the cap: ${JSON.stringify(summary.stopped_at_cap)}; cost (ledger) ${JSON.stringify(summary.cost_usd)}`);
   lines.push('', '## Gates', '```json', JSON.stringify(summary.gates, null, 2), '```', '', `Go for default-on under the pre-registered rule: ${summary.go}`);
   return `${lines.join('\n')}\n`;
 }
 
-// ------------------------------------------------- identity and costs
+// ------------------------------------------------- identity and manifest
 
 /** Package identity at prepare: commit, uncommitted changes under src/ and scripts/, and the src tree. */
 function packageIdentity() {
@@ -1384,44 +1630,45 @@ function packageIdentity() {
   };
 }
 
-/** Every stage after prepare runs only on the frozen package, harness, and labels. */
-async function assertFrozenIdentity(manifest) {
+/** Every stage after prepare runs only on the frozen package, harness, labels, briefs, and prompts. */
+async function assertFrozenIdentity(ctx, manifest) {
+  const { dir } = ctx;
   const problems = [];
-  const identity = packageIdentity();
+  const identity = (ctx.identity ?? packageIdentity)();
   if (identity.package_commit !== manifest.package_commit) problems.push(`package HEAD ${identity.package_commit} is not the prepared ${manifest.package_commit}`);
   if (identity.package_dirty) problems.push(`package src/ or scripts/ has uncommitted changes: ${identity.package_dirty}`);
   if (sha256(await readFile(harnessPath, 'utf8')) !== manifest.harness_sha256) problems.push('the harness changed since prepare');
   for (const [file, hash] of Object.entries(manifest.label_sha256)) {
-    if (sha256(await readFile(path.join(outDir, 'labels', file), 'utf8')) !== hash) problems.push(`labels/${file} changed since prepare`);
+    if (sha256(await readFile(path.join(dir, 'labels', file), 'utf8').catch(() => '')) !== hash) problems.push(`labels/${file} changed since prepare`);
+  }
+  for (const [id, brief] of Object.entries(manifest.briefs)) {
+    if (sha256(await readFile(path.join(dir, 'briefs', `${id}.md`), 'utf8').catch(() => '')) !== brief.graded_file_sha256) problems.push(`briefs/${id}.md changed since prepare`);
+  }
+  for (const entry of manifest.runs) {
+    if (sha256(await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => '')) !== entry.prompt_sha256) problems.push(`prompts/${entry.id}.txt changed since prepare`);
   }
   if (problems.length > 0) throw new Error(`Frozen identity check failed:\n- ${problems.join('\n- ')}`);
 }
 
-async function writeManifest(manifest) {
+/** Writes the manifest and records its hash in the ledger; only `prepare` and `confirm` write it. */
+async function writeManifest(dir, manifest, reason) {
   const record = { ...manifest, package_dirty: Boolean(manifest.package_dirty), harness_sha256: sha256(await readFile(harnessPath, 'utf8')) };
-  await writeFile(path.join(outDir, 'manifest.json'), `${JSON.stringify(record, null, 2)}\n`);
+  const text = `${JSON.stringify(record, null, 2)}\n`;
+  await writeFile(path.join(dir, 'manifest.json'), text);
+  await appendLedger(dir, { event: 'manifest', reason, manifest_sha256: sha256(text) });
 }
 
-function requireCostCap() {
-  const cap = Number(option('--max-cost-usd'));
-  if (!Number.isFinite(cap) || cap <= 0) throw new Error(`${command} requires --max-cost-usd <amount> (the founder-approved spending cap).`);
-  return cap;
+/** The manifest, refused if it differs from the last one the harness wrote. */
+async function readManifest(dir) {
+  const text = await readFile(path.join(dir, 'manifest.json'), 'utf8');
+  const recorded = (await readLedger(dir)).filter((record) => record.event === 'manifest').at(-1);
+  if (!recorded || recorded.manifest_sha256 !== sha256(text)) throw new Error('manifest.json differs from the last manifest the harness wrote.');
+  return JSON.parse(text);
 }
 
-/** Actual spend so far: every run (research and report turn) and every grader call, invalid attempts included. */
-async function spentSoFar(manifest) {
-  let total = 0;
-  for (const entry of manifest.runs) {
-    if (!(await exists(path.join(outDir, 'transcripts', `${entry.id}.meta.json`)))) continue;
-    total += (await auditRun(outDir, entry, manifest.tool_call_cap)).cost_usd ?? 0;
-  }
-  const gradingDir = path.join(outDir, 'grading');
-  for (const name of await readdir(gradingDir).catch(() => [])) {
-    if (!name.endsWith('.json')) continue;
-    const record = JSON.parse(await readFile(path.join(gradingDir, name), 'utf8'));
-    total += record.cost_usd ?? 0;
-  }
-  return total;
+function requireCap(ctx) {
+  if (!Number.isFinite(ctx.cap) || ctx.cap <= 0) throw new Error('this stage requires --max-cost-usd <amount> (the founder-approved spending cap).');
+  return ctx.cap;
 }
 
 // ----------------------------------------------------------------- labels
@@ -1431,9 +1678,9 @@ async function spentSoFar(manifest) {
  * revisions merged (recall-evaluation.md › A7 protocol › Merged v2 tuning
  * labels), then the 8 held-out blocks.
  */
-async function loadLabels(labelsDir, manifest) {
-  const tuningText = await readFile(path.join(labelsDir, 'recall-evaluation.md'), 'utf8');
-  const heldoutText = await readFile(path.join(labelsDir, 'recall-evaluation-heldout-v2.md'), 'utf8');
+async function loadLabels(dir, manifest) {
+  const tuningText = await readFile(path.join(dir, 'labels', 'recall-evaluation.md'), 'utf8');
+  const heldoutText = await readFile(path.join(dir, 'labels', 'recall-evaluation-heldout-v2.md'), 'utf8');
   if (sha256(heldoutText) !== manifest.heldout_sha256) throw new Error('recall-evaluation-heldout-v2.md changed since prepare.');
   return mergeLabels(tuningText, heldoutText);
 }
@@ -1493,14 +1740,15 @@ export function parseLabels(markdown, level = 4) {
 // ----------------------------------------------------------------- shared
 
 /**
- * Spawns `claude`, streaming stdout. With a finite `cap`, kills the process
- * as soon as the stream shows tool call cap + 1 (distinct tool_use ids). The
- * kill only bounds wasted work: what reaches the report is decided by the
- * boundary-truncated replay, not by when the kill lands.
+ * Spawns `claude`, streaming stdout (to `streamFile` as it arrives, when
+ * given). With a finite `cap`, kills the process as soon as the stream shows
+ * tool call cap + 1 (distinct tool_use ids). The kill only bounds wasted
+ * work: what reaches the report is decided by the boundary-truncated replay.
  */
-export function spawnClaudeStream(claudeArgs, prompt, cwd, cap) {
+export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = null } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(CLAUDE_BIN, claudeArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    const sink = streamFile ? createWriteStream(streamFile, { flags: 'wx' }) : null;
     let stdout = '';
     let stderr = '';
     let buffer = '';
@@ -1508,6 +1756,7 @@ export function spawnClaudeStream(claudeArgs, prompt, cwd, cap) {
     const seen = new Set();
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
+      sink?.write(chunk);
       if (!Number.isFinite(cap) || stopped) return;
       buffer += chunk;
       const lines = buffer.split('\n');
@@ -1533,7 +1782,11 @@ export function spawnClaudeStream(claudeArgs, prompt, cwd, cap) {
       stderr += chunk;
     });
     child.on('error', reject);
-    child.on('close', (code) => resolve({ code, stdout, stderr, stopped }));
+    child.on('close', (code) => {
+      const done = () => resolve({ code, stdout, stderr, stopped });
+      if (sink) sink.end(done);
+      else done();
+    });
     child.stdin.on('error', () => {});
     child.stdin.end(prompt);
   });
@@ -1554,12 +1807,11 @@ async function pool(items, size, worker) {
           await worker(item);
         } catch (error) {
           failures.push(error);
-          console.error(error.message);
         }
       }
     }),
   );
-  if (failures.length > 0) throw new Error(`${failures.length} job(s) failed.`);
+  if (failures.length > 0) throw new Error(`${failures.length} job(s) failed:\n- ${failures.map((error) => error.message).join('\n- ')}`);
 }
 
 async function listFiles(root, prefix = '') {
@@ -1586,6 +1838,18 @@ function gitBlobHash(buffer) {
   return createHash('sha1').update(`blob ${buffer.length}\0`).update(buffer).digest('hex');
 }
 
+/** "2.1.288 (Claude Code)" → "2.1.288"; null when no complete version is present. */
+export function parseVersion(text) {
+  return String(text ?? '').match(/\b(\d+\.\d+\.\d+)\b/)?.[1] ?? null;
+}
+
+async function nonEmptyDirectory(dir) {
+  const info = await stat(dir).catch(() => null);
+  if (!info) return false;
+  if (!info.isDirectory()) return true;
+  return (await readdir(dir)).length > 0;
+}
+
 async function safeRealpath(target) {
   try {
     return await realpath(target);
@@ -1599,20 +1863,6 @@ async function exists(target) {
     () => true,
     () => false,
   );
-}
-
-async function readGrade(gradingDir, name) {
-  return JSON.parse(await readFile(path.join(gradingDir, `${name}.json`), 'utf8'));
-}
-
-async function readManifest() {
-  return JSON.parse(await readFile(path.join(outDir, 'manifest.json'), 'utf8'));
-}
-
-function requireOption(name) {
-  const value = option(name);
-  if (!value) throw new Error(`${command} requires ${name}.`);
-  return value;
 }
 
 function sha256(value) {
@@ -1638,6 +1888,10 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+function log(ctx, message) {
+  if (!ctx.quiet) console.log(message);
+}
+
 function describe() {
   console.log(
     JSON.stringify(
@@ -1650,9 +1904,11 @@ function describe() {
         stage1_replicates: STAGE1_REPLICATES,
         stage2_replicates: STAGE2_REPLICATES,
         regression: REGRESSION,
+        reserves_usd: { run: RUN_RESERVE_USD, grader: GRADE_RESERVE_USD },
+        max_grade_attempts: MAX_GRADE_ATTEMPTS,
         agent_args: [...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM],
         report_turn_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM],
-        grader_args: [...CLAUDE_ARGS, ...NO_TOOLS, '--output-format', 'json', '--json-schema', '<schema>'],
+        grader_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', '<schema>'],
       },
       null,
       2,
@@ -1662,10 +1918,34 @@ function describe() {
 
 // Dispatch only when run as a script, so tests can import the functions above.
 if (process.argv[1] && path.resolve(process.argv[1]) === harnessPath) {
-  const commands = { prepare, run, grade, screen, confirm, score, smoke, describe };
+  const [command, ...args] = process.argv.slice(2);
+  const option = (name, fallback = null) => {
+    const index = args.indexOf(name);
+    return index === -1 ? fallback : args[index + 1];
+  };
+  const required = (name) => {
+    const value = option(name);
+    if (!value) throw new Error(`${command} requires ${name}.`);
+    return value;
+  };
+  const ctx = {
+    dir: option('--out') ? path.resolve(option('--out')) : null,
+    cap: option('--max-cost-usd') === null ? null : Number(option('--max-cost-usd')),
+    concurrency: Number(option('--concurrency', '4')),
+    only: option('--only') ? new Set(option('--only').split(',')) : null,
+  };
+  const commands = {
+    prepare: () => prepare(ctx, { corpus: required('--corpus'), docsRepo: required('--docs-repo'), labelsDir: required('--labels'), heldoutSha: required('--heldout-sha256'), warmRuns: Number(option('--warm-runs', '10')) }),
+    run: () => run(ctx),
+    grade: () => grade(ctx),
+    screen: () => screen(ctx),
+    confirm: () => confirm(ctx),
+    score: () => score(ctx),
+    smoke: () => smoke(ctx, { corpus: required('--corpus'), labelsDir: required('--labels'), task: required('--task'), cap: Number(option('--cap', '3')), statedCap: Number(option('--stated-cap', option('--cap', '3'))) }),
+  };
   if (command === 'describe') {
     describe();
-  } else if (!commands[command] || !outDir) {
+  } else if (!commands[command] || !ctx.dir) {
     console.error('Usage: node scripts/evaluate-brief-a7.js <prepare|run|grade|screen|confirm|score|smoke|describe> --out <dir> [...]');
     process.exit(2);
   } else {

@@ -1384,18 +1384,24 @@ function buildDecisionAnchors(documents, decisionIds) {
  * `decision-lineage.js`. A fence opens on three or more backticks or tildes
  * indented at most three spaces; a backtick fence's info string has no
  * backtick. It closes only on a line holding the same character at least as
- * many times and nothing else, so a ``` line inside a ```` example stays code.
+ * many times and nothing else (no other character, so ```~~~ never closes), so
+ * a ``` line inside a ```` example stays code.
  */
 function stepFence(fence, line) {
   const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
   if (fence) {
-    const closes = marker && marker[1][0] === fence.char && marker[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line);
+    const closes = marker && marker[1][0] === fence.char && marker[1].length >= fence.length && closingFence(fence.char).test(line);
     return { fence: closes ? null : fence, delimiter: Boolean(closes) };
   }
   if (marker && !(marker[1][0] === '`' && line.slice(line.indexOf(marker[1]) + marker[1].length).includes('`'))) {
     return { fence: { char: marker[1][0], length: marker[1].length }, delimiter: true };
   }
   return { fence: null, delimiter: false };
+}
+
+/** A closing fence line: only the opener's character (three or more), then whitespace — never mixed delimiters. */
+function closingFence(char) {
+  return char === '`' ? /^ {0,3}`{3,}\s*$/ : /^ {0,3}~{3,}\s*$/;
 }
 
 /** Paragraphs, list items, and table rows of a markdown body with their level-2 section, fence-aware. */
