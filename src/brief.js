@@ -1379,6 +1379,25 @@ function buildDecisionAnchors(documents, decisionIds) {
   return new Map([...anchors].map(([id, sentences]) => [id, [...sentences].join('\n')]));
 }
 
+/**
+ * One line of fenced-code tracking, with the rules of `findFencedRanges` in
+ * `decision-lineage.js`. A fence opens on three or more backticks or tildes
+ * indented at most three spaces; a backtick fence's info string has no
+ * backtick. It closes only on a line holding the same character at least as
+ * many times and nothing else, so a ``` line inside a ```` example stays code.
+ */
+function stepFence(fence, line) {
+  const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
+  if (fence) {
+    const closes = marker && marker[1][0] === fence.char && marker[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line);
+    return { fence: closes ? null : fence, delimiter: Boolean(closes) };
+  }
+  if (marker && !(marker[1][0] === '`' && line.slice(line.indexOf(marker[1]) + marker[1].length).includes('`'))) {
+    return { fence: { char: marker[1][0], length: marker[1].length }, delimiter: true };
+  }
+  return { fence: null, delimiter: false };
+}
+
 /** Paragraphs, list items, and table rows of a markdown body with their level-2 section, fence-aware. */
 function markdownBlocks(content) {
   const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
@@ -1391,11 +1410,10 @@ function markdownBlocks(content) {
     current = null;
   };
   for (const line of body.split(/\r?\n/)) {
-    const marker = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (marker) {
+    const step = stepFence(fence, line);
+    fence = step.fence;
+    if (step.delimiter) {
       flush();
-      if (!fence) fence = marker[1][0];
-      else if (marker[1][0] === fence) fence = null;
       continue;
     }
     if (fence) continue;
@@ -1573,12 +1591,10 @@ function splitSections(content, level = 2) {
   let fence = null;
   let current = null;
   for (const line of lines) {
-    const marker = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (marker) {
-      if (!fence) fence = marker[1][0];
-      else if (marker[1][0] === fence) fence = null;
-    }
-    if (!fence && !marker && heading.test(line)) {
+    const step = stepFence(fence, line);
+    const fenced = fence !== null || step.delimiter;
+    fence = step.fence;
+    if (!fenced && heading.test(line)) {
       const match = line.match(exact);
       current = match && !sections.has(match[1]) ? { title: match[1], lines: [] } : null;
       if (current) sections.set(current.title, current);

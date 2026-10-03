@@ -299,6 +299,35 @@ test('anchor text: a decision is reached through the doc sentences that cite it,
   assert.ok(!has(evidenceOnly, 'doc:architecture/sync/installations.md'));
 });
 
+test('nested code fences: a shorter inner fence never closes the outer one, so example text is never anchor text (review R5)', async (t) => {
+  const task = 'Rotate the quartzite telemetry beacons for the observatory.';
+  const decision = '\n---\n\n### D-901 — Unrelated example decision\n**Timestamp:** 2026-01-09 10:00 UTC\n**Decision:** Widgets use the brand palette.\n**Rationale:** Fixture.\n';
+  async function rootWith(t, details) {
+    const { rootDir } = await makeRoot(t);
+    await writeFile(path.join(rootDir, 'decisions', 'cross-cutting.md'), `${await readFile(path.join(rootDir, 'decisions', 'cross-cutting.md'), 'utf8')}${decision}`);
+    const lanes = path.join(rootDir, 'architecture', 'sync', 'lanes.md');
+    // Into Details, which is not an indexed field: only anchor text could pick it up.
+    await writeFile(lanes, (await readFile(lanes, 'utf8')).replace('## Retrieval guidance\n', `${details}\n\n## Retrieval guidance\n`));
+    return buildSessionBrief({ rootDir, laneId: 'eval', task });
+  }
+  const cases = {
+    // ```` outer, ``` inner: the inner lines are code, and so is the citing sentence.
+    longerOuter: '````md\n```\nnot a closing fence\n```\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n````',
+    // ~~~ outer with a ``` line inside: a different character never closes it.
+    otherChar: '~~~\n```\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n~~~',
+    // A fence-like line with trailing text is not a closing fence.
+    notClosing: '```\n``` not a fence\nThe quartzite telemetry beacons of the observatory rotate under D-901.\n```',
+  };
+  for (const [name, details] of Object.entries(cases)) {
+    const result = await rootWith(t, details);
+    assert.equal(result.status, 'no-match', `${name}: example text must not select memory`);
+    assert.ok(!result.units.some((unit) => unit.id === 'lineage:D-901'), `${name}: D-901 is not anchored by a fenced example`);
+  }
+  // The same sentence outside any fence is anchor text.
+  const plain = await rootWith(t, 'The quartzite telemetry beacons of the observatory rotate under D-901.');
+  assert.ok(plain.units.some((unit) => unit.id === 'lineage:D-901'), 'outside a fence the sentence anchors D-901');
+});
+
 test('abbreviations meet their long forms (A7)', () => {
   assert.equal(stemWord('organizations'), stemWord('org'));
   assert.equal(stemWord('repositories'), stemWord('repos'));
