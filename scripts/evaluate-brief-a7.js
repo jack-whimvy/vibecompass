@@ -51,7 +51,7 @@
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFile, copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSessionBrief, estimateBriefTokens } from '../src/brief.js';
@@ -352,7 +352,8 @@ function renderPrompt(task, startup) {
 
 async function makeRunCopy(corpus, root, task) {
   await rm(root, { recursive: true, force: true });
-  await cp(corpus, root, { recursive: true });
+  // Symlinks are copied verbatim, so a copy's link text equals the corpus's (and git's).
+  await cp(corpus, root, { recursive: true, verbatimSymlinks: true });
   const laneDir = path.join(root, 'sessions', 'active', 'eval');
   await mkdir(laneDir, { recursive: true });
   const claimed = task.files.length > 0 ? `claimed_paths:\n${task.files.map((file) => `  - ${JSON.stringify(file)}`).join('\n')}` : 'claimed_paths: []';
@@ -369,7 +370,12 @@ async function makeRunCopy(corpus, root, task) {
   return root;
 }
 
-/** Every corpus file must be a file of the tag with the same git blob hash, and every tag file not excluded must be present. */
+/**
+ * Every corpus entry must be an entry of the tag with the same git blob hash
+ * and kind (a symlink exactly where the tag has one, compared by its link
+ * text as git stores it, and resolving inside the corpus), and every tag
+ * entry not excluded must be present.
+ */
 async function verifyCorpus(corpus, docsRepo) {
   const failures = [];
   const listing = spawnSync('git', ['-C', docsRepo, 'ls-tree', '-r', CORPUS_TAG], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -378,9 +384,9 @@ async function verifyCorpus(corpus, docsRepo) {
     listing.stdout
       .trim()
       .split('\n')
-      .map((line) => line.match(/^\d+ blob ([0-9a-f]+)\t(.+)$/))
+      .map((line) => line.match(/^(\d+) blob ([0-9a-f]+)\t(.+)$/))
       .filter(Boolean)
-      .map((match) => [match[2], match[1]])
+      .map((match) => [match[3], { blob: match[2], symlink: match[1] === '120000' }])
       .filter(([file]) => !CORPUS_EXCLUDED(file)),
   );
   const actual = await listFiles(corpus);
@@ -389,7 +395,16 @@ async function verifyCorpus(corpus, docsRepo) {
       failures.push(`corpus file ${file} is not in ${CORPUS_TAG} (or is excluded)`);
       continue;
     }
-    if (gitBlobHash(await readFile(path.join(corpus, file))) !== expected.get(file)) failures.push(`corpus file ${file} differs from ${CORPUS_TAG}`);
+    const symlink = (await lstat(path.join(corpus, file))).isSymbolicLink();
+    if (symlink !== expected.get(file).symlink) {
+      failures.push(`corpus file ${file} ${symlink ? 'is a symlink but is not one' : 'is not a symlink but is one'} in ${CORPUS_TAG}`);
+      continue;
+    }
+    if (gitBlobHash(await entryBytes(corpus, file)) !== expected.get(file).blob) failures.push(`corpus file ${file} differs from ${CORPUS_TAG}`);
+    if (symlink) {
+      const resolved = path.resolve(path.dirname(path.join(corpus, file)), await readlink(path.join(corpus, file)));
+      if (!resolved.startsWith(`${corpus}${path.sep}`)) failures.push(`corpus symlink ${file} points outside the corpus`);
+    }
   }
   for (const file of expected.keys()) if (!actual.includes(file)) failures.push(`corpus is missing ${file} from ${CORPUS_TAG}`);
   return failures;
@@ -1932,9 +1947,18 @@ async function listFiles(root, prefix = '') {
   return files.sort();
 }
 
+/** A tree entry's bytes: a file's contents, or a symlink's link text (what git stores for it). Links are never followed. */
+async function entryBytes(root, file) {
+  const target = path.join(root, file);
+  return (await lstat(target)).isSymbolicLink() ? Buffer.from(await readlink(target)) : readFile(target);
+}
+
 async function hashTree(root) {
   const hashes = new Map();
-  for (const file of await listFiles(root)) hashes.set(file, createHash('sha256').update(await readFile(path.join(root, file))).digest('hex'));
+  for (const file of await listFiles(root)) {
+    const symlink = (await lstat(path.join(root, file))).isSymbolicLink();
+    hashes.set(file, createHash('sha256').update(symlink ? 'symlink\0' : '').update(await entryBytes(root, file)).digest('hex'));
+  }
   return hashes;
 }
 

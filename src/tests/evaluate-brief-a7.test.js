@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -268,10 +268,16 @@ const HELDOUT_LABELS = `#### F5 — task-only · held-out
 `;
 
 /** A tagged docs repo, its corpus export, label copies, and a prepared evaluation directory. */
-async function prepared(harness, dir) {
+async function prepared(harness, dir, { link = null } = {}) {
   const repo = path.join(dir, 'docs');
   await cp(FIXTURE_ROOT, repo, { recursive: true });
   await writeFile(path.join(repo, 'CLAUDE.md'), '# Acme Widgets\n');
+  const addLink = async (root) => {
+    if (!link) return;
+    await mkdir(path.dirname(path.join(root, link.path)), { recursive: true });
+    await symlink(link.target, path.join(root, link.path));
+  };
+  await addLink(repo);
   await mkdir(path.join(repo, 'architecture', 'platform', 'project-memory'), { recursive: true });
   await writeFile(path.join(repo, 'architecture', 'platform', 'project-memory', 'recall-evaluation.md'), TUNING_LABELS);
   const git = (...args) => spawnSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' });
@@ -279,6 +285,7 @@ async function prepared(harness, dir) {
   const corpus = path.join(dir, 'corpus');
   await cp(FIXTURE_ROOT, corpus, { recursive: true });
   await writeFile(path.join(corpus, 'CLAUDE.md'), '# Acme Widgets\n');
+  await addLink(corpus);
   const labelsDir = path.join(dir, 'labels-in');
   await mkdir(labelsDir, { recursive: true });
   await writeFile(path.join(labelsDir, 'recall-evaluation.md'), TUNING_LABELS);
@@ -561,4 +568,28 @@ test('an interruption between a session finishing and its metadata write never r
   await harness.run({ ...ctx, only: new Set(['r003']) });
   await rm(`${base('r003')}.meta.json`);
   await assert.rejects(() => harness.runAgent('PROMPT', r003.root, base('r003'), 24, { ledgerDir: ctx.dir, runId: 'r003' }), /already finished in the ledger/);
+});
+
+// --------------------------------------------------------- Phase 2 preflight
+
+test('corpus symlinks are verified by their link text and copied verbatim; changed, replaced, or escaping links stop preparation', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  // As in recall-eval-corpus-v2: a relative link whose target is not in the corpus.
+  const link = { path: '.agent/skills/postgres', target: '../../.agents/skills/postgres' };
+  const { ctx, opts } = await prepared(harness, dir, { link });
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  for (const entry of manifest.runs) assert.equal(await readlink(path.join(entry.root, link.path)), link.target, 'copied verbatim');
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+
+  const corpusLink = path.join(opts.corpus, link.path);
+  const prepareAgain = (name) => harness.prepare({ ...ctx, dir: path.join(dir, name) }, opts);
+  await rm(corpusLink);
+  await symlink('../../.agents/skills/other', corpusLink);
+  await assert.rejects(() => prepareAgain('changed'), /corpus file \.agent\/skills\/postgres differs from recall-eval-corpus-v2/);
+  await rm(corpusLink);
+  await writeFile(corpusLink, link.target);
+  await assert.rejects(() => prepareAgain('replaced'), /is not a symlink but is one in recall-eval-corpus-v2/);
+  await rm(corpusLink);
+  await symlink('../../../outside', corpusLink);
+  await assert.rejects(() => prepareAgain('escaping'), /corpus symlink \.agent\/skills\/postgres points outside the corpus/);
 });
