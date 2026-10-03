@@ -428,7 +428,7 @@ test('missing, empty, or partial run metadata never disables transcript verifica
   const attemptsBefore = await harness.attemptsOf(ctx.dir, 'run:r001');
   await harness.run(ctx);
   assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), attemptsBefore, 'nothing is re-run');
-  assert.equal(JSON.parse(await readFile(metaFile, 'utf8')).recovered, true);
+  assert.equal(JSON.parse(await readFile(metaFile, 'utf8')).reconciled, true);
   assert.equal((await harness.score(ctx)).go, true);
 });
 
@@ -501,4 +501,64 @@ test('the split guard uses final task means: a stage-1 dip that confirmation run
   // The stage-1 means alone would have breached the guard.
   const stage1Drop = stage1Rows.slice(0, 9).reduce((sum, entry) => sum + entry.recall.baseline.mean - entry.recall.brief.mean, 0) / 9;
   assert.ok(stage1Drop > 0.05);
+});
+
+// --------------------------------------------------------- pass 5
+
+test('an interruption between a session finishing and its metadata write never repeats the paid session (review pass 5, R12)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const base = (id) => path.join(ctx.dir, 'transcripts', id);
+  const attempts = async (id) => [await harness.attemptsOf(ctx.dir, `run:${id}`), await harness.attemptsOf(ctx.dir, `report:${id}`)];
+  const clean = async (id) => (await harness.auditRun(ctx.dir, manifest.runs.find((entry) => entry.id === id), manifest.tool_call_cap, manifest)).violations;
+
+  // r001: a stopped run whose report turn finished in the ledger, interrupted
+  // before the report copy and the final metadata write.
+  process.env.MOCK_CALLS = '25';
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+  const done = JSON.parse(await readFile(`${base('r001')}.meta.json`, 'utf8'));
+  await writeFile(`${base('r001')}.meta.json`, JSON.stringify({ ...done, state: 'report-pending', report_attempt: null, report_sha256: null, report_wall_ms: null }));
+  await rm(`${base('r001')}.report.jsonl`);
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+  assert.deepEqual(await attempts('r001'), [1, 1], 'the finished report is reconciled, not paid for again');
+  const reconciled = JSON.parse(await readFile(`${base('r001')}.meta.json`, 'utf8'));
+  assert.equal(reconciled.state, 'complete');
+  assert.equal(reconciled.reconciled, true);
+  assert.deepEqual(await clean('r001'), []);
+
+  // r002: research finished in the ledger, interrupted before the transcript copy and metadata.
+  delete process.env.MOCK_CALLS;
+  await harness.run({ ...ctx, only: new Set(['r002']) });
+  await rm(`${base('r002')}.meta.json`);
+  await rm(`${base('r002')}.jsonl`);
+  await harness.run({ ...ctx, only: new Set(['r002']) });
+  assert.deepEqual(await attempts('r002'), [1, 0]);
+  assert.deepEqual(await clean('r002'), []);
+
+  // Empty and partial metadata on resume: reconciled, never re-run.
+  await writeFile(`${base('r002')}.meta.json`, '{}');
+  await harness.run({ ...ctx, only: new Set(['r002']) });
+  const partial = JSON.parse(await readFile(`${base('r002')}.meta.json`, 'utf8'));
+  delete partial.research_sha256;
+  partial.state = 'report-pending';
+  await writeFile(`${base('r002')}.meta.json`, JSON.stringify(partial));
+  await harness.run({ ...ctx, only: new Set(['r002']) });
+  assert.deepEqual(await attempts('r002'), [1, 0]);
+  assert.deepEqual(await clean('r002'), []);
+
+  // Two finished research attempts: the run stops without spending.
+  const ledger = await harness.readLedger(ctx.dir);
+  const start = ledger.find((record) => record.event === 'start' && record.job === 'run:r002');
+  const finish = ledger.find((record) => record.event === 'finish' && record.call === start.call);
+  await appendFile(path.join(ctx.dir, 'ledger.jsonl'), `${JSON.stringify({ ...start, call: 'run:r002#2', attempt: 2 })}\n${JSON.stringify({ ...finish, call: 'run:r002#2' })}\n`);
+  const before = (await harness.readLedger(ctx.dir)).length;
+  await assert.rejects(() => harness.run({ ...ctx, only: new Set(['r002']) }), /2 finished attempts for run:r002; refusing/);
+  assert.equal((await harness.readLedger(ctx.dir)).length, before, 'nothing was spent');
+
+  // Direct dispatch of a finished session is refused too.
+  const r003 = manifest.runs.find((entry) => entry.id === 'r003');
+  await harness.run({ ...ctx, only: new Set(['r003']) });
+  await rm(`${base('r003')}.meta.json`);
+  await assert.rejects(() => harness.runAgent('PROMPT', r003.root, base('r003'), 24, { ledgerDir: ctx.dir, runId: 'r003' }), /already finished in the ledger/);
 });

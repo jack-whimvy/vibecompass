@@ -465,10 +465,10 @@ export async function run(ctx) {
   const pending = [];
   for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
     const base = path.join(dir, 'transcripts', entry.id);
-    let meta = await readMeta(base);
-    // A run whose research the ledger records as finished is never run again;
-    // missing metadata is rebuilt from the ledger and the attempt streams.
-    if (!meta && (await finishedAttempts(dir, `run:${entry.id}`)).length > 0) meta = await recoverMeta(dir, entry, manifest.tool_call_cap);
+    // The ledger, not the metadata, says which sessions finished: every run
+    // with a finished session is reconciled before anything is scheduled, so a
+    // finished session is never paid for twice.
+    const meta = (await ledgerHasFinished(dir, entry.id)) ? await reconcileRun(dir, entry, manifest.tool_call_cap) : await readMeta(base);
     if (meta?.state !== 'complete') pending.push(entry);
   }
   const skipped = [];
@@ -507,6 +507,10 @@ export async function run(ctx) {
 export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true } = {}) {
   let meta = await readMeta(transcriptBase);
   if (meta?.state === 'complete') return meta;
+  // Never pay twice for a session the ledger records as finished.
+  const refuseFinished = async (job) => {
+    if (ledgerDir && (await finishedAttempts(ledgerDir, job)).length > 0) throw new Error(`${runId}: ${job} already finished in the ledger; reconcile the run instead of starting it again.`);
+  };
   let researchEvents;
   if (meta?.state === 'report-pending') {
     const researchText = await readFile(`${transcriptBase}.jsonl`, 'utf8');
@@ -514,6 +518,7 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     researchEvents = parseEvents(researchText);
   } else {
     if (!(await guard(RUN_RESERVE_USD))) return { state: 'not-started' };
+    await refuseFinished(`run:${runId}`);
     const started = Date.now();
     const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile) =>
       spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile }),
@@ -538,6 +543,7 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
   }
   if (meta.state === 'report-pending') {
     if (!(await guard(RUN_RESERVE_USD))) return meta;
+    await refuseFinished(`report:${runId}`);
     const reportPrompt = renderReportTurn(prompt, researchEvents, cap);
     meta.report_prompt_sha256 = sha256(reportPrompt);
     await writeFile(`${transcriptBase}.report-prompt.txt`, reportPrompt);
@@ -571,37 +577,52 @@ async function finishedAttempts(dir, job) {
   return ledger.filter((record) => record.event === 'finish' && starts.has(record.call)).map((finish) => ({ ...starts.get(finish.call), finish }));
 }
 
+async function ledgerHasFinished(dir, runId) {
+  return (await finishedAttempts(dir, `run:${runId}`)).length > 0 || (await finishedAttempts(dir, `report:${runId}`)).length > 0;
+}
+
 /**
- * Rebuilds a run's metadata from the ledger when it is missing (for example
- * after an interruption between a session's finish and the metadata write).
- * The transcripts are copied from the immutable attempt streams, whose hashes
- * the ledger holds; nothing is re-run.
+ * Reconciles a run with the ledger before anything is scheduled, whatever its
+ * metadata says (it may be missing, empty, partial, or one step behind after
+ * an interruption between a session's finish and the metadata write). Each
+ * session must have at most one finished attempt; its transcript is restored
+ * from that attempt's immutable stream, whose hash the ledger holds; the
+ * metadata is rewritten from the ledger. An inconsistency stops the run
+ * without spending. Nothing finished is ever re-run.
  */
-async function recoverMeta(dir, entry, cap) {
+export async function reconcileRun(dir, entry, cap) {
   const base = path.join(dir, 'transcripts', entry.id);
-  const restore = async (job, target) => {
+  const settle = async (job, target) => {
     const attempts = await finishedAttempts(dir, job);
     if (attempts.length === 0) return null;
-    if (attempts.length > 1) throw new Error(`${entry.id}: ${attempts.length} finished attempts for ${job}; refusing to choose one.`);
+    if (attempts.length > 1) throw new Error(`${entry.id}: ${attempts.length} finished attempts for ${job}; refusing to choose one or to spend again.`);
     const [attempt] = attempts;
-    const text = await readFile(attempt.file, 'utf8');
-    if (sha256(text) !== attempt.finish.stream_sha256) throw new Error(`${entry.id}: the attempt stream for ${job} does not match the ledger.`);
-    await writeFile(target, text);
-    return { attempt: attempt.attempt, sha256: attempt.finish.stream_sha256, text };
+    const text = await readFile(attempt.file, 'utf8').catch(() => null);
+    if (text === null || sha256(text) !== attempt.finish.stream_sha256) throw new Error(`${entry.id}: the attempt stream for ${job} is missing or does not match the ledger.`);
+    const current = await readFile(target, 'utf8').catch(() => null);
+    if (current !== text) await writeFile(target, text);
+    return { attempt: attempt.attempt, sha256: attempt.finish.stream_sha256, text, restored: current !== text };
   };
-  const research = await restore(`run:${entry.id}`, `${base}.jsonl`);
+  const research = await settle(`run:${entry.id}`, `${base}.jsonl`);
+  if (!research) throw new Error(`${entry.id}: a report turn finished in the ledger without a finished research session.`);
   const stopped = collectToolUses(parseEvents(research.text)).length > cap;
-  const report = stopped ? await restore(`report:${entry.id}`, `${base}.report.jsonl`) : null;
+  if (!stopped && (await finishedAttempts(dir, `report:${entry.id}`)).length > 0) throw new Error(`${entry.id}: a report turn finished for a run that was not stopped.`);
+  const report = stopped ? await settle(`report:${entry.id}`, `${base}.report.jsonl`) : null;
+  const previous = await readMeta(base);
   const meta = {
+    ...(previous && typeof previous === 'object' ? previous : {}),
     state: !stopped || report ? 'complete' : 'report-pending',
-    recovered: true,
     stopped,
     research_attempt: research.attempt,
     research_sha256: research.sha256,
     report_attempt: report?.attempt ?? null,
     report_sha256: report?.sha256 ?? null,
   };
-  await writeMeta(base, meta);
+  const changed = JSON.stringify(previous) !== JSON.stringify(meta) || research.restored || Boolean(report?.restored);
+  if (changed) {
+    meta.reconciled = true;
+    await writeMeta(base, meta);
+  }
   return meta;
 }
 
