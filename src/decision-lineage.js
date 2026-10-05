@@ -1476,8 +1476,7 @@ export function findFencedRanges(text) {
     offset += line.length + 1;
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (fence) {
-      // A closing fence holds only the opener's character, so ```~~~ never closes.
-      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length && (fence.char === '`' ? /^ {0,3}`+\s*$/ : /^ {0,3}~+\s*$/).test(line)) {
+      if (closesFence(fence, marker, line)) {
         ranges.push([fence.start, Math.min(offset - 1, text.length)]);
         fence = null;
       }
@@ -1489,6 +1488,13 @@ export function findFencedRanges(text) {
   }
   if (fence) ranges.push([fence.start, text.length]);
   return ranges;
+}
+
+// A closing fence holds only the opener's character, at least as many times,
+// so ```~~~ never closes. Shared by masking and the section index.
+function closesFence(fence, marker, line) {
+  return Boolean(marker) && marker[1][0] === fence.char && marker[1].length >= fence.length &&
+    (fence.char === '`' ? /^ {0,3}`+\s*$/ : /^ {0,3}~+\s*$/).test(line);
 }
 
 function insideRanges(offset, ranges) {
@@ -1580,7 +1586,7 @@ function buildSectionIndex(content, bodyStart) {
 
     const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (fence) {
-      if (fenceMatch && fenceMatch[1][0] === fence.char && fenceMatch[1].length >= fence.length && /^ {0,3}[`~]+\s*$/.test(line)) {
+      if (closesFence(fence, fenceMatch, line)) {
         fence = null;
       }
       continue;

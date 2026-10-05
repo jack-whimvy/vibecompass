@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Lineage: section headings in architecture docs and session notes now follow
+  the closing-fence rule that 0.17.0 gave masking. A fence closes only on a
+  line of its opener's own character, so a mixed line such as ```` ```~~~ ````
+  no longer ends an example early. In 0.17.0 a sample `## Decisions made`
+  heading after such a line could make a false `made` relation, and later real
+  headings could be read as fenced. A shared golden fixture pair
+  (`decisions-fence-closing`, `note-fence-closing`) pins the rule for the app
+  port.
+
 ## 0.17.0 - 2026-10-03
 
 Session brief retrieval and framing fixes (recall plan A7). The lane brief stays
