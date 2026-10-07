@@ -539,11 +539,41 @@ test('assignLanePort skips ports recorded by parseable siblings only (unit)', ()
   );
 });
 
+// The defaults depend on the OS temp root, so the test pins TMPDIR rather than
+// inheriting it: a suite run inside a `lane-env` shell (H4) sees a lane temp
+// dir there, and D-284 rightly warns about it.
+const LANE_TMP_NAMESPACE = 'vibecompass-lanes';
+
+function withTmpdir(value, run) {
+  const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  process.env.TMPDIR = value;
+  process.env.TMP = value;
+  process.env.TEMP = value;
+  try {
+    return run();
+  } finally {
+    for (const [key, previous] of Object.entries(saved)) {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+  }
+}
+
 test('resolveRuntimeSettings validates overrides and reports every problem (unit)', () => {
-  const defaults = resolveRuntimeSettings(null);
+  const osTempRoot = stripLaneTmpNamespace(os.tmpdir());
+  const defaults = withTmpdir(osTempRoot, () => resolveRuntimeSettings(null));
   assert.equal(defaults.portBase, DEFAULT_LANE_PORT_BASE);
   assert.equal(defaults.warnings.length, 0);
-  assert.equal(defaults.tmpBase, defaultLaneTmpBase());
+  assert.equal(defaults.tmpBase, path.join(osTempRoot, LANE_TMP_NAMESPACE));
+
+  // Inside a lane-env shell, TMPDIR is a lane temp dir: D-284 un-nests the
+  // base to the real OS temp root and says so.
+  const laneTmpdir = path.join(osTempRoot, LANE_TMP_NAMESPACE, '0123456789ab', 'other-lane');
+  const insideLaneEnv = withTmpdir(laneTmpdir, () => resolveRuntimeSettings(null));
+  assert.equal(insideLaneEnv.tmpBase, path.join(osTempRoot, LANE_TMP_NAMESPACE));
+  assert.equal(insideLaneEnv.warnings.length, 1);
+  assert.match(insideLaneEnv.warnings[0], /lane temp dir in TMPDIR/);
+  assert.equal(withTmpdir(laneTmpdir, () => defaultLaneTmpBase()), path.join(osTempRoot, LANE_TMP_NAMESPACE));
 
   const invalid = resolveRuntimeSettings({ runtime: { port_base: '3200', port_step: -1, tmp_base: 42, extra: true } });
   assert.equal(invalid.portBase, DEFAULT_LANE_PORT_BASE);
