@@ -15,6 +15,7 @@ import {
   removeLaneWorktreesAtClose,
   rollbackGitBinding,
 } from '../git-binding.js';
+import * as gitBindingModule from '../git-binding.js';
 import { renderLaneMarker } from '../lane-marker.js';
 import { PACKAGE_VERSION } from '../version.js';
 import { inspectProjectCompatibility } from '../compatibility.js';
@@ -1935,6 +1936,113 @@ test('pre-close staleness names a recorded base revision whose current head is u
     assert.deepEqual(plan.staleness.staleBaseRevisions, []);
     assert.ok(plan.staleness.notEvaluated.some((entry) =>
       entry.includes('base-revision staleness for repo "app"') && entry.includes('could not be read')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// H3: git is the only deleter at close, so its own refusals come before any
+// deletion, and no timer kills it mid-delete.
+test('close-time worktree removal runs without a kill timeout (H3)', () => {
+  const options = gitBindingModule.WORKTREE_REMOVE_AT_CLOSE_EXEC_OPTIONS;
+  assert.ok(options, 'close-time removal options are defined');
+  assert.equal(options.timeout, undefined, 'no timer may kill git while it deletes a large tree');
+  assert.equal(options.killSignal, undefined);
+  assert.ok(options.maxBuffer > 0);
+});
+
+async function createAppRepoIgnoringDependencies(appDir) {
+  await mkdir(appDir, { recursive: true });
+  git(appDir, ['init']);
+  git(appDir, ['config', 'user.email', 'test@example.com']);
+  git(appDir, ['config', 'user.name', 'Test']);
+  await writeFile(path.join(appDir, 'README.md'), 'hello\n', 'utf8');
+  await writeFile(path.join(appDir, '.gitignore'), 'node_modules/\n', 'utf8');
+  git(appDir, ['add', '.']);
+  git(appDir, ['commit', '-m', 'initial']);
+}
+
+async function addDependencies(worktreePath) {
+  const file = path.join(worktreePath, 'node_modules', 'left-pad', 'index.js');
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, 'module.exports = 1;\n', 'utf8');
+  return file;
+}
+
+for (const scenario of [
+  {
+    name: 'a locked worktree',
+    reason: /locked working tree/,
+    async prepare({ appDir, worktreePath }) {
+      git(appDir, ['worktree', 'lock', worktreePath]);
+    },
+  },
+  {
+    name: 'a worktree with an initialized submodule',
+    reason: /submodules/,
+    async prepare({ tempDir, worktreePath }) {
+      const subDir = path.join(tempDir, 'sub');
+      await createGitRepoWithCommit(subDir);
+      git(worktreePath, ['-c', 'protocol.file.allow=always', 'submodule', 'add', subDir, 'sm']);
+      git(worktreePath, ['commit', '-m', 'add submodule']);
+    },
+  },
+  {
+    name: 'a target that is not a worktree of the recorded source',
+    reason: /is not a working tree/,
+    async prepare({ appDir, worktreePath }) {
+      git(appDir, ['worktree', 'remove', '--force', worktreePath]);
+      await createAppRepoIgnoringDependencies(worktreePath);
+    },
+  },
+]) {
+  test(`close-session keeps ${scenario.name} with its ignored dependencies and the marker; nothing is deleted before git refuses (H3)`, async (t) => {
+    if (!hasGit()) {
+      t.skip('git is required.');
+      return;
+    }
+
+    const { tempDir } = await createInitializedRoot('vibecompass-close-refused-');
+    try {
+      const appDir = path.join(tempDir, 'app');
+      await createAppRepoIgnoringDependencies(appDir);
+      const { container, markerPath, worktreePath } = await startBoundLane(tempDir);
+      await scenario.prepare({ tempDir, appDir, worktreePath });
+      const dependency = await addDependencies(worktreePath);
+      assert.equal(git(worktreePath, ['status', '--porcelain=v1', '--untracked-files=all']), '', 'clean, so the package guards let git decide');
+
+      const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+      assert.deepEqual(result.worktreeCleanup.removed, []);
+      assert.equal(result.worktreeCleanup.surviving.length, 1);
+      assert.equal(result.worktreeCleanup.surviving[0].reason, 'git-refused');
+      assert.ok(result.warnings.some((warning) => scenario.reason.test(warning)), result.warnings.join('\n'));
+      assert.equal(await readFile(dependency, 'utf8'), 'module.exports = 1;\n', 'ignored dependencies survive');
+      assert.equal(existsSync(path.join(worktreePath, 'README.md')), true, 'tracked files survive');
+      assert.equal(existsSync(markerPath), true, 'marker kept while a recorded worktree survives');
+      assert.equal(existsSync(container), true);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('close-session removes a clean worktree with ignored dependencies, git deleting them (H3)', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+
+  const { tempDir } = await createInitializedRoot('vibecompass-close-deps-');
+  try {
+    const appDir = path.join(tempDir, 'app');
+    await createAppRepoIgnoringDependencies(appDir);
+    const { container, worktreePath } = await startBoundLane(tempDir);
+    await addDependencies(worktreePath);
+
+    const result = await closeProjectSession({ cwd: tempDir, sessionId: 'lane-a', ...CLOSE_DEFAULTS });
+    assert.deepEqual(result.worktreeCleanup.removed, [{ repoId: 'app', worktreePath, sourceDir: appDir }]);
+    assert.equal(existsSync(worktreePath), false);
+    assert.equal(existsSync(container), false);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

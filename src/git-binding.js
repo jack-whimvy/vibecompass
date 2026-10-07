@@ -15,6 +15,14 @@ const QUICK_GIT_TIMEOUT_MS = 5000;
 const WORKTREE_GIT_TIMEOUT_MS = 120000;
 const GIT_OUTPUT_MAX_BUFFER = 1024 * 1024;
 
+// H3: close-time removal has no kill timeout. Git is the only deleter, and it
+// makes every refusal (locked, submodules, modified or untracked files, not a
+// worktree of this repo) before it deletes anything; killing it while it
+// deletes a large tree (a full node_modules) left a half-deleted checkout that
+// the next close saw as modified. A filesystem that stalls makes close wait
+// until git finishes or the user interrupts it.
+export const WORKTREE_REMOVE_AT_CLOSE_EXEC_OPTIONS = Object.freeze({ maxBuffer: GIT_OUTPUT_MAX_BUFFER });
+
 /**
  * Repo working copies live as siblings of the memory root: the workspace is
  * `dirname(rootDir)` and a declared `repo.path` (else the repo id) resolves
@@ -396,6 +404,9 @@ export async function rollbackGitBinding(progress, branch) {
  *   container AND covered by a token-matched container marker are removable
  *   (D-279/D-280 guards — arbitrary path removal is refused)
  * - removal is never forced; a status failure counts as unknown, not clean
+ * - git is the only deleter and runs without a kill timeout (H3), so its own
+ *   refusals (lock, submodules, registration) come before any deletion and a
+ *   large ignored tree is never left half-deleted by a timer
  * - removal is skipped with guidance when the process cwd sits inside the
  *   target
  * - branches are never deleted at close
@@ -487,10 +498,16 @@ export async function removeLaneWorktreesAtClose(options) {
       await execFileAsync(
         'git',
         ['-C', sourceDir, 'worktree', 'remove', entry.worktreePath],
-        { timeout: WORKTREE_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+        WORKTREE_REMOVE_AT_CLOSE_EXEC_OPTIONS,
       );
       removed.push({ repoId: entry.repoId, worktreePath: entry.worktreePath, sourceDir });
     } catch (error) {
+      if (error && typeof error === 'object' && error.signal) {
+        // No timer kills this call (H3), so a signal is an outside
+        // interruption, possibly mid-delete.
+        keep(entry, 'git-interrupted', `git was interrupted (${error.signal}) while removing it, so the checkout may be partly deleted. Inspect it before removing it.`);
+        continue;
+      }
       keep(entry, 'git-refused', `git refused the removal: ${describeGitError(error)}. Resolve that first.`);
     }
   }
