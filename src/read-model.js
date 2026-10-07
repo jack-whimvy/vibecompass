@@ -83,6 +83,12 @@ export function getProjectContext(readModel, options = {}) {
     domains: readModel.domains,
     recent_decisions: readModel.decisions.slice(0, decisionLimit),
     recent_sessions: readModel.sessions.slice(0, sessionLimit),
+    // D-371: whether decision lineage could be read, in every response, so a
+    // reader (Local MCP's project context) can tell unavailable from empty.
+    decision_lineage: {
+      status: readModel.decision_lineage.status,
+      unavailable_sources: readModel.decision_lineage.unavailable_sources,
+    },
   };
 }
 
@@ -113,7 +119,8 @@ export function getDecisionLog(readModel, options = {}) {
  * what later decisions declare about it, and `declared_successors` follows
  * declared `supersedes`/`amends` transitively. Mentions stay mentions: no
  * relation here certifies that a decision governs anything or is currently
- * valid.
+ * valid. When lineage is unavailable (D-371), `lineage_status` says so and
+ * every relation-derived value is null, never an empty list.
  */
 export function getDecisionLineage(readModel, decisionId, options = {}) {
   const id = typeof decisionId === 'number' ? decisionId : Number(String(decisionId ?? '').replace(/^D-/i, ''));
@@ -122,8 +129,27 @@ export function getDecisionLineage(readModel, decisionId, options = {}) {
   }
 
   const citationLimit = Math.max(1, Math.min(options.citationLimit ?? 50, 500));
-  const relations = readModel.decision_lineage.relations;
+  const lineage = readModel.decision_lineage;
   const decision = readModel.decisions.find((entry) => entry.decision_id === id) ?? null;
+  if (lineage.status === 'unavailable') {
+    return {
+      freshness: readModel.freshness,
+      decision_id: id,
+      exists: Boolean(decision),
+      title: decision?.title ?? null,
+      path: decision?.path ?? null,
+      lineage_status: 'unavailable',
+      unavailable_sources: lineage.unavailable_sources,
+      outgoing: null,
+      incoming: null,
+      declared_successors: null,
+      made_in: null,
+      cited_by: null,
+      cited_by_total: null,
+    };
+  }
+
+  const relations = lineage.relations;
   const lineageRelations = new Set(['supersedes', 'amends', 'preserves', 'unknown']);
   const outgoing = relations.filter(
     (relation) => relation.source_decision_id === id && lineageRelations.has(relation.relation),
@@ -142,6 +168,8 @@ export function getDecisionLineage(readModel, decisionId, options = {}) {
     exists: Boolean(decision),
     title: decision?.title ?? null,
     path: decision?.path ?? null,
+    lineage_status: 'available',
+    unavailable_sources: [],
     outgoing,
     incoming,
     declared_successors: collectDeclaredSuccessors(relations, id),

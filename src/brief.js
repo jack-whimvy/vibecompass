@@ -119,6 +119,15 @@ export async function buildSessionBrief(options = {}) {
     }
   }
 
+  // D-371: with lineage unavailable no decision can be shown with its
+  // declared successors (D-359), so the brief abstains: the lane unit only,
+  // and the sources lineage could not be read from as required reads.
+  let lineageUnavailable = [];
+  if (!retrievalError && loaded.readModel.decision_lineage.status === 'unavailable') {
+    lineageUnavailable = loaded.readModel.decision_lineage.unavailable_sources;
+    retrievalError = `decision lineage is unavailable (D-371): it could not be extracted from ${describePaths(lineageUnavailable.map((source) => source.path))}, so no decision can be shown with its declared successors`;
+  }
+
   const overviewExcluded = exclusions?.matches(BRIEF_OVERVIEW_PATH) ?? false;
   const overviewExists = !overviewExcluded && (await pathExists(path.join(input.rootDir, BRIEF_OVERVIEW_PATH)));
   if (!overviewExists) {
@@ -149,7 +158,7 @@ export async function buildSessionBrief(options = {}) {
   };
 
   if (retrievalError) {
-    return finalizeRetrievalFailure(context, retrievalError);
+    return finalizeRetrievalFailure(context, retrievalError, lineageUnavailable);
   }
 
   const selection = selectCandidates(context, loaded, task);
@@ -1241,8 +1250,17 @@ function buildFollowUps(selection, context, included, omitted) {
   }
   entries.push(...requiredDecisions.sort((left, right) => right.decision_id - left.decision_id));
 
-  // A failed retrieval can still point at the fixed entry points.
+  // A failed retrieval can still point at the fixed entry points, after the
+  // sources lineage could not be read from (D-371).
   if (selection.retrievalError) {
+    for (const source of selection.lineageUnavailable ?? []) {
+      entries.push({
+        priority: 'required',
+        path: source.path,
+        heading: null,
+        reason: 'decision lineage could not be extracted from this file (D-371); read it directly',
+      });
+    }
     if (context.overview.exists) {
       entries.push({ priority: 'required', path: BRIEF_OVERVIEW_PATH, heading: null, reason: 'whole-project orientation' });
     }
@@ -1328,8 +1346,14 @@ function lineageReads(unit, priority) {
     }));
 }
 
-function finalizeRetrievalFailure(context, reason) {
-  return packBrief(context, { retrievalError: reason, terms: [], distinctive: [], relations: [], nearby: [] });
+function finalizeRetrievalFailure(context, reason, lineageUnavailable = []) {
+  return packBrief(context, { retrievalError: reason, lineageUnavailable, terms: [], distinctive: [], relations: [], nearby: [] });
+}
+
+/** Up to three paths, then "+N more". */
+function describePaths(paths) {
+  const shown = paths.slice(0, 3).map((value) => `\`${value}\``);
+  return paths.length > 3 ? `${shown.join(', ')} and ${paths.length - 3} more` : shown.join(', ');
 }
 
 /**

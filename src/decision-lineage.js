@@ -309,30 +309,37 @@ export function extractDecisionFileRelations({ path, content }) {
 /**
  * Builds the corpus-wide lineage view over scanned canonical documents
  * (`{ path, kind, content }`): every relation plus `target_exists`, the
- * diagnostics, and per-relation counts.
+ * diagnostics, and per-relation counts, with `status: 'available'`.
+ *
+ * D-371: each lineage source is extracted inside its own guard, which holds
+ * only that source's pure extraction (entry parse and relation extraction;
+ * no I/O). When any source throws, lineage is unavailable as a whole — a
+ * missing decision file can hide a declared successor of any decision — so
+ * the model carries `status: 'unavailable'`, the failed sources, and their
+ * `lineage-extraction-failed` diagnostics, with null relations and counts.
+ * Unavailable lineage is never returned as empty lineage.
  */
 export function buildDecisionLineageModel(documents) {
   const knownIds = new Set();
-  for (const document of documents) {
-    if (document.kind !== 'decision') continue;
-    for (const entry of parseDecisionEntries(document.content)) knownIds.add(entry.decision_id);
-  }
-
   const relations = [];
   const diagnostics = [];
+  const failures = [];
   for (const document of documents) {
-    const extractor =
-      document.kind === 'architecture'
-        ? extractArchitectureDocCitations
-        : document.kind === 'session'
-          ? extractSessionNoteRelations
-          : document.kind === 'decision'
-            ? extractDecisionFileRelations
-            : null;
-    if (!extractor) continue;
-    const result = extractor({ path: document.path, content: document.content });
-    relations.push(...result.relations);
-    diagnostics.push(...result.diagnostics);
+    if (!LINEAGE_SOURCE_KINDS.has(document.kind)) continue;
+    let extracted;
+    try {
+      extracted = extractLineageSource(document);
+    } catch (error) {
+      failures.push({ path: document.path, kind: document.kind, error: describeExtractionError(error) });
+      continue;
+    }
+    for (const id of extracted.decisionIds) knownIds.add(id);
+    relations.push(...extracted.relations);
+    diagnostics.push(...extracted.diagnostics);
+  }
+
+  if (failures.length > 0) {
+    return buildUnavailableLineageModel(failures);
   }
 
   const unresolved = new Set();
@@ -356,11 +363,99 @@ export function buildDecisionLineageModel(documents) {
 
   return {
     contract_version: DECISION_LINEAGE_CONTRACT_VERSION,
+    status: 'available',
     decision_count: knownIds.size,
     relation_counts: relationCounts,
     relations: sortRelations(withExistence),
+    unavailable_sources: [],
     diagnostics: sortDiagnostics(diagnostics),
   };
+}
+
+function buildUnavailableLineageModel(failures) {
+  const sources = [...failures].sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    contract_version: DECISION_LINEAGE_CONTRACT_VERSION,
+    status: 'unavailable',
+    decision_count: null,
+    relation_counts: null,
+    relations: null,
+    unavailable_sources: sources.map(({ path, kind, error }) => ({ path, kind, error })),
+    diagnostics: sources.map(({ path, error }) => ({
+      code: 'lineage-extraction-failed',
+      path,
+      line: null,
+      message: `Decision lineage could not be extracted from this file (${error}), so lineage is unavailable for the whole root until the file changes or the extractor is fixed.`,
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Per-source extraction (D-371)
+// ---------------------------------------------------------------------------
+
+const LINEAGE_SOURCE_KINDS = new Set(['architecture', 'session', 'decision']);
+const EXTRACTION_ERROR_LIMIT = 200;
+
+/** The relations of one canonical document, by kind. */
+function extractDocumentRelations({ path, kind, content }) {
+  if (kind === 'architecture') return extractArchitectureDocCitations({ path, content });
+  if (kind === 'session') return extractSessionNoteRelations({ path, content });
+  return extractDecisionFileRelations({ path, content });
+}
+
+const DEFAULT_LINEAGE_PHASES = Object.freeze({
+  parseEntries: parseDecisionEntries,
+  extractRelations: extractDocumentRelations,
+});
+let lineagePhases = DEFAULT_LINEAGE_PHASES;
+
+/**
+ * Internal fault-injection seam for degraded-lineage tests (D-371): replaces
+ * the entry-parse and/or relation-extraction phase of per-source extraction
+ * and returns a function that restores the previous phases. It is not
+ * exported from `index.js`, so the package's `exports` map keeps it out of
+ * reach of consumers. Tests restore it in `finally`.
+ */
+export function setLineagePhasesForTesting(overrides = {}) {
+  const previous = lineagePhases;
+  lineagePhases = Object.freeze({ ...DEFAULT_LINEAGE_PHASES, ...overrides });
+  return () => {
+    lineagePhases = previous;
+  };
+}
+
+// One source's extraction: pure, synchronous, and the only code inside the
+// D-371 guard. A decision file contributes its entry IDs (known targets) and
+// its relations; a doc or note contributes relations.
+function extractLineageSource(document) {
+  const decisionIds =
+    document.kind === 'decision' ? lineagePhases.parseEntries(document.content).map((entry) => entry.decision_id) : [];
+  const result = lineagePhases.extractRelations({ path: document.path, kind: document.kind, content: document.content });
+  return { decisionIds, relations: result.relations, diagnostics: result.diagnostics };
+}
+
+/**
+ * The error class (or a thrown non-Error value's type) and the first line of
+ * its message, at most 200 code points; never a stack trace. The source path
+ * is recorded separately, so cutting this text never hides which source failed.
+ */
+function describeExtractionError(error) {
+  let text;
+  try {
+    if (error instanceof Error) {
+      const name = typeof error.name === 'string' && error.name ? error.name : 'Error';
+      const message = typeof error.message === 'string' ? error.message.split(/\r?\n/, 1)[0].trim() : '';
+      text = message ? `${name}: ${message}` : name;
+    } else {
+      const type = error === null ? 'null' : typeof error;
+      const value = typeof error === 'string' ? error.split(/\r?\n/, 1)[0].trim() : '';
+      text = value ? `thrown ${type}: ${value}` : `thrown ${type}`;
+    }
+  } catch {
+    text = 'unreadable thrown value';
+  }
+  return boundText(collapse(text), EXTRACTION_ERROR_LIMIT);
 }
 
 /**
