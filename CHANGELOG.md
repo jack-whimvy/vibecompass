@@ -1,15 +1,50 @@
 # Changelog
 
-## Unreleased
+## 0.17.1 - 2026-10-07
 
+Hardening release: decision lineage fails soft, the read model reads sections
+fence-aware, and close-session no longer leaves half-deleted worktrees. The lane
+brief stays opt-in (D-368).
+
+- Lineage fails soft (D-371): when the lineage parser throws on a file, the read
+  model still loads and `decision_lineage.status` is `unavailable`, listing the
+  file in `unavailable_sources` with a `lineage-extraction-failed` diagnostic
+  (the error's class and first line, at most 200 characters). Relations, counts,
+  and `getDecisionLineage`'s lists are null, never empty. `getProjectContext`
+  gains a `decision_lineage` status, so Local MCP's project context shows it.
+  Before, one parser exception failed the whole read model: the brief, every
+  Local MCP read, and agent-file sync. Available lineage is unchanged, with the
+  same relation records and contract version 1.
+- Brief: with lineage unavailable, the brief abstains. It is `incomplete`, shows
+  the lane only, and lists the file lineage could not be read from, the
+  overview, and `decisions/INDEX.md` as required reads. A lane `brief.md`
+  written then records a failed generation, so `continue-session` regenerates
+  it.
+- Read model (D-372): architecture component sections (Description, Details,
+  Next steps, Retrieval guidance, Review metadata, Involved files) are read
+  fence-aware, and the first section of a title wins. A heading inside a fenced
+  example no longer replaces the real section (for example a sample
+  `## Description` in a schema doc). It is the brief's reader, now shared.
 - Lineage: section headings in architecture docs and session notes now follow
   the closing-fence rule that 0.17.0 gave masking. A fence closes only on a
   line of its opener's own character, so a mixed line such as ```` ```~~~ ````
   no longer ends an example early. In 0.17.0 a sample `## Decisions made`
-  heading after such a line could make a false `made` relation, and later real
-  headings could be read as fenced. A shared golden fixture pair
+  heading after such a line could be taken as the note's listing, making a
+  false `made` relation and missing the real ones, and later real headings
+  could be read as fenced. A shared golden fixture pair
   (`decisions-fence-closing`, `note-fence-closing`) pins the rule for the app
   port.
+- close-session: git removes a lane's worktrees with no time limit. A removal
+  killed by the 120-second limit while deleting a full `node_modules` left a
+  half-deleted checkout that the next close counted as modified. Git still
+  refuses locked worktrees, worktrees with submodules, and modified ones before
+  it deletes anything.
+- Tests: the lane-runtime settings test passes inside a `lane-env` shell.
+
+Not listed in 0.17.0's notes, though it shipped there: masking and decision
+entry structure closed a fence only on a line of its opener's own character,
+so a sample `**Supersedes:**` line after a mixed ```` ```~~~ ```` line no longer
+declared false lineage.
 
 ## 0.17.0 - 2026-10-03
 

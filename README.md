@@ -162,7 +162,9 @@ npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow
 # (guarded, never forced; branches are never deleted); dirty or in-use
 # worktrees survive with guidance and the lane marker stays as a breadcrumb.
 # Gitignored files (e.g. .env) do not count as dirty and are deleted with a
-# clean worktree — copy ignored local files out before closing.
+# clean worktree — copy ignored local files out before closing. Git does the
+# removal with no time limit, so a large node_modules can take a while; it
+# keeps locked worktrees and worktrees with submodules.
 # close-session and docs-update also print a pre-close staleness set: new
 # decisions since lane start, stale base revisions, newer finalized notes
 # that mention the lane's scope, and claim overlap with other active lanes.
@@ -268,7 +270,9 @@ own text explicitly declares that it replaces or amends it, and the brief never
 claims that a decision governs your task. It cannot spot a replacement that is
 only implied, so read the follow-up list too. When the task's distinctive words
 match nothing in memory, the status is `no-match`, with at most four nearby
-reads that share the task's other words.
+reads that share the task's other words. If decision lineage cannot be read
+from a file, the brief shows no decisions or docs: it is `incomplete` and lists
+that file, the overview, and the decision index to read first.
 
 The brief in a session lane is an experiment you turn on (D-368):
 
@@ -416,8 +420,13 @@ the parser cannot certify is `unknown`. Every relation carries its source
 path, section, line, and content hashes. `getDecisionLineage(readModel, id)`
 returns one decision's incoming and outgoing lineage and its declared
 successors, followed transitively. Nothing is ever reported as "governs" or
-"currently valid". Architecture components also carry `retrieval_guidance`
-and `retrieval_scope` when their docs define them.
+"currently valid". If the parser throws on any file, `decision_lineage.status`
+is `unavailable`, with the file in `unavailable_sources` and null relations
+and counts, never empty ones; the rest of the read model still loads, and
+`getProjectContext` reports the lineage status. Architecture components also
+carry `retrieval_guidance` and `retrieval_scope` when their docs define them;
+their sections are read fence-aware, so a heading inside a code example never
+replaces a real section.
 
 `buildSessionBrief({ rootDir, task, files, featureSlugs, claims, laneId, budget })`
 is the read-only engine behind `vibecompass brief`: it returns the selection
