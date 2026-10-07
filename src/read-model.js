@@ -3,9 +3,9 @@ import path from 'node:path';
 import { buildDecisionLineageModel, collectDeclaredSuccessors } from './decision-lineage.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { generateStateManifest } from './manifest.js';
+import { splitSections } from './markdown-sections.js';
 import { scanProjectMemory } from './project-memory.js';
 
-const SECTION_PATTERN = /^##\s+(.+)$/gm;
 const DECISION_HEADING_PATTERN = /^###\s+D-(\d{3,})\s+—\s+(.+)$/gm;
 
 export async function loadProjectReadModel(rootDir) {
@@ -265,7 +265,9 @@ function buildFeatureMap(scanResult, repoAliases, projectRepos) {
 
 function buildComponentRecord(document, repoAliases, projectRepos) {
   const frontmatter = parseFrontmatter(document.content, { sourceName: document.path });
-  const sections = splitMarkdownSections(frontmatter.body);
+  // D-372: the brief's fence-aware reader, so a fenced example heading or a
+  // repeated title never replaces a real section.
+  const sections = splitSections(frontmatter.body, 2);
   const repoIds = uniqueSorted(document.extracted.repo_ids ?? []);
   const involvedFiles = parseInvolvedFiles({
     rawSection: sections.get('Involved files') ?? '',
@@ -444,19 +446,6 @@ function extractDecisionEntries(content, sourcePath) {
       path: sourcePath,
     };
   });
-}
-
-function splitMarkdownSections(body) {
-  const sections = new Map();
-  const matches = [...body.matchAll(SECTION_PATTERN)];
-
-  for (const [index, match] of matches.entries()) {
-    const start = (match.index ?? 0) + match[0].length;
-    const end = matches[index + 1]?.index ?? body.length;
-    sections.set(match[1].trim(), body.slice(start, end).trim());
-  }
-
-  return sections;
 }
 
 function parseInvolvedFiles({ rawSection, defaultRepoIds, repoAliases, projectRepos }) {

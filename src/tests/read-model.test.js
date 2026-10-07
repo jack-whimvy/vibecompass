@@ -234,3 +234,87 @@ test('loadProjectReadModel exposes a recovery checkpoint as dated but unnumbered
     await rm(rootDir, { recursive: true, force: true });
   }
 });
+
+test('component sections ignore fenced example headings and keep the first section of a title (D-372, H9)', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-read-model-sections-'));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  await initializeProjectMemory({
+    rootDir,
+    force: true,
+    name: 'Sections Project',
+    mode: 'local-primary',
+    repos: [{ id: 'core', remote: 'https://github.com/example/core.git', defaultBranch: 'main' }],
+    generatedAt: new Date('2026-10-07T07:00:00Z'),
+  });
+  await rm(path.join(rootDir, 'architecture/overview'), { recursive: true, force: true });
+  await mkdir(path.join(rootDir, 'architecture/platform/project-memory'), { recursive: true });
+  // The shape of `file-schema.md`: a real Description, then a fenced example
+  // doc whose own `## Description` and `## Involved files` once overwrote it.
+  await writeFile(
+    path.join(rootDir, 'architecture/platform/project-memory/file-schema.md'),
+    [
+      '---',
+      'domain: Platform',
+      'feature: Project Memory',
+      'component: File Schema',
+      'status: Complete',
+      'repos:',
+      '  - core',
+      '---',
+      '',
+      '## Description',
+      'Canonical file contracts for the project-memory root.',
+      '',
+      '## Details',
+      'An architecture doc looks like this:',
+      '',
+      '```md',
+      '---',
+      'domain: Auth',
+      '---',
+      '',
+      '## Description',
+      'Supabase Auth configuration and callback handling.',
+      '',
+      '## Involved files',
+      '- `src/example/auth.ts`',
+      '```',
+      '',
+      '~~~',
+      '## Retrieval guidance',
+      'Sample guidance inside a tilde fence.',
+      '~~~',
+      '',
+      '## Retrieval guidance',
+      'Load before changing file contracts.',
+      '',
+      '## Involved files',
+      '- `src/project-memory.js`',
+      '',
+      '## Next steps',
+      'First list.',
+      '',
+      '## Next steps',
+      'A repeated title never replaces the first section.',
+      '',
+      '# Appendix',
+      'A level-1 heading ends the current section.',
+      '',
+    ].join('\n'),
+  );
+
+  const readModel = await loadProjectReadModel(rootDir);
+  const component = readModel.features
+    .flatMap((feature) => feature.components)
+    .find((entry) => entry.path === 'architecture/platform/project-memory/file-schema.md');
+  assert.equal(component.description, 'Canonical file contracts for the project-memory root.');
+  assert.ok(component.details.includes('Supabase Auth configuration'), 'the fenced example stays inside Details');
+  assert.equal(component.retrieval_guidance, 'Load before changing file contracts.');
+  assert.equal(component.next_steps, 'First list.');
+  assert.deepEqual(component.involved_files, ['core:src/project-memory.js']);
+  assert.deepEqual(getFileContext(readModel, 'core:src/example/auth.ts').owners, []);
+  assert.equal(getFileContext(readModel, 'core:src/project-memory.js').owners.length, 1);
+
+  const feature = getFeatureContext(readModel, { domain: 'Platform', feature: 'Project Memory' }).feature;
+  assert.equal(feature.components[0].description, 'Canonical file contracts for the project-memory root.');
+});
