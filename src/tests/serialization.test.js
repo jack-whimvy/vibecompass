@@ -132,7 +132,7 @@ test('withMemoryRootLock re-enters across symlinked root spellings', async () =>
   }
 });
 
-test('withMemoryRootLock re-enters when an absent alias root is created by the outer lock', async () => {
+test('withMemoryRootLock re-enters across spellings of an absent root (which it no longer creates, PC1)', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-alias-created-'));
   const realParent = path.join(tempDir, 'real-parent');
   const aliasParent = path.join(tempDir, 'alias-parent');
@@ -537,6 +537,72 @@ test('CLI smoke: next-decision-id, append-decision, rebuild-active-index', async
     const index = await readFile(path.join(rootDir, 'sessions', 'active', 'index.yaml'), 'utf8');
     assert.match(index, /^current: smoke-b$/m);
     assert.match(index, /smoke-a/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+async function listTree(dir) {
+  const { readdir } = await import('node:fs/promises');
+  const entries = [];
+  async function walk(current, prefix) {
+    for (const entry of (await readdir(current, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      entries.push(`${prefix}${entry.name}${entry.isDirectory() ? '/' : ''}`);
+      if (entry.isDirectory()) await walk(path.join(current, entry.name), `${prefix}${entry.name}/`);
+    }
+  }
+  await walk(dir, '');
+  return entries;
+}
+
+test('write commands on a missing or empty root create nothing and report the uninitialized root (PC1)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-uninitialized-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const output = [];
+  const io = {
+    stdout: { write(chunk) { output.push(chunk); } },
+    stderr: { write(chunk) { output.push(chunk); } },
+  };
+
+  try {
+    const entryPath = path.join(tempDir, 'staged-entry.md');
+    await writeFile(entryPath, stagedEntry('Never written'), 'utf8');
+    const before = await listTree(tempDir);
+
+    // A missing root: the lock no longer creates it (or its state/), so the
+    // session check sees the missing root itself.
+    await assert.rejects(
+      startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'A.', date: '2026-04-20' }),
+      /No project memory root was found at .*\.compass\. Run "vibecompass init"/,
+    );
+    await assert.rejects(
+      runCli(['append-decision', '--root', rootDir, '--target', 'cross-cutting.md', '--entry', entryPath], io, { cwd: tempDir }),
+      /Decision target cross-cutting\.md does not exist/,
+    );
+    await assert.rejects(runCli(['sync-agents', '--root', rootDir], io, { cwd: tempDir }), /project\.yaml/);
+    assert.deepEqual(await listTree(tempDir), before);
+
+    // An existing directory holding no memory root entries stays empty too.
+    await mkdir(rootDir);
+    await assert.rejects(
+      startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'A.', date: '2026-04-20' }),
+      /No project\.yaml was found/,
+    );
+    assert.deepEqual(await listTree(rootDir), []);
+
+    // An initialized root still takes the disk lock and creates state/ as before.
+    await rm(rootDir, { recursive: true, force: true });
+    const initialized = await createInitializedRoot('vibecompass-lock-initialized-');
+    try {
+      await rm(path.join(initialized.rootDir, 'state'), { recursive: true, force: true });
+      let lockSeen = false;
+      await withMemoryRootLock(initialized.rootDir, 'test-initialized', async () => {
+        lockSeen = Boolean(await stat(memoryRootLockPath(initialized.rootDir)).catch(() => null));
+      });
+      assert.equal(lockSeen, true, 'an initialized root is locked on disk');
+    } finally {
+      await rm(initialized.tempDir, { recursive: true, force: true });
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

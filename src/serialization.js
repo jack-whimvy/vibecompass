@@ -28,6 +28,13 @@ const DEFAULT_ATTEMPTS = 120;
 const RETRY_BASE_DELAY_MS = 25;
 const RETRY_MAX_DELAY_MS = 100;
 
+// Commands that create a memory root where none exists (D-289 bootstrap
+// materializes a fresh root), so the lock may create its state directory there.
+const ROOT_CREATING_COMMANDS = new Set(['bootstrap']);
+// Any of these marks a directory as a memory root the lock may hold: the files
+// `init` or `bootstrap` create, or memory content from an older or legacy root.
+const MEMORY_ROOT_ENTRIES = ['project.yaml', 'state', 'architecture', 'decisions', 'sessions'];
+
 const heldRoots = new AsyncLocalStorage();
 const processQueues = new Map();
 
@@ -88,13 +95,15 @@ export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
   await previous;
 
   try {
-    const ownerToken = await acquireDiskLock(key, label, options);
+    const ownerToken = ROOT_CREATING_COMMANDS.has(label) || (await isMemoryRoot(key))
+      ? await acquireDiskLock(key, label, options)
+      : null;
     try {
       const nextHeld = new Set(held ?? []);
       nextHeld.add(key);
       return await heldRoots.run(nextHeld, fn);
     } finally {
-      await releaseDiskLock(key, ownerToken);
+      if (ownerToken !== null) await releaseDiskLock(key, ownerToken);
     }
   } finally {
     releaseQueue();
@@ -102,6 +111,29 @@ export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
       processQueues.delete(key);
     }
   }
+}
+
+/**
+ * Whether `rootDir` is a memory root the disk lock may create `state/` in
+ * (PC1). A missing directory, or one holding none of the root's own entries,
+ * is not: taking the lock there would leave an empty `state/` (and the root
+ * directory itself) behind when the command then refuses the uninitialized
+ * root. On such a root the command runs under the in-process queue only and
+ * reports its own "run vibecompass init" error, creating nothing. No locked
+ * command except bootstrap (which takes the disk lock) writes memory into a
+ * root without these entries, and `init` creates them without this lock, as
+ * it always has.
+ */
+async function isMemoryRoot(rootDir) {
+  for (const entry of MEMORY_ROOT_ENTRIES) {
+    try {
+      await stat(path.join(rootDir, entry));
+      return true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return true;
+    }
+  }
+  return false;
 }
 
 async function canonicalizeMemoryRootKey(rootDir) {
