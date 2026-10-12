@@ -1025,3 +1025,114 @@ async function createFixture(files) {
 function normalize(value) {
   return value.replace(/^\n/, '');
 }
+
+test('recommended-section warnings ignore headings inside fenced code (H10)', async () => {
+  const fence = '```';
+  const fixture = await createFixture({
+    'project.yaml': `
+format_version: 1
+name: Fence Sections
+mode: local-only
+repos:
+  - id: app
+    remote: https://github.com/example/app.git
+`,
+    'architecture/platform/fenced.md': `
+---
+domain: Platform
+feature: Fence Sections
+component: Fenced
+status: In progress
+---
+
+## Review metadata
+- Evidence: app:src/fenced.js
+- Blindspots: none.
+
+## Details
+A doc's sections look like this:
+
+${fence}md
+## Description
+## Next steps
+${fence}
+
+## Retrieval guidance
+Load for fence tests.
+
+## Involved files
+- \`src/fenced.js\`
+`,
+    'architecture/platform/real.md': `
+---
+domain: Platform
+feature: Fence Sections
+component: Real
+status: In progress
+---
+
+## Description
+Real description.
+
+## Review metadata
+- Evidence: app:src/real.js
+- Blindspots: none.
+
+## Details
+Example:
+
+${fence}md
+## Description
+${fence}
+
+## Retrieval guidance
+Load for fence tests.
+
+## Next steps
+- None.
+
+## Involved files
+- \`src/real.js\`
+`,
+    'sessions/2026-07-01-1-fenced-note.md': `
+# Session — 2026-07-01-1 — Fenced Note
+
+## What we worked on
+A sample note:
+
+~~~md
+## Completed
+## Decisions made
+~~~
+
+## Models used
+- Codex
+
+## Blockers / open questions
+- None.
+
+## Next session should start with
+- Continue.
+`,
+  });
+
+  try {
+    const result = await scanProjectMemory(fixture.rootDir);
+    const codes = (documentPath, code) => result.documents
+      .find((document) => document.path === documentPath)
+      .warnings.filter((warning) => warning.code === code)
+      .map((warning) => warning.message);
+
+    assert.deepEqual(codes('architecture/platform/fenced.md', 'architecture-missing-section'), [
+      'Architecture doc is missing recommended section "## Description".',
+      'Architecture doc is missing recommended section "## Next steps".',
+    ]);
+    assert.deepEqual(codes('architecture/platform/real.md', 'architecture-missing-section'), []);
+    assert.deepEqual(codes('sessions/2026-07-01-1-fenced-note.md', 'session-missing-section'), [
+      'Session note is missing recommended section "## Completed".',
+      'Session note is missing recommended section "## Decisions made".',
+    ]);
+  } finally {
+    await fixture.cleanup();
+  }
+});

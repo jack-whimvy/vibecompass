@@ -3,6 +3,7 @@ import path from 'node:path';
 import { validateBriefSettings } from './brief-settings.js';
 import { parseFrontmatter } from './frontmatter.js';
 import { sha256Text } from './hash.js';
+import { splitSections } from './markdown-sections.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 
 const PROJECT_FILE = 'project.yaml';
@@ -886,12 +887,11 @@ function findDuplicateDecisionErrors(documents) {
   return errors;
 }
 
+// Level-2 section titles, lowercased, read fence-aware with the section reader
+// the read model and the brief share (D-372; H10): a heading inside fenced
+// code is an example, so it never satisfies a recommended section.
 function extractLevelTwoSections(content) {
-  const sections = new Set();
-  for (const match of content.matchAll(/^##\s+(.+)$/gm)) {
-    sections.add(match[1].trim().toLowerCase());
-  }
-  return sections;
+  return new Set([...splitSections(content, 2).keys()].map((title) => title.trim().toLowerCase()));
 }
 
 // D-292 changelog-shape detector, shared by the scanner and the docs-review
