@@ -1577,12 +1577,19 @@ export function findFencedRanges(text) {
       }
       continue;
     }
-    if (marker && !(marker[1][0] === '`' && line.slice(line.indexOf(marker[1]) + marker[1].length).includes('`'))) {
+    if (opensFence(marker, line)) {
       fence = { char: marker[1][0], length: marker[1].length, start: lineStart };
     }
   }
   if (fence) ranges.push([fence.start, text.length]);
   return ranges;
+}
+
+// A fence opens on three or more backticks or tildes indented at most three
+// spaces; a backtick opener's info string holds no backtick, so ```a`b is
+// prose. Shared by masking and the section index.
+function opensFence(marker, line) {
+  return Boolean(marker) && !(marker[1][0] === '`' && line.slice(line.indexOf(marker[1]) + marker[1].length).includes('`'));
 }
 
 // A closing fence holds only the opener's character, at least as many times,
@@ -1686,7 +1693,7 @@ function buildSectionIndex(content, bodyStart) {
       }
       continue;
     }
-    if (fenceMatch) {
+    if (opensFence(fenceMatch, line)) {
       fence = { char: fenceMatch[1][0], length: fenceMatch[1].length };
       continue;
     }

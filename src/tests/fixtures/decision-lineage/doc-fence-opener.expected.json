@@ -1,0 +1,161 @@
+{
+  "contract_version": 1,
+  "input": {
+    "kind": "architecture",
+    "path": "architecture/fixtures/fence-opener.md"
+  },
+  "relations": [
+    {
+      "relation": "cites",
+      "source_kind": "architecture",
+      "source_path": "architecture/fixtures/fence-opener.md",
+      "source_decision_id": null,
+      "source_section": "Description",
+      "source_field": null,
+      "source_line": 9,
+      "source_hash": "sha256:b095a02ed7c64b28c6d667284b8b2e0e03b9c12390d9550a5d5d3d97062da4fc",
+      "section_hash": "sha256:c17f69f6484d1dd867e7fdb481561a795f675eaa2412006dc3372fc2030168ea",
+      "target_decision_id": 10,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 1
+    },
+    {
+      "relation": "cites",
+      "source_kind": "architecture",
+      "source_path": "architecture/fixtures/fence-opener.md",
+      "source_decision_id": null,
+      "source_section": "Details",
+      "source_field": null,
+      "source_line": 15,
+      "source_hash": "sha256:b095a02ed7c64b28c6d667284b8b2e0e03b9c12390d9550a5d5d3d97062da4fc",
+      "section_hash": "sha256:7888d18fa5e418f4a25ff7a846b434c362763f9a8216f02c9c575d832deb52ac",
+      "target_decision_id": 11,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 1
+    },
+    {
+      "relation": "cites",
+      "source_kind": "architecture",
+      "source_path": "architecture/fixtures/fence-opener.md",
+      "source_decision_id": null,
+      "source_section": "Details > Storage",
+      "source_field": null,
+      "source_line": 21,
+      "source_hash": "sha256:b095a02ed7c64b28c6d667284b8b2e0e03b9c12390d9550a5d5d3d97062da4fc",
+      "section_hash": "sha256:bd96b9779d6c538a9a951a89d314ab625fd1c94688a539de47e84525a6acb97c",
+      "target_decision_id": 14,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 1
+    },
+    {
+      "relation": "cites",
+      "source_kind": "architecture",
+      "source_path": "architecture/fixtures/fence-opener.md",
+      "source_decision_id": null,
+      "source_section": "Next steps",
+      "source_field": null,
+      "source_line": 24,
+      "source_hash": "sha256:b095a02ed7c64b28c6d667284b8b2e0e03b9c12390d9550a5d5d3d97062da4fc",
+      "section_hash": "sha256:68a822436b158634723ca3df399ced6c2dd32ad8d57a9918edc3625431ac1619",
+      "target_decision_id": 16,
+      "evidence": "explicit",
+      "basis": "mention",
+      "extent": null,
+      "scope": null,
+      "cue": null,
+      "excerpt": null,
+      "occurrences": 1
+    }
+  ],
+  "diagnostics": [],
+  "context": {
+    "sourceHash": "sha256:b095a02ed7c64b28c6d667284b8b2e0e03b9c12390d9550a5d5d3d97062da4fc",
+    "bodyStart": 94,
+    "lineStarts": [
+      0,
+      4,
+      21,
+      46,
+      70,
+      90,
+      94,
+      95,
+      110,
+      125,
+      126,
+      137,
+      201,
+      202,
+      215,
+      238,
+      242,
+      243,
+      312,
+      313,
+      325,
+      348,
+      349,
+      363,
+      380
+    ],
+    "sections": {
+      "headings": [
+        {
+          "level": 2,
+          "text": "Description",
+          "start": 95,
+          "line": 8,
+          "path": "Description",
+          "end": 126,
+          "hash": "sha256:c17f69f6484d1dd867e7fdb481561a795f675eaa2412006dc3372fc2030168ea"
+        },
+        {
+          "level": 2,
+          "text": "Details",
+          "start": 126,
+          "line": 11,
+          "path": "Details",
+          "end": 349,
+          "hash": "sha256:7888d18fa5e418f4a25ff7a846b434c362763f9a8216f02c9c575d832deb52ac"
+        },
+        {
+          "level": 3,
+          "text": "Storage",
+          "start": 313,
+          "line": 20,
+          "path": "Details > Storage",
+          "end": 349,
+          "hash": "sha256:bd96b9779d6c538a9a951a89d314ab625fd1c94688a539de47e84525a6acb97c"
+        },
+        {
+          "level": 2,
+          "text": "Next steps",
+          "start": 349,
+          "line": 23,
+          "path": "Next steps",
+          "end": 380,
+          "hash": "sha256:68a822436b158634723ca3df399ced6c2dd32ad8d57a9918edc3625431ac1619"
+        }
+      ],
+      "preamble": {
+        "path": null,
+        "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  }
+}

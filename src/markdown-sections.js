@@ -2,7 +2,7 @@
  * The one markdown section reader shared by the read model's component fields
  * (D-372) and the session brief (D-359): fence-aware, first section of a title
  * wins. The lineage extractor keeps its own section index
- * (`decision-lineage.js`), whose fence opener differs (`decision-lineage.md`).
+ * (`decision-lineage.js`), which follows the same opening and closing rules.
  */
 
 /**

@@ -838,3 +838,30 @@ test('fenced ranges close only on the opener\'s own character, never on mixed de
   assert.ok(inside('still inside'), 'a shorter tilde fence does not close a longer one');
   assert.ok(!inside('after'));
 });
+
+test('masking and the section index open a fence on the same lines: a backtick opener\'s info string holds no backtick (session 19)', () => {
+  const note = [
+    '# Session — 2026-07-05-3 — Opener',
+    '',
+    '## Summary',
+    '',
+    '```a`b is prose, not an opener.',
+    '',
+    '## Decisions made',
+    '',
+    '- D-002 — listed under a real heading',
+    '',
+    '~~~md`x',
+    '## Decisions made',
+    '~~~',
+  ].join('\n');
+  assert.deepEqual(findFencedRanges(note).map(([start]) => note.slice(start).split('\n', 1)[0]), ['~~~md`x']);
+  const relations = extractSessionNoteRelations({ path: 'sessions/2026-07-05-3-opener.md', content: note }).relations;
+  assert.deepEqual(
+    relations.map((relation) => [relation.relation, relation.target_decision_id, relation.source_section]),
+    [
+      ['references', 2, 'Decisions made'],
+      ['made', 2, 'Decisions made'],
+    ],
+  );
+});
