@@ -74,9 +74,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     io.stdout.write(`Wrote ${result.projectFilePath}\n`);
     if (result.gitignoreUpdated) {
-      io.stdout.write(`Updated ${result.gitignorePath} to ignore state/\n`);
+      io.stdout.write(`Updated ${result.gitignorePath} to ignore state/ and sessions/active/\n`);
     } else {
-      io.stdout.write(`${result.gitignorePath} already ignored state/\n`);
+      io.stdout.write(`${result.gitignorePath} already ignored state/ and sessions/active/\n`);
     }
     io.stdout.write(
       `Generated ${result.manifestPath} (${result.manifest.canonical.document_count} canonical docs, ${result.manifest.canonical.warning_count} warnings)\n`,

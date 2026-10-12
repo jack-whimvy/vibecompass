@@ -59,7 +59,7 @@ test('initializeProjectMemory scaffolds a new root and writes a manifest', async
     assert.match(projectYaml, /refresh_decision_files: true/);
     assert.match(projectYaml, /commit_template: "docs\(session\): YYYY-MM-DD-N — <summary>"/);
     assert.match(projectYaml, new RegExp(`package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`));
-    assert.equal(gitignore, 'state/\n');
+    assert.equal(gitignore, 'state/\nsessions/active/\n');
     assert.match(starterArchitecture, /confidence: Initial scaffold/);
     assert.match(starterArchitecture, /repos:\n  - "docs"/);
     assert.match(starterArchitecture, /## Coverage/);
@@ -5372,6 +5372,43 @@ test('managed blocks and context.md show a Git repo\'s remote beside its local p
     assert.match(context, /^- `app` → https:\/\/github\.com\/example\/app\.git \(local path app-checkout\)$/m);
     assert.match(context, /^- `core` → https:\/\/github\.com\/example\/core\.git$/m);
     assert.match(context, /^- `notes` → local folder notes$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('init ignores lane scratch under sessions/active/ beside state/, once, keeping existing lines (PC5)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-init-gitignore-lanes-'));
+  const rootDir = path.join(tempDir, '.compass');
+  const options = {
+    cwd: tempDir,
+    rootDir,
+    name: 'Ignore Project',
+    mode: 'local-only',
+    repos: [{ id: 'docs', remote: 'https://github.com/example/docs.git' }],
+  };
+
+  try {
+    // A root whose .gitignore predates PC5 gains only the missing entry.
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(path.join(rootDir, '.gitignore'), 'node_modules/\nstate/', 'utf8');
+    const first = await initializeProjectMemory(options);
+    assert.equal(first.gitignoreUpdated, true);
+    assert.equal(await readFile(path.join(rootDir, '.gitignore'), 'utf8'), 'node_modules/\nstate/\nsessions/active/\n');
+
+    // Re-running init leaves a complete .gitignore unchanged.
+    const second = await initializeProjectMemory({ ...options, force: true });
+    assert.equal(second.gitignoreUpdated, false);
+    assert.equal(await readFile(path.join(rootDir, '.gitignore'), 'utf8'), 'node_modules/\nstate/\nsessions/active/\n');
+
+    // Lane scratch is ignored by git; finalized notes are not.
+    const git = (...args) => spawnSync('git', args, { cwd: rootDir, encoding: 'utf8' });
+    if (git('init', '-q').status === 0) {
+      await mkdir(path.join(rootDir, 'sessions', 'active', 'lane-a'), { recursive: true });
+      await writeFile(path.join(rootDir, 'sessions', 'active', 'lane-a', 'wip.md'), '# WIP\n', 'utf8');
+      assert.equal(git('check-ignore', '-q', 'sessions/active/lane-a/wip.md').status, 0);
+      assert.equal(git('check-ignore', '-q', 'sessions/2026-04-19-1-project-memory-initialized.md').status, 1);
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

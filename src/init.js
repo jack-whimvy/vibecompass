@@ -34,7 +34,7 @@ export async function initializeProjectMemory(options) {
   const gitignorePath = path.join(normalized.rootDir, '.gitignore');
 
   await writeProjectFile(projectFilePath, normalized.projectConfig, normalized.force);
-  const gitignoreUpdated = await ensureStateIgnored(gitignorePath);
+  const gitignoreUpdated = await ensureLocalOnlyPathsIgnored(gitignorePath);
   const scaffoldResult = await scaffoldInitFiles(normalized.bootstrap);
   const manifestResult = await writeStateManifest(normalized.rootDir, {
     generatedAt: normalized.generatedAt,
@@ -461,22 +461,25 @@ async function writeProjectFile(projectFilePath, projectConfig, force) {
   await writeFile(projectFilePath, source, 'utf8');
 }
 
-async function ensureStateIgnored(gitignorePath) {
-  const stateEntry = 'state/';
+// Local-only paths a versioned memory root never commits: derived state, and
+// lane scratch under sessions/active/ (D-278; PC5).
+const LOCAL_ONLY_IGNORE_ENTRIES = ['state/', 'sessions/active/'];
 
+async function ensureLocalOnlyPathsIgnored(gitignorePath) {
   if (!(await fileExists(gitignorePath))) {
-    await writeFile(gitignorePath, `${stateEntry}\n`, 'utf8');
+    await writeFile(gitignorePath, `${LOCAL_ONLY_IGNORE_ENTRIES.join('\n')}\n`, 'utf8');
     return true;
   }
 
   const current = await readFile(gitignorePath, 'utf8');
   const entries = current.split(/\r?\n/).map((line) => line.trim());
-  if (entries.includes(stateEntry)) {
+  const missing = LOCAL_ONLY_IGNORE_ENTRIES.filter((entry) => !entries.includes(entry));
+  if (missing.length === 0) {
     return false;
   }
 
   const separator = current.length > 0 && !current.endsWith('\n') ? '\n' : '';
-  await writeFile(gitignorePath, `${current}${separator}${stateEntry}\n`, 'utf8');
+  await writeFile(gitignorePath, `${current}${separator}${missing.join('\n')}\n`, 'utf8');
   return true;
 }
 
