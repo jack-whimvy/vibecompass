@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- Lineage: section headings in architecture docs and session notes now open a
+  fence only where masking does. A backtick fence's info string holds no
+  backtick, so a prose line that starts with backticks, such as
+  ```` ```a`b ````, no longer hides every later heading of the file. Before,
+  the decisions listed under a later `## Decisions made` heading were missed as
+  `made` relations, and later citations were filed under the wrong section.
+  Tilde fences may still hold backticks in their info string. A shared golden
+  fixture pair (`note-fence-opener`, `doc-fence-opener`) pins the rule for the
+  app port.
+- Commands no longer create directories on an uninitialized root. A write
+  command run against a missing root (or a folder holding no project memory)
+  left an empty `state/` directory, and the root folder itself, behind before
+  it failed. It now creates nothing, and session commands report the missing
+  root instead of a missing `project.yaml`. `bootstrap` still creates the fresh
+  root it materializes.
+- Agent files and `context.md` show a Git repo's remote when `project.yaml` also
+  records its local `path:`, as `<remote> (local path <path>)`. Before, any repo
+  with a path read as a local folder. Local-folder sources and repos without a
+  path read as before; run `vibecompass sync-agents` to refresh managed blocks.
+- `init` adds `sessions/active/` to the root's `.gitignore` beside `state/`, so
+  a versioned memory root never commits local-only lane scratch (D-278). It
+  appends only the entries a `.gitignore` lacks. An existing root's
+  `.gitignore` is not changed; add the line yourself.
+- Scanner: the recommended-section warnings for architecture docs and session
+  notes ignore headings inside fenced code, with the read model's fence-aware
+  reader. A fenced example `## Description` no longer hides a missing real
+  section.
+
 ## 0.17.1 - 2026-10-07
 
 Hardening release: decision lineage fails soft, the read model reads sections
