@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.17.2 - 2026-10-12
+
+Lockstep release with the app's lineage port: section headings open a fence
+only where masking does, commands create nothing on an uninitialized root,
+agent files show a repo's remote beside its local path, `init` ignores lane
+scratch, and the scanner's section warnings read headings fence-aware. The
+lane brief stays opt-in (D-368).
 
 - Lineage: section headings in architecture docs and session notes now open a
   fence only where masking does. A backtick fence's info string holds no
