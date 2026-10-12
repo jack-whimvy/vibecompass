@@ -231,8 +231,8 @@ npx -y @vibecompass/vibecompass@latest docs-review --root .compass --rebuild --a
 Docs review writes derived state under `state/`, including scanned source
 inventory, accepted coverage, and the accepted documentation-plan projection.
 `init` adds `state/` and `sessions/active/` (local-only lane scratch) to the
-root's `.gitignore`, and commands create nothing in a folder that is not a
-project memory root yet.
+root's `.gitignore`. A command that fails in a folder that is not a project
+memory root yet leaves nothing behind there.
 
 Generated agent files can also include managed VibeCompass blocks:
 

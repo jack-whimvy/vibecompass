@@ -3,7 +3,7 @@
 ## 0.17.2 - 2026-10-12
 
 Lockstep release with the app's lineage port: section headings open a fence
-only where masking does, commands create nothing on an uninitialized root,
+only where masking does, commands leave nothing behind on an uninitialized root,
 agent files show a repo's remote beside its local path, `init` ignores lane
 scratch, and the scanner's section warnings read headings fence-aware. The
 lane brief stays opt-in (D-368).
@@ -17,12 +17,14 @@ lane brief stays opt-in (D-368).
   Tilde fences may still hold backticks in their info string. A shared golden
   fixture pair (`note-fence-opener`, `doc-fence-opener`) pins the rule for the
   app port.
-- Commands no longer create directories on an uninitialized root. A write
-  command run against a missing root (or a folder holding no project memory)
-  left an empty `state/` directory, and the root folder itself, behind before
-  it failed. It now creates nothing, and session commands report the missing
-  root instead of a missing `project.yaml`. `bootstrap` still creates the fresh
-  root it materializes.
+- Commands no longer leave directories behind on an uninitialized root. A
+  write command run against a missing root (or a folder holding no project
+  memory) left an empty `state/` directory, and the root folder itself, behind
+  before it failed. The cross-process lock still serializes every command
+  there, since `bootstrap` and `apply-export` from an external bundle can
+  create a root, but at release it removes the directories it made while they
+  are still empty. Session commands report the missing root instead of a
+  missing `project.yaml`.
 - Agent files and `context.md` show a Git repo's remote when `project.yaml` also
   records its local `path:`, as `<remote> (local path <path>)`. Before, any repo
   with a path read as a local folder. Local-folder sources and repos without a

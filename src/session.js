@@ -16,7 +16,7 @@ import {
   removeLaneWorktreesAtClose,
   rollbackGitBinding,
 } from './git-binding.js';
-import { withMemoryRootLock } from './serialization.js';
+import { memoryRootCreatedByLock, withMemoryRootLock } from './serialization.js';
 import { findDuplicateDecisionIds, formatDecisionId } from './decisions.js';
 import {
   assignLanePort,
@@ -1782,7 +1782,9 @@ function getLanePaths(normalized, sessionId) {
 }
 
 async function ensureInitializedProjectMemory(rootDir, options = {}) {
-  if (!(await fileExists(rootDir))) {
+  // The lock makes a missing root to hold its state/ and removes it again at
+  // release (PC1), so a root it created is still missing here.
+  if (!(await fileExists(rootDir)) || (await memoryRootCreatedByLock(rootDir))) {
     throw new Error(
       `No project memory root was found at ${rootDir}. Run "vibecompass init" before using session commands.`,
     );

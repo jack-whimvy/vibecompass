@@ -7,7 +7,9 @@ import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
 import { closeProjectSession, rebuildActiveSessionIndex, startProjectSession } from '../session.js';
 import { appendDecisionEntry, findDuplicateDecisionIds, readNextDecisionId } from '../decisions.js';
-import { MemoryRootLockError, memoryRootLockPath, withMemoryRootLock } from '../serialization.js';
+import { MemoryRootLockError, memoryRootCreatedByLock, memoryRootLockPath, withMemoryRootLock } from '../serialization.js';
+import { applyPullExport } from '../sync.js';
+import { sha256Text } from '../hash.js';
 
 const DOCUMENT_MAINTENANCE_UPDATED = {
   architectureDocs: 'updated',
@@ -132,7 +134,7 @@ test('withMemoryRootLock re-enters across symlinked root spellings', async () =>
   }
 });
 
-test('withMemoryRootLock re-enters across spellings of an absent root (which it no longer creates, PC1)', async () => {
+test('withMemoryRootLock re-enters across spellings of an absent root, and removes the root it created (PC1)', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-alias-created-'));
   const realParent = path.join(tempDir, 'real-parent');
   const aliasParent = path.join(tempDir, 'alias-parent');
@@ -143,12 +145,16 @@ test('withMemoryRootLock re-enters across spellings of an absent root (which it 
     await mkdir(realParent);
     await symlink(realParent, aliasParent);
     const result = await withMemoryRootLock(aliasRoot, 'outer-absent-alias', () =>
-      withMemoryRootLock(realRoot, 'inner-created-real', async () => 'created-root-reentered', {
+      withMemoryRootLock(realRoot, 'inner-created-real', async () => {
+        assert.equal(await memoryRootCreatedByLock(realRoot), true, 'the held lock made the root');
+        return 'created-root-reentered';
+      }, {
         attempts: 2,
         staleMs: 60_000,
       }),
     );
     assert.equal(result, 'created-root-reentered');
+    await assert.rejects(stat(realRoot), { code: 'ENOENT' });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -569,8 +575,8 @@ test('write commands on a missing or empty root create nothing and report the un
     await writeFile(entryPath, stagedEntry('Never written'), 'utf8');
     const before = await listTree(tempDir);
 
-    // A missing root: the lock no longer creates it (or its state/), so the
-    // session check sees the missing root itself.
+    // A missing root: the lock makes it to hold state/ and removes both at
+    // release, and the session check still sees the root as missing.
     await assert.rejects(
       startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'A.', date: '2026-04-20' }),
       /No project memory root was found at .*\.compass\. Run "vibecompass init"/,
@@ -590,7 +596,8 @@ test('write commands on a missing or empty root create nothing and report the un
     );
     assert.deepEqual(await listTree(rootDir), []);
 
-    // An initialized root still takes the disk lock and creates state/ as before.
+    // An initialized root takes the disk lock; a state/ the lock had to make
+    // is removed again once empty.
     await rm(rootDir, { recursive: true, force: true });
     const initialized = await createInitializedRoot('vibecompass-lock-initialized-');
     try {
@@ -600,9 +607,104 @@ test('write commands on a missing or empty root create nothing and report the un
         lockSeen = Boolean(await stat(memoryRootLockPath(initialized.rootDir)).catch(() => null));
       });
       assert.equal(lockSeen, true, 'an initialized root is locked on disk');
+      await assert.rejects(stat(path.join(initialized.rootDir, 'state')), { code: 'ENOENT' });
     } finally {
       await rm(initialized.tempDir, { recursive: true, force: true });
     }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+function exportBundle(operations) {
+  return `${JSON.stringify({ run_id: 'run-r2', proposal_ids: ['p-1'], operations }, null, 2)}\n`;
+}
+
+function writeOperation(relativePath, rawText) {
+  return { op: 'write', path: relativePath, before_content_hash: null, after_content_hash: sha256Text(rawText), raw_text: rawText };
+}
+
+test('apply-export from an external bundle into a missing root holds the disk lock, and a refused one creates nothing (R2, D-276, PC1)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-apply-export-'));
+  const rootDir = path.join(tempDir, '.compass');
+  try {
+    // Every locked command holds the disk lock on a missing root, so a
+    // root-creating write is serialized across processes.
+    let lockSeen = false;
+    await withMemoryRootLock(rootDir, 'apply-export', async () => {
+      lockSeen = Boolean(await stat(memoryRootLockPath(rootDir)).catch(() => null));
+    });
+    assert.equal(lockSeen, true);
+    await assert.rejects(stat(rootDir), { code: 'ENOENT' }, 'nothing written, so the lock removed the root it made');
+
+    // A bundle the hash check refuses writes nothing and leaves nothing.
+    const refusedPath = path.join(tempDir, 'refused.json');
+    await writeFile(refusedPath, exportBundle([{ ...writeOperation('project.yaml', 'name: a\n'), after_content_hash: 'sha256:wrong' }]), 'utf8');
+    const before = await listTree(tempDir);
+    await assert.rejects(applyPullExport({ rootDir, outputPath: refusedPath }, { cwd: tempDir }), /does not match raw_text/);
+    assert.deepEqual(await listTree(tempDir), before);
+
+    // A valid external bundle creates the root's files under the lock.
+    const bundlePath = path.join(tempDir, 'bundle.json');
+    await writeFile(bundlePath, exportBundle([writeOperation('project.yaml', 'name: Created\n')]), 'utf8');
+    const result = await applyPullExport({ rootDir, outputPath: bundlePath }, { cwd: tempDir });
+    assert.equal(result.status, 'applied');
+    assert.equal(await readFile(path.join(rootDir, 'project.yaml'), 'utf8'), 'name: Created\n');
+    assert.deepEqual(await listTree(rootDir), ['project.yaml'], 'no lock or empty state/ is left behind');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('cross-process writers on a missing root never overlap, and only one creates a contested file (R2, D-276)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-xproc-missing-'));
+  const rootDir = path.join(tempDir, '.compass');
+  try {
+    const serializationUrl = new URL('../serialization.js', import.meta.url).href;
+    const syncUrl = new URL('../sync.js', import.meta.url).href;
+    const logPath = path.join(tempDir, 'race-log.txt');
+    // Each child holds the lock on the missing root, then applies its own
+    // bundle creating project.yaml: both expect the file missing.
+    const childScript = (name) => `
+      import { appendFile } from 'node:fs/promises';
+      const { withMemoryRootLock } = await import(${JSON.stringify(serializationUrl)});
+      const { applyPullExport } = await import(${JSON.stringify(syncUrl)});
+      await withMemoryRootLock(${JSON.stringify(rootDir)}, 'apply-export', async () => {
+        await appendFile(${JSON.stringify(logPath)}, 'start-${name}' + '\\n');
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        let outcome = 'applied';
+        try {
+          await applyPullExport({ rootDir: ${JSON.stringify(rootDir)}, outputPath: ${JSON.stringify(path.join(tempDir, 'bundle-'))} + '${name}.json' });
+        } catch {
+          outcome = 'refused';
+        }
+        await appendFile(${JSON.stringify(logPath)}, 'end-${name}-' + outcome + '\\n');
+      });
+    `;
+    for (const name of ['a', 'b']) {
+      await writeFile(path.join(tempDir, `bundle-${name}.json`), exportBundle([writeOperation('project.yaml', `name: ${name}\n`)]), 'utf8');
+    }
+
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await Promise.all([
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('a')]),
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('b')]),
+    ]);
+
+    const events = (await readFile(logPath, 'utf8')).trim().split('\n');
+    assert.equal(events.length, 4, 'both children must run');
+    for (let index = 0; index < events.length; index += 2) {
+      const name = events[index].split('-')[1];
+      assert.equal(events[index], `start-${name}`);
+      assert.match(events[index + 1], new RegExp(`^end-${name}-`), 'critical sections must not interleave');
+    }
+    const [first, second] = [events[1], events[3]];
+    assert.match(first, /-applied$/);
+    assert.match(second, /-refused$/, 'the second writer sees the first one\'s file and refuses');
+    assert.equal(await readFile(path.join(rootDir, 'project.yaml'), 'utf8'), `name: ${first.split('-')[1]}\n`);
+    await assert.rejects(stat(memoryRootLockPath(rootDir)), { code: 'ENOENT' });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

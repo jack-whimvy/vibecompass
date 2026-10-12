@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 /**
@@ -16,6 +16,15 @@ import path from 'node:path';
  *   re-enter instead of deadlocking (e.g. close-session refreshing the
  *   manifest, which is itself lock-wrapped)
  *
+ * Every command takes the disk lock, on an uninitialized root too: a locked
+ * command can create a root there (bootstrap, or apply-export from an external
+ * bundle), so skipping the lock would let two of them validate the same
+ * missing files and both write. The lock leaves nothing behind (PC1): at
+ * release it removes the directories it created to hold itself (state/, and
+ * the root when it was missing) while they are still empty, and a root the
+ * lock created still counts as missing to the command
+ * (`memoryRootCreatedByLock`).
+ *
  * This tier is intentionally local-only. Cross-machine serialization belongs
  * to git merge (local-primary teams) or the hosted database (hosted-only);
  * no distributed locking is ever built on top of this file.
@@ -28,13 +37,7 @@ const DEFAULT_ATTEMPTS = 120;
 const RETRY_BASE_DELAY_MS = 25;
 const RETRY_MAX_DELAY_MS = 100;
 
-// Commands that create a memory root where none exists (D-289 bootstrap
-// materializes a fresh root), so the lock may create its state directory there.
-const ROOT_CREATING_COMMANDS = new Set(['bootstrap']);
-// Any of these marks a directory as a memory root the lock may hold: the files
-// `init` or `bootstrap` create, or memory content from an older or legacy root.
-const MEMORY_ROOT_ENTRIES = ['project.yaml', 'state', 'architecture', 'decisions', 'sessions'];
-
+// Held root key -> { createdRoot }: whether this lock made the root directory.
 const heldRoots = new AsyncLocalStorage();
 const processQueues = new Map();
 
@@ -95,15 +98,14 @@ export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
   await previous;
 
   try {
-    const ownerToken = ROOT_CREATING_COMMANDS.has(label) || (await isMemoryRoot(key))
-      ? await acquireDiskLock(key, label, options)
-      : null;
+    const lock = await acquireDiskLock(key, label, options);
     try {
-      const nextHeld = new Set(held ?? []);
-      nextHeld.add(key);
+      const nextHeld = new Map(held ?? []);
+      nextHeld.set(key, { createdRoot: lock.createdRoot });
       return await heldRoots.run(nextHeld, fn);
     } finally {
-      if (ownerToken !== null) await releaseDiskLock(key, ownerToken);
+      await releaseDiskLock(key, lock.ownerToken);
+      await removeLockCreatedDirectories(key, lock.created);
     }
   } finally {
     releaseQueue();
@@ -114,26 +116,54 @@ export async function withMemoryRootLock(rootDir, label, fn, options = {}) {
 }
 
 /**
- * Whether `rootDir` is a memory root the disk lock may create `state/` in
- * (PC1). A missing directory, or one holding none of the root's own entries,
- * is not: taking the lock there would leave an empty `state/` (and the root
- * directory itself) behind when the command then refuses the uninitialized
- * root. On such a root the command runs under the in-process queue only and
- * reports its own "run vibecompass init" error, creating nothing. No locked
- * command except bootstrap (which takes the disk lock) writes memory into a
- * root without these entries, and `init` creates them without this lock, as
- * it always has.
+ * Whether `rootDir` exists only because the lock this caller holds made it
+ * (PC1): the root was missing when the command started and still holds
+ * nothing but the lock, so a command that requires an existing root reports
+ * it missing instead of reading the lock's own directory as one. Once the
+ * command writes into it (bootstrap), it is a root in its own right. False
+ * outside a lock holder.
  */
-async function isMemoryRoot(rootDir) {
-  for (const entry of MEMORY_ROOT_ENTRIES) {
+export async function memoryRootCreatedByLock(rootDir) {
+  const held = heldRoots.getStore();
+  if (!held) {
+    return false;
+  }
+  const heldKey = await findHeldMemoryRootKey(held, await canonicalizeMemoryRootKey(rootDir));
+  if (!heldKey || !held.get(heldKey).createdRoot) {
+    return false;
+  }
+  try {
+    const rootEntries = await readdir(heldKey);
+    const stateEntries = await readdir(path.dirname(memoryRootLockPath(heldKey)));
+    return rootEntries.every((entry) => entry === 'state') && stateEntries.every((entry) => entry.startsWith(LOCK_DIR_NAME));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Removes the directories acquisition created (state/, then the root and any
+ * missing parents up to `created`) while each is still empty (PC1). A command
+ * that wrote memory there, or another holder's lock, keeps a directory
+ * non-empty, so it stays. Two commands racing on the same missing root can
+ * leave an empty directory when the second found it already made; it never
+ * holds memory.
+ */
+async function removeLockCreatedDirectories(key, created) {
+  if (!created) {
+    return;
+  }
+  const top = path.resolve(created);
+  for (let dir = path.dirname(memoryRootLockPath(key)); ; dir = path.dirname(dir)) {
     try {
-      await stat(path.join(rootDir, entry));
-      return true;
-    } catch (error) {
-      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return true;
+      await rmdir(dir);
+    } catch {
+      return;
+    }
+    if (dir === top || path.dirname(dir) === dir) {
+      return;
     }
   }
-  return false;
 }
 
 async function canonicalizeMemoryRootKey(rootDir) {
@@ -158,7 +188,7 @@ async function findHeldMemoryRootKey(held, key) {
     return key;
   }
 
-  for (const heldKey of held) {
+  for (const heldKey of held.keys()) {
     if (await memoryRootKeysReferToSamePath(heldKey, key)) {
       return heldKey;
     }
@@ -177,9 +207,11 @@ async function memoryRootKeysReferToSamePath(left, right) {
 
 async function acquireDiskLock(key, label, options) {
   const lockDir = memoryRootLockPath(key);
+  const stateDir = path.dirname(lockDir);
   const attempts = options.attempts ?? DEFAULT_ATTEMPTS;
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
-  await mkdir(path.dirname(lockDir), { recursive: true });
+  // The topmost directory this acquisition created, if any (mkdir reports it).
+  let created = await mkdir(stateDir, { recursive: true });
 
   for (let attempt = 1; ; attempt += 1) {
     const ownerToken = randomUUID();
@@ -190,9 +222,17 @@ async function acquireDiskLock(key, label, options) {
         `${JSON.stringify({ pid: process.pid, token: ownerToken, label, acquired_at: new Date().toISOString() })}\n`,
         'utf8',
       );
-      return ownerToken;
+      return {
+        ownerToken,
+        created,
+        createdRoot: Boolean(created) && path.resolve(created) !== path.resolve(stateDir),
+      };
     } catch (error) {
-      if (error?.code !== 'EEXIST') {
+      if (error?.code === 'ENOENT') {
+        // A releasing holder removed the state/ (or root) it had created; make
+        // it again, and remove it at release in turn.
+        created = topmostDirectory(created, await mkdir(stateDir, { recursive: true }));
+      } else if (error?.code !== 'EEXIST') {
         throw error;
       }
     }
@@ -216,6 +256,13 @@ async function acquireDiskLock(key, label, options) {
 
     await delay(RETRY_BASE_DELAY_MS + Math.floor(Math.random() * RETRY_MAX_DELAY_MS));
   }
+}
+
+function topmostDirectory(left, right) {
+  if (!left || !right) {
+    return left ?? right;
+  }
+  return path.resolve(left).length <= path.resolve(right).length ? left : right;
 }
 
 /**
