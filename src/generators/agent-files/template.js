@@ -88,13 +88,15 @@ function renderProjectSnapshot(context) {
   return lines.length > 0 ? lines : ['- No project details recorded yet.'];
 }
 
+// A local-folder source shows its folder; a Git repo shows its remote, plus
+// the local path where one is recorded beside it (PC2).
 function formatRepoDescriptor(repo) {
-  if (repo?.source === 'local' || repo?.path) {
+  if (repo?.source === 'local' || (repo?.path && !repo?.remote)) {
     return `local folder ${repo.path ?? '.'}`;
   }
 
   if (repo?.remote) {
-    return repo.remote;
+    return repo.path ? `${repo.remote} (local path ${repo.path})` : repo.remote;
   }
 
   return 'source not recorded';

@@ -5331,3 +5331,48 @@ test('isDirectExecution resolves symlinked bin entry paths', async () => {
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('managed blocks and context.md show a Git repo\'s remote beside its local path (PC2)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-repo-remote-path-'));
+  const silent = { stdout: { write() {} }, stderr: { write() {} } };
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Remote Path Project',
+      mode: 'local-primary',
+      repos: [
+        { id: 'core', remote: 'https://github.com/example/core.git' },
+        { id: 'app', remote: 'https://github.com/example/app.git' },
+        { id: 'notes', source: 'local', path: 'notes' },
+      ],
+      bootstrap: { workflow: true },
+    });
+    const projectPath = path.join(tempDir, '.compass/project.yaml');
+    const projectYaml = await readFile(projectPath, 'utf8');
+    // A checked-out sibling repo records its folder beside the remote
+    // (the hand-maintained vibecompass-docs project.yaml does this).
+    const withPath = projectYaml.replace(
+      '    remote: https://github.com/example/app.git\n',
+      '    remote: https://github.com/example/app.git\n    path: app-checkout\n',
+    );
+    assert.notEqual(withPath, projectYaml);
+    await writeFile(projectPath, withPath, 'utf8');
+
+    assert.equal(await runCli(['sync-agents', '--root', '.compass'], silent, { cwd: tempDir }), 0);
+    assert.equal(await runCli(['refresh-workflow', '--root', '.compass', '--apply'], silent, { cwd: tempDir }), 0);
+
+    const agents = await readFile(path.join(tempDir, 'AGENTS.md'), 'utf8');
+    assert.match(agents, /^- Repo `app`: https:\/\/github\.com\/example\/app\.git \(local path app-checkout\)$/m);
+    assert.match(agents, /^- Repo `core`: https:\/\/github\.com\/example\/core\.git$/m);
+    assert.match(agents, /^- Repo `notes`: local folder notes$/m);
+
+    const context = await readFile(path.join(tempDir, '.compass/context.md'), 'utf8');
+    assert.match(context, /^- `app` → https:\/\/github\.com\/example\/app\.git \(local path app-checkout\)$/m);
+    assert.match(context, /^- `core` → https:\/\/github\.com\/example\/core\.git$/m);
+    assert.match(context, /^- `notes` → local folder notes$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
