@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.17.3 - 2026-10-12
 
-- `push` prints what the hosted dashboard could not show. The server builds
-  the dashboard in the same step as the push and reports anything it could not
+A small sync release: `push` tells you what the hosted dashboard could not
+show. The lane brief stays opt-in (D-368).
+
+- `push` prints the server's projection warnings. The server builds the
+  dashboard in the same step as the push and reports anything it could not
   build, such as a file whose decision links could not be read
   (`lineage_extraction_failed`, D-371). `push` now prints each one as a
   `Note: <code> (<path>): <message>` line after the run, so you learn about it

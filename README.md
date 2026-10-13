@@ -339,6 +339,11 @@ changed canonical project-memory files and the hosted dashboard should catch
 up. Hosted-only projects do not use a local authoritative push; update or
 refresh them through the hosted dashboard/proposal flow.
 
+`push` prints a `Note: <code> (<path>): <message>` line for anything the
+hosted dashboard could not build from your files, such as a file whose decision
+links could not be read. The push itself succeeded; the note names the file so
+you can check it.
+
 ### Where the token lives (D-355)
 
 Hosted commands look for the token in this order:
