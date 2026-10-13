@@ -56,8 +56,30 @@ export async function pushProjectMemory(options = {}, environment = {}) {
     remoteRevisionId: response.remote_revision_id,
     appliedProposalIds: response.applied_proposal_ids ?? [],
     staleProposalIds: response.stale_proposal_ids ?? [],
+    warnings: readProjectionWarnings(response),
     message: `Pushed ${documents.length} canonical document${documents.length === 1 ? '' : 's'} to hosted project memory.`,
   };
+}
+
+/**
+ * The hosted push projects the dashboard read model in the same transaction
+ * (D-239) and reports what it could not project as `projection.warnings`
+ * (`{ code, message, path? }`), such as `lineage_extraction_failed` (D-371).
+ * The push itself succeeded, so these are notes, not errors. A server that
+ * sends no projection block, or an entry without a message, yields nothing.
+ */
+function readProjectionWarnings(response) {
+  const warnings = response?.projection?.warnings;
+  if (!Array.isArray(warnings)) {
+    return [];
+  }
+  return warnings
+    .filter((warning) => warning && typeof warning === 'object' && typeof warning.message === 'string')
+    .map((warning) => ({
+      code: typeof warning.code === 'string' && warning.code ? warning.code : 'projection_warning',
+      message: warning.message,
+      ...(typeof warning.path === 'string' && warning.path ? { path: warning.path } : {}),
+    }));
 }
 
 export async function pullPreviewProjectMemory(options = {}, environment = {}) {

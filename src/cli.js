@@ -619,6 +619,10 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.staleProposalIds.length > 0) {
       io.stdout.write(`Stale proposals: ${result.staleProposalIds.join(', ')}\n`);
     }
+    for (const warning of result.warnings) {
+      const where = warning.path ? ` (${warning.path})` : '';
+      io.stdout.write(`Note: ${warning.code}${where}: ${warning.message}\n`);
+    }
     io.stdout.write(`Recorded ${result.manifestPath}\n`);
     io.stdout.write(`${result.message}\n`);
     return 0;

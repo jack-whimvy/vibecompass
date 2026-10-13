@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `push` prints what the hosted dashboard could not show. The server builds
+  the dashboard in the same step as the push and reports anything it could not
+  build, such as a file whose decision links could not be read
+  (`lineage_extraction_failed`, D-371). `push` now prints each one as a
+  `Note: <code> (<path>): <message>` line after the run, so you learn about it
+  in the terminal instead of only from a dashboard notice. The push itself
+  still succeeded. A push with nothing to report prints no extra lines.
+
 ## 0.17.2 - 2026-10-12
 
 Lockstep release with the app's lineage port: section headings open a fence

@@ -273,6 +273,95 @@ test('push resolves the default target and honors --sync-target per invocation',
   }
 });
 
+test('push prints the server projection warnings as Note lines, and nothing when there are none', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-targets-push-notes-'));
+
+  try {
+    await createLocalPrimaryProject(tempDir);
+    await connectTarget(tempDir, 'dev', 'http://localhost:3000', 'proj-dev', 'VIBECOMPASS_SYNC_TOKEN_DEV');
+    const env = { VIBECOMPASS_SYNC_TOKEN_DEV: 'vcsync_dev_token' };
+    const lineageMessage =
+      'Decision lineage could not be extracted from this file (TypeError: boom), so the dashboard shows decision links as unavailable.';
+    const responses = [
+      // A completed push whose in-transaction projection reported warnings
+      // (D-239, D-371). Entries without a message are skipped.
+      {
+        status: 'completed',
+        run_id: 'run-warned',
+        remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
+        applied_proposal_ids: [],
+        stale_proposal_ids: [],
+        projection: {
+          counts: { domains: 1, features: 1, components: 1, decisions: 2 },
+          warnings: [
+            { code: 'lineage_extraction_failed', message: lineageMessage, path: 'decisions/platform.md' },
+            { code: 'slug_collision', message: 'Feature slug "auth" is owned by source "scan".' },
+            { code: 'invalid_frontmatter' },
+            null,
+          ],
+        },
+      },
+      // An idempotent no-op push projects nothing and sends an empty list.
+      {
+        status: 'already_current',
+        run_id: 'run-current',
+        remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
+        applied_proposal_ids: [],
+        stale_proposal_ids: [],
+        projection: { counts: { domains: 0 }, warnings: [] },
+      },
+      // A server without a projection block.
+      {
+        status: 'completed',
+        run_id: 'run-plain',
+        remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
+        applied_proposal_ids: [],
+        stale_proposal_ids: [],
+      },
+    ];
+    const fetchMock = async () => {
+      const body = responses.shift();
+      return {
+        ok: true,
+        async json() {
+          return body;
+        },
+      };
+    };
+
+    const warnedStdout = [];
+    const warnedStderr = [];
+    assert.equal(
+      await runCli(['push'], createIo(warnedStdout, warnedStderr), { cwd: tempDir, env, fetch: fetchMock }),
+      0,
+    );
+    const warnedLines = warnedStdout.join('').split('\n');
+    const noteLines = warnedLines.filter((line) => line.startsWith('Note: '));
+    assert.deepEqual(noteLines, [
+      `Note: lineage_extraction_failed (decisions/platform.md): ${lineageMessage}`,
+      'Note: slug_collision: Feature slug "auth" is owned by source "scan".',
+    ]);
+    // The notes follow the run and proposal lines and precede the closing lines.
+    const runIndex = warnedLines.findIndex((line) => line === 'Run: run-warned');
+    const firstNoteIndex = warnedLines.indexOf(noteLines[0]);
+    const recordedIndex = warnedLines.findIndex((line) => line.startsWith('Recorded '));
+    assert.ok(runIndex >= 0 && runIndex < firstNoteIndex && firstNoteIndex < recordedIndex);
+    assert.doesNotMatch(warnedStderr.join(''), /lineage_extraction_failed|slug_collision/);
+
+    for (const runId of ['run-current', 'run-plain']) {
+      const stdout = [];
+      const stderr = [];
+      assert.equal(await runCli(['push'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: fetchMock }), 0);
+      assert.match(stdout.join(''), new RegExp(`Run: ${runId}`));
+      assert.doesNotMatch(stdout.join(''), /Note:/);
+      assert.doesNotMatch(stderr.join(''), /Note:/);
+    }
+    assert.equal(responses.length, 0);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('legacy flat sync bindings keep working without named targets', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-targets-legacy-'));
 
