@@ -4,14 +4,21 @@
 // architecture/platform/project-memory/recall-evaluation.md › A7 protocol).
 // Development tool; not shipped in the npm package.
 //
-//   node scripts/evaluate-brief-a7.js prepare --corpus <dir> --docs-repo <dir> --labels <dir> --heldout-sha256 <hex> --out <dir> [--warm-runs 10]
+//   node scripts/evaluate-brief-a7.js prepare --corpus <dir> --docs-repo <dir> --tuning-labels <file> --heldout <file> --heldout-sha256 <hex> --out <dir> [--warm-runs 10]
 //   node scripts/evaluate-brief-a7.js run     --out <dir> --max-cost-usd <n> [--concurrency 4] [--only r001,r002]
 //   node scripts/evaluate-brief-a7.js grade   --out <dir> --max-cost-usd <n> [--concurrency 4] [--only F1,T2]
 //   node scripts/evaluate-brief-a7.js screen  --out <dir>        (stage 1: which tasks need confirmation runs)
 //   node scripts/evaluate-brief-a7.js confirm --out <dir>        (stage 2: adds replicates 4–6 for the flagged tasks)
 //   node scripts/evaluate-brief-a7.js score   --out <dir>
-//   node scripts/evaluate-brief-a7.js smoke   --corpus <dir> --labels <dir> --out <dir> --task <id> [--cap 3] [--stated-cap 24]
+//   node scripts/evaluate-brief-a7.js smoke   --corpus <dir> --tuning-labels <file> --out <dir> --task <id> [--cap 3] [--stated-cap 24]
 //   node scripts/evaluate-brief-a7.js describe
+//
+// The later attempt (recall-evaluation.md › A7 later attempt) keeps the
+// frozen protocol and changes the harness only: corpus v3 (the single root,
+// D-382), whose startup files replace the former primer `CLAUDE.md` with
+// `context.md` and `architecture/overview/project-status.md`; a new held-out
+// set authored outside every repo; a provenance-based isolation rule (below);
+// and abort handling (below).
 //
 // What A7 changes from A5 (scripts/evaluate-brief-a5.js):
 // - Startup order is enforced by construction: the harness reads the
@@ -46,7 +53,30 @@
 //
 // Label isolation: `prepare`, `confirm`, and `run` read only each task's Task
 // and Files lines. Only `grade`, `screen`, and `score` read labels, and only
-// graders see them.
+// graders see them. `prepare` also fingerprints the label copies for the
+// isolation audit, and records only hashes.
+//
+// Evaluation isolation is judged by provenance, not by markers. The forbidden
+// artifact set is the label copies and everything the harness writes outside
+// a run copy. The controls: the corpus and every run copy are verified
+// against the tag entry by entry (symlinks by link text, resolving inside);
+// every tool input must stay inside the run copy, glob patterns included; and
+// every session passes the session checks. On top of that, every input an
+// evaluated session receives — its prompt, every tool result, and a report
+// turn's replay — is scanned for content fingerprints that occur in the label
+// copies but nowhere in the run copy. Only delivered forbidden content is a
+// deviation. Naming an evaluation file is an observation, counted as an
+// exclusion, an unsuccessful search, or a mention.
+//
+// Abort handling: SIGINT, SIGTERM, or SIGHUP during `run`, `grade`, or
+// `smoke` stops dispatch, terminates every live child session's process group
+// (SIGTERM, then SIGKILL after a grace period; a second signal kills at
+// once), awaits them, keeps their streams, and records each as an `aborted`
+// ledger attempt costed from its streamed usage, or by its reserve as
+// unresolved. An aborted evaluated session is never retried. A `STOP` file in
+// the evaluation directory stops dispatch gracefully instead: running
+// sessions finish. The next `run` or `grade` first terminates and records any
+// session a killed harness left behind, from the pids the ledger records.
 
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
@@ -66,16 +96,30 @@ export const EFFORT = 'high';
 export const TOOL_CALL_CAP = 24;
 export const STAGE1_REPLICATES = 3;
 export const STAGE2_REPLICATES = 3;
-const LANE_SESSION_DATE = '2026-10-02';
-const CORPUS_TAG = 'recall-eval-corpus-v2';
+const LANE_SESSION_DATE = '2026-10-14';
+const CORPUS_TAG = 'recall-eval-corpus-v3';
 const CORPUS_EXCLUDED = (file) => /^architecture\/platform\/project-memory\/recall-evaluation[^/]*\.md$/.test(file) || file.startsWith('sessions/active/');
-const LABEL_FILES = ['recall-evaluation.md', 'recall-evaluation-heldout-v2.md'];
+const TUNING_LABEL_FILE = 'recall-evaluation.md';
+const HELDOUT_LABEL_FILE = 'recall-evaluation-heldout-v3.md';
+const LABEL_FILES = [TUNING_LABEL_FILE, HELDOUT_LABEL_FILE];
+const MERGED_TUNING_HEADING = '#### Merged v3 tuning labels';
+export const TUNING_TASKS = 12;
+// The root's own startup files before the session note (D-382: the single
+// root has no `CLAUDE.md`; its protocol is `context.md` and its primer is
+// `project-status.md`, read in that order by the workspace startup).
+const STARTUP_ROOT_FILES = ['context.md', 'architecture/overview/project-status.md', 'project.yaml'];
 const LANE_FILES = ['sessions/active/index.yaml', 'sessions/active/eval/session.yaml', 'sessions/active/eval/wip.md', 'sessions/active/eval/handoff.md'];
 // Reserves the cost cap holds back before starting a paid call, and the cost
 // counted for an attempt whose cost cannot be established.
 export const RUN_RESERVE_USD = 1.5;
 export const GRADE_RESERVE_USD = 0.5;
 export const MAX_GRADE_ATTEMPTS = 3;
+// Abort: how long a child session gets after SIGTERM before SIGKILL.
+export const ABORT_GRACE_MS = 5000;
+// Isolation fingerprints: word 8-grams of normalized text with at least five
+// words of three or more letters, so runs of numbers, IDs, or punctuation
+// never count.
+export const FINGERPRINT = Object.freeze({ words: 8, min_long_words: 5, long_word_letters: 3 });
 const RESEARCH_TOOLS = ['Glob', 'Grep', 'Read'];
 // --json-schema runs the built-in structured-output tool even with --tools "".
 const GRADER_TOOLS = ['StructuredOutput'];
@@ -134,7 +178,9 @@ const harnessPath = fileURLToPath(import.meta.url);
 
 /**
  * Prepares stage 1 in an empty or new directory. `opts`: corpus, docsRepo,
- * labelsDir, heldoutSha, warmRuns, expectTasks (20 for A7).
+ * tuningLabels (recall-evaluation.md), heldout (the held-out file, outside
+ * every repo), heldoutSha, warmRuns, expectTasks (20 for A7), tuningTasks
+ * (12 for A7).
  */
 export async function prepare(ctx, opts) {
   const { dir } = ctx;
@@ -146,17 +192,26 @@ export async function prepare(ctx, opts) {
   if (identity.package_dirty) failures.push(`package src/ or scripts/ has uncommitted changes: ${identity.package_dirty}`);
   await mkdir(path.join(dir, 'labels'), { recursive: true });
   const labelHashes = {};
-  for (const file of LABEL_FILES) {
-    await copyFile(path.join(opts.labelsDir, file), path.join(dir, 'labels', file));
+  for (const [file, source] of [[TUNING_LABEL_FILE, opts.tuningLabels], [HELDOUT_LABEL_FILE, opts.heldout]]) {
+    await copyFile(path.resolve(source), path.join(dir, 'labels', file));
     labelHashes[file] = sha256(await readFile(path.join(dir, 'labels', file), 'utf8'));
   }
-  if (labelHashes['recall-evaluation-heldout-v2.md'] !== opts.heldoutSha) failures.push('recall-evaluation-heldout-v2.md does not match --heldout-sha256; the held-out set changed since its handback');
+  if (labelHashes[HELDOUT_LABEL_FILE] !== opts.heldoutSha) failures.push(`the held-out file does not match --heldout-sha256; the held-out set changed since its handback`);
   failures.push(...(await verifyCorpus(corpus, path.resolve(opts.docsRepo))));
 
   const labelsText = Object.fromEntries(await Promise.all(LABEL_FILES.map(async (file) => [file, await readFile(path.join(dir, 'labels', file), 'utf8')])));
-  const tasks = [...parseTasks(labelsText['recall-evaluation.md'], 'tuning'), ...parseTasks(labelsText['recall-evaluation-heldout-v2.md'], 'held-out')];
+  let tuning = [];
+  try {
+    tuning = parseTasks(mergedTuningSection(labelsText[TUNING_LABEL_FILE]), 'tuning', 5);
+  } catch (error) {
+    failures.push(error.message);
+  }
+  const tasks = [...tuning, ...parseTasks(labelsText[HELDOUT_LABEL_FILE], 'held-out')];
   const expectTasks = opts.expectTasks ?? 20;
+  if (tuning.length !== (opts.tuningTasks ?? TUNING_TASKS)) failures.push(`expected ${opts.tuningTasks ?? TUNING_TASKS} tuning tasks in the merged v3 labels, found ${tuning.length}`);
   if (tasks.length !== expectTasks) failures.push(`expected ${expectTasks} tasks, found ${tasks.length}`);
+  const ids = tasks.map((task) => task.id);
+  for (const id of new Set(ids.filter((value, index) => ids.indexOf(value) !== index))) failures.push(`task ID ${id} appears more than once`);
   for (const task of tasks) if (!task.task) failures.push(`${task.id}: no task text`);
   if (failures.length > 0) throw new Error(`Preflight failed; nothing prepared:\n- ${failures.join('\n- ')}`);
 
@@ -164,6 +219,11 @@ export async function prepare(ctx, opts) {
   await mkdir(path.join(dir, 'prompts'), { recursive: true });
   const relations = (await loadProjectReadModel(corpus)).decision_lineage.relations;
   const corpusHashes = await hashTree(corpus);
+  // The isolation fingerprints: label-copy content that occurs nowhere in the corpus.
+  const isolation = await buildIsolationIndex(Object.values(labelsText), corpus);
+  const isolationText = `${JSON.stringify(isolation, null, 2)}\n`;
+  await writeFile(path.join(dir, 'isolation.json'), isolationText);
+  const forbidden = new Set(isolation.fingerprints);
 
   // Arms alternate by task and replicate; run ids follow launch order.
   const runs = [];
@@ -171,7 +231,7 @@ export async function prepare(ctx, opts) {
     for (let replicate = 1; replicate <= STAGE1_REPLICATES; replicate += 1) runs.push(...armPair(runs, task, taskIndex, replicate, 1));
   });
   const briefs = {};
-  for (const entry of runs) failures.push(...(await prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs)));
+  for (const entry of runs) failures.push(...(await prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs, forbidden)));
 
   const latency = await measureLatency(dir, corpus, tasks, opts.warmRuns ?? 10);
   // Pre-run gates (A7 protocol): a failure here is the outcome — no-go — and no paid run starts.
@@ -204,8 +264,10 @@ export async function prepare(ctx, opts) {
     corpus,
     corpus_tag: CORPUS_TAG,
     corpus_sha256: treeDigest(corpusHashes),
+    startup_root_files: STARTUP_ROOT_FILES,
     label_sha256: labelHashes,
     heldout_sha256: opts.heldoutSha,
+    isolation: { sha256: sha256(isolationText), fingerprints: isolation.fingerprints.length, method: isolation.method },
     tasks: tasks.map(({ id, split, task, files }) => ({ id, split, task, files })),
     runs,
     briefs,
@@ -214,10 +276,15 @@ export async function prepare(ctx, opts) {
     pre_run_gates: { pass: preRunGateFailures.length === 0, failures: preRunGateFailures },
   };
   await writeManifest(dir, manifest, 'prepare');
-  log(ctx, `Prepared ${runs.length} stage-1 runs (${tasks.length} tasks × 2 arms × ${STAGE1_REPLICATES}) in ${dir}; package ${manifest.package_commit}`);
+  log(ctx, `Prepared ${runs.length} stage-1 runs (${tasks.length} tasks × 2 arms × ${STAGE1_REPLICATES}) in ${dir}; package ${manifest.package_commit}; ${isolation.fingerprints.length} isolation fingerprints`);
+  // Held-out briefs are summarized, not listed, so preparing exposes no per-task held-out detail.
+  const heldoutIds = new Set(tasks.filter((task) => task.split === 'held-out').map((task) => task.id));
   for (const [id, brief] of Object.entries(briefs)) {
+    if (heldoutIds.has(id)) continue;
     log(ctx, `- ${id}: ${brief.status}${brief.topic_absent ? ' (topic absent)' : ''}; body ${brief.body_tokens} / whole file ${brief.whole_file_tokens} est. tokens; safe overflow ${brief.safe_overflow.length === 0 ? 'yes' : brief.safe_overflow.join('; ')}`);
   }
+  const heldoutBriefs = Object.entries(briefs).filter(([id]) => heldoutIds.has(id));
+  log(ctx, `- held-out: ${heldoutBriefs.length} briefs, safe overflow on ${heldoutBriefs.filter(([, brief]) => brief.safe_overflow.length === 0).length}`);
   log(ctx, `Latency: cold CLI first ${latency.cold_first_ms} ms, max ${latency.cold_max_ms} ms; warm p50 max ${latency.warm_p50_max_ms} ms`);
   if (!manifest.pre_run_gates.pass) log(ctx, `PRE-RUN GATES FAILED — the outcome is no-go and \`run\` will refuse:\n- ${preRunGateFailures.join('\n- ')}`);
   return manifest;
@@ -228,8 +295,12 @@ function armPair(existing, task, taskIndex, replicate, stage) {
   return arms.map((arm, index) => ({ id: `r${String(existing.length + index + 1).padStart(3, '0')}`, task: task.id, arm, replicate, stage }));
 }
 
-/** Builds one run copy, its brief (brief arm), and its prompt, and records their identities; returns preflight failures. */
-async function prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs) {
+/**
+ * Builds one run copy, its brief (brief arm), and its prompt, and records
+ * their identities; returns preflight failures. The prompt must carry no
+ * isolation fingerprint beyond its own run copy and the templates.
+ */
+async function prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs, forbidden) {
   const failures = [];
   const task = tasks.find((candidate) => candidate.id === entry.task);
   const root = await makeRunCopy(corpus, path.join(dir, 'runs', entry.id), task);
@@ -258,6 +329,8 @@ async function prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, br
   entry.startup_files = startup.map((file) => ({ path: file.path, sha256: sha256(file.content) }));
   entry.prompt_sha256 = sha256(prompt);
   await writeFile(path.join(dir, 'prompts', `${entry.id}.txt`), prompt);
+  const promptHits = countFingerprintHits(prompt, withoutTemplates(await runForbidden(forbidden, root, task)));
+  if (promptHits > 0) failures.push(`${entry.id} (${task.id}): the prompt carries ${promptHits} isolation fingerprint(s) from the label copies`);
 
   // The copy must equal the corpus byte for byte, plus the eval lane (and brief.md).
   const expectedExtra = new Set([...LANE_FILES, ...(entry.arm === 'brief' ? ['sessions/active/eval/brief.md'] : [])]);
@@ -323,15 +396,19 @@ async function writeLaneBrief(root, task, relations) {
   };
 }
 
-/** The prescribed startup reads, in order, from the run copy (recall-evaluation.md › Baseline protocol). */
+/**
+ * The prescribed startup reads, in order, from the run copy
+ * (recall-evaluation.md › Baseline protocol, with the later attempt's v3
+ * startup set: `context.md` and `project-status.md` where corpus v2 had the
+ * primer `CLAUDE.md`).
+ */
 async function readStartupFiles(root, arm) {
   const notes = (await readdir(path.join(root, 'sessions')))
     .map((name) => ({ name, match: name.match(/^(\d{4}-\d{2}-\d{2})-(\d+)-.*\.md$/) }))
     .filter((entry) => entry.match)
     .sort((left, right) => left.match[1].localeCompare(right.match[1]) || Number(left.match[2]) - Number(right.match[2]));
   const order = [
-    'CLAUDE.md',
-    'project.yaml',
+    ...STARTUP_ROOT_FILES,
     `sessions/${notes.at(-1).name}`,
     'sessions/active/index.yaml',
     'sessions/active/eval/wip.md',
@@ -341,8 +418,12 @@ async function readStartupFiles(root, arm) {
   return Promise.all(order.map(async (file) => ({ path: file, content: await readFile(path.join(root, file), 'utf8') })));
 }
 
+function renderFiles(task) {
+  return task.files.length > 0 ? task.files.map((file) => `\`${file}\``).join(', ') : 'none';
+}
+
 function renderPrompt(task, startup) {
-  const files = task.files.length > 0 ? task.files.map((file) => `\`${file}\``).join(', ') : 'none';
+  const files = renderFiles(task);
   const text = /[.?!]$/.test(task.task) ? task.task : `${task.task}.`;
   const bundle = startup
     .map((file, index) => `<startup-file order="${index + 1}" path="${file.path}"${file.path.endsWith('/brief.md') ? ' note="the lane\'s generated session brief"' : ''}>\n${file.content.trimEnd()}\n</startup-file>`)
@@ -475,38 +556,67 @@ export async function run(ctx) {
   if (!manifest.pre_run_gates.pass) throw new Error(`Pre-run gates failed; the outcome is no-go and no run starts:\n- ${manifest.pre_run_gates.failures.join('\n- ')}`);
   const cap = requireCap(ctx);
   await mkdir(path.join(dir, 'transcripts'), { recursive: true });
-  // Every paid session — research or report turn — starts only within the cap.
-  const guard = async (reserve) => (await ledgerSpend(dir)).total + reserve <= cap;
-  const pending = [];
-  for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
-    const base = path.join(dir, 'transcripts', entry.id);
-    // The ledger, not the metadata, says which sessions finished: every run
-    // with a finished session is reconciled before anything is scheduled, so a
-    // finished session is never paid for twice.
-    const meta = (await ledgerHasFinished(dir, entry.id)) ? await reconcileRun(dir, entry, manifest.tool_call_cap) : await readMeta(base);
-    if (meta?.state !== 'complete') pending.push(entry);
-  }
-  const skipped = [];
-  await pool(pending, ctx.concurrency ?? 4, async (entry) => {
-    const treeProblems = await verifyRunTree(entry);
-    if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
-    const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
-    if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-    const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard });
-    if (meta.state !== 'complete') {
-      skipped.push(`${entry.id}${meta.state === 'report-pending' ? ' (report turn pending)' : ''}`);
-      return;
+  return withHarnessLock(ctx, async () => {
+    // Sessions a killed harness left behind are terminated and recorded before anything else.
+    await reapOrphans(ctx);
+    // Every paid session — research or report turn — starts only within the cap.
+    const guard = async (reserve) => (await ledgerSpend(dir)).total + reserve <= cap;
+    const pending = [];
+    for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
+      const base = path.join(dir, 'transcripts', entry.id);
+      // The ledger, not the metadata, says which sessions finished: every run
+      // with a finished session is reconciled before anything is scheduled, so a
+      // finished session is never paid for twice.
+      const meta = (await ledgerHasFinished(dir, entry.id)) ? await reconcileRun(dir, entry, manifest.tool_call_cap) : await readMeta(base);
+      if (meta?.state !== 'complete') pending.push(entry);
     }
-    const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest);
-    log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${metrics.stopped_at_cap ? ' (stopped at the cap; report turn)' : ''}, ${Math.round(metrics.duration_ms / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, VIOLATIONS: ${metrics.violations.join('; ')}` : ''}`);
+    const skipped = [];
+    const aborted = [];
+    const deviations = [];
+    const dispatched = new Set();
+    // A run with a deviation makes the entry nonconforming, so dispatch stops there (A7 protocol › Residual risk).
+    const stop = async () => deviations.length > 0 || (await stopRequested(dir));
+    await pool(pending, ctx.concurrency ?? 4, async (entry) => {
+      dispatched.add(entry.id);
+      const treeProblems = await verifyRunTree(entry);
+      if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
+      const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
+      if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
+      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs });
+      if (meta.state === 'aborted') {
+        aborted.push(entry.id);
+        return;
+      }
+      if (meta.state !== 'complete') {
+        skipped.push(`${entry.id}${meta.state === 'report-pending' ? ' (report turn pending)' : ''}`);
+        return;
+      }
+      const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest);
+      if (metrics.violations.length > 0) deviations.push(entry.id);
+      log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: ${metrics.tool_calls} calls${metrics.stopped_at_cap ? ' (stopped at the cap; report turn)' : ''}, ${Math.round(metrics.duration_ms / 1000)} s, $${metrics.cost_usd?.toFixed(3) ?? '?'}${metrics.violations.length > 0 ? `, DEVIATIONS: ${metrics.violations.join('; ')}` : ''}`);
+    }, { signal: ctx.signal, stop });
+    skipped.push(...pending.filter((entry) => !dispatched.has(entry.id)).map((entry) => `${entry.id} (not started)`));
+    const spend = await ledgerSpend(dir);
+    log(ctx, `Spent so far: $${spend.total.toFixed(2)} of the $${cap} cap${spend.estimated.length > 0 ? `; ${spend.estimated.length} attempt(s) estimated from streamed usage` : ''}${spend.unresolved.length > 0 ? `; includes $${spend.reserved_unresolved.toFixed(2)} reserved for ${spend.unresolved.length} attempt(s) of unknown cost (${spend.unresolved.join(', ')})` : ''}.`);
+    if (ctx.signal?.aborted) {
+      await recordAbort(ctx, 'run', aborted);
+    } else if (deviations.length > 0) {
+      await appendLedger(dir, { event: 'stopped', stage: 'run', reason: 'deviation', runs: deviations });
+      log(ctx, `Stopped dispatch at a deviation (${deviations.join(', ')}): the entry cannot be conforming. Running sessions finished; nothing else starts.`);
+      process.exitCode = 4;
+    } else if (skipped.length > 0) {
+      const why = (await stopRequested(dir)) ? 'at the STOP file' : 'at the cost cap';
+      log(ctx, `Stopped ${why}: ${skipped.length} run(s) not finished (${skipped.join(', ')}). Resume with a cap the founder approves${why === 'at the STOP file' ? ', after removing STOP' : ''}.`);
+      process.exitCode = 3;
+    }
+    if (aborted.length > 0 && !ctx.signal?.aborted) log(ctx, `${aborted.length} run(s) have an aborted session and are never retried: ${aborted.join(', ')}.`);
+    return { skipped, aborted, deviations };
   });
-  const spend = await ledgerSpend(dir);
-  log(ctx, `Spent so far: $${spend.total.toFixed(2)} of the $${cap} cap${spend.unresolved.length > 0 ? ` (includes $${spend.reserved_unresolved.toFixed(2)} reserved for ${spend.unresolved.length} attempt(s) of unknown cost)` : ''}.`);
-  if (skipped.length > 0) {
-    log(ctx, `Stopped at the cost cap: ${skipped.length} run(s) not finished (${skipped.join(', ')}). Resume with a cap the founder approves.`);
-    process.exitCode = 3;
-  }
-  return { skipped };
+}
+
+/** A `STOP` file in the evaluation directory stops dispatch; running sessions finish. */
+async function stopRequested(dir) {
+  return exists(path.join(dir, 'STOP'));
 }
 
 /**
@@ -519,12 +629,20 @@ export async function run(ctx) {
  * `ledgerDir`, every session is a ledger attempt whose stream is written to
  * its own file as it arrives.
  */
-export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true } = {}) {
+export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true, signal = null, graceMs = ABORT_GRACE_MS } = {}) {
   let meta = await readMeta(transcriptBase);
   if (meta?.state === 'complete') return meta;
-  // Never pay twice for a session the ledger records as finished.
+  // Never pay twice for a session the ledger records as finished, and never
+  // retry an evaluated session that was aborted (or left behind by a killed
+  // harness): its partial output exists, so a retry could be selective.
   const refuseFinished = async (job) => {
     if (ledgerDir && (await finishedAttempts(ledgerDir, job)).length > 0) throw new Error(`${runId}: ${job} already finished in the ledger; reconcile the run instead of starting it again.`);
+  };
+  const wasAborted = async (job) => Boolean(ledgerDir) && (await abortedAttempts(ledgerDir, job)).length > 0;
+  const abortedMeta = async (extra) => {
+    const out = { ...(meta ?? {}), ...extra, state: 'aborted' };
+    await writeMeta(transcriptBase, out);
+    return out;
   };
   let researchEvents;
   if (meta?.state === 'report-pending') {
@@ -532,12 +650,15 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     if (sha256(researchText) !== meta.research_sha256) throw new Error(`${runId}: the research transcript changed while its report turn was pending.`);
     researchEvents = parseEvents(researchText);
   } else {
+    if (await wasAborted(`run:${runId}`)) return { ...(meta ?? {}), state: 'aborted' };
+    if (signal?.aborted) return { state: 'not-started' };
     if (!(await guard(RUN_RESERVE_USD))) return { state: 'not-started' };
     await refuseFinished(`run:${runId}`);
     const started = Date.now();
-    const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile) =>
-      spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile }),
+    const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile, onSpawn) =>
+      spawnClaudeStream([...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM], prompt, cwd, cap, { streamFile, signal, graceMs, onSpawn }),
     );
+    if (research.aborted) return abortedMeta({ research_attempt: research.attempt, research_wall_ms: Date.now() - started });
     researchEvents = research.events;
     const stopped = research.killed || collectToolUses(research.events).length > cap;
     meta = {
@@ -557,15 +678,18 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     await writeMeta(transcriptBase, meta);
   }
   if (meta.state === 'report-pending') {
+    if (await wasAborted(`report:${runId}`)) return { ...meta, state: 'aborted' };
+    if (signal?.aborted) return meta;
     if (!(await guard(RUN_RESERVE_USD))) return meta;
     await refuseFinished(`report:${runId}`);
     const reportPrompt = renderReportTurn(prompt, researchEvents, cap);
     meta.report_prompt_sha256 = sha256(reportPrompt);
     await writeFile(`${transcriptBase}.report-prompt.txt`, reportPrompt);
     const reportStarted = Date.now();
-    const report = await paidCall(ledgerDir, 'report', `report:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.report.attempt-${attempt}.jsonl`, (streamFile) =>
-      spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM], reportPrompt, cwd, 0, { streamFile }),
+    const report = await paidCall(ledgerDir, 'report', `report:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.report.attempt-${attempt}.jsonl`, (streamFile, onSpawn) =>
+      spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM], reportPrompt, cwd, 0, { streamFile, signal, graceMs, onSpawn }),
     );
+    if (report.aborted) return abortedMeta({ report_attempt: report.attempt, report_wall_ms: Date.now() - reportStarted });
     meta.report_attempt = report.attempt;
     meta.report_sha256 = report.sha256;
     meta.report_wall_ms = Date.now() - reportStarted;
@@ -624,9 +748,10 @@ export async function reconcileRun(dir, entry, cap) {
   if (!stopped && (await finishedAttempts(dir, `report:${entry.id}`)).length > 0) throw new Error(`${entry.id}: a report turn finished for a run that was not stopped.`);
   const report = stopped ? await settle(`report:${entry.id}`, `${base}.report.jsonl`) : null;
   const previous = await readMeta(base);
+  const reportAborted = stopped && !report && (await abortedAttempts(dir, `report:${entry.id}`)).length > 0;
   const meta = {
     ...(previous && typeof previous === 'object' ? previous : {}),
-    state: !stopped || report ? 'complete' : 'report-pending',
+    state: !stopped || report ? 'complete' : reportAborted ? 'aborted' : 'report-pending',
     stopped,
     research_attempt: research.attempt,
     research_sha256: research.sha256,
@@ -795,17 +920,33 @@ export async function auditRun(dir, entry, cap, manifest = null) {
   }
 
   const reads = [];
-  let evaluationExclusions = 0;
+  const errors = collectToolResultErrors(research);
+  // Path confinement covers every call issued, beyond the allowance too.
+  for (const use of calls) violations.push(...(await confinementProblems(use, realRoot)));
   for (const use of counted) {
     const target = use.input?.file_path ?? use.input?.path ?? null;
-    if (target) {
-      const resolved = await safeRealpath(path.isAbsolute(target) ? target : path.join(realRoot, target));
-      if (use.name === 'Read') reads.push(path.relative(realRoot, resolved));
-      if (resolved !== realRoot && !resolved.startsWith(`${realRoot}${path.sep}`)) violations.push(`${use.name} outside the run copy: ${target}`);
-    }
-    if (EVALUATION_NAME.test(JSON.stringify(use.input))) {
-      if (isEvaluationExclusion(use)) evaluationExclusions += 1;
-      else violations.push(`${use.name} names an evaluation file`);
+    if (target && use.name === 'Read') reads.push(path.relative(realRoot, await safeRealpath(path.isAbsolute(target) ? target : path.join(realRoot, target))));
+  }
+  // Naming an evaluation file is an observation, never a deviation by itself.
+  const observations = isolationObservations(counted, results, errors);
+
+  // Provenance: no input the evaluated sessions received may carry label-copy
+  // content that the run copy does not hold.
+  const isolation = await isolationFor(dir, manifest, entry);
+  if (isolation.problem) violations.push(isolation.problem);
+  if (isolation.forbidden) {
+    const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
+    const promptSet = withoutTemplates(isolation.forbidden);
+    const promptHits = prompt === null ? 0 : countFingerprintHits(prompt, promptSet);
+    if (promptHits > 0) violations.push(`forbidden content delivered: ${promptHits} isolation fingerprint(s) in the prompt`);
+    calls.forEach((use, index) => {
+      const hits = results.has(use.id) ? countFingerprintHits(results.get(use.id), isolation.forbidden, { toolOutput: true }) : 0;
+      if (hits > 0) violations.push(`forbidden content delivered: ${hits} isolation fingerprint(s) in the result of call ${index + 1} (${use.name})`);
+    });
+    if (stopped) {
+      const reportPrompt = await readFile(`${base}.report-prompt.txt`, 'utf8').catch(() => null);
+      const hits = reportPrompt === null ? 0 : countFingerprintHits(reportPrompt, promptSet, { toolOutput: true });
+      if (hits > 0) violations.push(`forbidden content delivered: ${hits} isolation fingerprint(s) in the report-turn prompt`);
     }
   }
   violations.push(...sessionProblems(research, { label: 'research', tools: RESEARCH_TOOLS, version, requireResult: !stopped }));
@@ -846,12 +987,59 @@ export async function auditRun(dir, entry, cap, manifest = null) {
     cost_usd: (researchCost ?? 0) + (reportResult?.total_cost_usd ?? 0) || null,
     cost_estimated: !researchResult,
     report,
-    evaluation_exclusions: evaluationExclusions,
+    evaluation_exclusions: observations.exclusions,
+    isolation_observations: observations,
     violations,
   };
 }
 
 const EVALUATION_NAME = /recall-evaluation/i;
+
+/**
+ * Observations, not deviations (later attempt › isolation rule): counted calls
+ * whose input names an evaluation file, split into exclusions (a Grep's
+ * negated glob, amendment 2), unsuccessful searches (the result delivered
+ * nothing: an error, an empty result, or "No files found" and the like), and
+ * other mentions (the result delivered run-copy content). The split of the
+ * last two reads the tool's result text and is for reporting only.
+ */
+export function isolationObservations(uses, results, errors = new Set()) {
+  const counts = { exclusions: 0, unsuccessful_searches: 0, mentions: 0 };
+  for (const use of uses) {
+    if (!EVALUATION_NAME.test(JSON.stringify(use.input ?? {}))) continue;
+    if (isEvaluationExclusion(use)) counts.exclusions += 1;
+    else if (unsuccessfulResult(results.get(use.id), errors.has(use.id))) counts.unsuccessful_searches += 1;
+    else counts.mentions += 1;
+  }
+  return counts;
+}
+
+function unsuccessfulResult(text, isError) {
+  if (isError || text === undefined) return true;
+  const trimmed = String(text).trim();
+  return trimmed === '' || /^(?:no files found|no matches found|found 0\b|file does not exist|<tool_use_error>)/i.test(trimmed);
+}
+
+/**
+ * Path confinement: a call's path must resolve inside the run copy, and a
+ * Glob pattern or Grep glob may name no absolute path, home path, or `..`
+ * segment. Brace lists and negations are read token by token.
+ */
+export async function confinementProblems(use, realRoot) {
+  const problems = [];
+  const target = use.input?.file_path ?? use.input?.path ?? null;
+  if (typeof target === 'string' && target) {
+    const resolved = await safeRealpath(path.isAbsolute(target) ? target : path.join(realRoot, target));
+    if (resolved !== realRoot && !resolved.startsWith(`${realRoot}${path.sep}`)) problems.push(`${use.name} outside the run copy: ${target}`);
+  }
+  const patterns = [use.name === 'Glob' ? use.input?.pattern : null, use.name === 'Grep' ? use.input?.glob : null].filter((value) => typeof value === 'string');
+  for (const pattern of patterns) {
+    for (const token of pattern.split(/[\s,{}]+/).map((value) => value.replace(/^!+/, '')).filter(Boolean)) {
+      if (token.startsWith('/') || token.startsWith('~') || /(^|[\\/])\.\.([\\/]|$)/.test(token)) problems.push(`${use.name} pattern reaches outside the run copy: ${token}`);
+    }
+  }
+  return problems;
+}
 
 /**
  * A7 pre-run amendment 2: a Grep whose only mention of an evaluation file is
@@ -904,6 +1092,16 @@ function collectToolUses(events) {
   return uses;
 }
 
+/** Ids of tool results the stream marks as errors. */
+function collectToolResultErrors(events) {
+  const ids = new Set();
+  for (const event of events) {
+    if (event.type !== 'user') continue;
+    for (const block of event.message?.content ?? []) if (block?.type === 'tool_result' && block.is_error) ids.add(block.tool_use_id);
+  }
+  return ids;
+}
+
 function collectToolResults(events) {
   const results = new Map();
   for (const event of events) {
@@ -922,6 +1120,127 @@ function sumUsage(usages) {
   const present = usages.filter(Boolean);
   if (present.length === 0) return null;
   return Object.fromEntries(keys.map((key) => [key, present.reduce((sum, usage) => sum + (usage[key] ?? 0), 0)]));
+}
+
+// -------------------------------------------------------------- isolation
+
+/**
+ * Text as fingerprints see it: NFKC, lower case, and every run of characters
+ * other than ASCII letters and digits as one space, so markup, punctuation,
+ * and line breaks never matter.
+ */
+export function normalizeText(text) {
+  return String(text ?? '').normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/** A tool result without its per-line framing: Read's line numbers and Grep's `path:line:` prefixes. */
+export function stripToolPrefixes(text) {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\d+(?:\u2192|\t)/, '').replace(/^[^\s:]+\.[A-Za-z0-9]+(?::\d+)?[:-]/, ''))
+    .join('\n');
+}
+
+/**
+ * The fingerprints of a text: hashes of its normalized word 8-grams that
+ * hold at least five words of three or more letters, taken within each line,
+ * never across a line break. Read and Grep deliver whole corpus lines, so any
+ * delivered corpus line carries only fingerprints its corpus file has, which
+ * the index never forbids; an 8-gram joined across two lines of a Grep
+ * result could otherwise match a label line by chance.
+ */
+export function fingerprints(text, { toolOutput = false } = {}) {
+  const { words, min_long_words: minLong, long_word_letters: letters } = FINGERPRINT;
+  const out = new Set();
+  for (const line of String(toolOutput ? stripToolPrefixes(text) : text ?? '').split(/\r?\n/)) {
+    const tokens = normalizeText(line).split(' ').filter(Boolean);
+    if (tokens.length < words) continue;
+    const long = tokens.map((token) => token.length >= letters && /^[a-z]+$/.test(token));
+    let longCount = 0;
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (long[index]) longCount += 1;
+      if (index >= words && long[index - words]) longCount -= 1;
+      if (index >= words - 1 && longCount >= minLong) out.add(sha256(tokens.slice(index - words + 1, index + 1).join(' ')).slice(0, 16));
+    }
+  }
+  return out;
+}
+
+/** How many distinct forbidden fingerprints a delivered text carries. */
+export function countFingerprintHits(text, forbidden, options = {}) {
+  if (!forbidden || forbidden.size === 0) return 0;
+  let hits = 0;
+  for (const print of fingerprints(text, options)) if (forbidden.has(print)) hits += 1;
+  return hits;
+}
+
+/** `forbidden` without the fingerprints of designed deliveries. */
+export function subtractFingerprints(forbidden, texts) {
+  const out = new Set(forbidden);
+  for (const text of texts) for (const print of fingerprints(text)) out.delete(print);
+  return out;
+}
+
+/** The prompt channels also carry the harness's own templates. */
+function withoutTemplates(forbidden) {
+  return subtractFingerprints(forbidden, [PROMPT_TEMPLATE, REPORT_TURN_TEMPLATE]);
+}
+
+/**
+ * The isolation index (later attempt › isolation rule): the fingerprints of
+ * the label copies that occur in no corpus file. Content shared with the
+ * corpus — its disclosed historical tuning contamination, quoted passages,
+ * marker-like text — is never forbidden; label-only content always is,
+ * whatever markers it carries or lacks.
+ */
+export async function buildIsolationIndex(labelTexts, corpusDir) {
+  const label = new Set();
+  for (const text of labelTexts) for (const print of fingerprints(text)) label.add(print);
+  const shared = new Set();
+  for (const file of await listFiles(corpusDir)) {
+    if ((await lstat(path.join(corpusDir, file))).isSymbolicLink()) continue;
+    for (const print of fingerprints(await readFile(path.join(corpusDir, file), 'utf8'))) if (label.has(print)) shared.add(print);
+  }
+  return {
+    method: {
+      ...FINGERPRINT,
+      hash: 'sha256 of the space-joined 8-gram, first 16 hex characters',
+      scope: 'within one line; never across a line break',
+      normalization: 'NFKC, lower case, runs of characters other than a-z and 0-9 as one space; tool results first lose Read line numbers and Grep path:line: prefixes',
+      forbidden: 'label-copy fingerprints minus every corpus file\'s fingerprints; per run also minus its lane files and its own Task and Files line, and in prompt channels minus the harness templates',
+    },
+    label_fingerprints: label.size,
+    shared_with_corpus: shared.size,
+    fingerprints: [...label].filter((print) => !shared.has(print)).sort(),
+  };
+}
+
+/** The run's own task line as the prompt and the brief render it: a designed delivery. */
+function designedTaskText(task) {
+  return `Task: ${task.task} Files: ${renderFiles(task)}`;
+}
+
+/** The forbidden set for one run: the index minus its lane files (run-copy content) and its own task line. */
+async function runForbidden(forbidden, root, task) {
+  const lane = await Promise.all(LANE_FILES.map((file) => readFile(path.join(root, file), 'utf8').catch(() => '')));
+  return subtractFingerprints(forbidden, [...lane, ...(task ? [designedTaskText(task)] : [])]);
+}
+
+const ISOLATION_CACHE = new Map();
+
+/**
+ * The run's forbidden set, from `isolation.json` verified against the
+ * manifest. A manifest without an isolation index (unit use) skips the scan;
+ * a missing or changed index is a deviation.
+ */
+async function isolationFor(dir, manifest, entry) {
+  if (!manifest?.isolation) return { forbidden: null };
+  const text = await readFile(path.join(dir, 'isolation.json'), 'utf8').catch(() => null);
+  if (text === null || sha256(text) !== manifest.isolation.sha256) return { problem: 'the isolation index is missing or changed since prepare' };
+  const key = `${dir}\0${manifest.isolation.sha256}`;
+  if (!ISOLATION_CACHE.has(key)) ISOLATION_CACHE.set(key, new Set(JSON.parse(text).fingerprints));
+  const task = (manifest.tasks ?? []).find((candidate) => candidate.id === entry.task) ?? null;
+  return { forbidden: await runForbidden(ISOLATION_CACHE.get(key), entry.root, task) };
 }
 
 // ----------------------------------------------------------------- ledger
@@ -950,25 +1269,44 @@ export async function attemptsOf(dir, job) {
 }
 
 /**
- * One paid session as a ledger attempt. Without a ledger (unit use) the
- * attempt is 1 and nothing is recorded.
+ * One paid session as a ledger attempt: a `start` record before it is
+ * spawned, a `spawned` record with its process id, and then a `finish`
+ * record, or an `aborted` record when an abort terminated it. Without a
+ * ledger (unit use) the attempt is 1 and nothing is recorded.
  */
 async function paidCall(ledgerDir, kind, job, reserve, fileFor, invoke) {
   const attempt = ledgerDir ? (await attemptsOf(ledgerDir, job)) + 1 : 1;
   const file = fileFor(attempt);
   const call = `${job}#${attempt}`;
   if (ledgerDir) await appendLedger(ledgerDir, { event: 'start', call, kind, job, attempt, reserve_usd: reserve, file });
-  const output = await invoke(file);
+  let spawned = Promise.resolve();
+  const onSpawn = (pid) => {
+    if (ledgerDir) spawned = appendLedger(ledgerDir, { event: 'spawned', call, pid });
+  };
+  const output = await invoke(file, onSpawn);
+  await spawned;
   const events = parseEvents(output.stdout);
   const result = [...events].reverse().find((event) => event.type === 'result');
   const reported = typeof result?.total_cost_usd === 'number' ? result.total_cost_usd : null;
   const estimated = reported === null ? estimateCost(streamUsage(events)) : null;
   const cost = reported ?? (estimated && estimated > 0 ? estimated : null);
+  const costSource = reported !== null ? 'reported' : cost !== null ? 'estimated' : 'unknown';
   const hash = sha256(output.stdout);
   if (ledgerDir) {
-    await appendLedger(ledgerDir, { event: 'finish', call, cost_usd: cost, cost_source: reported !== null ? 'reported' : cost !== null ? 'estimated' : 'unknown', stream_sha256: hash });
+    if (output.aborted) {
+      await appendLedger(ledgerDir, { event: 'aborted', call, cost_usd: cost, cost_source: costSource, stream_sha256: hash, reason: output.abortReason, exit: { code: output.code, signal: output.signal } });
+    } else {
+      await appendLedger(ledgerDir, { event: 'finish', call, cost_usd: cost, cost_source: costSource, stream_sha256: hash });
+    }
   }
   return { ...output, events, attempt, call, file, sha256: hash, killed: output.stopped, cost };
+}
+
+/** Aborted ledger attempts for a job: terminated by an abort, or left behind by a killed harness and recorded at the next start. */
+async function abortedAttempts(dir, job) {
+  const ledger = await readLedger(dir);
+  const calls = new Set(ledger.filter((record) => record.event === 'start' && record.job === job).map((record) => record.call));
+  return ledger.filter((record) => record.event === 'aborted' && calls.has(record.call));
 }
 
 /**
@@ -979,11 +1317,14 @@ async function paidCall(ledgerDir, kind, job, reserve, fileFor, invoke) {
  */
 export async function ledgerSpend(dir) {
   const entries = await readLedger(dir);
-  const finishes = new Map(entries.filter((record) => record.event === 'finish').map((record) => [record.call, record]));
-  const spend = { total: 0, by_kind: { research: 0, report: 0, grader: 0 }, attempts: 0, estimated: [], unresolved: [], reserved_unresolved: 0 };
+  // An aborted attempt is closed by its `aborted` record, costed the same way.
+  const finishes = new Map(entries.filter((record) => record.event === 'finish' || record.event === 'aborted').map((record) => [record.call, record]));
+  const spend = { total: 0, by_kind: { research: 0, report: 0, grader: 0 }, attempts: 0, estimated: [], unresolved: [], reserved_unresolved: 0, aborted: [], open: [] };
   for (const start of entries.filter((record) => record.event === 'start')) {
     spend.attempts += 1;
     const finish = finishes.get(start.call);
+    if (finish?.event === 'aborted') spend.aborted.push(start.call);
+    if (!finish) spend.open.push(start.call);
     let cost = typeof finish?.cost_usd === 'number' ? finish.cost_usd : null;
     if (finish?.cost_source === 'estimated') spend.estimated.push(start.call);
     if (cost === null) {
@@ -1013,7 +1354,7 @@ export async function ledgerSpend(dir) {
  */
 async function smoke(ctx, opts) {
   const { dir } = ctx;
-  const task = parseTasks(await readFile(path.join(opts.labelsDir, 'recall-evaluation.md'), 'utf8'), 'tuning').find((entry) => entry.id === opts.task);
+  const task = parseTasks(mergedTuningSection(await readFile(path.resolve(opts.tuningLabels), 'utf8')), 'tuning', 5).find((entry) => entry.id === opts.task);
   if (!task) throw new Error(`smoke: no tuning task ${opts.task}.`);
   await mkdir(path.join(dir, 'transcripts'), { recursive: true });
   await mkdir(path.join(dir, 'prompts'), { recursive: true });
@@ -1023,9 +1364,17 @@ async function smoke(ctx, opts) {
     .replaceAll(`when you make call ${TOOL_CALL_CAP + 1}`, `when you make call ${opts.statedCap + 1}`)
     .replaceAll(`from your first ${TOOL_CALL_CAP} calls`, `from your first ${opts.statedCap} calls`);
   await writeFile(path.join(dir, 'prompts', 'smoke.txt'), prompt);
-  const outcome = await runAgent(prompt, root, path.join(dir, 'transcripts', 'smoke'), opts.cap, { ledgerDir: dir, runId: 'smoke' });
-  const metrics = await auditRun(dir, { id: 'smoke', root }, opts.cap);
-  log(ctx, JSON.stringify({ ...outcome, ...metrics, report: `${metrics.report.slice(0, 400)}…` }, null, 2));
+  await withHarnessLock(ctx, async () => {
+    await reapOrphans(ctx);
+    const outcome = await runAgent(prompt, root, path.join(dir, 'transcripts', 'smoke'), opts.cap, { ledgerDir: dir, runId: 'smoke', signal: ctx.signal, graceMs: ctx.graceMs });
+    if (outcome.state !== 'complete') {
+      if (ctx.signal?.aborted) await recordAbort(ctx, 'smoke', ['smoke']);
+      log(ctx, `smoke: ${outcome.state}`);
+      return;
+    }
+    const metrics = await auditRun(dir, { id: 'smoke', root }, opts.cap);
+    log(ctx, JSON.stringify({ ...outcome, ...metrics, report: `${metrics.report.slice(0, 400)}…` }, null, 2));
+  });
 }
 
 // ------------------------------------------------------------------ grade
@@ -1039,6 +1388,16 @@ export async function grade(ctx) {
   const gradingDir = path.join(dir, 'grading');
   await mkdir(path.join(gradingDir, 'empty-cwd'), { recursive: true });
   const tasks = manifest.tasks.filter((candidate) => !ctx.only || ctx.only.has(candidate.id));
+  return withHarnessLock(ctx, async () => {
+    await reapOrphans(ctx);
+    const outcome = await gradeTasks(ctx, manifest, labels, tasks, cap);
+    if (ctx.signal?.aborted) await recordAbort(ctx, 'grade', []);
+    return outcome;
+  });
+}
+
+async function gradeTasks(ctx, manifest, labels, tasks, cap) {
+  const { dir } = ctx;
 
   // Pass 1: two independent graders per report pair and per brief.
   const jobs = [];
@@ -1056,7 +1415,7 @@ export async function grade(ctx) {
 
   // Pass 2: a third grader wherever the first two disagree on any verdict.
   const tiebreaks = [];
-  if (first.skipped.length === 0) {
+  if (first.skipped.length === 0 && !ctx.signal?.aborted) {
     for (const task of tasks) {
       const label = labels.get(task.id);
       for (const replicate of replicatesOf(manifest, task.id)) {
@@ -1123,8 +1482,14 @@ async function runGraders(ctx, jobs, manifest, cap) {
   const gradingDir = path.join(dir, 'grading');
   const workDir = path.join(gradingDir, 'empty-cwd');
   const skipped = [];
+  const dispatched = new Set();
   await pool(jobs, ctx.concurrency ?? 4, async (job) => {
+    dispatched.add(job.name);
     const target = path.join(gradingDir, `${job.name}.json`);
+    if (ctx.signal?.aborted) {
+      skipped.push(job.name);
+      return;
+    }
     if (await exists(target)) {
       const problems = await gradeProblems(dir, JSON.parse(await readFile(target, 'utf8')), job, manifest);
       if (problems.length > 0) throw new Error(`${job.name}: the saved grade does not match its inputs or its session (${problems.join('; ')}); refusing to reuse it.`);
@@ -1137,9 +1502,18 @@ async function runGraders(ctx, jobs, manifest, cap) {
         skipped.push(job.name);
         return;
       }
-      const call = await paidCall(dir, 'grader', `grade:${job.name}`, GRADE_RESERVE_USD, (attempt) => path.join(gradingDir, `${job.name}.attempt-${attempt}.stdout.jsonl`), (streamFile) =>
-        spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', JSON.stringify(job.schema)], job.prompt, workDir, Infinity, { streamFile }),
+      if (ctx.signal?.aborted) {
+        skipped.push(job.name);
+        return;
+      }
+      const call = await paidCall(dir, 'grader', `grade:${job.name}`, GRADE_RESERVE_USD, (attempt) => path.join(gradingDir, `${job.name}.attempt-${attempt}.stdout.jsonl`), (streamFile, onSpawn) =>
+        spawnClaudeStream([...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', JSON.stringify(job.schema)], job.prompt, workDir, Infinity, { streamFile, signal: ctx.signal, graceMs: ctx.graceMs, onSpawn }),
       );
+      // An aborted grader attempt counts toward the attempt limit; a later invocation may try again within it.
+      if (call.aborted) {
+        skipped.push(job.name);
+        return;
+      }
       const result = [...call.events].reverse().find((event) => event.type === 'result');
       const graded = result?.structured_output ?? null;
       const record = gradeRecord(job, call, graded);
@@ -1154,9 +1528,10 @@ async function runGraders(ctx, jobs, manifest, cap) {
       }
       await writeFile(path.join(gradingDir, `${job.name}.attempt-${call.attempt}.invalid.json`), `${JSON.stringify({ ...record, problems }, null, 2)}\n`, { flag: 'wx' });
     }
-  });
-  if (skipped.length > 0) {
-    log(ctx, `Stopped at the cost cap: ${skipped.length} grading job(s) not started. Resume with a cap the founder approves.`);
+  }, { signal: ctx.signal, stop: () => stopRequested(dir) });
+  skipped.push(...jobs.filter((job) => !dispatched.has(job.name)).map((job) => job.name));
+  if (skipped.length > 0 && !ctx.signal?.aborted) {
+    log(ctx, `Stopped at the cost cap or the STOP file: ${skipped.length} grading job(s) not started. Resume with a cap the founder approves.`);
     process.exitCode = 3;
   }
   return { skipped };
@@ -1495,6 +1870,7 @@ export async function confirm(ctx) {
   const relations = (await loadProjectReadModel(manifest.corpus)).decision_lineage.relations;
   const corpusHashes = await hashTree(manifest.corpus);
   if (treeDigest(corpusHashes) !== manifest.corpus_sha256) throw new Error('the corpus changed since prepare.');
+  const forbidden = new Set(JSON.parse(await readFile(path.join(dir, 'isolation.json'), 'utf8')).fingerprints);
   const failures = [];
   const added = [];
   for (const { id } of screened.flagged) {
@@ -1504,7 +1880,7 @@ export async function confirm(ctx) {
       for (const entry of armPair(manifest.runs, task, taskIndex, replicate, 2)) {
         manifest.runs.push(entry);
         added.push(entry);
-        failures.push(...(await prepareRun(dir, entry, manifest.tasks, manifest.corpus, corpusHashes, relations, manifest.briefs)));
+        failures.push(...(await prepareRun(dir, entry, manifest.tasks, manifest.corpus, corpusHashes, relations, manifest.briefs, forbidden)));
       }
     }
   }
@@ -1721,9 +2097,22 @@ export function summarize(rows, manifest, agreement, spend, stage1) {
     brief_no_match_status: Object.fromEntries(noMatchRows.map((row) => [row.id, row.brief.status])),
     grader_agreement: Object.fromEntries(Object.entries(agreement).map(([key, pairs]) => [key, agreementStats(pairs)])),
     stopped_at_cap: Object.fromEntries(['baseline', 'brief'].map((arm) => [arm, rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => entry.metrics.stopped_at_cap).length, 0)])),
-    // Amendment 2: Grep calls that excluded the evaluation files (not deviations), and the runs that made them.
-    evaluation_exclusions: Object.fromEntries(['baseline', 'brief'].map((arm) => [arm, { calls: rows.reduce((sum, row) => sum + row.runs[arm].reduce((runs, entry) => runs + (entry.metrics.evaluation_exclusions ?? 0), 0), 0), runs: rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => (entry.metrics.evaluation_exclusions ?? 0) > 0).length, 0) }])),
-    cost_usd: { total: spend.total, by_kind: spend.by_kind, attempts: spend.attempts, estimated: spend.estimated.length, unresolved: spend.unresolved, reserved_unresolved: spend.reserved_unresolved },
+    // Later attempt › isolation rule: calls naming an evaluation file (observations, not deviations), and the runs that made them.
+    isolation_observations: Object.fromEntries(
+      ['baseline', 'brief'].map((arm) => [
+        arm,
+        Object.fromEntries(
+          ['exclusions', 'unsuccessful_searches', 'mentions'].map((kind) => [
+            kind,
+            {
+              calls: rows.reduce((sum, row) => sum + row.runs[arm].reduce((runs, entry) => runs + (entry.metrics.isolation_observations?.[kind] ?? 0), 0), 0),
+              runs: rows.reduce((sum, row) => sum + row.runs[arm].filter((entry) => (entry.metrics.isolation_observations?.[kind] ?? 0) > 0).length, 0),
+            },
+          ]),
+        ),
+      ]),
+    ),
+    cost_usd: { total: spend.total, by_kind: spend.by_kind, attempts: spend.attempts, estimated: spend.estimated.length, unresolved: spend.unresolved, reserved_unresolved: spend.reserved_unresolved, aborted: spend.aborted, open: spend.open },
     gates,
     go: Object.values(gates).filter((gate) => gate && typeof gate === 'object' && 'pass' in gate).every((gate) => gate.pass),
   };
@@ -1792,6 +2181,7 @@ async function assertFrozenIdentity(ctx, manifest) {
   for (const [id, brief] of Object.entries(manifest.briefs)) {
     if (sha256(await readFile(path.join(dir, 'briefs', `${id}.md`), 'utf8').catch(() => '')) !== brief.graded_file_sha256) problems.push(`briefs/${id}.md changed since prepare`);
   }
+  if (manifest.isolation && sha256(await readFile(path.join(dir, 'isolation.json'), 'utf8').catch(() => '')) !== manifest.isolation.sha256) problems.push('isolation.json changed since prepare');
   for (const entry of manifest.runs) {
     if (sha256(await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => '')) !== entry.prompt_sha256) problems.push(`prompts/${entry.id}.txt changed since prepare`);
   }
@@ -1822,31 +2212,39 @@ function requireCap(ctx) {
 // ----------------------------------------------------------------- labels
 
 /**
- * Grading labels: the 12 tuning blocks with the reviewer-confirmed corpus v2
- * revisions merged (recall-evaluation.md › A7 protocol › Merged v2 tuning
- * labels), then the 8 held-out blocks.
+ * Grading labels: the 12 tuning blocks as re-verified for corpus v3
+ * (recall-evaluation.md › A7 later attempt › Merged v3 tuning labels, every
+ * tuning block in full), then the held-out blocks.
  */
 async function loadLabels(dir, manifest) {
-  const tuningText = await readFile(path.join(dir, 'labels', 'recall-evaluation.md'), 'utf8');
-  const heldoutText = await readFile(path.join(dir, 'labels', 'recall-evaluation-heldout-v2.md'), 'utf8');
-  if (sha256(heldoutText) !== manifest.heldout_sha256) throw new Error('recall-evaluation-heldout-v2.md changed since prepare.');
+  const tuningText = await readFile(path.join(dir, 'labels', TUNING_LABEL_FILE), 'utf8');
+  const heldoutText = await readFile(path.join(dir, 'labels', HELDOUT_LABEL_FILE), 'utf8');
+  if (sha256(heldoutText) !== manifest.heldout_sha256) throw new Error(`${HELDOUT_LABEL_FILE} changed since prepare.`);
   return mergeLabels(tuningText, heldoutText);
 }
 
+/** The merged v3 tuning section: from its heading to the next heading of level 2–4. */
+export function mergedTuningSection(tuningText) {
+  const start = tuningText.indexOf(`${MERGED_TUNING_HEADING}`);
+  if (start === -1) throw new Error(`${TUNING_LABEL_FILE} has no "${MERGED_TUNING_HEADING.replace(/^#+ /, '')}" section.`);
+  const rest = tuningText.slice(start + MERGED_TUNING_HEADING.length);
+  const end = rest.search(/\n#{2,4} /);
+  return `${MERGED_TUNING_HEADING}${end === -1 ? rest : rest.slice(0, end)}`;
+}
+
 export function mergeLabels(tuningText, heldoutText) {
-  const tuningSection = tuningText.slice(tuningText.indexOf('### Tuning tasks'), tuningText.indexOf('### Corpus v2 tuning-label re-verification'));
-  const mergedStart = tuningText.indexOf('#### Merged v2 tuning labels');
-  if (mergedStart === -1) throw new Error('recall-evaluation.md has no merged v2 tuning labels.');
-  const ends = ['\n## ', '\n### ', '\n#### '].map((marker) => tuningText.indexOf(marker, mergedStart + 1)).filter((index) => index !== -1);
-  const mergedSection = tuningText.slice(mergedStart, ends.length > 0 ? Math.min(...ends) : undefined);
-  const labels = new Map(parseLabels(tuningSection).map((label) => [label.id, label]));
-  for (const merged of parseLabels(mergedSection, 5)) labels.set(merged.id, merged);
-  for (const label of parseLabels(heldoutText)) labels.set(label.id, label);
+  const labels = new Map(parseLabels(mergedTuningSection(tuningText), 5).map((label) => [label.id, label]));
+  for (const label of parseLabels(heldoutText)) {
+    if (labels.has(label.id)) throw new Error(`label ${label.id} is both a tuning and a held-out task.`);
+    labels.set(label.id, label);
+  }
   return labels;
 }
 
-export function parseTasks(markdown, split) {
-  return [...markdown.matchAll(/^#### ([FTCN]\d+) — [^\n]*· ([a-z-]+)\s*\n([\s\S]*?)(?=^#{2,4} |(?![\s\S]))/gm)]
+export function parseTasks(markdown, split, level = 4) {
+  const hashes = '#'.repeat(level);
+  const pattern = new RegExp(`^${hashes} ([FTCN]\\d+) — [^\\n]*?· (tuning|held-out)\\b[^\\n]*\\n([\\s\\S]*?)(?=^#{2,${level}} |(?![\\s\\S]))`, 'gm');
+  return [...markdown.matchAll(pattern)]
     .filter((match) => (split === 'tuning' ? match[2] === 'tuning' : match[2] === 'held-out'))
     .map((match) => {
       const body = match[3];
@@ -1892,16 +2290,37 @@ export function parseLabels(markdown, level = 4) {
  * given). With a finite `cap`, kills the process as soon as the stream shows
  * tool call cap + 1 (distinct tool_use ids). The kill only bounds wasted
  * work: what reaches the report is decided by the boundary-truncated replay.
+ *
+ * The child runs in its own process group, so a kill reaches everything it
+ * started. When `signal` aborts, the group gets SIGTERM, then SIGKILL after
+ * `graceMs`; the promise still waits for the child to close, so its stream
+ * is complete as far as it got, and resolves with `aborted: true`.
  */
-export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = null } = {}) {
+export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = null, signal = null, graceMs = ABORT_GRACE_MS, onSpawn = null } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, claudeArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(CLAUDE_BIN, claudeArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     const sink = streamFile ? createWriteStream(streamFile, { flags: 'wx' }) : null;
     let stdout = '';
     let stderr = '';
     let buffer = '';
     let stopped = false;
+    let aborted = false;
+    let abortReason = null;
+    let escalation = null;
     const seen = new Set();
+    if (child.pid) {
+      LIVE_CHILDREN.set(child.pid, child);
+      onSpawn?.(child.pid);
+    }
+    const onAbort = () => {
+      if (aborted || child.exitCode !== null || child.signalCode !== null) return;
+      aborted = true;
+      abortReason = String(signal.reason ?? 'aborted');
+      killGroup(child.pid, 'SIGTERM');
+      escalation = setTimeout(() => killGroup(child.pid, 'SIGKILL'), graceMs);
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
       sink?.write(chunk);
@@ -1921,7 +2340,7 @@ export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = n
         for (const block of event.message?.content ?? []) if (block.type === 'tool_use') seen.add(block.id);
         if (seen.size > cap) {
           stopped = true;
-          child.kill('SIGKILL');
+          killGroup(child.pid, 'SIGKILL');
           return;
         }
       }
@@ -1929,9 +2348,18 @@ export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = n
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      const done = () => resolve({ code, stdout, stderr, stopped });
+    child.on('error', (error) => {
+      LIVE_CHILDREN.delete(child.pid);
+      signal?.removeEventListener('abort', onAbort);
+      reject(error);
+    });
+    child.on('close', (code, exitSignal) => {
+      clearTimeout(escalation);
+      LIVE_CHILDREN.delete(child.pid);
+      signal?.removeEventListener('abort', onAbort);
+      // The group may still hold processes the child started; none may outlive it.
+      if (aborted || stopped) killGroup(child.pid, 'SIGKILL');
+      const done = () => resolve({ code, signal: exitSignal, stdout, stderr, stopped, aborted, abortReason, pid: child.pid });
       if (sink) sink.end(done);
       else done();
     });
@@ -1940,16 +2368,136 @@ export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = n
   });
 }
 
+// Live child sessions by pid, so a second signal can kill them all at once.
+const LIVE_CHILDREN = new Map();
+
+/** Kills a child's whole process group (it leads one); falls back to the process alone. */
+function killGroup(pid, signalName) {
+  if (!pid) return;
+  try {
+    process.kill(-pid, signalName);
+  } catch {
+    try {
+      process.kill(pid, signalName);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/** A second abort signal: SIGKILL every live child group without waiting for the grace period. */
+export function killAllLiveChildren() {
+  for (const pid of LIVE_CHILDREN.keys()) killGroup(pid, 'SIGKILL');
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+/** Whether a live pid is a session this harness would have started (guards against pid reuse). */
+function isHarnessChild(pid) {
+  const command = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+  return command.length > 0 && command.includes(path.basename(CLAUDE_BIN));
+}
+
+async function waitUntilGone(pid, ms) {
+  const deadline = Date.now() + ms;
+  while (processAlive(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  return !processAlive(pid);
+}
+
+/**
+ * Before any dispatch: every ledger attempt that started but never finished
+ * or aborted belongs to a harness that was killed. A session still running
+ * from it is terminated (its group, SIGTERM then SIGKILL) and awaited; each
+ * such attempt is then recorded as aborted, costed from its stream when it
+ * has usage, else held at its reserve as unresolved. It is never retried.
+ */
+export async function reapOrphans(ctx) {
+  const { dir } = ctx;
+  const graceMs = ctx.graceMs ?? ABORT_GRACE_MS;
+  const ledger = await readLedger(dir);
+  const closed = new Set(ledger.filter((record) => record.event === 'finish' || record.event === 'aborted').map((record) => record.call));
+  const pids = new Map(ledger.filter((record) => record.event === 'spawned').map((record) => [record.call, record.pid]));
+  const reaped = [];
+  for (const start of ledger.filter((record) => record.event === 'start' && !closed.has(record.call))) {
+    const pid = pids.get(start.call) ?? null;
+    let reason = pid ? 'left by a killed harness; not running' : 'left by a killed harness before it spawned';
+    if (pid && processAlive(pid) && isHarnessChild(pid)) {
+      killGroup(pid, 'SIGTERM');
+      if (!(await waitUntilGone(pid, graceMs))) {
+        killGroup(pid, 'SIGKILL');
+        if (!(await waitUntilGone(pid, 5000))) throw new Error(`${start.call}: its session (pid ${pid}) survived SIGKILL; nothing is dispatched until it is gone.`);
+      }
+      killGroup(pid, 'SIGKILL');
+      reason = 'left running by a killed harness; terminated';
+    }
+    const streamed = start.file ? await readFile(start.file, 'utf8').catch(() => '') : '';
+    const estimate = estimateCost(streamUsage(parseEvents(streamed)));
+    const cost = estimate && estimate > 0 ? estimate : null;
+    await appendLedger(dir, { event: 'aborted', call: start.call, recovered: true, reason, pid, cost_usd: cost, cost_source: cost === null ? 'unknown' : 'estimated', stream_sha256: sha256(streamed) });
+    reaped.push(`${start.call} (${reason}; ${cost === null ? `unresolved, $${start.reserve_usd.toFixed(2)} reserved` : `estimated $${cost.toFixed(3)}`})`);
+  }
+  if (reaped.length > 0) log(ctx, `Recorded ${reaped.length} attempt(s) a killed harness left open, never retried:\n- ${reaped.join('\n- ')}`);
+  return reaped;
+}
+
+/**
+ * One harness invocation per evaluation directory at a time, so reaping can
+ * never mistake another live invocation's sessions for orphans.
+ */
+async function withHarnessLock(ctx, work) {
+  const lock = path.join(ctx.dir, 'harness.lock');
+  const record = `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`;
+  try {
+    await writeFile(lock, record, { flag: 'wx' });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const holder = await readFile(lock, 'utf8').then(JSON.parse, () => null);
+    if (holder?.pid && holder.pid !== process.pid && processAlive(holder.pid)) throw new Error(`another harness invocation (pid ${holder.pid}) holds ${lock}; wait for it, or stop it, first.`);
+    log(ctx, `Taking over a stale harness lock${holder?.pid ? ` from pid ${holder.pid}` : ''}.`);
+    await writeFile(lock, record);
+  }
+  ctx.startedAt = Date.now();
+  try {
+    return await work();
+  } finally {
+    await rm(lock, { force: true });
+  }
+}
+
+/** After an abort: one ledger record and a summary that keeps estimated and unresolved costs explicit. */
+async function recordAbort(ctx, stage, abortedJobs) {
+  const { dir } = ctx;
+  const ledger = await readLedger(dir);
+  const startedAt = ctx.startedAt ?? 0;
+  const mine = ledger.filter((record) => record.event === 'aborted' && !record.recovered && Date.parse(record.at) >= startedAt);
+  const estimated = mine.filter((record) => record.cost_source === 'estimated').map((record) => record.call);
+  const unresolved = mine.filter((record) => record.cost_source === 'unknown').map((record) => record.call);
+  const spend = await ledgerSpend(dir);
+  await appendLedger(dir, { event: 'abort', stage, reason: String(ctx.signal?.reason ?? 'aborted'), terminated: mine.map((record) => record.call), estimated, unresolved, open_attempts: spend.open, ledger_total_usd: spend.total });
+  log(ctx, `Aborted (${ctx.signal?.reason ?? 'signal'}): dispatch stopped; ${mine.length} running session(s) terminated and awaited${abortedJobs.length > 0 ? ` (${abortedJobs.join(', ')})` : ''}. Costs: ${estimated.length} estimated from streamed usage${unresolved.length > 0 ? `, ${unresolved.length} unresolved and held at their reserve (${unresolved.join(', ')})` : ''}; ledger total $${spend.total.toFixed(2)}. Aborted evaluated sessions are never retried.`);
+  if (spend.open.length > 0) log(ctx, `Still open in the ledger (no finish or abort record): ${spend.open.join(', ')}.`);
+  process.exitCode = 130;
+}
+
 function replicatesOf(manifest, taskId) {
   return [...new Set(manifest.runs.filter((entry) => entry.task === taskId).map((entry) => entry.replicate))].sort((left, right) => left - right);
 }
 
-async function pool(items, size, worker) {
+/** Runs `worker` over `items`, `size` at a time; no new item starts once `signal` aborts or `stop()` says so. */
+async function pool(items, size, worker, { signal = null, stop = async () => false } = {}) {
   const queue = [...items];
   const failures = [];
   await Promise.all(
     Array.from({ length: Math.min(size, queue.length) }, async () => {
-      while (queue.length > 0) {
+      while (queue.length > 0 && !signal?.aborted && !(await stop())) {
+        if (signal?.aborted || queue.length === 0) break;
         const item = queue.shift();
         try {
           await worker(item);
@@ -2063,6 +2611,11 @@ function describe() {
         regression: REGRESSION,
         reserves_usd: { run: RUN_RESERVE_USD, grader: GRADE_RESERVE_USD },
         max_grade_attempts: MAX_GRADE_ATTEMPTS,
+        corpus_tag: CORPUS_TAG,
+        startup_root_files: STARTUP_ROOT_FILES,
+        label_files: LABEL_FILES,
+        isolation_fingerprint: FINGERPRINT,
+        abort_grace_ms: ABORT_GRACE_MS,
         agent_args: [...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM],
         report_turn_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM],
         grader_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', '<schema>'],
@@ -2073,9 +2626,14 @@ function describe() {
   );
 }
 
-// Dispatch only when run as a script, so tests can import the functions above.
-if (process.argv[1] && path.resolve(process.argv[1]) === harnessPath) {
-  const [command, ...args] = process.argv.slice(2);
+/**
+ * The command line. `overrides` is for offline tests only: a package
+ * identity, a shorter abort grace, quiet logs. SIGINT, SIGTERM, and SIGHUP
+ * abort `run`, `grade`, and `smoke` (a second signal kills every live
+ * session at once); the process exits only after every child is awaited.
+ */
+export async function main(argv, overrides = {}) {
+  const [command, ...args] = argv;
   const option = (name, fallback = null) => {
     const index = args.indexOf(name);
     return index === -1 ? fallback : args[index + 1];
@@ -2085,27 +2643,51 @@ if (process.argv[1] && path.resolve(process.argv[1]) === harnessPath) {
     if (!value) throw new Error(`${command} requires ${name}.`);
     return value;
   };
+  const controller = new AbortController();
   const ctx = {
     dir: option('--out') ? path.resolve(option('--out')) : null,
     cap: option('--max-cost-usd') === null ? null : Number(option('--max-cost-usd')),
     concurrency: Number(option('--concurrency', '4')),
     only: option('--only') ? new Set(option('--only').split(',')) : null,
+    signal: controller.signal,
+    ...overrides,
   };
   const commands = {
-    prepare: () => prepare(ctx, { corpus: required('--corpus'), docsRepo: required('--docs-repo'), labelsDir: required('--labels'), heldoutSha: required('--heldout-sha256'), warmRuns: Number(option('--warm-runs', '10')) }),
+    prepare: () => prepare(ctx, { corpus: required('--corpus'), docsRepo: required('--docs-repo'), tuningLabels: required('--tuning-labels'), heldout: required('--heldout'), heldoutSha: required('--heldout-sha256'), warmRuns: Number(option('--warm-runs', '10')) }),
     run: () => run(ctx),
     grade: () => grade(ctx),
     screen: () => screen(ctx),
     confirm: () => confirm(ctx),
     score: () => score(ctx),
-    smoke: () => smoke(ctx, { corpus: required('--corpus'), labelsDir: required('--labels'), task: required('--task'), cap: Number(option('--cap', '3')), statedCap: Number(option('--stated-cap', option('--cap', '3'))) }),
+    smoke: () => smoke(ctx, { corpus: required('--corpus'), tuningLabels: required('--tuning-labels'), task: required('--task'), cap: Number(option('--cap', '3')), statedCap: Number(option('--stated-cap', option('--cap', '3'))) }),
   };
-  if (command === 'describe') {
-    describe();
-  } else if (!commands[command] || !ctx.dir) {
+  if (command === 'describe') return describe();
+  if (!commands[command] || !ctx.dir) {
     console.error('Usage: node scripts/evaluate-brief-a7.js <prepare|run|grade|screen|confirm|score|smoke|describe> --out <dir> [...]');
-    process.exit(2);
-  } else {
-    await commands[command]();
+    process.exitCode = 2;
+    return undefined;
   }
+  const paid = ['run', 'grade', 'smoke'].includes(command);
+  let received = 0;
+  const onSignal = (name) => {
+    received += 1;
+    if (received === 1) {
+      log(ctx, `${name}: aborting — no new session starts; running sessions get SIGTERM, then SIGKILL after ${ctx.graceMs ?? ABORT_GRACE_MS} ms. Send it again to kill them now.`);
+      controller.abort(name);
+    } else {
+      killAllLiveChildren();
+    }
+  };
+  const signals = paid ? ['SIGINT', 'SIGTERM', 'SIGHUP'] : [];
+  for (const name of signals) process.on(name, onSignal);
+  try {
+    return await commands[command]();
+  } finally {
+    for (const name of signals) process.off(name, onSignal);
+  }
+}
+
+// Dispatch only when run as a script, so tests can import the functions above.
+if (process.argv[1] && path.resolve(process.argv[1]) === harnessPath) {
+  await main(process.argv.slice(2));
 }

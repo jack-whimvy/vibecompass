@@ -1,15 +1,18 @@
 // Offline checks for the A7 evaluation harness (scripts/evaluate-brief-a7.js):
 // no model calls. A mock `claude` child stands in for the CLI — research
 // sessions, report turns, and graders — and the whole pipeline runs against a
-// tiny tagged corpus.
+// tiny tagged corpus. The later attempt adds the isolation fixtures (leaked
+// content without markers, harmless marker-like corpus text) and the
+// interruption tests, which signal a real harness process with live mock
+// children.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.resolve(here, '..', '..');
@@ -17,9 +20,15 @@ const FIXTURE_ROOT = path.join(here, 'fixtures', 'brief', 'root');
 
 // The mock CLI. Modes come from its arguments; failure switches from env:
 // MOCK_SCENARIO=excess (research stream with an excess call), MOCK_CALLS=N,
+// MOCK_TOOL_INPUTS / MOCK_TOOL_RESULTS / MOCK_TOOL_ERRORS (JSON, per call),
 // MOCK_REPORT_TURN=bad, MOCK_GRADER=invalid|error|wrongmodel.
+// MOCK_SCENARIO=slow: a research session that streams its first message and
+// then waits, with a grandchild process in its group, recording both pids in
+// MOCK_PID_DIR; MOCK_IGNORE_TERM=1 ignores SIGTERM; MOCK_NO_USAGE=1 streams no
+// usage. MOCK_DELAY_MS delays a normal session's output.
 const MOCK = `#!/usr/bin/env node
 const args = process.argv.slice(2);
+if (process.env.MOCK_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
 if (args[0] === '--version') { console.log('2.1.288 (Claude Code)'); process.exit(0); }
 const toolsIndex = args.indexOf('--tools');
 const noTools = toolsIndex !== -1 && args[toolsIndex + 1] === '';
@@ -48,6 +57,15 @@ process.stdin.on('end', () => {
     out([init([], bad ? { model: 'claude-haiku-4-5', claude_code_version: '0.0.0', permissionMode: 'default', mcp_servers: [{ name: 'x' }] } : {}), { type: 'result', subtype: 'success', is_error: false, result: 'REPORT from the transcript', total_cost_usd: 0.1, modelUsage: usage }]);
     return;
   }
+  if (env.MOCK_SCENARIO === 'slow') {
+    const usage = env.MOCK_NO_USAGE === '1' ? undefined : { input_tokens: 10, cache_creation_input_tokens: 2000, cache_read_input_tokens: 5000, output_tokens: 300 };
+    out([init(['Glob', 'Grep', 'Read']), { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'project.yaml' } }], ...(usage ? { usage } : {}) } }]);
+    const { spawn } = require('node:child_process');
+    const sleeper = spawn('sleep', ['60'], { stdio: 'ignore' });
+    require('node:fs').writeFileSync(require('node:path').join(env.MOCK_PID_DIR, process.pid + '.json'), JSON.stringify({ pid: process.pid, grandchild: sleeper.pid }));
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (env.MOCK_SCENARIO === 'excess') {
     out([
       init(['Glob', 'Grep', 'Read']),
@@ -64,15 +82,20 @@ process.stdin.on('end', () => {
   const calls = Number(env.MOCK_CALLS ?? 1);
   const events = [init(['Glob', 'Grep', 'Read'])];
   const custom = env.MOCK_TOOL_INPUTS ? JSON.parse(env.MOCK_TOOL_INPUTS) : [];
+  const results = env.MOCK_TOOL_RESULTS ? JSON.parse(env.MOCK_TOOL_RESULTS) : [];
+  const errors = env.MOCK_TOOL_ERRORS ? JSON.parse(env.MOCK_TOOL_ERRORS) : [];
   for (let index = 1; index <= calls; index += 1) {
-    const use = custom[index - 1] ?? { name: 'Read', input: { file_path: 'CLAUDE.md' } };
+    const use = custom[index - 1] ?? { name: 'Read', input: { file_path: 'project.yaml' } };
     events.push({ type: 'assistant', message: { id: 'm' + index, content: [{ type: 'tool_use', id: 'c' + index, name: use.name, input: use.input }], usage: { input_tokens: 1, cache_creation_input_tokens: 100, cache_read_input_tokens: 0, output_tokens: 5 } } });
-    events.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'c' + index, content: 'read ' + index }] } });
+    events.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'c' + index, content: results[index - 1] ?? 'read ' + index, ...(errors.includes(index) ? { is_error: true } : {}) }] } });
   }
   events.push({ type: 'result', subtype: 'success', is_error: false, result: 'REPORT ' + (env.MOCK_REPORT ?? 'ok'), total_cost_usd: 0.3, modelUsage: usage });
-  out(events);
+  if (env.MOCK_DELAY_MS) setTimeout(() => out(events), Number(env.MOCK_DELAY_MS));
+  else out(events);
 });
 `;
+
+const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS'];
 
 async function loadHarness(t) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'a7-harness-'));
@@ -81,9 +104,12 @@ async function loadHarness(t) {
   await writeFile(mock, MOCK);
   await chmod(mock, 0o755);
   process.env.A7_CLAUDE_BIN = mock;
-  for (const key of ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT']) delete process.env[key];
+  for (const key of MOCK_ENV) delete process.env[key];
+  t.after(() => {
+    for (const key of MOCK_ENV) delete process.env[key];
+  });
   const harness = await import(`../../scripts/evaluate-brief-a7.js?mock=${Date.now()}-${Math.random()}`);
-  return { harness, dir };
+  return { harness, dir, mock };
 }
 
 function sha256(value) {
@@ -233,67 +259,91 @@ test('the pre-registered screen flags baseline-majority clause drops of two and 
 
 // ------------------------------------------------- end-to-end pipeline
 
+// Synthetic labels in the v3 layout: the harness grades the merged v3 blocks.
+// F1 quotes a corpus passage (shared with the corpus, so never forbidden) and
+// holds label-only prose; F5's label-only prose stands in for held-out content.
+const LABEL_ONLY_TUNING = 'The quarterly audit freezes the plum ledger before the vendor reconciliation window closes.';
+const LABEL_ONLY_HELDOUT = 'Zebra invoices settle only after the copper review board signs the quarterly attestation.';
+const QUOTED_CORPUS = 'Each account has a metered allowance of refresh runs per period under D-101';
 const TUNING_LABELS = `### Tuning tasks
 
 #### F1 — file-scoped · tuning
+- **Task:** Superseded v1 block; the harness never reads it.
+
+### A7 later attempt
+
+#### Merged v3 tuning labels (the harness grades these)
+Every tuning block in full.
+
+##### F1 — file-scoped · tuning · v3
 - **Task:** Rewrite the message a user sees when a hosted refresh run is refused.
 - **Files:** \`app:src/lib/entitlements.ts\`
 - **Must-have facts:**
-  - M1 (a) One; (b) two.
-  - M2 Single.
+  - M1 (a) ${QUOTED_CORPUS}; (b) two.
+  - M2 ${LABEL_ONLY_TUNING}
 - **Forbidden authority claims:**
   - X1 Bad.
   - X2 Worse.
 - **Tags:** —
 
-#### N1 — no-match · tuning
+##### N1 — no-match · tuning · v3
 - **Task:** Add Klingon subtitles and a karaoke kiosk mode.
 - **Forbidden authority claims:**
   - X1 Bad.
 - **Tags:** no-match
-
-### Corpus v2 tuning-label re-verification (A7)
-Synthetic.
-
-#### Merged v2 tuning labels (mechanical consolidation; the harness grades these)
-None.
 
 ## Results
 `;
 const HELDOUT_LABELS = `#### F5 — task-only · held-out
 - **Task:** Change the Free plan credit balance and the Solo plan price.
 - **Must-have facts:**
-  - M1 Single.
+  - M1 ${LABEL_ONLY_HELDOUT}
 - **Forbidden authority claims:**
   - X1 Bad.
 - **Tags:** —
 `;
+// Corpus text that looks like evaluation material but is ordinary memory.
+const MARKER_DOC = `---
+domain: Sync
+feature: Lanes
+component: Evaluation Notes
+status: In progress
+---
+
+## Description
+Evaluation files such as recall-evaluation-heldout-v3.md hold labels; this note is not one. A label lists - **Must-have facts:** and - **Forbidden authority claims:** with items like M1 (a) and X1.
+`;
+const STARTUP_ROOT = {
+  'context.md': '# Project Context — Acme Widgets\n\nThe generated session protocol.\n',
+  'architecture/overview/project-status.md': '---\ndomain: Overview\nfeature: Project Shape\ncomponent: Status and Working Agreements\nstatus: In progress\n---\n\n## Description\nAcme status and working agreements.\n',
+};
 
 /** A tagged docs repo, its corpus export, label copies, and a prepared evaluation directory. */
-async function prepared(harness, dir, { link = null } = {}) {
+async function prepared(harness, dir, { link = null, heldout = HELDOUT_LABELS } = {}) {
   const repo = path.join(dir, 'docs');
-  await cp(FIXTURE_ROOT, repo, { recursive: true });
-  await writeFile(path.join(repo, 'CLAUDE.md'), '# Acme Widgets\n');
+  const corpus = path.join(dir, 'corpus');
   const addLink = async (root) => {
     if (!link) return;
     await mkdir(path.dirname(path.join(root, link.path)), { recursive: true });
     await symlink(link.target, path.join(root, link.path));
   };
-  await addLink(repo);
+  for (const root of [repo, corpus]) {
+    await cp(FIXTURE_ROOT, root, { recursive: true });
+    for (const [file, text] of Object.entries(STARTUP_ROOT)) await writeFile(path.join(root, file), text);
+    await writeFile(path.join(root, 'architecture', 'sync', 'evaluation-notes.md'), MARKER_DOC);
+    await addLink(root);
+  }
   await mkdir(path.join(repo, 'architecture', 'platform', 'project-memory'), { recursive: true });
   await writeFile(path.join(repo, 'architecture', 'platform', 'project-memory', 'recall-evaluation.md'), TUNING_LABELS);
   const git = (...args) => spawnSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' });
-  for (const args of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'corpus'], ['tag', 'recall-eval-corpus-v2']]) assert.equal(git(...args).status, 0);
-  const corpus = path.join(dir, 'corpus');
-  await cp(FIXTURE_ROOT, corpus, { recursive: true });
-  await writeFile(path.join(corpus, 'CLAUDE.md'), '# Acme Widgets\n');
-  await addLink(corpus);
+  for (const args of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'corpus'], ['tag', 'recall-eval-corpus-v3']]) assert.equal(git(...args).status, 0);
   const labelsDir = path.join(dir, 'labels-in');
   await mkdir(labelsDir, { recursive: true });
   await writeFile(path.join(labelsDir, 'recall-evaluation.md'), TUNING_LABELS);
-  await writeFile(path.join(labelsDir, 'recall-evaluation-heldout-v2.md'), HELDOUT_LABELS);
-  const ctx = { dir: path.join(dir, 'eval'), cap: 100, concurrency: 4, quiet: true, identity: () => ({ package_commit: 'test', package_dirty: '', package_src_tree: 'test' }) };
-  const opts = { corpus, docsRepo: repo, labelsDir, heldoutSha: sha256(HELDOUT_LABELS), warmRuns: 1, expectTasks: 3 };
+  // The held-out file lives outside every repo, under any name.
+  await writeFile(path.join(labelsDir, 'held-out-set.md'), heldout);
+  const ctx = { dir: path.join(dir, 'eval'), cap: 100, concurrency: 4, quiet: true, graceMs: 300, identity: () => ({ package_commit: 'test', package_dirty: '', package_src_tree: 'test' }) };
+  const opts = { corpus, docsRepo: repo, tuningLabels: path.join(labelsDir, 'recall-evaluation.md'), heldout: path.join(labelsDir, 'held-out-set.md'), heldoutSha: sha256(heldout), warmRuns: 1, expectTasks: 3, tuningTasks: 2 };
   await harness.prepare(ctx, opts);
   return { ctx, opts };
 }
@@ -382,10 +432,18 @@ test('every paid attempt stays in the ledger across resumes; the attempt limit a
   assert.deepEqual(interrupted.unresolved, ['run:r001#1']);
   assert.equal(Math.round(interrupted.total * 100) / 100, 5.7);
 
-  // The cap counts it: with $6 approved, no further run starts.
+  // The next run records that attempt as aborted (a killed harness left it
+  // open) and never retries r001; the cap counts its reserve, so with $6
+  // approved r002 does not start either.
   delete process.env.MOCK_GRADER;
   const capped = await harness.run({ ...ctx, cap: 6, only: new Set(['r001', 'r002']) });
-  assert.deepEqual(capped.skipped.sort(), ['r001', 'r002']);
+  assert.deepEqual(capped.aborted, ['r001']);
+  assert.deepEqual(capped.skipped, ['r002']);
+  const closed = await harness.ledgerSpend(ctx.dir);
+  assert.deepEqual(closed.aborted, ['run:r001#1']);
+  assert.deepEqual(closed.unresolved, ['run:r001#1'], 'still unresolved: no stream, so its reserve is held');
+  assert.deepEqual(closed.open, []);
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), 1, 'never retried');
   process.exitCode = 0;
 });
 
@@ -576,7 +634,7 @@ test('an interruption between a session finishing and its metadata write never r
 
 test('corpus symlinks are verified by their link text and copied verbatim; changed, replaced, or escaping links stop preparation', async (t) => {
   const { harness, dir } = await loadHarness(t);
-  // As in recall-eval-corpus-v2: a relative link whose target is not in the corpus.
+  // As in recall-eval-corpus-v2 and v3: a relative link whose target is not in the corpus.
   const link = { path: '.agent/skills/postgres', target: '../../.agents/skills/postgres' };
   const { ctx, opts } = await prepared(harness, dir, { link });
   const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
@@ -587,18 +645,18 @@ test('corpus symlinks are verified by their link text and copied verbatim; chang
   const prepareAgain = (name) => harness.prepare({ ...ctx, dir: path.join(dir, name) }, opts);
   await rm(corpusLink);
   await symlink('../../.agents/skills/other', corpusLink);
-  await assert.rejects(() => prepareAgain('changed'), /corpus file \.agent\/skills\/postgres differs from recall-eval-corpus-v2/);
+  await assert.rejects(() => prepareAgain('changed'), /corpus file \.agent\/skills\/postgres differs from recall-eval-corpus-v3/);
   await rm(corpusLink);
   await writeFile(corpusLink, link.target);
-  await assert.rejects(() => prepareAgain('replaced'), /is not a symlink but is one in recall-eval-corpus-v2/);
+  await assert.rejects(() => prepareAgain('replaced'), /is not a symlink but is one in recall-eval-corpus-v3/);
   await rm(corpusLink);
   await symlink('../../../outside', corpusLink);
   await assert.rejects(() => prepareAgain('escaping'), /corpus symlink \.agent\/skills\/postgres points outside the corpus/);
 });
 
-// --------------------------------------------------------- pre-run amendment 2
+// --------------------------------------------------------- pre-run amendment 2, as observations
 
-test('a Grep that only excludes the evaluation files is counted, not a deviation; any other mention still is (A7 pre-run amendment 2)', async (t) => {
+test('naming an evaluation file is an observation: exclusions, unsuccessful searches, and mentions are counted, never deviations (later attempt; amendment 2 and the 2026-10-03 r061 shape)', async (t) => {
   const { harness, dir } = await loadHarness(t);
   // Inputs from the aborted Phase 2 attempt's r001 (F1 baseline #1); its fourth repeats the second's glob.
   const observed = [
@@ -608,32 +666,309 @@ test('a Grep that only excludes the evaluation files is counted, not a deviation
   ];
   for (const input of observed) assert.equal(harness.isEvaluationExclusion({ name: 'Grep', input }), true, JSON.stringify(input));
   assert.equal(harness.isEvaluationExclusion({ name: 'Grep', input: { pattern: 'x', glob: '*.md !recall-evaluation*' } }), true);
-  const deviations = [
+  for (const use of [
     { name: 'Grep', input: { pattern: 'recall-evaluation' } },
     { name: 'Grep', input: { pattern: 'x', glob: '**/recall-evaluation*' } },
-    { name: 'Grep', input: { pattern: 'x', glob: '*.md,!recall-evaluation*' } },
-    { name: 'Grep', input: { pattern: 'x', glob: '!**/recall-evaluation* recall-evaluation-heldout-v2.md' } },
-    { name: 'Grep', input: { pattern: 'x', path: 'architecture/platform/project-memory/recall-evaluation.md', glob: '!**/recall-evaluation*' } },
     { name: 'Glob', input: { pattern: '!**/recall-evaluation*' } },
-    { name: 'Read', input: { file_path: 'architecture/platform/project-memory/recall-evaluation-heldout-v2.md' } },
-  ];
-  for (const use of deviations) assert.equal(harness.isEvaluationExclusion(use), false, JSON.stringify(use));
+  ]) assert.equal(harness.isEvaluationExclusion(use), false, JSON.stringify(use));
 
-  // End to end: the exclusion run audits clean and is counted; a positive glob is a deviation.
   const { ctx } = await prepared(harness, dir);
   const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
-  process.env.MOCK_CALLS = '2';
-  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Grep', input: observed[1] }]);
+  // One research session: an exclusion, r061's positive Glob that found nothing,
+  // a Read of an absent evaluation file, and a Grep whose corpus results name one.
+  process.env.MOCK_CALLS = '4';
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([
+    { name: 'Grep', input: observed[1] },
+    { name: 'Glob', input: { pattern: 'architecture/**/recall-evaluation*.md' } },
+    { name: 'Read', input: { file_path: 'architecture/platform/project-memory/recall-evaluation-heldout-v3.md' } },
+    { name: 'Grep', input: { pattern: 'recall-evaluation', output_mode: 'content', '-n': true } },
+  ]);
+  process.env.MOCK_TOOL_RESULTS = JSON.stringify(['No matches found', 'No files found', 'File does not exist.', 'architecture/sync/evaluation-notes.md:9:Evaluation files such as recall-evaluation-heldout-v3.md hold labels; this note is not one. A label lists - **Must-have facts:** and - **Forbidden authority claims:** with items like M1 (a) and X1.']);
+  process.env.MOCK_TOOL_ERRORS = JSON.stringify([3]);
   await harness.run({ ...ctx, only: new Set(['r001']) });
-  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Grep', input: { pattern: 'x', glob: '**/recall-evaluation*' } }]);
-  await harness.run({ ...ctx, only: new Set(['r002']) });
-  delete process.env.MOCK_TOOL_INPUTS;
-  delete process.env.MOCK_CALLS;
+  const audit = await harness.auditRun(ctx.dir, manifest.runs.find((entry) => entry.id === 'r001'), manifest.tool_call_cap, manifest);
+  assert.deepEqual(audit.violations, [], 'no evaluation content reached the session');
+  assert.deepEqual(audit.isolation_observations, { exclusions: 1, unsuccessful_searches: 2, mentions: 1 });
+  assert.equal(audit.evaluation_exclusions, 1);
+});
+
+// ------------------------------------------------------------- isolation rule
+
+test('the isolation index holds label-only content: corpus text, quoted passages, and marker-like text are never forbidden (later attempt › isolation rule)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const index = JSON.parse(await readFile(path.join(ctx.dir, 'isolation.json'), 'utf8'));
+  const forbidden = new Set(index.fingerprints);
+  assert.ok(index.fingerprints.length > 0);
+  assert.ok(index.shared_with_corpus > 0, 'the label quotes a corpus passage');
+  // Leaked content with no markers at all is caught, in any framing.
+  assert.ok(harness.countFingerprintHits(LABEL_ONLY_HELDOUT, forbidden) > 0);
+  // Read and Grep deliver lines intact: a label line among corpus lines is caught in every framing.
+  const corpusLine = 'Accepted runs stay consumed. The ledger records every accepted run.';
+  assert.ok(harness.countFingerprintHits(`    12\u2192${corpusLine}\n    13\u2192  - M1 ${LABEL_ONLY_HELDOUT}\n    14\u2192`, forbidden, { toolOutput: true }) > 0, 'arrow-framed Read lines');
+  assert.ok(harness.countFingerprintHits(`    12\t${corpusLine}\n    13\t${LABEL_ONLY_HELDOUT}`, forbidden, { toolOutput: true }) > 0, 'tab-framed Read lines');
+  assert.equal(harness.countFingerprintHits(`    12\u2192${corpusLine}`, forbidden, { toolOutput: true }), 0);
+  // Each line is fingerprinted alone: a line under eight words carries no fingerprint (a disclosed bound).
+  assert.equal(harness.countFingerprintHits('Zebra invoices settle only after the copper', forbidden), 0);
+  assert.ok(harness.countFingerprintHits(`docs/notes.md:4:${LABEL_ONLY_HELDOUT.toUpperCase()}`, forbidden, { toolOutput: true }) > 0, 'Grep framing, any case');
+  assert.ok(harness.countFingerprintHits(LABEL_ONLY_TUNING, forbidden) > 0, 'tuning-label-only text too');
+  // Corpus text is never forbidden: a quoted passage, and marker-like strings.
+  assert.equal(harness.countFingerprintHits(QUOTED_CORPUS, forbidden), 0);
+  assert.equal(harness.countFingerprintHits(MARKER_DOC, forbidden), 0);
+  // Every corpus file, delivered whole, carries nothing forbidden.
+  for (const file of ['architecture/billing/ledger.md', 'architecture/billing/pricing.md', 'architecture/sync/evaluation-notes.md', 'context.md', 'project.yaml']) {
+    assert.equal(harness.countFingerprintHits(await readFile(path.join(dir, 'corpus', file), 'utf8'), forbidden, { toolOutput: true }), 0, file);
+  }
+  // Markers alone never decide: a marker-only line is too short and too generic to fingerprint.
+  assert.equal(harness.fingerprints('- **Must-have facts:** M1 (a) X1 X2 D-101 D-102').size, 0);
+  // Changing the index after prepare stops every later stage.
+  await writeFile(path.join(ctx.dir, 'isolation.json'), JSON.stringify({ ...index, fingerprints: [] }));
+  await assert.rejects(() => harness.run(ctx), /isolation\.json changed since prepare/);
+});
+
+test('forbidden content delivered through a tool result is a deviation; designed deliveries and corpus content are not; escaping patterns are (later attempt › isolation rule)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const f1Baseline = manifest.runs.filter((entry) => entry.task === 'F1' && entry.arm === 'baseline').map((entry) => entry.id);
   const audit = (id) => harness.auditRun(ctx.dir, manifest.runs.find((entry) => entry.id === id), manifest.tool_call_cap, manifest);
-  const excluded = await audit('r001');
-  assert.deepEqual(excluded.violations, []);
-  assert.equal(excluded.evaluation_exclusions, 1);
-  const positive = await audit('r002');
-  assert.deepEqual(positive.violations, ['Grep names an evaluation file']);
-  assert.equal(positive.evaluation_exclusions, 0);
+  const session = async (id, inputs, results) => {
+    process.env.MOCK_CALLS = String(inputs.length);
+    process.env.MOCK_TOOL_INPUTS = JSON.stringify(inputs);
+    process.env.MOCK_TOOL_RESULTS = JSON.stringify(results);
+    await harness.run({ ...ctx, only: new Set([id]) });
+    process.exitCode = 0;
+    return audit(id);
+  };
+  const read = (file) => ({ name: 'Read', input: { file_path: file } });
+
+  // Designed deliveries: the run's own task line (in its lane files and brief) and corpus files.
+  const lane = await readFile(path.join(manifest.runs.find((entry) => entry.id === f1Baseline[0]).root, 'sessions/active/eval/wip.md'), 'utf8');
+  const clean = await session(f1Baseline[0], [read('sessions/active/eval/wip.md'), read('architecture/billing/ledger.md'), read('notes.md')], [
+    lane,
+    await readFile(path.join(dir, 'corpus', 'architecture/billing/ledger.md'), 'utf8'),
+    '- Task: Rewrite the message a user sees when a hosted refresh run is refused.\n- Files: `app:src/lib/entitlements.ts`',
+  ]);
+  assert.deepEqual(clean.violations, []);
+
+  // Leaked held-out content with no markers, framed as an ordinary Read result.
+  const leaked = await session(f1Baseline[1], [read('architecture/billing/ledger.md')], [`     3\u2192${LABEL_ONLY_HELDOUT}`]);
+  assert.equal(leaked.violations.length, 1, leaked.violations.join(' | '));
+  assert.match(leaked.violations[0], /^forbidden content delivered: \d+ isolation fingerprint\(s\) in the result of call 1 \(Read\)$/);
+  assert.doesNotMatch(leaked.violations[0], /zebra/i, 'the finding names no forbidden content');
+
+  // Another task's text is not a designed delivery for this run.
+  const crossTask = await session(f1Baseline[2], [{ name: 'Grep', input: { pattern: 'plan price', output_mode: 'content' } }], ['docs/x.md:Task: Change the Free plan credit balance and the Solo plan price.']);
+  assert.ok(crossTask.violations.some((entry) => /forbidden content delivered/.test(entry)), crossTask.violations.join(' | '));
+
+  // Path confinement covers glob patterns, even when nothing was found.
+  const f1Brief = manifest.runs.filter((entry) => entry.task === 'F1' && entry.arm === 'brief').map((entry) => entry.id);
+  const escaping = await session(f1Brief[0], [
+    { name: 'Glob', input: { pattern: '../../labels/*.md' } },
+    { name: 'Grep', input: { pattern: 'x', glob: '{*.md,/etc/*}' } },
+    { name: 'Read', input: { file_path: '/etc/hosts' } },
+  ], ['No files found', 'No matches found', 'File does not exist.']);
+  for (const expected of [/Glob pattern reaches outside the run copy: \.\.\/\.\.\/labels\/\*\.md/, /Grep pattern reaches outside the run copy: \/etc\/\*/, /Read outside the run copy: \/etc\/hosts/]) {
+    assert.ok(escaping.violations.some((entry) => expected.test(entry)), `${expected} in ${escaping.violations.join(' | ')}`);
+  }
+  assert.deepEqual(await harness.confinementProblems({ name: 'Glob', input: { pattern: 'architecture/**/*.md' } }, '/tmp/x'), []);
+});
+
+// ------------------------------------------------------------- abort handling (S12)
+
+const ALIVE_MS = 3000;
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+async function until(check, ms = 8000, what = 'condition') {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+async function mockPids(pidDir) {
+  const files = await readdir(pidDir).catch(() => []);
+  return Promise.all(files.map(async (file) => JSON.parse(await readFile(path.join(pidDir, file), 'utf8'))));
+}
+
+/** A real harness process (`run`, via `main`) whose children are live mock sessions. */
+async function startHarnessProcess(t, dir, mock, ctx, env = {}) {
+  const driver = path.join(dir, 'driver.mjs');
+  await writeFile(driver, `const { main } = await import(process.env.A7_HARNESS_URL);\nawait main(process.argv.slice(2), { identity: () => ({ package_commit: 'test', package_dirty: '', package_src_tree: 'test' }), graceMs: Number(process.env.A7_GRACE_MS) });\n`);
+  const pidDir = path.join(dir, 'pids');
+  await mkdir(pidDir, { recursive: true });
+  const child = spawn(process.execPath, [driver, 'run', '--out', ctx.dir, '--max-cost-usd', '100', '--concurrency', '2'], {
+    env: { ...process.env, A7_CLAUDE_BIN: mock, A7_HARNESS_URL: pathToFileURL(path.join(packageDir, 'scripts', 'evaluate-brief-a7.js')).href, A7_GRACE_MS: '300', MOCK_SCENARIO: 'slow', MOCK_PID_DIR: pidDir, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    output += chunk;
+  });
+  const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    for (const entry of await mockPids(pidDir)) {
+      for (const pid of [entry.pid, entry.grandchild]) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // gone
+        }
+      }
+    }
+  });
+  return { child, exited, pidDir, output: () => output };
+}
+
+/** Waits until both sessions are live: spawned in the ledger, pids recorded, and their streams on disk. */
+async function twoLiveSessions(harness, ctx, pidDir) {
+  await until(async () => (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'spawned').length === 2 && (await mockPids(pidDir)).length === 2, 8000, 'two live sessions');
+  const starts = (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start');
+  await until(async () => (await Promise.all(starts.map((record) => stat(record.file).then((info) => info.size > 0, () => false)))).every(Boolean), 4000, 'streams on disk');
+  return starts;
+}
+
+test('an abort stops dispatch, terminates and awaits live child sessions and their process groups, drains their streams, and keeps estimated costs explicit (S12)', async (t) => {
+  const { harness, dir, mock } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const proc = await startHarnessProcess(t, dir, mock, ctx);
+  const starts = await twoLiveSessions(harness, ctx, proc.pidDir);
+  const pids = await mockPids(proc.pidDir);
+  // A second invocation on the same directory is refused while this one lives.
+  await assert.rejects(() => harness.run(ctx), /another harness invocation \(pid \d+\) holds/);
+
+  proc.child.kill('SIGINT');
+  const exit = await proc.exited;
+  assert.equal(exit.code, 130, proc.output());
+  for (const entry of pids) {
+    await until(() => !alive(entry.pid) && !alive(entry.grandchild), ALIVE_MS, `pids ${entry.pid}/${entry.grandchild} gone`);
+  }
+  const ledger = await harness.readLedger(ctx.dir);
+  assert.equal(ledger.filter((record) => record.event === 'start').length, 2, 'no session started after the abort');
+  const aborted = ledger.filter((record) => record.event === 'aborted');
+  assert.deepEqual(aborted.map((record) => record.call).sort(), starts.map((record) => record.call).sort());
+  // Each stream holds its usage, so its cost is estimated from it, never zero or missing.
+  const expected = (10 + 2000) * 8e-6 + 5000 * 0.2e-6 + 300 * 20e-6;
+  for (const record of aborted) {
+    assert.equal(record.cost_source, 'estimated');
+    assert.ok(Math.abs(record.cost_usd - expected) < 1e-9, String(record.cost_usd));
+    assert.equal(record.reason, 'SIGINT');
+    const start = starts.find((entry) => entry.call === record.call);
+    assert.match(await readFile(start.file, 'utf8'), /"type":"assistant"/, 'the stream was drained to its file');
+  }
+  const summary = ledger.find((record) => record.event === 'abort');
+  assert.deepEqual(summary.terminated.sort(), starts.map((record) => record.call).sort());
+  assert.deepEqual(summary.unresolved, []);
+  const spend = await harness.ledgerSpend(ctx.dir);
+  assert.ok(Math.abs(spend.total - 2 * expected) < 1e-9);
+  assert.deepEqual(spend.open, []);
+  assert.deepEqual(spend.estimated.sort(), starts.map((record) => record.call).sort());
+
+  // Resume: the aborted runs are never retried; every other run proceeds.
+  delete process.env.MOCK_SCENARIO;
+  const resumed = await harness.run(ctx);
+  const abortedRuns = starts.map((record) => record.job.replace('run:', '')).sort();
+  assert.deepEqual(resumed.aborted.sort(), abortedRuns);
+  for (const id of abortedRuns) assert.equal(await harness.attemptsOf(ctx.dir, `run:${id}`), 1);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'finish').length, 16);
+  process.exitCode = 0;
+});
+
+test('a child that ignores SIGTERM is killed after the grace period, and a stream without usage stays unresolved at its reserve (S12)', async (t) => {
+  const { harness, dir, mock } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const proc = await startHarnessProcess(t, dir, mock, ctx, { MOCK_IGNORE_TERM: '1', MOCK_NO_USAGE: '1' });
+  await twoLiveSessions(harness, ctx, proc.pidDir);
+  const pids = await mockPids(proc.pidDir);
+  proc.child.kill('SIGTERM');
+  const exit = await proc.exited;
+  assert.equal(exit.code, 130, proc.output());
+  for (const entry of pids) assert.ok(!alive(entry.pid), `pid ${entry.pid} was awaited before the harness exited`);
+  for (const entry of pids) await until(() => !alive(entry.grandchild), ALIVE_MS, `grandchild ${entry.grandchild} gone`);
+  const ledger = await harness.readLedger(ctx.dir);
+  const aborted = ledger.filter((record) => record.event === 'aborted');
+  assert.equal(aborted.length, 2);
+  for (const record of aborted) {
+    assert.equal(record.cost_source, 'unknown');
+    assert.equal(record.exit.signal, 'SIGKILL', 'escalated after the grace period');
+  }
+  const spend = await harness.ledgerSpend(ctx.dir);
+  assert.equal(spend.unresolved.length, 2);
+  assert.equal(spend.reserved_unresolved, 3);
+  assert.equal(spend.total, 3);
+  assert.equal(ledger.find((record) => record.event === 'abort').unresolved.length, 2);
+});
+
+test('sessions a killed harness leaves running are terminated and recorded before the next dispatch, and never retried (S12)', async (t) => {
+  const { harness, dir, mock } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const proc = await startHarnessProcess(t, dir, mock, ctx);
+  const starts = await twoLiveSessions(harness, ctx, proc.pidDir);
+  const pids = await mockPids(proc.pidDir);
+  // An uncatchable kill: the harness cannot clean up, and its children survive it (as on 2026-10-03).
+  proc.child.kill('SIGKILL');
+  await proc.exited;
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  for (const entry of pids) assert.ok(alive(entry.pid), 'the orphan outlived its harness');
+  assert.deepEqual((await harness.ledgerSpend(ctx.dir)).open.sort(), starts.map((record) => record.call).sort());
+
+  delete process.env.MOCK_SCENARIO;
+  const resumed = await harness.run(ctx);
+  for (const entry of pids) await until(() => !alive(entry.pid) && !alive(entry.grandchild), ALIVE_MS, `orphan ${entry.pid} gone`);
+  const recovered = (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'aborted');
+  assert.equal(recovered.length, 2);
+  for (const record of recovered) {
+    assert.equal(record.recovered, true);
+    assert.equal(record.reason, 'left running by a killed harness; terminated');
+    assert.equal(record.cost_source, 'estimated');
+  }
+  assert.deepEqual(resumed.aborted.sort(), starts.map((record) => record.job.replace('run:', '')).sort());
+  assert.deepEqual((await harness.ledgerSpend(ctx.dir)).open, []);
+  process.exitCode = 0;
+});
+
+test('a STOP file stops dispatch gracefully: running sessions finish, nothing is aborted, and a resume continues (S12)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  process.env.MOCK_DELAY_MS = '400';
+  const running = harness.run({ ...ctx, concurrency: 2 });
+  await until(async () => (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'spawned').length === 2, 4000, 'two sessions');
+  await writeFile(path.join(ctx.dir, 'STOP'), '');
+  const stopped = await running;
+  process.exitCode = 0;
+  const ledger = await harness.readLedger(ctx.dir);
+  assert.equal(ledger.filter((record) => record.event === 'finish').length, 2, 'the running sessions finished');
+  assert.equal(ledger.filter((record) => record.event === 'aborted').length, 0);
+  assert.equal(stopped.skipped.length, 16);
+  await rm(path.join(ctx.dir, 'STOP'));
+  delete process.env.MOCK_DELAY_MS;
+  const resumed = await harness.run(ctx);
+  assert.deepEqual(resumed.skipped, []);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'finish').length, 18);
+});
+
+test('a run with a deviation stops dispatch; running sessions finish (later attempt: stop as the protocol says)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Read', input: { file_path: '/etc/hosts' } }]);
+  const outcome = await harness.run({ ...ctx, concurrency: 1 });
+  assert.equal(process.exitCode, 4);
+  process.exitCode = 0;
+  assert.deepEqual(outcome.deviations, ['r001']);
+  assert.equal(outcome.skipped.length, 17);
+  const ledger = await harness.readLedger(ctx.dir);
+  assert.deepEqual(ledger.find((record) => record.event === 'stopped').runs, ['r001']);
+  assert.equal(ledger.filter((record) => record.event === 'start').length, 1);
 });
