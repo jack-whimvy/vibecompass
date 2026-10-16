@@ -622,24 +622,36 @@ export async function run(ctx) {
       const meta = (await ledgerHasFinished(dir, entry.id)) ? await reconcileRun(dir, entry, manifest.tool_call_cap) : await readMeta(base);
       if (meta?.state !== 'complete') pending.push(entry);
     }
+    // Before anything is spent, whatever --only selects: an entry that can no longer conform stops here.
+    await refuseTerminal(ctx, manifest, 'run');
     const skipped = [];
     const aborted = [];
     const deviations = [];
     const dispatched = new Set();
     // A run with a deviation makes the entry nonconforming, so dispatch stops there (A7 protocol › Residual risk).
     const stop = async () => deviations.length > 0 || version.found !== null || (await stopRequested(dir));
+    // The one guard before every paid session, research and report turns alike (reviewer pass 1, R2).
+    const dispatchAllowed = async () => !ctx.signal?.aborted && !(await stop()) && version.check();
     await pool(pending, ctx.concurrency ?? 4, async (entry) => {
       dispatched.add(entry.id);
       const treeProblems = await verifyRunTree(entry);
       if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
       const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
       if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs, beforeSpawn: version.check });
+      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs, beforeSpawn: dispatchAllowed });
       if (meta.state === 'aborted') {
         aborted.push(entry.id);
         return;
       }
       if (meta.state !== 'complete') {
+        if (meta.state === 'report-pending') {
+          // Its research is evidence already: audit it now, so a deviation stops dispatch at once.
+          const pendingAudit = await auditRun(dir, entry, manifest.tool_call_cap, manifest, { researchOnly: true });
+          if (pendingAudit.violations.length > 0) {
+            deviations.push(entry.id);
+            log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: research finished, report turn pending; DEVIATIONS: ${pendingAudit.violations.join('; ')}`);
+          }
+        }
         skipped.push(`${entry.id}${meta.state === 'report-pending' ? ' (report turn pending)' : ''}`);
         return;
       }
@@ -668,6 +680,42 @@ export async function run(ctx) {
     if (aborted.length > 0 && !ctx.signal?.aborted) log(ctx, `${aborted.length} run(s) have an aborted session and are never retried: ${aborted.join(', ')}.`);
     return { skipped, aborted, deviations, version_changed: version.found };
   });
+}
+
+/**
+ * Why the entry can no longer conform, from the evidence on disk (reviewer
+ * pass 1, R1): an earlier deviation stop; an aborted research or report-turn
+ * session, including one a killed harness left behind; or a deviation in any
+ * run whose research finished, found by auditing it again, since a harness
+ * can die before it records its stop. An aborted grader attempt is not
+ * terminal; it counts toward the grade's attempts. Empty when the entry can
+ * still conform. Run after `reapOrphans` and the ledger reconciliation.
+ */
+export async function terminalFindings(dir, manifest) {
+  const ledger = await readLedger(dir);
+  const findings = [];
+  for (const record of ledger.filter((entry) => entry.event === 'stopped' && entry.reason === 'deviation')) findings.push(`a deviation stopped dispatch on ${record.at} (${(record.runs ?? []).join(', ')})`);
+  const starts = new Map(ledger.filter((entry) => entry.event === 'start').map((entry) => [entry.call, entry]));
+  for (const record of ledger.filter((entry) => entry.event === 'aborted')) {
+    const start = starts.get(record.call);
+    if (start && (start.kind === 'research' || start.kind === 'report')) findings.push(`${record.call} was aborted${record.recovered ? ' (left open by a killed harness)' : ''}`);
+  }
+  for (const entry of manifest.runs) {
+    if ((await finishedAttempts(dir, `run:${entry.id}`)).length === 0) continue;
+    const meta = await readMeta(path.join(dir, 'transcripts', entry.id));
+    if (meta?.state === 'aborted') continue;
+    const metrics = await auditRun(dir, entry, manifest.tool_call_cap, manifest, { researchOnly: meta?.state !== 'complete' });
+    if (metrics.violations.length > 0) findings.push(`${entry.id}: ${metrics.violations.join('; ')}`);
+  }
+  return findings;
+}
+
+/** Refuses a paid stage for an entry that can no longer conform; nothing is spent. */
+async function refuseTerminal(ctx, manifest, stage) {
+  const findings = await terminalFindings(ctx.dir, manifest);
+  if (findings.length === 0) return;
+  await appendLedger(ctx.dir, { event: 'refused', stage, findings });
+  throw new Error(`The entry can no longer conform, so no paid session starts (${stage}):\n- ${findings.join('\n- ')}`);
 }
 
 /** A `STOP` file in the evaluation directory stops dispatch; running sessions finish. */
@@ -929,7 +977,13 @@ function estimateCost(usage) {
 }
 
 /** Tool calls, tokens read, wall time, cost, the final report, the boundary audit, artifact integrity, and session checks for one run. */
-export async function auditRun(dir, entry, cap, manifest = null) {
+/**
+ * `researchOnly` audits a run whose report turn has not run yet (a STOP, the
+ * cap, or a version pause left it pending): everything except the report
+ * turn's own evidence, so a deviation in its research is found before any
+ * more is spent (reviewer pass 1, R1).
+ */
+export async function auditRun(dir, entry, cap, manifest = null, { researchOnly = false } = {}) {
   const base = path.join(dir, 'transcripts', entry.id);
   const researchText = await readFile(`${base}.jsonl`, 'utf8');
   const research = parseEvents(researchText);
@@ -965,13 +1019,13 @@ export async function auditRun(dir, entry, cap, manifest = null) {
       return out;
     };
     violations.push(...(await expect('research', `run:${entry.id}`, researchText, meta.research_attempt, meta.research_sha256)));
-    if (stopped) violations.push(...(await expect('report-turn', `report:${entry.id}`, reportText, meta.report_attempt, meta.report_sha256)));
+    if (stopped && !researchOnly) violations.push(...(await expect('report-turn', `report:${entry.id}`, reportText, meta.report_attempt, meta.report_sha256)));
     else if ((await finishedAttempts(dir, `report:${entry.id}`)).length > 0) violations.push('report turn recorded for a run that was not stopped');
   } else {
     if (!meta.research_sha256 || sha256(researchText) !== meta.research_sha256) violations.push('research transcript has no matching run metadata');
-    if (stopped && (!meta.report_sha256 || sha256(reportText ?? '') !== meta.report_sha256)) violations.push('report-turn transcript has no matching run metadata');
+    if (stopped && !researchOnly && (!meta.report_sha256 || sha256(reportText ?? '') !== meta.report_sha256)) violations.push('report-turn transcript has no matching run metadata');
   }
-  if (meta.state !== undefined && meta.state !== 'complete') violations.push(`run state is ${meta.state}`);
+  if (!researchOnly && meta.state !== undefined && meta.state !== 'complete') violations.push(`run state is ${meta.state}`);
   if (entry.prompt_sha256) {
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
     if (prompt === null || sha256(prompt) !== entry.prompt_sha256) violations.push('prompt changed since prepare');
@@ -1008,7 +1062,9 @@ export async function auditRun(dir, entry, cap, manifest = null) {
   const excessIds = new Set(calls.filter((use) => boundary && !boundary.allowed.has(use.id)).map((use) => use.id));
   const resultChars = counted.reduce((sum, use) => sum + [...(results.get(use.id) ?? '')].length, 0);
   let report = '';
-  if (stopped) {
+  if (stopped && researchOnly) {
+    if (!boundary) violations.push('stopped run without an identifiable boundary');
+  } else if (stopped) {
     if (!boundary) violations.push('stopped run without an identifiable boundary');
     const reportPrompt = await readFile(`${base}.report-prompt.txt`, 'utf8').catch(() => null);
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
@@ -1401,11 +1457,7 @@ async function paidCall(ledgerDir, kind, job, reserve, fileFor, invoke) {
   const output = await invoke(file, onSpawn);
   await spawned;
   const events = parseEvents(output.stdout);
-  const result = [...events].reverse().find((event) => event.type === 'result');
-  const reported = typeof result?.total_cost_usd === 'number' ? result.total_cost_usd : null;
-  const estimated = reported === null ? estimateCost(streamUsage(events)) : null;
-  const cost = reported ?? (estimated && estimated > 0 ? estimated : null);
-  const costSource = reported !== null ? 'reported' : cost !== null ? 'estimated' : 'unknown';
+  const { cost, source: costSource } = streamCost(events);
   const hash = sha256(output.stdout);
   if (ledgerDir) {
     if (output.aborted) {
@@ -1415,6 +1467,18 @@ async function paidCall(ledgerDir, kind, job, reserve, fileFor, invoke) {
     }
   }
   return { ...output, events, attempt, call, file, sha256: hash, killed: output.stopped, cost };
+}
+
+/**
+ * One session's cost from its stream, in the spending contract's order: the
+ * result's reported cost (zero included), else the estimate from its
+ * per-message usage, else unknown (the ledger then holds its reserve).
+ */
+export function streamCost(events) {
+  const result = [...events].reverse().find((event) => event.type === 'result');
+  if (typeof result?.total_cost_usd === 'number' && Number.isFinite(result.total_cost_usd)) return { cost: result.total_cost_usd, source: 'reported' };
+  const estimate = estimateCost(streamUsage(events));
+  return estimate && estimate > 0 ? { cost: estimate, source: 'estimated' } : { cost: null, source: 'unknown' };
 }
 
 /** Aborted ledger attempts for a job: terminated by an abort, or left behind by a killed harness and recorded at the next start. */
@@ -1444,10 +1508,10 @@ export async function ledgerSpend(dir) {
     if (finish?.cost_source === 'estimated') spend.estimated.push(start.call);
     if (cost === null) {
       const streamed = start.file ? await readFile(start.file, 'utf8').catch(() => '') : '';
-      const estimate = estimateCost(streamUsage(parseEvents(streamed)));
-      if (estimate && estimate > 0) {
-        cost = estimate;
-        spend.estimated.push(start.call);
+      const fromStream = streamCost(parseEvents(streamed));
+      if (fromStream.cost !== null) {
+        cost = fromStream.cost;
+        if (fromStream.source === 'estimated') spend.estimated.push(start.call);
       } else {
         cost = start.reserve_usd;
         spend.unresolved.push(start.call);
@@ -1505,6 +1569,8 @@ export async function grade(ctx) {
   const tasks = manifest.tasks.filter((candidate) => !ctx.only || ctx.only.has(candidate.id));
   return withHarnessLock(ctx, async () => {
     await reapOrphans(ctx);
+    for (const entry of manifest.runs) if (await ledgerHasFinished(ctx.dir, entry.id)) await reconcileRun(ctx.dir, entry, manifest.tool_call_cap);
+    await refuseTerminal(ctx, manifest, 'grade');
     const version = versionGuard(manifest);
     if (!version.check()) throw new Error(versionChangedError(version));
     const outcome = await gradeTasks({ ...ctx, version }, manifest, labels, tasks, cap);
@@ -1624,7 +1690,8 @@ async function runGraders(ctx, jobs, manifest, cap) {
         skipped.push(job.name);
         return;
       }
-      if (ctx.signal?.aborted || (ctx.version && !ctx.version.check())) {
+      // The same guard as research sessions, before every grader attempt (reviewer pass 1, R2).
+      if (ctx.signal?.aborted || (await stopRequested(dir)) || (ctx.version && !ctx.version.check())) {
         skipped.push(job.name);
         return;
       }
@@ -2521,9 +2588,15 @@ function processAlive(pid) {
   }
 }
 
-/** Whether a live pid is a session this harness would have started (guards against pid reuse). */
+/**
+ * Whether a live pid is a session this harness would have started (guards
+ * against pid reuse): true, false, or null when the process cannot be
+ * inspected (no `ps`, or no permission).
+ */
 function isHarnessChild(pid) {
-  const command = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+  const listing = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' });
+  const command = String(listing.stdout ?? '').trim();
+  if (listing.error || (listing.status !== 0 && command === '')) return processAlive(pid) ? null : false;
   return command.length > 0 && command.includes(path.basename(CLAUDE_BIN));
 }
 
@@ -2550,7 +2623,9 @@ export async function reapOrphans(ctx) {
   for (const start of ledger.filter((record) => record.event === 'start' && !closed.has(record.call))) {
     const pid = pids.get(start.call) ?? null;
     let reason = pid ? 'left by a killed harness; not running' : 'left by a killed harness before it spawned';
-    if (pid && processAlive(pid) && isHarnessChild(pid)) {
+    const ours = pid && processAlive(pid) ? isHarnessChild(pid) : false;
+    if (ours === null) throw new Error(`${start.call}: pid ${pid} is alive but cannot be inspected, so it may still be this harness's session; check it, stop it if so, and run again. Nothing was dispatched.`);
+    if (ours) {
       killGroup(pid, 'SIGTERM');
       if (!(await waitUntilGone(pid, graceMs))) {
         killGroup(pid, 'SIGKILL');
@@ -2560,10 +2635,9 @@ export async function reapOrphans(ctx) {
       reason = 'left running by a killed harness; terminated';
     }
     const streamed = start.file ? await readFile(start.file, 'utf8').catch(() => '') : '';
-    const estimate = estimateCost(streamUsage(parseEvents(streamed)));
-    const cost = estimate && estimate > 0 ? estimate : null;
-    await appendLedger(dir, { event: 'aborted', call: start.call, recovered: true, reason, pid, cost_usd: cost, cost_source: cost === null ? 'unknown' : 'estimated', stream_sha256: sha256(streamed) });
-    reaped.push(`${start.call} (${reason}; ${cost === null ? `unresolved, $${start.reserve_usd.toFixed(2)} reserved` : `estimated $${cost.toFixed(3)}`})`);
+    const { cost, source } = streamCost(parseEvents(streamed));
+    await appendLedger(dir, { event: 'aborted', call: start.call, recovered: true, reason, pid, cost_usd: cost, cost_source: source, stream_sha256: sha256(streamed) });
+    reaped.push(`${start.call} (${reason}; ${cost === null ? `unresolved, $${(start.reserve_usd ?? 0).toFixed(2)} reserved` : `${source} $${cost.toFixed(3)}`})`);
   }
   if (reaped.length > 0) log(ctx, `Recorded ${reaped.length} attempt(s) a killed harness left open, never retried:\n- ${reaped.join('\n- ')}`);
   return reaped;

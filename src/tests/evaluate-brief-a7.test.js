@@ -53,12 +53,16 @@ process.stdin.on('end', () => {
     const side = { clauses: keys.map((key) => ({ key, stated: true, attributed: true, evidence: '' })), forbidden: forbidden.map((id) => ({ id, violated: false, evidence: '', reasoning: '' })), states_no_governing_memory: keys.length === 0, notes: '' };
     const structured = input.includes('\\nReport P:\\n') ? { P: side, Q: side } : { forbidden: side.forbidden, presents_governing_memory_for_no_match: false, closest_call: '', notes: '' };
     const error = env.MOCK_GRADER === 'error';
-    out([init(['StructuredOutput']), { type: 'result', subtype: error ? 'error_max_turns' : 'success', is_error: error, structured_output: structured, total_cost_usd: 0.1, modelUsage: env.MOCK_GRADER === 'wrongmodel' ? { 'claude-haiku-4-5': { costUSD: 0.1 } } : usage }]);
+    const graded = [init(['StructuredOutput']), { type: 'result', subtype: error ? 'error_max_turns' : 'success', is_error: error, structured_output: structured, total_cost_usd: 0.1, modelUsage: env.MOCK_GRADER === 'wrongmodel' ? { 'claude-haiku-4-5': { costUSD: 0.1 } } : usage }];
+    if (env.MOCK_GRADER_DELAY_MS) setTimeout(() => out(graded), Number(env.MOCK_GRADER_DELAY_MS));
+    else out(graded);
     return;
   }
   if (noTools) {
     const bad = env.MOCK_REPORT_TURN === 'bad';
-    out([init([], bad ? { model: 'claude-haiku-4-5', claude_code_version: '0.0.0', permissionMode: 'default', mcp_servers: [{ name: 'x' }] } : {}), { type: 'result', subtype: 'success', is_error: false, result: 'REPORT from the transcript', total_cost_usd: 0.1, modelUsage: usage }]);
+    const turn = [init([], bad ? { model: 'claude-haiku-4-5', claude_code_version: '0.0.0', permissionMode: 'default', mcp_servers: [{ name: 'x' }] } : {}), { type: 'result', subtype: 'success', is_error: false, result: 'REPORT from the transcript', total_cost_usd: 0.1, modelUsage: usage }];
+    if (env.MOCK_REPORT_DELAY_MS) setTimeout(() => out(turn), Number(env.MOCK_REPORT_DELAY_MS));
+    else out(turn);
     return;
   }
   if (env.MOCK_SCENARIO === 'slow') {
@@ -99,7 +103,7 @@ process.stdin.on('end', () => {
 });
 `;
 
-const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS', 'MOCK_VERSION_FILE', 'MOCK_ENV_DUMP_DIR', 'MOCK_STARTED_DIR'];
+const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS', 'MOCK_VERSION_FILE', 'MOCK_ENV_DUMP_DIR', 'MOCK_STARTED_DIR', 'MOCK_REPORT_DELAY_MS', 'MOCK_GRADER_DELAY_MS'];
 
 async function loadHarness(t) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'a7-harness-'));
@@ -459,18 +463,17 @@ test('every paid attempt stays in the ledger across resumes; the attempt limit a
   assert.equal(Math.round(interrupted.total * 100) / 100, 5.7);
 
   // The next run records that attempt as aborted (a killed harness left it
-  // open) and never retries r001; the cap counts its reserve, so with $6
-  // approved r002 does not start either.
+  // open): an aborted evaluated session ends the entry, so nothing more
+  // starts, for any run (reviewer pass 1, R1).
   delete process.env.MOCK_GRADER;
-  const capped = await harness.run({ ...ctx, cap: 6, only: new Set(['r001', 'r002']) });
-  assert.deepEqual(capped.aborted, ['r001']);
-  assert.deepEqual(capped.skipped, ['r002']);
+  const startsBefore = (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length;
+  await assert.rejects(() => harness.run({ ...ctx, cap: 6, only: new Set(['r002']) }), /can no longer conform[\s\S]*run:r001#1 was aborted \(left open by a killed harness\)/);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, startsBefore, 'no paid session started');
   const closed = await harness.ledgerSpend(ctx.dir);
   assert.deepEqual(closed.aborted, ['run:r001#1']);
   assert.deepEqual(closed.unresolved, ['run:r001#1'], 'still unresolved: no stream, so its reserve is held');
   assert.deepEqual(closed.open, []);
   assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), 1, 'never retried');
-  process.exitCode = 0;
 });
 
 test('a grader session that errors or used another model never yields a grade (review R9)', async (t) => {
@@ -640,6 +643,12 @@ test('an interruption between a session finishing and its metadata write never r
   assert.deepEqual(await attempts('r002'), [1, 0]);
   assert.deepEqual(await clean('r002'), []);
 
+  // Direct dispatch of a finished session is refused too.
+  const r003 = manifest.runs.find((entry) => entry.id === 'r003');
+  await harness.run({ ...ctx, only: new Set(['r003']) });
+  await rm(`${base('r003')}.meta.json`);
+  await assert.rejects(() => harness.runAgent('PROMPT', r003.root, base('r003'), 24, { ledgerDir: ctx.dir, runId: 'r003' }), /already finished in the ledger/);
+
   // Two finished research attempts: the run stops without spending.
   const ledger = await harness.readLedger(ctx.dir);
   const start = ledger.find((record) => record.event === 'start' && record.job === 'run:r002');
@@ -649,11 +658,6 @@ test('an interruption between a session finishing and its metadata write never r
   await assert.rejects(() => harness.run({ ...ctx, only: new Set(['r002']) }), /2 finished attempts for run:r002; refusing/);
   assert.equal((await harness.readLedger(ctx.dir)).length, before, 'nothing was spent');
 
-  // Direct dispatch of a finished session is refused too.
-  const r003 = manifest.runs.find((entry) => entry.id === 'r003');
-  await harness.run({ ...ctx, only: new Set(['r003']) });
-  await rm(`${base('r003')}.meta.json`);
-  await assert.rejects(() => harness.runAgent('PROMPT', r003.root, base('r003'), 24, { ledgerDir: ctx.dir, runId: 'r003' }), /already finished in the ledger/);
 });
 
 // --------------------------------------------------------- Phase 2 preflight
@@ -754,17 +758,22 @@ test('the isolation index holds label-only content: corpus text, quoted passages
 
 test('forbidden content delivered through a tool result is a deviation; designed deliveries and corpus content are not; escaping patterns are (later attempt › isolation rule)', async (t) => {
   const { harness, dir } = await loadHarness(t);
-  const { ctx } = await prepared(harness, dir);
+  const { ctx, opts } = await prepared(harness, dir);
   const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
   const f1Baseline = manifest.runs.filter((entry) => entry.task === 'F1' && entry.arm === 'baseline').map((entry) => entry.id);
-  const audit = (id) => harness.auditRun(ctx.dir, manifest.runs.find((entry) => entry.id === id), manifest.tool_call_cap, manifest);
+  // A deviation ends an entry (R1), so each session runs in its own freshly prepared evaluation directory.
+  let fresh = 0;
   const session = async (id, inputs, results) => {
+    fresh += 1;
+    const own = { ...ctx, dir: path.join(dir, `eval-${fresh}`) };
+    await harness.prepare(own, opts);
+    const ownManifest = JSON.parse(await readFile(path.join(own.dir, 'manifest.json'), 'utf8'));
     process.env.MOCK_CALLS = String(inputs.length);
     process.env.MOCK_TOOL_INPUTS = JSON.stringify(inputs);
     process.env.MOCK_TOOL_RESULTS = JSON.stringify(results);
-    await harness.run({ ...ctx, only: new Set([id]) });
+    await harness.run({ ...own, only: new Set([id]) });
     process.exitCode = 0;
-    return audit(id);
+    return harness.auditRun(own.dir, ownManifest.runs.find((entry) => entry.id === id), ownManifest.tool_call_cap, ownManifest);
   };
   const read = (file) => ({ name: 'Read', input: { file_path: file } });
 
@@ -1009,14 +1018,11 @@ test('an abort stops dispatch, terminates and awaits live child sessions and the
   assert.deepEqual(spend.open, []);
   assert.deepEqual(spend.estimated.sort(), starts.map((record) => record.call).sort());
 
-  // Resume: the aborted runs are never retried; every other run proceeds.
+  // Resume: an aborted evaluated session ends the entry; no paid session starts, for any run (reviewer pass 1, R1).
   delete process.env.MOCK_SCENARIO;
-  const resumed = await harness.run(ctx);
-  const abortedRuns = starts.map((record) => record.job.replace('run:', '')).sort();
-  assert.deepEqual(resumed.aborted.sort(), abortedRuns);
-  for (const id of abortedRuns) assert.equal(await harness.attemptsOf(ctx.dir, `run:${id}`), 1);
-  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'finish').length, 16);
-  process.exitCode = 0;
+  await assert.rejects(() => harness.run(ctx), /can no longer conform/);
+  await assert.rejects(() => harness.grade(ctx), /can no longer conform/, 'grading refuses too');
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, 2, 'zero new paid starts');
 });
 
 test('a child that ignores SIGTERM is killed after the grace period, and a stream without usage stays unresolved at its reserve (S12)', async (t) => {
@@ -1058,7 +1064,8 @@ test('sessions a killed harness leaves running are terminated and recorded befor
   assert.deepEqual((await harness.ledgerSpend(ctx.dir)).open.sort(), starts.map((record) => record.call).sort());
 
   delete process.env.MOCK_SCENARIO;
-  const resumed = await harness.run(ctx);
+  // The next run terminates and records the orphans first, then refuses: they were aborted evaluated sessions (R1).
+  await assert.rejects(() => harness.run(ctx), /can no longer conform[\s\S]*left open by a killed harness/);
   for (const entry of pids) await until(() => !alive(entry.pid) && !alive(entry.grandchild), ALIVE_MS, `orphan ${entry.pid} gone`);
   const recovered = (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'aborted');
   assert.equal(recovered.length, 2);
@@ -1067,9 +1074,8 @@ test('sessions a killed harness leaves running are terminated and recorded befor
     assert.equal(record.reason, 'left running by a killed harness; terminated');
     assert.equal(record.cost_source, 'estimated');
   }
-  assert.deepEqual(resumed.aborted.sort(), starts.map((record) => record.job.replace('run:', '')).sort());
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, 2, 'zero new paid starts');
   assert.deepEqual((await harness.ledgerSpend(ctx.dir)).open, []);
-  process.exitCode = 0;
 });
 
 test('a STOP file stops dispatch gracefully: running sessions finish, nothing is aborted, and a resume continues (S12)', async (t) => {
@@ -1104,4 +1110,106 @@ test('a run with a deviation stops dispatch; running sessions finish (later atte
   const ledger = await harness.readLedger(ctx.dir);
   assert.deepEqual(ledger.find((record) => record.event === 'stopped').runs, ['r001']);
   assert.equal(ledger.filter((record) => record.event === 'start').length, 1);
+  // A resume, with any --only, spends nothing more (reviewer pass 1, R1).
+  delete process.env.MOCK_TOOL_INPUTS;
+  await assert.rejects(() => harness.run({ ...ctx, only: new Set(['r002']) }), /can no longer conform[\s\S]*a deviation stopped dispatch/);
+  // Even when the harness died before it recorded the stop, auditing the finished run finds it.
+  const ledgerFile = path.join(ctx.dir, 'ledger.jsonl');
+  const lines = (await readFile(ledgerFile, 'utf8')).split('\n').filter((line) => line && !/"event":"(stopped|refused)"/.test(line));
+  await writeFile(ledgerFile, `${lines.join('\n')}\n`);
+  await assert.rejects(() => harness.run(ctx), /can no longer conform[\s\S]*r001: Read outside the run copy: \/etc\/hosts/);
+  await assert.rejects(() => harness.grade(ctx), /can no longer conform/);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, 1, 'zero new paid starts');
+});
+
+test('an aborted report turn ends the entry; a deviation in research whose report turn is pending is found before the report turn is paid for (reviewer pass 1, R1)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  // r001 stops at the cap; its report turn is live when the abort lands.
+  process.env.MOCK_CALLS = '25';
+  process.env.MOCK_REPORT_DELAY_MS = '3000';
+  const controller = new AbortController();
+  const running = harness.run({ ...ctx, concurrency: 1, only: new Set(['r001']), signal: controller.signal });
+  await until(async () => (await harness.readLedger(ctx.dir)).some((record) => record.event === 'spawned' && record.call === 'report:r001#1'), 8000, 'a live report turn');
+  controller.abort('SIGINT');
+  await running;
+  process.exitCode = 0;
+  assert.ok((await harness.readLedger(ctx.dir)).some((record) => record.event === 'aborted' && record.call === 'report:r001#1'));
+  delete process.env.MOCK_REPORT_DELAY_MS;
+  const starts = (await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length;
+  await assert.rejects(() => harness.run(ctx), /can no longer conform[\s\S]*report:r001#1 was aborted/);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, starts, 'zero new paid starts');
+
+  // A second entry: r001's research reads outside the copy and stops at the cap, but the cap cannot fund its report turn.
+  const second = { ...ctx, dir: path.join(dir, 'eval-2') };
+  const { opts } = await prepared(harness, path.join(dir, 'second'));
+  await harness.prepare(second, opts);
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Read', input: { file_path: '/etc/hosts' } }]);
+  const pending = await harness.run({ ...second, cap: 1.51, concurrency: 1, only: new Set(['r001']) });
+  process.exitCode = 0;
+  assert.deepEqual(pending.deviations, ['r001'], 'audited as soon as its research finished');
+  delete process.env.MOCK_TOOL_INPUTS;
+  delete process.env.MOCK_CALLS;
+  await assert.rejects(() => harness.run({ ...second, cap: 10 }), /can no longer conform/);
+  assert.equal(await harness.attemptsOf(second.dir, 'report:r001'), 0, 'its report turn was never paid for');
+});
+
+test('STOP guards every paid session: a capped research session leaves its report turn pending, and a grader does not retry (reviewer pass 1, R2)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  process.env.MOCK_CALLS = '25';
+  process.env.MOCK_DELAY_MS = '400';
+  const running = harness.run({ ...ctx, concurrency: 1, only: new Set(['r001']) });
+  await until(async () => (await harness.readLedger(ctx.dir)).some((record) => record.event === 'spawned'), 4000, 'live research');
+  await writeFile(path.join(ctx.dir, 'STOP'), '');
+  const stopped = await running;
+  process.exitCode = 0;
+  assert.deepEqual(stopped.skipped, ['r001 (report turn pending)']);
+  assert.deepEqual((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').map((record) => record.job), ['run:r001'], 'no report turn after STOP');
+  // Resumable: after STOP is removed the report turn runs, and research is not repeated.
+  await rm(path.join(ctx.dir, 'STOP'));
+  delete process.env.MOCK_DELAY_MS;
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+  assert.deepEqual([await harness.attemptsOf(ctx.dir, 'run:r001'), await harness.attemptsOf(ctx.dir, 'report:r001')], [1, 1]);
+
+  // Grading: an invalid grade would be retried, but not after STOP.
+  delete process.env.MOCK_CALLS;
+  await harness.run(ctx);
+  process.env.MOCK_GRADER = 'invalid';
+  process.env.MOCK_GRADER_DELAY_MS = '400';
+  const grading = harness.grade({ ...ctx, concurrency: 1, only: new Set(['F5']) });
+  await until(async () => (await harness.readLedger(ctx.dir)).some((record) => record.event === 'spawned' && record.call.startsWith('grade:')), 4000, 'a live grader');
+  await writeFile(path.join(ctx.dir, 'STOP'), '');
+  await grading;
+  process.exitCode = 0;
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start' && record.kind === 'grader').length, 1, 'no retry and no new job after STOP');
+});
+
+test('a recovered attempt keeps the cost its stream reports, zero included; else its usage estimate; else its reserve (reviewer pass 1, R3)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const stream = async (name, events) => {
+    const file = path.join(dir, `${name}.jsonl`);
+    await writeFile(file, events.map((event) => `${JSON.stringify(event)}\n`).join(''));
+    return file;
+  };
+  const usage = { type: 'assistant', message: { id: 'm1', usage: { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 } } };
+  const cases = {
+    'grade:reported': await stream('reported', [usage, { type: 'result', subtype: 'success', total_cost_usd: 0.75 }]),
+    'grade:zero': await stream('zero', [usage, { type: 'result', subtype: 'success', total_cost_usd: 0 }]),
+    'grade:partial': await stream('partial', [usage]),
+    'grade:empty': await stream('empty', []),
+  };
+  for (const [job, file] of Object.entries(cases)) await appendFile(path.join(dir, 'ledger.jsonl'), `${JSON.stringify({ event: 'start', call: `${job}#1`, job, kind: 'grader', attempt: 1, reserve_usd: 0.5, file })}\n`);
+  await harness.reapOrphans({ dir, quiet: true });
+  const recorded = Object.fromEntries((await harness.readLedger(dir)).filter((record) => record.event === 'aborted').map((record) => [record.call, [record.cost_usd, record.cost_source]]));
+  assert.deepEqual(recorded, { 'grade:reported#1': [0.75, 'reported'], 'grade:zero#1': [0, 'reported'], 'grade:partial#1': [10 * 8e-6, 'estimated'], 'grade:empty#1': [null, 'unknown'] });
+  const spend = await harness.ledgerSpend(dir);
+  assert.ok(Math.abs(spend.total - (0.75 + 0 + 10 * 8e-6 + 0.5)) < 1e-12);
+  assert.deepEqual(spend.unresolved, ['grade:empty#1']);
+  assert.deepEqual(spend.estimated, ['grade:partial#1']);
+  // The same order for an attempt still open in the ledger.
+  const openDir = path.join(dir, 'open');
+  await mkdir(openDir);
+  await appendFile(path.join(openDir, 'ledger.jsonl'), `${JSON.stringify({ event: 'start', call: 'grade:x#1', job: 'grade:x', kind: 'grader', attempt: 1, reserve_usd: 0.5, file: cases['grade:reported'] })}\n`);
+  assert.equal((await harness.ledgerSpend(openDir)).total, 0.75);
 });
