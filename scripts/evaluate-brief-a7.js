@@ -614,13 +614,16 @@ export async function run(ctx) {
     // Every paid session — research or report turn — starts only within the cap.
     const guard = async (reserve) => (await ledgerSpend(dir)).total + reserve <= cap;
     const pending = [];
-    for (const entry of manifest.runs.filter((candidate) => !ctx.only || ctx.only.has(candidate.id))) {
+    for (const entry of manifest.runs) {
       const base = path.join(dir, 'transcripts', entry.id);
       // The ledger, not the metadata, says which sessions finished: every run
       // with a finished session is reconciled before anything is scheduled, so a
-      // finished session is never paid for twice.
+      // finished session is never paid for twice. All runs, not only --only's:
+      // the terminal audit below reads every run's evidence, and a missing
+      // metadata or transcript file is recoverable state, not a deviation
+      // (reviewer pass 2, R5). --only decides scheduling alone.
       const meta = (await ledgerHasFinished(dir, entry.id)) ? await reconcileRun(dir, entry, manifest.tool_call_cap) : await readMeta(base);
-      if (meta?.state !== 'complete') pending.push(entry);
+      if ((!ctx.only || ctx.only.has(entry.id)) && meta?.state !== 'complete') pending.push(entry);
     }
     // Before anything is spent, whatever --only selects: an entry that can no longer conform stops here.
     await refuseTerminal(ctx, manifest, 'run');
@@ -638,20 +641,21 @@ export async function run(ctx) {
       if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
       const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
       if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs, beforeSpawn: dispatchAllowed });
+      // A capped run's research is evidence before its report turn exists: audit it at that boundary,
+      // so a deviation there stops the report turn and all other dispatch (reviewer pass 2, R4).
+      const beforeReport = async () => {
+        const researchAudit = await auditRun(dir, entry, manifest.tool_call_cap, manifest, { researchOnly: true });
+        if (researchAudit.violations.length === 0) return true;
+        deviations.push(entry.id);
+        log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: research finished at the call cap; its report turn is not started; DEVIATIONS: ${researchAudit.violations.join('; ')}`);
+        return false;
+      };
+      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs, beforeSpawn: dispatchAllowed, beforeReport });
       if (meta.state === 'aborted') {
         aborted.push(entry.id);
         return;
       }
       if (meta.state !== 'complete') {
-        if (meta.state === 'report-pending') {
-          // Its research is evidence already: audit it now, so a deviation stops dispatch at once.
-          const pendingAudit = await auditRun(dir, entry, manifest.tool_call_cap, manifest, { researchOnly: true });
-          if (pendingAudit.violations.length > 0) {
-            deviations.push(entry.id);
-            log(ctx, `${entry.id} ${entry.task} ${entry.arm} #${entry.replicate}: research finished, report turn pending; DEVIATIONS: ${pendingAudit.violations.join('; ')}`);
-          }
-        }
         skipped.push(`${entry.id}${meta.state === 'report-pending' ? ' (report turn pending)' : ''}`);
         return;
       }
@@ -733,7 +737,7 @@ async function stopRequested(dir) {
  * `ledgerDir`, every session is a ledger attempt whose stream is written to
  * its own file as it arrives.
  */
-export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true, signal = null, graceMs = ABORT_GRACE_MS, beforeSpawn = () => true } = {}) {
+export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true, signal = null, graceMs = ABORT_GRACE_MS, beforeSpawn = () => true, beforeReport = async () => true } = {}) {
   let meta = await readMeta(transcriptBase);
   if (meta?.state === 'complete') return meta;
   // Never pay twice for a session the ledger records as finished, and never
@@ -785,6 +789,8 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
   if (meta.state === 'report-pending') {
     if (await wasAborted(`report:${runId}`)) return { ...meta, state: 'aborted' };
     if (signal?.aborted) return meta;
+    // The finished research is audited before its report turn is paid for (reviewer pass 2, R4).
+    if (!(await beforeReport())) return meta;
     if (!(await guard(RUN_RESERVE_USD))) return meta;
     if (!(await beforeSpawn())) return meta;
     await refuseFinished(`report:${runId}`);

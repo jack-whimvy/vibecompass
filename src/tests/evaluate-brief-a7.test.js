@@ -1154,6 +1154,58 @@ test('an aborted report turn ends the entry; a deviation in research whose repor
   assert.equal(await harness.attemptsOf(second.dir, 'report:r001'), 0, 'its report turn was never paid for');
 });
 
+test('capped research is audited before its funded report turn is paid for; valid capped research still gets its report (reviewer pass 2, R4)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx, opts } = await prepared(harness, dir);
+  process.env.MOCK_CALLS = '25';
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Read', input: { file_path: '/etc/hosts' } }]);
+  const outcome = await harness.run({ ...ctx, cap: 10, concurrency: 1, only: new Set(['r001']) });
+  assert.equal(process.exitCode, 4);
+  process.exitCode = 0;
+  assert.deepEqual(outcome.deviations, ['r001']);
+  assert.deepEqual((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').map((record) => record.job), ['run:r001'], 'no report turn for research that already deviates');
+  // Valid capped research, funded: its report turn runs.
+  delete process.env.MOCK_TOOL_INPUTS;
+  const valid = { ...ctx, dir: path.join(dir, 'eval-valid') };
+  await harness.prepare(valid, opts);
+  const clean = await harness.run({ ...valid, cap: 10, concurrency: 1, only: new Set(['r001']) });
+  assert.deepEqual(clean.deviations, []);
+  assert.deepEqual((await harness.readLedger(valid.dir)).filter((record) => record.event === 'start').map((record) => record.job), ['run:r001', 'report:r001']);
+});
+
+test('every finished run is reconciled before the terminal audit, whatever --only selects; a real deviation outside --only still blocks (reviewer pass 2, R5)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx, opts } = await prepared(harness, dir);
+  await harness.run({ ...ctx, concurrency: 1, only: new Set(['r001']) });
+  const base = path.join(ctx.dir, 'transcripts', 'r001');
+  // The supported crash window: the finish is in the ledger, the metadata and transcript copies are not.
+  await rm(`${base}.meta.json`);
+  await rm(`${base}.jsonl`);
+  await harness.run({ ...ctx, concurrency: 1, only: new Set(['r002']) });
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r001'), 1, 'finished research is not retried');
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r002'), 1, 'the selected run proceeds');
+  assert.equal(JSON.parse(await readFile(`${base}.meta.json`, 'utf8')).state, 'complete', 'restored from the ledger');
+  // A genuinely inconsistent stream outside --only still stops everything.
+  const ledger = await harness.readLedger(ctx.dir);
+  const start = ledger.find((record) => record.event === 'start' && record.job === 'run:r001');
+  await writeFile(start.file, 'tampered\n');
+  await rm(`${base}.meta.json`);
+  await assert.rejects(() => harness.run({ ...ctx, only: new Set(['r003']) }), /attempt stream for run:r001 is missing or does not match the ledger/);
+  assert.equal(await harness.attemptsOf(ctx.dir, 'run:r003'), 0);
+  // And an excluded run with a real deviation blocks all spending, after its metadata is restored.
+  const second = { ...ctx, dir: path.join(dir, 'eval-2') };
+  await harness.prepare(second, opts);
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Read', input: { file_path: '/etc/hosts' } }]);
+  await harness.run({ ...second, concurrency: 1, only: new Set(['r001']) });
+  process.exitCode = 0;
+  delete process.env.MOCK_TOOL_INPUTS;
+  await rm(path.join(second.dir, 'transcripts', 'r001.meta.json'));
+  const ledgerFile = path.join(second.dir, 'ledger.jsonl');
+  await writeFile(ledgerFile, `${(await readFile(ledgerFile, 'utf8')).split('\n').filter((line) => line && !line.includes('"event":"stopped"')).join('\n')}\n`);
+  await assert.rejects(() => harness.run({ ...second, only: new Set(['r002']) }), /can no longer conform[\s\S]*r001: Read outside the run copy/);
+  assert.equal(await harness.attemptsOf(second.dir, 'run:r002'), 0);
+});
+
 test('STOP guards every paid session: a capped research session leaves its report turn pending, and a grader does not retry (reviewer pass 1, R2)', async (t) => {
   const { harness, dir } = await loadHarness(t);
   const { ctx } = await prepared(harness, dir);
