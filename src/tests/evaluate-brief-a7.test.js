@@ -29,12 +29,15 @@ const FIXTURE_ROOT = path.join(here, 'fixtures', 'brief', 'root');
 const MOCK = `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (process.env.MOCK_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
-if (args[0] === '--version') { console.log('2.1.288 (Claude Code)'); process.exit(0); }
+// The version is read once, at start, as a real binary has one version for its whole life.
+const VERSION = (() => { try { return require('node:fs').readFileSync(process.env.MOCK_VERSION_FILE, 'utf8').trim(); } catch { return '2.1.288'; } })();
+if (process.env.MOCK_ENV_DUMP_DIR) require('node:fs').writeFileSync(require('node:path').join(process.env.MOCK_ENV_DUMP_DIR, process.pid + '.json'), JSON.stringify(Object.keys(process.env)));
+if (args[0] === '--version') { console.log(VERSION + ' (Claude Code)'); process.exit(0); }
 const toolsIndex = args.indexOf('--tools');
 const noTools = toolsIndex !== -1 && args[toolsIndex + 1] === '';
 const grader = args.includes('--json-schema');
 const env = process.env;
-const init = (tools, overrides = {}) => ({ type: 'system', subtype: 'init', session_id: 's-' + Math.random().toString(16).slice(2), model: 'claude-opus-5-5', tools, permissionMode: 'dontAsk', mcp_servers: [], claude_code_version: '2.1.288', ...overrides });
+const init = (tools, overrides = {}) => ({ type: 'system', subtype: 'init', session_id: 's-' + Math.random().toString(16).slice(2), model: 'claude-opus-5-5', tools, permissionMode: 'dontAsk', mcp_servers: [], claude_code_version: VERSION, ...overrides });
 const usage = { 'claude-opus-5-5': { costUSD: 0.1 } };
 const out = (events) => process.stdout.write(events.map((event) => JSON.stringify(event)).join('\\n') + '\\n');
 let input = '';
@@ -95,7 +98,7 @@ process.stdin.on('end', () => {
 });
 `;
 
-const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS'];
+const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS', 'MOCK_VERSION_FILE', 'MOCK_ENV_DUMP_DIR'];
 
 async function loadHarness(t) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'a7-harness-'));
@@ -826,6 +829,65 @@ test('what a tool or the prompt frame can compose from the run copy is never for
   // Label-only text is still caught under every one of these subtractions.
   assert.ok(harness.countFingerprintHits(LABEL_ONLY_HELDOUT, withBrief) > 0);
   assert.ok(harness.countFingerprintHits(`/tmp/Private Backups/x.md:${LABEL_ONLY_HELDOUT}`, forbidden, { toolOutput: true }) > 0);
+});
+
+// ------------------------------------------------------- session environment and version
+
+test('a Claude Code update stops dispatch before any session runs on the new version; a resume on the prepared version continues (later attempt)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const versionFile = path.join(dir, 'version');
+  await writeFile(versionFile, '2.1.288');
+  process.env.MOCK_VERSION_FILE = versionFile;
+  const { ctx } = await prepared(harness, dir);
+  // Changed before the stage: nothing starts.
+  await writeFile(versionFile, '2.1.289');
+  await assert.rejects(() => harness.run(ctx), /Claude Code is 2\.1\.289, but this evaluation was prepared with 2\.1\.288/);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'start').length, 0);
+  // Changed while a session runs: that session finishes on 2.1.288, and no other starts.
+  await writeFile(versionFile, '2.1.288');
+  process.env.MOCK_DELAY_MS = '600';
+  const running = harness.run({ ...ctx, concurrency: 1 });
+  await until(async () => (await harness.readLedger(ctx.dir)).some((record) => record.event === 'spawned'), 4000, 'a live session');
+  await writeFile(versionFile, '2.1.289');
+  const outcome = await running;
+  assert.equal(process.exitCode, 5);
+  process.exitCode = 0;
+  assert.equal(outcome.version_changed, '2.1.289');
+  assert.deepEqual(outcome.deviations, [], 'the finished session ran on the prepared version');
+  const ledger = await harness.readLedger(ctx.dir);
+  assert.equal(ledger.filter((record) => record.event === 'start').length, 1);
+  assert.deepEqual(ledger.filter((record) => record.event === 'stopped').map((record) => [record.reason, record.expected, record.found]), [['claude-version', '2.1.288', '2.1.289']]);
+  // Reinstalled: the evaluation resumes, and nothing ran twice.
+  await writeFile(versionFile, '2.1.288');
+  delete process.env.MOCK_DELAY_MS;
+  const resumed = await harness.run(ctx);
+  assert.deepEqual(resumed.skipped, []);
+  assert.equal((await harness.readLedger(ctx.dir)).filter((record) => record.event === 'finish').length, 18);
+});
+
+test('child sessions never inherit the parent Claude Code session or VibeCompass credentials; auth and config pass through (later attempt)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const planted = { CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/socket', CLAUDE_CODE_MESSAGING_TOKEN: 'token', CLAUDE_CODE_SESSION_ID: 'parent', CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_EFFORT: 'low', CLAUDECODE: '1', AI_AGENT: 'claude', VIBECOMPASS_SYNC_TOKEN: 'secret', CLAUDE_CONFIG_DIR: '/tmp/claude-config', ANTHROPIC_BASE_URL: 'https://example.invalid' };
+  const saved = Object.fromEntries(Object.keys(planted).map((name) => [name, process.env[name]]));
+  t.after(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  Object.assign(process.env, planted);
+  const dumpDir = path.join(dir, 'env-dump');
+  await mkdir(dumpDir, { recursive: true });
+  process.env.MOCK_ENV_DUMP_DIR = dumpDir;
+  await harness.run({ ...ctx, only: new Set(['r001']) });
+  const dumps = await Promise.all((await readdir(dumpDir)).map(async (file) => JSON.parse(await readFile(path.join(dumpDir, file), 'utf8'))));
+  assert.ok(dumps.length >= 2, 'the version check and the session both ran');
+  for (const names of dumps) {
+    for (const dropped of ['CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_EFFORT', 'CLAUDECODE', 'AI_AGENT', 'VIBECOMPASS_SYNC_TOKEN']) assert.ok(!names.includes(dropped), dropped);
+    for (const kept of ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_BASE_URL', 'MOCK_ENV_DUMP_DIR', 'PATH']) assert.ok(names.includes(kept), kept);
+  }
+  assert.deepEqual(Object.keys(harness.childEnv({ CLAUDE_CODE_X: '1', CLAUDE_CONFIG_DIR: 'c', VIBECOMPASS_ROOT: 'r', HOME: 'h' })).sort(), ['CLAUDE_CONFIG_DIR', 'HOME']);
 });
 
 // ------------------------------------------------------------- abort handling (S12)

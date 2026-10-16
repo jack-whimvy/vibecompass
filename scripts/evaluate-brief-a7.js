@@ -170,6 +170,45 @@ const STREAM = ['--output-format', 'stream-json', '--verbose'];
 // Tests point this at a mock child; an evaluation run records it, and the
 // audit requires the recorded Claude Code version in every session.
 const CLAUDE_BIN = process.env.A7_CLAUDE_BIN ?? 'claude';
+// Variables a child session must not inherit: the parent Claude Code
+// session's own (its messaging socket and token, session ids, entry point,
+// effort), and VibeCompass credentials. Auth and config (CLAUDE_CONFIG_DIR,
+// ANTHROPIC_*) pass through.
+const CHILD_ENV_DROPPED = (name) => (/^CLAUDE/.test(name) && name !== 'CLAUDE_CONFIG_DIR') || name === 'AI_AGENT' || /^VIBECOMPASS_/.test(name);
+
+/** The environment every child session gets: the harness's, without the dropped variables. */
+export function childEnv(env = process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !CHILD_ENV_DROPPED(name)));
+}
+
+/** The Claude Code version a session would run now ("2.1.301"), or null. */
+export function currentClaudeVersion() {
+  return parseVersion(spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', env: childEnv() }).stdout);
+}
+
+/**
+ * Claude Code updates itself in place, and every session must run exactly
+ * the version recorded at prepare. Each paid stage checks the version before
+ * it starts and again before every session; a change stops dispatch before
+ * anything runs on the new version.
+ */
+function versionGuard(manifest) {
+  const expected = parseVersion(manifest.claude_version);
+  const guard = {
+    expected,
+    found: null,
+    check: () => {
+      const now = currentClaudeVersion();
+      if (now !== expected) guard.found = now ?? 'unreadable';
+      return guard.found === null;
+    },
+  };
+  return guard;
+}
+
+function versionChangedError(guard) {
+  return `Claude Code is ${guard.found}, but this evaluation was prepared with ${guard.expected}; reinstall exactly ${guard.expected} (and keep auto-update off) before resuming. No session started on ${guard.found}.`;
+}
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const harnessPath = fileURLToPath(import.meta.url);
@@ -242,7 +281,7 @@ export async function prepare(ctx, opts) {
   ];
   if (failures.length > 0) throw new Error(`Preflight failed; nothing prepared:\n- ${failures.join('\n- ')}`);
 
-  const claudeVersion = spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8' }).stdout.trim();
+  const claudeVersion = spawnSync(CLAUDE_BIN, ['--version'], { encoding: 'utf8', env: childEnv() }).stdout.trim();
   if (!parseVersion(claudeVersion)) throw new Error(`cannot read the Claude Code version (got "${claudeVersion}")`);
   const manifest = {
     prepared_at: new Date().toISOString(),
@@ -250,6 +289,7 @@ export async function prepare(ctx, opts) {
     node: process.version,
     claude_bin: CLAUDE_BIN,
     claude_version: claudeVersion,
+    child_env_removed: Object.keys(process.env).filter(CHILD_ENV_DROPPED).sort(),
     harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM].join(' ')}), cwd = run copy, prompt on stdin, stopped when tool call ${TOOL_CALL_CAP + 1} appears`,
     report_turn_harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, '--tools', '""', ...STREAM].join(' ')}), cwd = run copy, prompt on stdin`,
     grader_harness: `Claude Code ${claudeVersion} headless (claude ${[...CLAUDE_ARGS, '--tools', '""', ...STREAM, '--json-schema', '<schema>'].join(' ')}), empty cwd, prompt on stdin`,
@@ -559,6 +599,8 @@ export async function run(ctx) {
   return withHarnessLock(ctx, async () => {
     // Sessions a killed harness left behind are terminated and recorded before anything else.
     await reapOrphans(ctx);
+    const version = versionGuard(manifest);
+    if (!version.check()) throw new Error(versionChangedError(version));
     // Every paid session — research or report turn — starts only within the cap.
     const guard = async (reserve) => (await ledgerSpend(dir)).total + reserve <= cap;
     const pending = [];
@@ -575,14 +617,14 @@ export async function run(ctx) {
     const deviations = [];
     const dispatched = new Set();
     // A run with a deviation makes the entry nonconforming, so dispatch stops there (A7 protocol › Residual risk).
-    const stop = async () => deviations.length > 0 || (await stopRequested(dir));
+    const stop = async () => deviations.length > 0 || version.found !== null || (await stopRequested(dir));
     await pool(pending, ctx.concurrency ?? 4, async (entry) => {
       dispatched.add(entry.id);
       const treeProblems = await verifyRunTree(entry);
       if (treeProblems.length > 0) throw new Error(`${entry.id}: ${treeProblems.join('; ')}`);
       const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8');
       if (sha256(prompt) !== entry.prompt_sha256) throw new Error(`${entry.id}: prompt changed since prepare.`);
-      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs });
+      const meta = await runAgent(prompt, entry.root, path.join(dir, 'transcripts', entry.id), manifest.tool_call_cap, { ledgerDir: dir, runId: entry.id, guard, signal: ctx.signal, graceMs: ctx.graceMs, beforeSpawn: version.check });
       if (meta.state === 'aborted') {
         aborted.push(entry.id);
         return;
@@ -604,13 +646,17 @@ export async function run(ctx) {
       await appendLedger(dir, { event: 'stopped', stage: 'run', reason: 'deviation', runs: deviations });
       log(ctx, `Stopped dispatch at a deviation (${deviations.join(', ')}): the entry cannot be conforming. Running sessions finished; nothing else starts.`);
       process.exitCode = 4;
+    } else if (version.found !== null) {
+      await appendLedger(dir, { event: 'stopped', stage: 'run', reason: 'claude-version', expected: version.expected, found: version.found });
+      log(ctx, `Stopped dispatch: ${versionChangedError(version)} Running sessions finished on ${version.expected}.`);
+      process.exitCode = 5;
     } else if (skipped.length > 0) {
       const why = (await stopRequested(dir)) ? 'at the STOP file' : 'at the cost cap';
       log(ctx, `Stopped ${why}: ${skipped.length} run(s) not finished (${skipped.join(', ')}). Resume with a cap the founder approves${why === 'at the STOP file' ? ', after removing STOP' : ''}.`);
       process.exitCode = 3;
     }
     if (aborted.length > 0 && !ctx.signal?.aborted) log(ctx, `${aborted.length} run(s) have an aborted session and are never retried: ${aborted.join(', ')}.`);
-    return { skipped, aborted, deviations };
+    return { skipped, aborted, deviations, version_changed: version.found };
   });
 }
 
@@ -629,7 +675,7 @@ async function stopRequested(dir) {
  * `ledgerDir`, every session is a ledger attempt whose stream is written to
  * its own file as it arrives.
  */
-export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true, signal = null, graceMs = ABORT_GRACE_MS } = {}) {
+export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = null, runId = path.basename(transcriptBase), guard = async () => true, signal = null, graceMs = ABORT_GRACE_MS, beforeSpawn = () => true } = {}) {
   let meta = await readMeta(transcriptBase);
   if (meta?.state === 'complete') return meta;
   // Never pay twice for a session the ledger records as finished, and never
@@ -653,6 +699,7 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     if (await wasAborted(`run:${runId}`)) return { ...(meta ?? {}), state: 'aborted' };
     if (signal?.aborted) return { state: 'not-started' };
     if (!(await guard(RUN_RESERVE_USD))) return { state: 'not-started' };
+    if (!(await beforeSpawn())) return { state: 'not-started' };
     await refuseFinished(`run:${runId}`);
     const started = Date.now();
     const research = await paidCall(ledgerDir, 'research', `run:${runId}`, RUN_RESERVE_USD, (attempt) => `${transcriptBase}.attempt-${attempt}.jsonl`, (streamFile, onSpawn) =>
@@ -681,6 +728,7 @@ export async function runAgent(prompt, cwd, transcriptBase, cap, { ledgerDir = n
     if (await wasAborted(`report:${runId}`)) return { ...meta, state: 'aborted' };
     if (signal?.aborted) return meta;
     if (!(await guard(RUN_RESERVE_USD))) return meta;
+    if (!(await beforeSpawn())) return meta;
     await refuseFinished(`report:${runId}`);
     const reportPrompt = renderReportTurn(prompt, researchEvents, cap);
     meta.report_prompt_sha256 = sha256(reportPrompt);
@@ -1447,8 +1495,15 @@ export async function grade(ctx) {
   const tasks = manifest.tasks.filter((candidate) => !ctx.only || ctx.only.has(candidate.id));
   return withHarnessLock(ctx, async () => {
     await reapOrphans(ctx);
-    const outcome = await gradeTasks(ctx, manifest, labels, tasks, cap);
+    const version = versionGuard(manifest);
+    if (!version.check()) throw new Error(versionChangedError(version));
+    const outcome = await gradeTasks({ ...ctx, version }, manifest, labels, tasks, cap);
     if (ctx.signal?.aborted) await recordAbort(ctx, 'grade', []);
+    else if (version.found !== null) {
+      await appendLedger(ctx.dir, { event: 'stopped', stage: 'grade', reason: 'claude-version', expected: version.expected, found: version.found });
+      log(ctx, `Stopped grading: ${versionChangedError(version)}`);
+      process.exitCode = 5;
+    }
     return outcome;
   });
 }
@@ -1472,7 +1527,7 @@ async function gradeTasks(ctx, manifest, labels, tasks, cap) {
 
   // Pass 2: a third grader wherever the first two disagree on any verdict.
   const tiebreaks = [];
-  if (first.skipped.length === 0 && !ctx.signal?.aborted) {
+  if (first.skipped.length === 0 && !ctx.signal?.aborted && !ctx.version?.found) {
     for (const task of tasks) {
       const label = labels.get(task.id);
       for (const replicate of replicatesOf(manifest, task.id)) {
@@ -1559,7 +1614,7 @@ async function runGraders(ctx, jobs, manifest, cap) {
         skipped.push(job.name);
         return;
       }
-      if (ctx.signal?.aborted) {
+      if (ctx.signal?.aborted || (ctx.version && !ctx.version.check())) {
         skipped.push(job.name);
         return;
       }
@@ -1585,9 +1640,9 @@ async function runGraders(ctx, jobs, manifest, cap) {
       }
       await writeFile(path.join(gradingDir, `${job.name}.attempt-${call.attempt}.invalid.json`), `${JSON.stringify({ ...record, problems }, null, 2)}\n`, { flag: 'wx' });
     }
-  }, { signal: ctx.signal, stop: () => stopRequested(dir) });
+  }, { signal: ctx.signal, stop: async () => Boolean(ctx.version?.found) || (await stopRequested(dir)) });
   skipped.push(...jobs.filter((job) => !dispatched.has(job.name)).map((job) => job.name));
-  if (skipped.length > 0 && !ctx.signal?.aborted) {
+  if (skipped.length > 0 && !ctx.signal?.aborted && !ctx.version?.found) {
     log(ctx, `Stopped at the cost cap or the STOP file: ${skipped.length} grading job(s) not started. Resume with a cap the founder approves.`);
     process.exitCode = 3;
   }
@@ -2355,7 +2410,7 @@ export function parseLabels(markdown, level = 4) {
  */
 export function spawnClaudeStream(claudeArgs, prompt, cwd, cap, { streamFile = null, signal = null, graceMs = ABORT_GRACE_MS, onSpawn = null } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(CLAUDE_BIN, claudeArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const child = spawn(CLAUDE_BIN, claudeArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: true, env: childEnv() });
     const sink = streamFile ? createWriteStream(streamFile, { flags: 'wx' }) : null;
     let stdout = '';
     let stderr = '';
@@ -2673,6 +2728,8 @@ function describe() {
         label_files: LABEL_FILES,
         isolation_fingerprint: FINGERPRINT,
         abort_grace_ms: ABORT_GRACE_MS,
+        child_env_dropped: 'CLAUDE* except CLAUDE_CONFIG_DIR, AI_AGENT, VIBECOMPASS_*',
+        claude_version_now: currentClaudeVersion(),
         agent_args: [...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM],
         report_turn_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM],
         grader_args: [...CLAUDE_ARGS, ...NO_TOOLS, ...STREAM, '--json-schema', '<schema>'],
