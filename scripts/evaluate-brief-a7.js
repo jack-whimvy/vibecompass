@@ -82,6 +82,7 @@ import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFile, copyFile, cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSessionBrief, estimateBriefTokens } from '../src/brief.js';
@@ -114,6 +115,11 @@ const LANE_FILES = ['sessions/active/index.yaml', 'sessions/active/eval/session.
 export const RUN_RESERVE_USD = 1.5;
 export const GRADE_RESERVE_USD = 0.5;
 export const MAX_GRADE_ATTEMPTS = 3;
+// Latency is measured only on a quiet machine: prepare refuses, preparing
+// nothing, when the one-minute load average exceeds this share of the logical
+// cores as measurement starts (the rehearsal measured warm p50 274 ms at load
+// 3.8 and 841 ms at load 31.8 on 16 cores, for the same code and corpus).
+export const LATENCY_MAX_LOAD_PER_CORE = 0.5;
 // Abort: how long a child session gets after SIGTERM before SIGKILL.
 export const ABORT_GRACE_MS = 5000;
 // Isolation fingerprints: word 8-grams of normalized text with at least five
@@ -272,7 +278,11 @@ export async function prepare(ctx, opts) {
   const briefs = {};
   for (const entry of runs) failures.push(...(await prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, briefs, forbidden)));
 
+  const loadLimit = (opts.cores ?? os.availableParallelism()) * LATENCY_MAX_LOAD_PER_CORE;
+  const loadBefore = (opts.loadavg ?? os.loadavg)();
+  if (loadBefore[0] > loadLimit) throw new Error(`Machine busy; nothing prepared: the one-minute load average is ${loadBefore[0].toFixed(2)}, above ${loadLimit} (${LATENCY_MAX_LOAD_PER_CORE} per logical core), so latency cannot be measured fairly. Stop other work (other lanes' tests and builds) and prepare again into a new, empty directory.`);
   const latency = await measureLatency(dir, corpus, tasks, opts.warmRuns ?? 10);
+  latency.load_average = { before: loadBefore.map((value) => Math.round(value * 100) / 100), after: (opts.loadavg ?? os.loadavg)().map((value) => Math.round(value * 100) / 100), limit: loadLimit, logical_cores: opts.cores ?? os.availableParallelism() };
   // Pre-run gates (A7 protocol): a failure here is the outcome — no-go — and no paid run starts.
   const preRunGateFailures = [
     ...Object.entries(briefs).flatMap(([id, brief]) => brief.safe_overflow.map((problem) => `${id}: ${problem}`)),
@@ -325,7 +335,7 @@ export async function prepare(ctx, opts) {
   }
   const heldoutBriefs = Object.entries(briefs).filter(([id]) => heldoutIds.has(id));
   log(ctx, `- held-out: ${heldoutBriefs.length} briefs, safe overflow on ${heldoutBriefs.filter(([, brief]) => brief.safe_overflow.length === 0).length}`);
-  log(ctx, `Latency: cold CLI first ${latency.cold_first_ms} ms, max ${latency.cold_max_ms} ms; warm p50 max ${latency.warm_p50_max_ms} ms`);
+  log(ctx, `Latency: cold CLI first ${latency.cold_first_ms} ms, max ${latency.cold_max_ms} ms; warm p50 max ${latency.warm_p50_max_ms} ms; load average ${latency.load_average.before.join(' ')} before, ${latency.load_average.after.join(' ')} after`);
   if (!manifest.pre_run_gates.pass) log(ctx, `PRE-RUN GATES FAILED — the outcome is no-go and \`run\` will refuse:\n- ${preRunGateFailures.join('\n- ')}`);
   return manifest;
 }
@@ -2728,6 +2738,7 @@ function describe() {
         label_files: LABEL_FILES,
         isolation_fingerprint: FINGERPRINT,
         abort_grace_ms: ABORT_GRACE_MS,
+        latency_max_load_per_core: LATENCY_MAX_LOAD_PER_CORE,
         child_env_dropped: 'CLAUDE* except CLAUDE_CONFIG_DIR, AI_AGENT, VIBECOMPASS_*',
         claude_version_now: currentClaudeVersion(),
         agent_args: [...CLAUDE_ARGS, ...AGENT_TOOLS, ...STREAM],

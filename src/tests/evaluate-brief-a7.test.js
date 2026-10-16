@@ -31,6 +31,7 @@ const args = process.argv.slice(2);
 if (process.env.MOCK_IGNORE_TERM === '1') process.on('SIGTERM', () => {});
 // The version is read once, at start, as a real binary has one version for its whole life.
 const VERSION = (() => { try { return require('node:fs').readFileSync(process.env.MOCK_VERSION_FILE, 'utf8').trim(); } catch { return '2.1.288'; } })();
+if (process.env.MOCK_STARTED_DIR && args[0] !== '--version') require('node:fs').writeFileSync(require('node:path').join(process.env.MOCK_STARTED_DIR, process.pid + '.started'), VERSION);
 if (process.env.MOCK_ENV_DUMP_DIR) require('node:fs').writeFileSync(require('node:path').join(process.env.MOCK_ENV_DUMP_DIR, process.pid + '.json'), JSON.stringify(Object.keys(process.env)));
 if (args[0] === '--version') { console.log(VERSION + ' (Claude Code)'); process.exit(0); }
 const toolsIndex = args.indexOf('--tools');
@@ -98,7 +99,7 @@ process.stdin.on('end', () => {
 });
 `;
 
-const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS', 'MOCK_VERSION_FILE', 'MOCK_ENV_DUMP_DIR'];
+const MOCK_ENV = ['MOCK_SCENARIO', 'MOCK_CALLS', 'MOCK_REPORT_TURN', 'MOCK_GRADER', 'MOCK_REPORT', 'MOCK_TOOL_INPUTS', 'MOCK_TOOL_RESULTS', 'MOCK_TOOL_ERRORS', 'MOCK_PID_DIR', 'MOCK_IGNORE_TERM', 'MOCK_NO_USAGE', 'MOCK_DELAY_MS', 'MOCK_VERSION_FILE', 'MOCK_ENV_DUMP_DIR', 'MOCK_STARTED_DIR'];
 
 async function loadHarness(t) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'a7-harness-'));
@@ -367,7 +368,8 @@ async function prepared(harness, dir, { link = null, heldout = HELDOUT_LABELS } 
   // The held-out file lives outside every repo, under any name.
   await writeFile(path.join(labelsDir, 'held-out-set.md'), heldout);
   const ctx = { dir: path.join(dir, 'eval'), cap: 100, concurrency: 4, quiet: true, graceMs: 300, identity: () => ({ package_commit: 'test', package_dirty: '', package_src_tree: 'test' }) };
-  const opts = { corpus, docsRepo: repo, tuningLabels: path.join(labelsDir, 'recall-evaluation.md'), heldout: path.join(labelsDir, 'held-out-set.md'), heldoutSha: sha256(heldout), warmRuns: 1, expectTasks: 3, tuningTasks: 2 };
+  // A quiet machine, whatever the test runner's real load.
+  const opts = { corpus, docsRepo: repo, tuningLabels: path.join(labelsDir, 'recall-evaluation.md'), heldout: path.join(labelsDir, 'held-out-set.md'), heldoutSha: sha256(heldout), warmRuns: 1, expectTasks: 3, tuningTasks: 2, cores: 16, loadavg: () => [1, 1, 1] };
   await harness.prepare(ctx, opts);
   return { ctx, opts };
 }
@@ -831,6 +833,17 @@ test('what a tool or the prompt frame can compose from the run copy is never for
   assert.ok(harness.countFingerprintHits(`/tmp/Private Backups/x.md:${LABEL_ONLY_HELDOUT}`, forbidden, { toolOutput: true }) > 0);
 });
 
+test('latency is measured only on a quiet machine: a busy one prepares nothing and records no outcome (later attempt, J8)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx, opts } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.latency.load_average, { before: [1, 1, 1], after: [1, 1, 1], limit: 8, logical_cores: 16 });
+  const busy = { ...ctx, dir: path.join(dir, 'busy') };
+  await assert.rejects(() => harness.prepare(busy, { ...opts, loadavg: () => [8.5, 4, 2] }), /Machine busy; nothing prepared: the one-minute load average is 8\.50, above 8/);
+  await assert.rejects(() => readFile(path.join(busy.dir, 'manifest.json')), /ENOENT/, 'no manifest, so no pre-run gate outcome');
+  await assert.rejects(() => harness.prepare(busy, opts), /Refusing to prepare/, 'the next try uses a new, empty directory');
+});
+
 // ------------------------------------------------------- session environment and version
 
 test('a Claude Code update stops dispatch before any session runs on the new version; a resume on the prepared version continues (later attempt)', async (t) => {
@@ -846,8 +859,12 @@ test('a Claude Code update stops dispatch before any session runs on the new ver
   // Changed while a session runs: that session finishes on 2.1.288, and no other starts.
   await writeFile(versionFile, '2.1.288');
   process.env.MOCK_DELAY_MS = '600';
+  const startedDir = path.join(dir, 'started');
+  await mkdir(startedDir, { recursive: true });
+  process.env.MOCK_STARTED_DIR = startedDir;
   const running = harness.run({ ...ctx, concurrency: 1 });
-  await until(async () => (await harness.readLedger(ctx.dir)).some((record) => record.event === 'spawned'), 4000, 'a live session');
+  // Wait until the session itself has read its version, not just until it was spawned.
+  await until(async () => (await readdir(startedDir)).length > 0, 8000, 'a live session on 2.1.288');
   await writeFile(versionFile, '2.1.289');
   const outcome = await running;
   assert.equal(process.exitCode, 5);
