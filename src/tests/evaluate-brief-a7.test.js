@@ -265,7 +265,27 @@ test('the pre-registered screen flags baseline-majority clause drops of two and 
 const LABEL_ONLY_TUNING = 'The quarterly audit freezes the plum ledger before the vendor reconciliation window closes.';
 const LABEL_ONLY_HELDOUT = 'Zebra invoices settle only after the copper review board signs the quarterly attestation.';
 const QUOTED_CORPUS = 'Each account has a metered allowance of refresh runs per period under D-101';
+// A long corpus path the labels cite with a heading, as real labels do
+// (`path › heading`), and a quote of A5's prompt template with its
+// "{files or 'none'}": both are label text that a tool or the prompt frame
+// can compose from the run copy, so neither may be forbidden there.
+const LONG_DOC_PATH = 'architecture/platform/project-memory/recall-and-plain-language-build-plan.md';
+const LONG_DOC = `---
+domain: Platform
+feature: Project Memory
+component: Build Plan
+status: In progress
+---
+
+## Description
+The build plan for the recall program.
+
+## Current state that motivates the plan
+Pushed notes reach the dashboard as Activity rows.
+`;
 const TUNING_LABELS = `### Tuning tasks
+Prompt template: "You are starting a builder session in this project-memory root. Task: {task}. Files: {files or 'none'}. Do not write code. Using project memory, produce a context report."
+Cited: \`docs:${LONG_DOC_PATH}\` › Current state that motivates the plan
 
 #### F1 — file-scoped · tuning
 - **Task:** Superseded v1 block; the harness never reads it.
@@ -331,9 +351,10 @@ async function prepared(harness, dir, { link = null, heldout = HELDOUT_LABELS } 
     await cp(FIXTURE_ROOT, root, { recursive: true });
     for (const [file, text] of Object.entries(STARTUP_ROOT)) await writeFile(path.join(root, file), text);
     await writeFile(path.join(root, 'architecture', 'sync', 'evaluation-notes.md'), MARKER_DOC);
+    await mkdir(path.dirname(path.join(root, LONG_DOC_PATH)), { recursive: true });
+    await writeFile(path.join(root, LONG_DOC_PATH), LONG_DOC);
     await addLink(root);
   }
-  await mkdir(path.join(repo, 'architecture', 'platform', 'project-memory'), { recursive: true });
   await writeFile(path.join(repo, 'architecture', 'platform', 'project-memory', 'recall-evaluation.md'), TUNING_LABELS);
   const git = (...args) => spawnSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { encoding: 'utf8' });
   for (const args of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'corpus'], ['tag', 'recall-eval-corpus-v3']]) assert.equal(git(...args).status, 0);
@@ -744,12 +765,12 @@ test('forbidden content delivered through a tool result is a deviation; designed
 
   // Designed deliveries: the run's own task line (in its lane files and brief) and corpus files.
   const lane = await readFile(path.join(manifest.runs.find((entry) => entry.id === f1Baseline[0]).root, 'sessions/active/eval/wip.md'), 'utf8');
-  const clean = await session(f1Baseline[0], [read('sessions/active/eval/wip.md'), read('architecture/billing/ledger.md'), read('notes.md')], [
-    lane,
-    await readFile(path.join(dir, 'corpus', 'architecture/billing/ledger.md'), 'utf8'),
-    '- Task: Rewrite the message a user sees when a hosted refresh run is refused.\n- Files: `app:src/lib/entitlements.ts`',
-  ]);
+  const clean = await session(f1Baseline[0], [read('sessions/active/eval/wip.md'), read('architecture/billing/ledger.md')], [lane, await readFile(path.join(dir, 'corpus', 'architecture/billing/ledger.md'), 'utf8')]);
   assert.deepEqual(clean.violations, []);
+  // The brief arm reads its own brief: run-copy content, including its own Task line and its `path › heading` references.
+  const f1BriefRun = manifest.runs.find((entry) => entry.task === 'F1' && entry.arm === 'brief');
+  const ownBrief = await session(f1BriefRun.id, [read('sessions/active/eval/brief.md')], [await readFile(path.join(f1BriefRun.root, 'sessions/active/eval/brief.md'), 'utf8')]);
+  assert.deepEqual(ownBrief.violations, []);
 
   // Leaked held-out content with no markers, framed as an ordinary Read result.
   const leaked = await session(f1Baseline[1], [read('architecture/billing/ledger.md')], [`     3\u2192${LABEL_ONLY_HELDOUT}`]);
@@ -763,7 +784,7 @@ test('forbidden content delivered through a tool result is a deviation; designed
 
   // Path confinement covers glob patterns, even when nothing was found.
   const f1Brief = manifest.runs.filter((entry) => entry.task === 'F1' && entry.arm === 'brief').map((entry) => entry.id);
-  const escaping = await session(f1Brief[0], [
+  const escaping = await session(f1Brief[1], [
     { name: 'Glob', input: { pattern: '../../labels/*.md' } },
     { name: 'Grep', input: { pattern: 'x', glob: '{*.md,/etc/*}' } },
     { name: 'Read', input: { file_path: '/etc/hosts' } },
@@ -772,6 +793,39 @@ test('forbidden content delivered through a tool result is a deviation; designed
     assert.ok(escaping.violations.some((entry) => expected.test(entry)), `${expected} in ${escaping.violations.join(' | ')}`);
   }
   assert.deepEqual(await harness.confinementProblems({ name: 'Glob', input: { pattern: 'architecture/**/*.md' } }, '/tmp/x'), []);
+});
+
+test('what a tool or the prompt frame can compose from the run copy is never forbidden: path › heading references, unstripped Grep prefixes, path listings, the brief, and the no-files template (later attempt › isolation rule)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const raw = new Set(JSON.parse(await readFile(path.join(ctx.dir, 'isolation.json'), 'utf8')).fingerprints);
+  const baseline = manifest.runs.find((entry) => entry.task === 'N1' && entry.arm === 'baseline');
+  const forbidden = await harness.runForbidden(raw, baseline.root);
+  // The label's reference is label text; delivered alone it would be caught, were the corpus not able to compose it.
+  const reference = `\`${LONG_DOC_PATH}\` › Current state that motivates the plan`;
+  assert.ok(harness.fingerprints(reference).size > 0);
+  assert.equal(harness.countFingerprintHits(reference, raw), 0, 'the index already knows a tool can compose it');
+  for (const delivered of [
+    `${LONG_DOC_PATH}:11:## Current state that motivates the plan`,
+    `/tmp/Private Backups/eval/runs/r001/${LONG_DOC_PATH}:## Current state that motivates the plan`,
+    `/tmp/Private Backups/eval/runs/r001/${LONG_DOC_PATH}-11-## Current state that motivates the plan`,
+    `/tmp/Private Backups/eval/runs/r001/${LONG_DOC_PATH}`,
+  ]) assert.equal(harness.countFingerprintHits(delivered, forbidden, { toolOutput: true }), 0, delivered);
+  // The prompt frame: a no-files task renders "Files: none. Do not write code. Using project memory", which the label quotes.
+  const prompt = await readFile(path.join(ctx.dir, 'prompts', `${baseline.id}.txt`), 'utf8');
+  assert.ok(harness.countFingerprintHits(prompt, forbidden) > 0, 'without the frame the template quote collides');
+  assert.equal(harness.countFingerprintHits(prompt, harness.withoutPromptFrame(forbidden, manifest.tasks.find((task) => task.id === 'N1'), baseline.startup_files.map((file) => file.path))), 0);
+  // A brief line that composes a path with a heading is run-copy content of the brief arm.
+  const briefRoot = path.join(dir, 'brief-root');
+  await mkdir(path.join(briefRoot, 'sessions', 'active', 'eval'), { recursive: true });
+  const briefLine = `- cited by ${reference}`;
+  await writeFile(path.join(briefRoot, 'sessions', 'active', 'eval', 'brief.md'), `${briefLine}\n`);
+  const withBrief = await harness.runForbidden(raw, briefRoot);
+  assert.equal(harness.countFingerprintHits(briefLine, withBrief), 0);
+  // Label-only text is still caught under every one of these subtractions.
+  assert.ok(harness.countFingerprintHits(LABEL_ONLY_HELDOUT, withBrief) > 0);
+  assert.ok(harness.countFingerprintHits(`/tmp/Private Backups/x.md:${LABEL_ONLY_HELDOUT}`, forbidden, { toolOutput: true }) > 0);
 });
 
 // ------------------------------------------------------------- abort handling (S12)

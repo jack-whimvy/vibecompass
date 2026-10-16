@@ -329,7 +329,7 @@ async function prepareRun(dir, entry, tasks, corpus, corpusHashes, relations, br
   entry.startup_files = startup.map((file) => ({ path: file.path, sha256: sha256(file.content) }));
   entry.prompt_sha256 = sha256(prompt);
   await writeFile(path.join(dir, 'prompts', `${entry.id}.txt`), prompt);
-  const promptHits = countFingerprintHits(prompt, withoutTemplates(await runForbidden(forbidden, root, task)));
+  const promptHits = countFingerprintHits(prompt, withoutPromptFrame(await runForbidden(forbidden, root), task, startup.map((file) => file.path)));
   if (promptHits > 0) failures.push(`${entry.id} (${task.id}): the prompt carries ${promptHits} isolation fingerprint(s) from the label copies`);
 
   // The copy must equal the corpus byte for byte, plus the eval lane (and brief.md).
@@ -936,18 +936,15 @@ export async function auditRun(dir, entry, cap, manifest = null) {
   if (isolation.problem) violations.push(isolation.problem);
   if (isolation.forbidden) {
     const prompt = await readFile(path.join(dir, 'prompts', `${entry.id}.txt`), 'utf8').catch(() => null);
-    const promptSet = withoutTemplates(isolation.forbidden);
-    const promptHits = prompt === null ? 0 : countFingerprintHits(prompt, promptSet);
+    const promptHits = prompt === null ? 0 : countFingerprintHits(prompt, isolation.prompt);
     if (promptHits > 0) violations.push(`forbidden content delivered: ${promptHits} isolation fingerprint(s) in the prompt`);
     calls.forEach((use, index) => {
       const hits = results.has(use.id) ? countFingerprintHits(results.get(use.id), isolation.forbidden, { toolOutput: true }) : 0;
       if (hits > 0) violations.push(`forbidden content delivered: ${hits} isolation fingerprint(s) in the result of call ${index + 1} (${use.name})`);
     });
-    if (stopped) {
-      const reportPrompt = await readFile(`${base}.report-prompt.txt`, 'utf8').catch(() => null);
-      const hits = reportPrompt === null ? 0 : countFingerprintHits(reportPrompt, promptSet, { toolOutput: true });
-      if (hits > 0) violations.push(`forbidden content delivered: ${hits} isolation fingerprint(s) in the report-turn prompt`);
-    }
+    // A report turn's input must equal the replay (checked below): the prompt
+    // and the allowed calls' results, both scanned here, plus the agent's own
+    // text, which is not a delivery and is not scanned.
   }
   violations.push(...sessionProblems(research, { label: 'research', tools: RESEARCH_TOOLS, version, requireResult: !stopped }));
   const excessIds = new Set(calls.filter((use) => boundary && !boundary.allowed.has(use.id)).map((use) => use.id));
@@ -1133,36 +1130,86 @@ export function normalizeText(text) {
   return String(text ?? '').normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
-/** A tool result without its per-line framing: Read's line numbers and Grep's `path:line:` prefixes. */
+/**
+ * A tool result without its per-line framing: Read's line numbers, and a
+ * Grep line's `path:line:` (or `path-line-`, or `path:`) prefix, where the
+ * path may hold spaces. Stripping only removes words, so it can never create
+ * a fingerprint; a prefix it misses is covered by the run copy's composed
+ * fingerprints (`runCopyFingerprints`).
+ */
 export function stripToolPrefixes(text) {
   return String(text ?? '')
     .split(/\r?\n/)
-    .map((line) => line.replace(/^\s*\d+(?:\u2192|\t)/, '').replace(/^[^\s:]+\.[A-Za-z0-9]+(?::\d+)?[:-]/, ''))
+    .map((line) => line.replace(/^\s*\d+(?:→|\t)/, '').replace(/^.*?\.[A-Za-z0-9]{1,8}(?::\d+)?[:-]/, ''))
     .join('\n');
+}
+
+function tokensOf(text) {
+  return normalizeText(text).split(' ').filter(Boolean);
+}
+
+/** Adds the eligible 8-grams of a token run (at least five words of three or more letters); `crossing` keeps only those that include index `crossing`. */
+function addGrams(tokens, out, { crossing = null, only = null } = {}) {
+  const { words, min_long_words: minLong, long_word_letters: letters } = FINGERPRINT;
+  if (tokens.length < words) return;
+  const long = tokens.map((token) => token.length >= letters && /^[a-z]+$/.test(token));
+  let longCount = 0;
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (long[index]) longCount += 1;
+    if (index >= words && long[index - words]) longCount -= 1;
+    if (index < words - 1 || longCount < minLong) continue;
+    const first = index - words + 1;
+    if (crossing !== null && (first >= crossing || index < crossing)) continue;
+    const print = sha256(tokens.slice(first, index + 1).join(' ')).slice(0, 16);
+    if (!only || only.has(print)) out.add(print);
+  }
+}
+
+/** The 8-grams that span the join of two token runs (the last seven of `left`, the first seven of `right`). */
+function addJoinGrams(left, right, out, only = null) {
+  const tail = left.slice(-(FINGERPRINT.words - 1));
+  const head = right.slice(0, FINGERPRINT.words - 1);
+  if (tail.length === 0 || head.length === 0) return;
+  addGrams([...tail, ...head], out, { crossing: tail.length, only });
 }
 
 /**
  * The fingerprints of a text: hashes of its normalized word 8-grams that
  * hold at least five words of three or more letters, taken within each line,
- * never across a line break. Read and Grep deliver whole corpus lines, so any
- * delivered corpus line carries only fingerprints its corpus file has, which
- * the index never forbids; an 8-gram joined across two lines of a Grep
- * result could otherwise match a label line by chance.
+ * never across a line break. Read and Grep deliver whole lines, so a
+ * delivered run-copy line carries only fingerprints its file has, which the
+ * index never forbids; an 8-gram joined across two lines of a Grep result
+ * could otherwise match a label line by chance.
  */
 export function fingerprints(text, { toolOutput = false } = {}) {
-  const { words, min_long_words: minLong, long_word_letters: letters } = FINGERPRINT;
   const out = new Set();
-  for (const line of String(toolOutput ? stripToolPrefixes(text) : text ?? '').split(/\r?\n/)) {
-    const tokens = normalizeText(line).split(' ').filter(Boolean);
-    if (tokens.length < words) continue;
-    const long = tokens.map((token) => token.length >= letters && /^[a-z]+$/.test(token));
-    let longCount = 0;
-    for (let index = 0; index < tokens.length; index += 1) {
-      if (long[index]) longCount += 1;
-      if (index >= words && long[index - words]) longCount -= 1;
-      if (index >= words - 1 && longCount >= minLong) out.add(sha256(tokens.slice(index - words + 1, index + 1).join(' ')).slice(0, 16));
-    }
-  }
+  for (const line of String(toolOutput ? stripToolPrefixes(text) : text ?? '').split(/\r?\n/)) addGrams(tokensOf(line), out);
+  return out;
+}
+
+/**
+ * Everything a tool can derive from one run-copy file without any other
+ * input: its lines, its path (a Glob or Grep listing), and a line composed
+ * with its path or its line number in any framing (`path:12:line`,
+ * `path:line`, `12→line`). Composition matters because label text cites
+ * passages as `path › heading`, which no single corpus line holds.
+ */
+export function runCopyFingerprints(relativePath, text, only = null) {
+  const out = new Set();
+  const pathTokens = tokensOf(relativePath);
+  addGrams(pathTokens, out, { only });
+  if (text === null) return out;
+  String(text)
+    .split(/\r?\n/)
+    .forEach((line, index) => {
+      const tokens = tokensOf(line);
+      const number = [String(index + 1)];
+      addGrams(tokens, out, { only });
+      addJoinGrams(pathTokens, tokens, out, only);
+      addJoinGrams([...pathTokens, ...number], tokens, out, only);
+      addJoinGrams(pathTokens, number, out, only);
+      addJoinGrams(number, tokens, out, only);
+    });
   return out;
 }
 
@@ -1181,25 +1228,32 @@ export function subtractFingerprints(forbidden, texts) {
   return out;
 }
 
-/** The prompt channels also carry the harness's own templates. */
-function withoutTemplates(forbidden) {
-  return subtractFingerprints(forbidden, [PROMPT_TEMPLATE, REPORT_TURN_TEMPLATE]);
+/**
+ * The prompt channel also carries the harness's own frame: the prompt
+ * template rendered with this run's task, files, and startup-file wrappers
+ * (contents left out), and the report-turn template.
+ */
+export function withoutPromptFrame(forbidden, task, startupPaths = []) {
+  const frame = task ? renderPrompt(task, startupPaths.map((file) => ({ path: file, content: '' }))) : PROMPT_TEMPLATE;
+  return subtractFingerprints(forbidden, [frame, REPORT_TURN_TEMPLATE.replace('{prompt}', '\n').replace('{transcript}', '\n')]);
 }
 
 /**
  * The isolation index (later attempt › isolation rule): the fingerprints of
- * the label copies that occur in no corpus file. Content shared with the
- * corpus — its disclosed historical tuning contamination, quoted passages,
- * marker-like text — is never forbidden; label-only content always is,
- * whatever markers it carries or lacks.
+ * the label copies that no corpus file can deliver (`runCopyFingerprints`).
+ * Content shared with the corpus — its disclosed historical tuning
+ * contamination, quoted passages, marker-like text, path and heading
+ * references a tool can compose — is never forbidden; label-only content
+ * always is, whatever markers it carries or lacks.
  */
 export async function buildIsolationIndex(labelTexts, corpusDir) {
   const label = new Set();
   for (const text of labelTexts) for (const print of fingerprints(text)) label.add(print);
   const shared = new Set();
   for (const file of await listFiles(corpusDir)) {
-    if ((await lstat(path.join(corpusDir, file))).isSymbolicLink()) continue;
-    for (const print of fingerprints(await readFile(path.join(corpusDir, file), 'utf8'))) if (label.has(print)) shared.add(print);
+    const symlink = (await lstat(path.join(corpusDir, file))).isSymbolicLink();
+    const text = symlink ? null : await readFile(path.join(corpusDir, file), 'utf8');
+    for (const print of runCopyFingerprints(file, text, label)) shared.add(print);
   }
   return {
     method: {
@@ -1207,7 +1261,7 @@ export async function buildIsolationIndex(labelTexts, corpusDir) {
       hash: 'sha256 of the space-joined 8-gram, first 16 hex characters',
       scope: 'within one line; never across a line break',
       normalization: 'NFKC, lower case, runs of characters other than a-z and 0-9 as one space; tool results first lose Read line numbers and Grep path:line: prefixes',
-      forbidden: 'label-copy fingerprints minus every corpus file\'s fingerprints; per run also minus its lane files and its own Task and Files line, and in prompt channels minus the harness templates',
+      forbidden: "label-copy fingerprints minus every corpus file's run-copy fingerprints (its lines, its path, and each line joined with its path or line number); per run also minus its lane files and brief; in the prompt channel also minus the prompt frame rendered for the run's own task, files, and startup files",
     },
     label_fingerprints: label.size,
     shared_with_corpus: shared.size,
@@ -1215,23 +1269,25 @@ export async function buildIsolationIndex(labelTexts, corpusDir) {
   };
 }
 
-/** The run's own task line as the prompt and the brief render it: a designed delivery. */
-function designedTaskText(task) {
-  return `Task: ${task.task} Files: ${renderFiles(task)}`;
-}
+const RUN_COPY_EXTRAS = [...LANE_FILES, 'sessions/active/eval/brief.md'];
 
-/** The forbidden set for one run: the index minus its lane files (run-copy content) and its own task line. */
-async function runForbidden(forbidden, root, task) {
-  const lane = await Promise.all(LANE_FILES.map((file) => readFile(path.join(root, file), 'utf8').catch(() => '')));
-  return subtractFingerprints(forbidden, [...lane, ...(task ? [designedTaskText(task)] : [])]);
+/** The forbidden set for one run: the index minus the run copy's own files beyond the corpus (lane files and, in the brief arm, its brief). */
+export async function runForbidden(forbidden, root) {
+  const out = new Set(forbidden);
+  for (const file of RUN_COPY_EXTRAS) {
+    const text = await readFile(path.join(root, file), 'utf8').catch(() => null);
+    if (text === null) continue;
+    for (const print of runCopyFingerprints(file, text, out)) out.delete(print);
+  }
+  return out;
 }
 
 const ISOLATION_CACHE = new Map();
 
 /**
  * The run's forbidden set, from `isolation.json` verified against the
- * manifest. A manifest without an isolation index (unit use) skips the scan;
- * a missing or changed index is a deviation.
+ * manifest, and its prompt-channel set. A manifest without an isolation
+ * index (unit use) skips the scan; a missing or changed index is a deviation.
  */
 async function isolationFor(dir, manifest, entry) {
   if (!manifest?.isolation) return { forbidden: null };
@@ -1240,7 +1296,8 @@ async function isolationFor(dir, manifest, entry) {
   const key = `${dir}\0${manifest.isolation.sha256}`;
   if (!ISOLATION_CACHE.has(key)) ISOLATION_CACHE.set(key, new Set(JSON.parse(text).fingerprints));
   const task = (manifest.tasks ?? []).find((candidate) => candidate.id === entry.task) ?? null;
-  return { forbidden: await runForbidden(ISOLATION_CACHE.get(key), entry.root, task) };
+  const forbidden = await runForbidden(ISOLATION_CACHE.get(key), entry.root);
+  return { forbidden, prompt: withoutPromptFrame(forbidden, task, (entry.startup_files ?? []).map((file) => file.path)) };
 }
 
 // ----------------------------------------------------------------- ledger
