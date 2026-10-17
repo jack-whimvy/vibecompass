@@ -1140,12 +1140,17 @@ function unsuccessfulResult(text, isError) {
 /**
  * Path confinement: a call's path must resolve inside the run copy, and a
  * Glob pattern or Grep glob may name no absolute path, home path, or `..`
- * segment. Brace groups are expanded first, as the tools read them, so a
- * group followed by a path is one relative pattern (attempt 1 stopped on
- * `{architecture,sessions}/**\/*.md` read as `/**\/*.md`; Change 7). Each
- * expansion is split on whitespace and commas and loses a leading `!`. A
- * pattern with unbalanced braces or too many expansions is read token by
- * token, as before, which errs toward flagging.
+ * segment. A pattern is read as ripgrep's glob grammar reads it (Change 7):
+ * brace groups are expanded first, nested ones included, so a group followed
+ * by a path is one relative pattern (attempt 1 stopped on
+ * `{architecture,sessions}/**\/*.md` read as `/**\/*.md`); a backslash
+ * escapes the next character, and inside a character class braces and commas
+ * are literal (reviewer pass 4, R6). Each expansion is split on whitespace
+ * and commas, loses a leading `!`, and is checked as written and unescaped.
+ * Ripgrep rejects unbalanced braces; such a pattern is read both with its
+ * stray braces as literals and token by token as before, and a finding in
+ * either counts. A pattern the check cannot read within its bounds is itself
+ * a finding, never a clean result (R7).
  */
 export async function confinementProblems(use, realRoot) {
   const problems = [];
@@ -1156,41 +1161,162 @@ export async function confinementProblems(use, realRoot) {
   }
   const patterns = [use.name === 'Glob' ? use.input?.pattern : null, use.name === 'Grep' ? use.input?.glob : null].filter((value) => typeof value === 'string');
   for (const pattern of patterns) {
-    const expansions = expandBraces(pattern);
-    const tokens = expansions === null ? pattern.split(/[\s,{}]+/) : expansions.flatMap((expansion) => expansion.split(/[\s,]+/));
-    for (const token of new Set(tokens.map((value) => value.replace(/^!+/, '')).filter(Boolean))) {
-      if (token.startsWith('/') || token.startsWith('~') || /(^|[\\/])\.\.([\\/]|$)/.test(token)) problems.push(`${use.name} pattern reaches outside the run copy: ${token}`);
+    const reading = readGlob(pattern);
+    if (reading.unchecked) {
+      problems.push(`${use.name} pattern cannot be checked (${reading.unchecked}): ${pattern.slice(0, 200)}`);
+      continue;
+    }
+    for (const token of reading.tokens) {
+      if ([token, token.replace(/\\(.)/gs, '$1')].some(escapesRunCopy)) problems.push(`${use.name} pattern reaches outside the run copy: ${token}`);
     }
   }
   return problems;
 }
 
-const BRACE_EXPANSION_LIMIT = 256;
+function escapesRunCopy(token) {
+  return token.startsWith('/') || token.startsWith('~') || /(^|[\\/])\.\.([\\/]|$)/.test(token);
+}
+
+const GLOB_EXPANSION_LIMIT = 4096;
+const GLOB_LENGTH_LIMIT = 4096;
+const GLOB_NESTING_LIMIT = 64;
+
+/**
+ * The tokens a glob names, as `confinementProblems` checks them, or
+ * `{ unchecked: reason }` when it is longer than GLOB_LENGTH_LIMIT, nests
+ * groups deeper than GLOB_NESTING_LIMIT, or has more than
+ * GLOB_EXPANSION_LIMIT expansions.
+ */
+export function readGlob(pattern) {
+  if (pattern.length > GLOB_LENGTH_LIMIT) return { unchecked: `longer than ${GLOB_LENGTH_LIMIT} characters` };
+  let expansions = expandBraces(pattern);
+  let fragments = [];
+  if (expansions === UNBALANCED) {
+    expansions = expandBraces(pattern, { lenient: true });
+    fragments = pattern.split(/[\s,{}]+/);
+  }
+  if (expansions === TOO_DEEP) return { unchecked: `brace groups nested deeper than ${GLOB_NESTING_LIMIT}` };
+  if (expansions === null) return { unchecked: `more than ${GLOB_EXPANSION_LIMIT} brace expansions` };
+  const tokens = [...expansions.flatMap((expansion) => expansion.split(/[\s,]+/)), ...fragments];
+  return { tokens: [...new Set(tokens.map((value) => value.replace(/^!+/, '')).filter(Boolean))] };
+}
+
+const UNBALANCED = Symbol('unbalanced braces');
+const TOO_DEEP = Symbol('brace groups nested too deep');
 
 /**
  * Every expansion of a glob's brace groups, nested groups included
- * (`{a,{b,c}}/x` → `a/x`, `b/x`, `c/x`), or null when its braces do not
- * balance or it has more than BRACE_EXPANSION_LIMIT expansions.
+ * (`{a,{b,c}}/x` → `a/x`, `b/x`, `c/x`), following ripgrep's grammar: a
+ * backslash escapes the next character, and a character class (`[...]`,
+ * where a `]` right after `[`, `[!`, or `[^` is a member) is literal.
+ * Escapes and classes stay in the expansions as written. Returns null past
+ * GLOB_EXPANSION_LIMIT expansions, TOO_DEEP past GLOB_NESTING_LIMIT nested
+ * groups, and UNBALANCED for an unclosed group, stray `}`, or unclosed
+ * class, unless `lenient`, which reads those as literal characters, as a
+ * shell does.
  */
-export function expandBraces(pattern) {
-  const open = pattern.indexOf('{');
-  if (open === -1) return pattern.includes('}') ? null : [pattern];
-  if (pattern.slice(0, open).includes('}')) return null;
-  let depth = 0;
-  let close = -1;
-  const commas = [];
-  for (let index = open; index < pattern.length && close === -1; index += 1) {
-    if (pattern[index] === '{') depth += 1;
-    else if (pattern[index] === '}' && (depth -= 1) === 0) close = index;
-    else if (pattern[index] === ',' && depth === 1) commas.push(index);
+export function expandBraces(pattern, { lenient = false } = {}) {
+  try {
+    const matches = matchBraces(pattern, lenient);
+    return expandGlobNodes(parseGlobRange(pattern, 0, pattern.length, matches));
+  } catch (error) {
+    if (error === UNBALANCED || error === TOO_DEEP) return error;
+    throw error;
   }
-  if (close === -1) return null;
-  const bounds = [open, ...commas, close];
-  const expansions = [];
-  for (let alternative = 0; alternative < bounds.length - 1; alternative += 1) {
-    const rest = expandBraces(`${pattern.slice(0, open)}${pattern.slice(bounds[alternative] + 1, bounds[alternative + 1])}${pattern.slice(close + 1)}`);
-    if (rest === null || expansions.length + rest.length > BRACE_EXPANSION_LIMIT) return null;
-    expansions.push(...rest);
+}
+
+/**
+ * One left-to-right pass pairs each `{` with its `}`, skipping escapes and
+ * classes, so parsing never backtracks. Unpaired braces and unclosed classes
+ * are UNBALANCED, or literal when `lenient` (a `}` closes the latest open
+ * `{`, as in a shell).
+ */
+function matchBraces(pattern, lenient) {
+  const matches = new Map();
+  const open = [];
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '\\') {
+      index += 1;
+    } else if (char === '[') {
+      const close = classClose(pattern, index);
+      if (close === -1 && !lenient) throw UNBALANCED;
+      if (close !== -1) index = close;
+    } else if (char === '{') {
+      open.push(index);
+      if (open.length > GLOB_NESTING_LIMIT) throw TOO_DEEP;
+    } else if (char === '}') {
+      if (open.length > 0) matches.set(open.pop(), index);
+      else if (!lenient) throw UNBALANCED;
+    }
+  }
+  if (open.length > 0 && !lenient) throw UNBALANCED;
+  return matches;
+}
+
+/** Literal text and brace groups (each a list of alternatives) in pattern[start, end). */
+function parseGlobRange(pattern, start, end, matches) {
+  const nodes = [];
+  let literal = '';
+  let index = start;
+  while (index < end) {
+    const char = pattern[index];
+    const close = char === '[' ? classClose(pattern, index) : -1;
+    if (char === '\\') {
+      literal += pattern.slice(index, index + 2);
+      index += 2;
+    } else if (close !== -1 && close < end) {
+      literal += pattern.slice(index, close + 1);
+      index = close + 1;
+    } else if (char === '{' && matches.has(index)) {
+      const groupEnd = matches.get(index);
+      const alternatives = [];
+      let alternativeStart = index + 1;
+      for (let cursor = index + 1; cursor <= groupEnd; cursor += 1) {
+        const inner = pattern[cursor];
+        const innerClose = inner === '[' ? classClose(pattern, cursor) : -1;
+        if (inner === '\\') cursor += 1;
+        else if (innerClose !== -1 && innerClose < groupEnd) cursor = innerClose;
+        else if (inner === '{' && matches.has(cursor)) cursor = matches.get(cursor);
+        else if (inner === ',' || cursor === groupEnd) {
+          alternatives.push(parseGlobRange(pattern, alternativeStart, cursor, matches));
+          alternativeStart = cursor + 1;
+        }
+      }
+      nodes.push(literal, { alternatives });
+      literal = '';
+      index = groupEnd + 1;
+    } else {
+      literal += char;
+      index += 1;
+    }
+  }
+  nodes.push(literal);
+  return nodes;
+}
+
+function classClose(pattern, open) {
+  let index = open + 1;
+  if (pattern[index] === '!' || pattern[index] === '^') index += 1;
+  if (pattern[index] === ']') index += 1;
+  return pattern.indexOf(']', index);
+}
+
+function expandGlobNodes(nodes) {
+  let expansions = [''];
+  for (const node of nodes) {
+    if (typeof node === 'string') {
+      expansions = expansions.map((expansion) => expansion + node);
+      continue;
+    }
+    const alternatives = [];
+    for (const alternative of node.alternatives) {
+      const expanded = expandGlobNodes(alternative);
+      if (expanded === null || alternatives.length + expanded.length > GLOB_EXPANSION_LIMIT) return null;
+      alternatives.push(...expanded);
+    }
+    if (expansions.length * alternatives.length > GLOB_EXPANSION_LIMIT) return null;
+    expansions = expansions.flatMap((expansion) => alternatives.map((alternative) => expansion + alternative));
   }
   return expansions;
 }

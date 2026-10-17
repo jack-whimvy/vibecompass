@@ -809,30 +809,50 @@ test('forbidden content delivered through a tool result is a deviation; designed
   assert.deepEqual(await harness.confinementProblems({ name: 'Glob', input: { pattern: 'architecture/**/*.md' } }, '/tmp/x'), []);
 });
 
-test('a brace group followed by a path is one relative pattern; an escape inside or after a group is still caught (attempt 1 r027 and r030; Change 7)', async (t) => {
+test('a brace group followed by a path is one relative pattern; an escape inside or after a group, behind an escape, or past the bounds is still caught (attempt 1 r027 and r030; Change 7; reviewer pass 4, R6 and R7)', async (t) => {
   const { harness, dir } = await loadHarness(t);
   const problems = async (name, glob) => harness.confinementProblems({ name, input: name === 'Glob' ? { pattern: glob } : { pattern: 'x', glob } }, '/tmp/x');
   assert.deepEqual(harness.expandBraces('{architecture,sessions}/**/*.md'), ['architecture/**/*.md', 'sessions/**/*.md']);
   assert.deepEqual(harness.expandBraces('{a,{b,c}}/x{1,2}'), ['a/x1', 'a/x2', 'b/x1', 'b/x2', 'c/x1', 'c/x2']);
-  assert.equal(harness.expandBraces('{a,/b'), null);
-  assert.equal(harness.expandBraces('a}/{b,c}'), null);
-  assert.equal(harness.expandBraces('{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}{o,p}{q,r}'), null, 'more than 256 expansions');
+  // Ripgrep's grammar (checked with `rg --debug`): escaped braces and braces or commas in a class are literal.
+  assert.deepEqual(harness.expandBraces(String.raw`{\{foo,/etc\},x}`), [String.raw`\{foo`, String.raw`/etc\}`, 'x']);
+  assert.deepEqual(harness.expandBraces('{a,[,]/etc}'), ['a', '[,]/etc']);
+  assert.deepEqual(harness.expandBraces('[]{]x'), ['[]{]x']);
+  for (const unbalanced of ['{a,/b', 'a}/{b,c}', '{a,b}[x', '{/etc']) assert.ok(!Array.isArray(harness.expandBraces(unbalanced)), unbalanced);
 
-  for (const glob of ['{architecture,sessions}/**/*.md', '{architecture,decisions}/**/*.md', '**/{a,b}/*.md', '{a,{b,c}}/x', 'docs/{a,b}.md', '!{recall-evaluation*,x}', '*.md,*.yaml']) {
+  for (const glob of ['{architecture,sessions}/**/*.md', '{architecture,decisions}/**/*.md', '**/{a,b}/*.md', '{a,{b,c}}/x', 'docs/{a,b}.md', '!{recall-evaluation*,x}', '*.md,*.yaml', '*.[jt]s', String.raw`\{literal\}/*.md`, String.raw`{docs,notes}/\{draft\}.md`, '{a,[,]/etc}', '[]{]x', '{a,b}'.repeat(12)]) {
     for (const name of ['Grep', 'Glob']) assert.deepEqual(await problems(name, glob), [], `${name} ${glob}`);
   }
-  for (const [glob, token] of [
-    ['{/etc,docs}/*.md', '/etc/*.md'],
-    ['docs/{..,x}/*', 'docs/../*'],
-    ['{a,b}/../x', 'a/../x'],
-    ['~/{a,b}', '~/a'],
-    ['!{/etc,x}', '/etc'],
-    ['{a,{b,/c}}', '/c'],
-    ['/{a,b}', '/a'],
-    ['x/{a,b} /etc/*', '/etc/*'],
-    ['{a,/b', '/b'],
+  const dots = (count) => `{${Array(count).fill('.').join(',')}}.`;
+  for (const [glob, finding] of [
+    ['{/etc,docs}/*.md', 'reaches outside the run copy: /etc/*.md'],
+    ['docs/{..,x}/*', 'reaches outside the run copy: docs/../*'],
+    ['{a,b}/../x', 'reaches outside the run copy: a/../x'],
+    ['~/{a,b}', 'reaches outside the run copy: ~/a'],
+    ['!{/etc,x}', 'reaches outside the run copy: /etc'],
+    ['{a,{b,/c}}', 'reaches outside the run copy: /c'],
+    ['/{a,b}', 'reaches outside the run copy: /a'],
+    ['x/{a,b} /etc/*', 'reaches outside the run copy: /etc/*'],
+    // Unbalanced (ripgrep rejects these): read with literal braces and token by token; either finding counts.
+    ['{a,/b', 'reaches outside the run copy: /b'],
+    ['{/etc', 'reaches outside the run copy: /etc'],
+    ['{.,.}./x{', 'reaches outside the run copy: ../x{'],
+    // R6: an escaped brace does not delimit a group, and an escaped slash is a slash.
+    [String.raw`{\{foo,/etc\},x}`, String.raw`reaches outside the run copy: /etc\}`],
+    [String.raw`\/etc/*`, String.raw`reaches outside the run copy: \/etc/*`],
+    [String.raw`\.\./x`, String.raw`reaches outside the run copy: \.\./x`],
+    // R7: a composed `..` at, below, and beyond the expansion bound.
+    [dots(257), 'reaches outside the run copy: ..'],
+    [dots(2000), 'reaches outside the run copy: ..'],
+    ['{a,b}'.repeat(13), 'cannot be checked (more than 4096 brace expansions)'],
+    [dots(2100), 'cannot be checked (longer than 4096 characters)'],
+    [`${'{'.repeat(65)}a${'}'.repeat(65)}`, 'cannot be checked (brace groups nested deeper than 64)'],
+    [`${'{'.repeat(65)}a`, 'cannot be checked (brace groups nested deeper than 64)'],
   ]) {
-    for (const name of ['Grep', 'Glob']) assert.ok((await problems(name, glob)).includes(`${name} pattern reaches outside the run copy: ${token}`), `${name} ${glob}: ${(await problems(name, glob)).join(' | ')}`);
+    for (const name of ['Grep', 'Glob']) {
+      const found = await problems(name, glob);
+      assert.ok(found.some((entry) => entry.startsWith(`${name} pattern ${finding}`)), `${name} ${glob.slice(0, 40)}: ${found.join(' | ').slice(0, 300)}`);
+    }
   }
 
   // Attempt 1's shape end to end: a Grep over the run copy with a brace-group glob passes the audit.
