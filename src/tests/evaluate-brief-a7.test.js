@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -867,6 +867,31 @@ test('a brace group followed by a path is one relative pattern; an escape inside
   process.exitCode = 0;
   const metrics = await harness.auditRun(ctx.dir, entry, manifest.tool_call_cap, manifest);
   assert.deepEqual(metrics.violations, []);
+});
+
+test("a run's own location is a designed delivery: an oversized-output notice naming it carries no forbidden content, while label content beside it still does (attempt 2; Change 8)", async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const entry = manifest.runs[0];
+  // A label copy that names the run's location, as recall-evaluation.md did for attempt 2.
+  const labelLine = `- the evaluation directory is \`${entry.root}\`, outside every repo and memory root, beside the corpus export.`;
+  const forbidden = new Set([...harness.fingerprints(labelLine), ...harness.fingerprints(LABEL_ONLY_HELDOUT)]);
+  const own = await harness.runForbidden(forbidden, entry.root);
+  const notice = [
+    '<persisted-output>',
+    `Output too large (33.3KB). Full output saved to: ${harness.claudeProjectDir(entry.root)}/0ea7ac03-81c2-49d8-94e0-e2d9dc7426fc/tool-results/toolu_01NLrMkjPANtnycKyawVSgFj.txt`,
+    '',
+    'Preview (first 2KB):',
+    'architecture/billing/ledger.md:1:# Ledger',
+    '...',
+    '</persisted-output>',
+  ].join('\n');
+  assert.ok(harness.countFingerprintHits(notice, forbidden, { toolOutput: true }) > 0, 'precondition: without the location rule the notice hits');
+  assert.equal(harness.countFingerprintHits(notice, own, { toolOutput: true }), 0);
+  assert.equal(harness.countFingerprintHits(`${entry.root}/architecture/billing/ledger.md\n${await realpath(entry.root)}/architecture/billing/ledger.md`, own, { toolOutput: true }), 0, 'absolute run-copy listings');
+  assert.ok(harness.countFingerprintHits(labelLine, own) > 0, 'label words joined to location words stay forbidden');
+  assert.ok(harness.countFingerprintHits(`${notice}\n${LABEL_ONLY_HELDOUT}`, own, { toolOutput: true }) > 0, 'label-only content beside a notice still hits');
 });
 
 test('what a tool or the prompt frame can compose from the run copy is never forbidden: path › heading references, unstripped Grep prefixes, path listings, the brief, and the no-files template (later attempt › isolation rule)', async (t) => {

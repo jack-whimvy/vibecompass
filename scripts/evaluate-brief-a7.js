@@ -1554,7 +1554,15 @@ export async function buildIsolationIndex(labelTexts, corpusDir) {
 
 const RUN_COPY_EXTRAS = [...LANE_FILES, 'sessions/active/eval/brief.md'];
 
-/** The forbidden set for one run: the index minus the run copy's own files beyond the corpus (lane files and, in the brief arm, its brief). */
+/**
+ * The forbidden set for one run: the index minus the run copy's own files
+ * beyond the corpus (lane files and, in the brief arm, its brief), and minus
+ * its own location (Change 8): its root as given and resolved, every run-copy
+ * file's absolute path, and Claude Code's project-store directory for that
+ * working directory, which an oversized-output notice names. Attempt 2
+ * stopped on that notice matching the evaluation folder's path in the label
+ * copy. An 8-gram joining label words to location words stays forbidden.
+ */
 export async function runForbidden(forbidden, root) {
   const out = new Set(forbidden);
   for (const file of RUN_COPY_EXTRAS) {
@@ -1562,7 +1570,16 @@ export async function runForbidden(forbidden, root) {
     if (text === null) continue;
     for (const print of runCopyFingerprints(file, text, out)) out.delete(print);
   }
+  const roots = [...new Set([root, await realpath(root).catch(() => root)])];
+  const files = await listFiles(root).catch(() => []);
+  const locations = roots.flatMap((value) => [value, claudeProjectDir(value), ...files.map((file) => path.join(value, file))]);
+  for (const location of locations) for (const print of fingerprints(location)) out.delete(print);
   return out;
+}
+
+/** Where Claude Code keeps a working directory's session files, including oversized tool results. */
+export function claudeProjectDir(cwd) {
+  return path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
 }
 
 const ISOLATION_CACHE = new Map();
