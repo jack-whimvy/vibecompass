@@ -809,6 +809,46 @@ test('forbidden content delivered through a tool result is a deviation; designed
   assert.deepEqual(await harness.confinementProblems({ name: 'Glob', input: { pattern: 'architecture/**/*.md' } }, '/tmp/x'), []);
 });
 
+test('a brace group followed by a path is one relative pattern; an escape inside or after a group is still caught (attempt 1 r027 and r030; Change 7)', async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const problems = async (name, glob) => harness.confinementProblems({ name, input: name === 'Glob' ? { pattern: glob } : { pattern: 'x', glob } }, '/tmp/x');
+  assert.deepEqual(harness.expandBraces('{architecture,sessions}/**/*.md'), ['architecture/**/*.md', 'sessions/**/*.md']);
+  assert.deepEqual(harness.expandBraces('{a,{b,c}}/x{1,2}'), ['a/x1', 'a/x2', 'b/x1', 'b/x2', 'c/x1', 'c/x2']);
+  assert.equal(harness.expandBraces('{a,/b'), null);
+  assert.equal(harness.expandBraces('a}/{b,c}'), null);
+  assert.equal(harness.expandBraces('{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}{o,p}{q,r}'), null, 'more than 256 expansions');
+
+  for (const glob of ['{architecture,sessions}/**/*.md', '{architecture,decisions}/**/*.md', '**/{a,b}/*.md', '{a,{b,c}}/x', 'docs/{a,b}.md', '!{recall-evaluation*,x}', '*.md,*.yaml']) {
+    for (const name of ['Grep', 'Glob']) assert.deepEqual(await problems(name, glob), [], `${name} ${glob}`);
+  }
+  for (const [glob, token] of [
+    ['{/etc,docs}/*.md', '/etc/*.md'],
+    ['docs/{..,x}/*', 'docs/../*'],
+    ['{a,b}/../x', 'a/../x'],
+    ['~/{a,b}', '~/a'],
+    ['!{/etc,x}', '/etc'],
+    ['{a,{b,/c}}', '/c'],
+    ['/{a,b}', '/a'],
+    ['x/{a,b} /etc/*', '/etc/*'],
+    ['{a,/b', '/b'],
+  ]) {
+    for (const name of ['Grep', 'Glob']) assert.ok((await problems(name, glob)).includes(`${name} pattern reaches outside the run copy: ${token}`), `${name} ${glob}: ${(await problems(name, glob)).join(' | ')}`);
+  }
+
+  // Attempt 1's shape end to end: a Grep over the run copy with a brace-group glob passes the audit.
+  const { ctx } = await prepared(harness, dir);
+  const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
+  const entry = manifest.runs.find((candidate) => candidate.task === 'F1' && candidate.arm === 'brief');
+  process.env.MOCK_CALLS = '1';
+  process.env.MOCK_TOOL_INPUTS = JSON.stringify([{ name: 'Grep', input: { pattern: 'ledger', path: entry.root, output_mode: 'content', '-n': true, glob: '{architecture,sessions}/**/*.md', head_limit: 20 } }]);
+  process.env.MOCK_TOOL_RESULTS = JSON.stringify(['architecture/billing/ledger.md:1:# Ledger']);
+  await harness.run({ ...ctx, only: new Set([entry.id]) });
+  assert.notEqual(process.exitCode, 4);
+  process.exitCode = 0;
+  const metrics = await harness.auditRun(ctx.dir, entry, manifest.tool_call_cap, manifest);
+  assert.deepEqual(metrics.violations, []);
+});
+
 test('what a tool or the prompt frame can compose from the run copy is never forbidden: path › heading references, unstripped Grep prefixes, path listings, the brief, and the no-files template (later attempt › isolation rule)', async (t) => {
   const { harness, dir } = await loadHarness(t);
   const { ctx } = await prepared(harness, dir);

@@ -1140,7 +1140,12 @@ function unsuccessfulResult(text, isError) {
 /**
  * Path confinement: a call's path must resolve inside the run copy, and a
  * Glob pattern or Grep glob may name no absolute path, home path, or `..`
- * segment. Brace lists and negations are read token by token.
+ * segment. Brace groups are expanded first, as the tools read them, so a
+ * group followed by a path is one relative pattern (attempt 1 stopped on
+ * `{architecture,sessions}/**\/*.md` read as `/**\/*.md`; Change 7). Each
+ * expansion is split on whitespace and commas and loses a leading `!`. A
+ * pattern with unbalanced braces or too many expansions is read token by
+ * token, as before, which errs toward flagging.
  */
 export async function confinementProblems(use, realRoot) {
   const problems = [];
@@ -1151,11 +1156,43 @@ export async function confinementProblems(use, realRoot) {
   }
   const patterns = [use.name === 'Glob' ? use.input?.pattern : null, use.name === 'Grep' ? use.input?.glob : null].filter((value) => typeof value === 'string');
   for (const pattern of patterns) {
-    for (const token of pattern.split(/[\s,{}]+/).map((value) => value.replace(/^!+/, '')).filter(Boolean)) {
+    const expansions = expandBraces(pattern);
+    const tokens = expansions === null ? pattern.split(/[\s,{}]+/) : expansions.flatMap((expansion) => expansion.split(/[\s,]+/));
+    for (const token of new Set(tokens.map((value) => value.replace(/^!+/, '')).filter(Boolean))) {
       if (token.startsWith('/') || token.startsWith('~') || /(^|[\\/])\.\.([\\/]|$)/.test(token)) problems.push(`${use.name} pattern reaches outside the run copy: ${token}`);
     }
   }
   return problems;
+}
+
+const BRACE_EXPANSION_LIMIT = 256;
+
+/**
+ * Every expansion of a glob's brace groups, nested groups included
+ * (`{a,{b,c}}/x` → `a/x`, `b/x`, `c/x`), or null when its braces do not
+ * balance or it has more than BRACE_EXPANSION_LIMIT expansions.
+ */
+export function expandBraces(pattern) {
+  const open = pattern.indexOf('{');
+  if (open === -1) return pattern.includes('}') ? null : [pattern];
+  if (pattern.slice(0, open).includes('}')) return null;
+  let depth = 0;
+  let close = -1;
+  const commas = [];
+  for (let index = open; index < pattern.length && close === -1; index += 1) {
+    if (pattern[index] === '{') depth += 1;
+    else if (pattern[index] === '}' && (depth -= 1) === 0) close = index;
+    else if (pattern[index] === ',' && depth === 1) commas.push(index);
+  }
+  if (close === -1) return null;
+  const bounds = [open, ...commas, close];
+  const expansions = [];
+  for (let alternative = 0; alternative < bounds.length - 1; alternative += 1) {
+    const rest = expandBraces(`${pattern.slice(0, open)}${pattern.slice(bounds[alternative] + 1, bounds[alternative + 1])}${pattern.slice(close + 1)}`);
+    if (rest === null || expansions.length + rest.length > BRACE_EXPANSION_LIMIT) return null;
+    expansions.push(...rest);
+  }
+  return expansions;
 }
 
 /**
