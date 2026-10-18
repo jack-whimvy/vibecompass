@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.17.4 - 2026-10-17
+
+A small sync fix: `pull-preview` and `sync-adopt` work on a root that has never
+synced. The lane brief stays opt-in (D-368).
+
+- `pull-preview` and `sync-adopt` no longer fail on a newly connected root.
+  With no sync cursor yet, they sent an empty base revision, which the hosted
+  server rejects as invalid (a 422) instead of returning a preview. They now
+  leave the base revision out until there is one, as `push` does.
+- Tests: the suite passes under any temp directory. One A7 evaluation-harness
+  test passed only under a long temp path, such as a `lane-env` shell's. The
+  harness's isolation index also names its own-location rule in its method
+  text; its fingerprints are unchanged. The harness is not part of the
+  published package.
+
 ## 0.17.3 - 2026-10-12
 
 A small sync release: `push` tells you what the hosted dashboard could not
