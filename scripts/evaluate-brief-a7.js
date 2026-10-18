@@ -1544,7 +1544,7 @@ export async function buildIsolationIndex(labelTexts, corpusDir) {
       hash: 'sha256 of the space-joined 8-gram, first 16 hex characters',
       scope: 'within one line; never across a line break',
       normalization: 'NFKC, lower case, runs of characters other than a-z and 0-9 as one space; tool results first lose Read line numbers and Grep path:line: prefixes',
-      forbidden: "label-copy fingerprints minus every corpus file's run-copy fingerprints (its lines, its path, and each line joined with its path or line number); per run also minus its lane files and brief; in the prompt channel also minus the prompt frame rendered for the run's own task, files, and startup files",
+      forbidden: "label-copy fingerprints minus every corpus file's run-copy fingerprints (its lines, its path, and each line joined with its path or line number); per run also minus its lane files, its brief, and its own location (Change 8: its root as given and resolved, each run-copy file's absolute path, and Claude Code's project-store directory for that root); in the prompt channel also minus the prompt frame rendered for the run's own task, files, and startup files",
     },
     label_fingerprints: label.size,
     shared_with_corpus: shared.size,

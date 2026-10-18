@@ -899,6 +899,18 @@ test("a run's own location is a designed delivery: an oversized-output notice na
   assert.ok(harness.countFingerprintHits(`${notice}\n${LABEL_ONLY_HELDOUT}`, own, { toolOutput: true }) > 0, 'label-only content beside a notice still hits');
 });
 
+test("the isolation method names the run's own-location rule, and the fingerprint list is what 255cb79 built from the same inputs (A7 review S1)", async (t) => {
+  const { harness, dir } = await loadHarness(t);
+  const { ctx } = await prepared(harness, dir);
+  const index = JSON.parse(await readFile(path.join(ctx.dir, 'isolation.json'), 'utf8'));
+  // Text only: the frozen harness (255cb79) built these from the same labels and corpus.
+  assert.deepEqual(
+    { label: index.label_fingerprints, shared: index.shared_with_corpus, forbidden: index.fingerprints.length, digest: sha256(index.fingerprints.join('\n')) },
+    { label: 77, shared: 17, forbidden: 60, digest: '37559ebe5c841063014bc6aefb52f1ed45152d1cea320c2a99db7eaaa9d92b10' },
+  );
+  assert.match(index.method.forbidden, /per run also minus its lane files, its brief, and its own location \(Change 8: its root as given and resolved, each run-copy file's absolute path, and Claude Code's project-store directory for that root\);/);
+});
+
 test('what a tool or the prompt frame can compose from the run copy is never forbidden: path › heading references, unstripped Grep prefixes, path listings, the brief, and the no-files template (later attempt › isolation rule)', async (t) => {
   const { harness, dir } = await loadHarness(t);
   const { ctx } = await prepared(harness, dir);
