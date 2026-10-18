@@ -874,13 +874,18 @@ test("a run's own location is a designed delivery: an oversized-output notice na
   const { ctx } = await prepared(harness, dir);
   const manifest = JSON.parse(await readFile(path.join(ctx.dir, 'manifest.json'), 'utf8'));
   const entry = manifest.runs[0];
+  // The run copy at a location shaped like attempt 2's (H17): its own words
+  // form fingerprints under any TMPDIR, so the precondition never depends on
+  // how long the test runner's temp path is.
+  const root = path.join(dir, 'vibecompass-eval.noindex', 'brief-a7-later-attempt', 'runs', entry.id);
+  await cp(entry.root, root, { recursive: true });
   // A label copy that names the run's location, as recall-evaluation.md did for attempt 2.
-  const labelLine = `- the evaluation directory is \`${entry.root}\`, outside every repo and memory root, beside the corpus export.`;
+  const labelLine = `- the evaluation directory is \`${root}\`, outside every repo and memory root, beside the corpus export.`;
   const forbidden = new Set([...harness.fingerprints(labelLine), ...harness.fingerprints(LABEL_ONLY_HELDOUT)]);
-  const own = await harness.runForbidden(forbidden, entry.root);
+  const own = await harness.runForbidden(forbidden, root);
   const notice = [
     '<persisted-output>',
-    `Output too large (33.3KB). Full output saved to: ${harness.claudeProjectDir(entry.root)}/0ea7ac03-81c2-49d8-94e0-e2d9dc7426fc/tool-results/toolu_01NLrMkjPANtnycKyawVSgFj.txt`,
+    `Output too large (33.3KB). Full output saved to: ${harness.claudeProjectDir(root)}/0ea7ac03-81c2-49d8-94e0-e2d9dc7426fc/tool-results/toolu_01NLrMkjPANtnycKyawVSgFj.txt`,
     '',
     'Preview (first 2KB):',
     'architecture/billing/ledger.md:1:# Ledger',
@@ -889,7 +894,7 @@ test("a run's own location is a designed delivery: an oversized-output notice na
   ].join('\n');
   assert.ok(harness.countFingerprintHits(notice, forbidden, { toolOutput: true }) > 0, 'precondition: without the location rule the notice hits');
   assert.equal(harness.countFingerprintHits(notice, own, { toolOutput: true }), 0);
-  assert.equal(harness.countFingerprintHits(`${entry.root}/architecture/billing/ledger.md\n${await realpath(entry.root)}/architecture/billing/ledger.md`, own, { toolOutput: true }), 0, 'absolute run-copy listings');
+  assert.equal(harness.countFingerprintHits(`${root}/architecture/billing/ledger.md\n${await realpath(root)}/architecture/billing/ledger.md`, own, { toolOutput: true }), 0, 'absolute run-copy listings');
   assert.ok(harness.countFingerprintHits(labelLine, own) > 0, 'label words joined to location words stay forbidden');
   assert.ok(harness.countFingerprintHits(`${notice}\n${LABEL_ONLY_HELDOUT}`, own, { toolOutput: true }) > 0, 'label-only content beside a notice still hits');
 });
