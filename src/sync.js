@@ -90,10 +90,11 @@ export async function pullPreviewProjectMemory(options = {}, environment = {}) {
   });
   const manifest = manifestResult.manifest;
   const cursor = readSyncCursor(manifest.sync, context.binding);
+  const baseRemoteRevisionId = normalizeUuid(cursor.last_successful_remote_revision);
 
   const response = await postJson(context, 'pull-preview', {
     state_version: manifest.state_version,
-    base_remote_revision_id: normalizeUuid(cursor.last_successful_remote_revision),
+    ...(baseRemoteRevisionId ? { base_remote_revision_id: baseRemoteRevisionId } : {}),
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
     local_documents: buildLocalDocumentSummaries(manifest.documents),
@@ -272,10 +273,11 @@ export async function adoptRemoteHead(options = {}, environment = {}) {
   });
   const manifest = manifestResult.manifest;
   const cursor = readSyncCursor(manifest.sync, context.binding);
+  const baseRemoteRevisionId = normalizeUuid(cursor.last_successful_remote_revision);
 
   const response = await postJson(context, 'pull-preview', {
     state_version: manifest.state_version,
-    base_remote_revision_id: normalizeUuid(cursor.last_successful_remote_revision),
+    ...(baseRemoteRevisionId ? { base_remote_revision_id: baseRemoteRevisionId } : {}),
     local_root_revision: manifest.canonical.local_root_revision,
     local_manifest_hash: manifest.canonical.manifest_hash,
     local_documents: buildLocalDocumentSummaries(manifest.documents),

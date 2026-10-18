@@ -135,3 +135,39 @@ test('sync-adopt refuses on pending proposals unless --accept-divergence (D-215 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('pull-preview and sync-adopt omit base_remote_revision_id without a cursor and send it once one exists (H14)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-sync-base-'));
+  try {
+    await createConnectedRoot(tempDir);
+    const mock = fetchMock({
+      preview_token: 'pt-3',
+      target_remote_revision_id: ADOPTED_HEAD,
+      proposals: [],
+      conflicts: [],
+      warnings: [],
+    });
+    const environment = { cwd: tempDir, env: { VIBECOMPASS_SYNC_TOKEN: 'token' }, fetch: mock.fetch };
+    const root = path.join(tempDir, '.compass');
+    const previewBodies = () =>
+      mock.calls.filter((call) => call.url.endsWith('/pull-preview')).map((call) => JSON.parse(call.init.body));
+
+    // A newly bound root has no cursor: the route accepts the field only as
+    // an optional UUID, so a null would be a schema 422.
+    assert.equal(await runCli(['pull-preview', '--root', root], createIo(), environment), 0);
+    assert.equal(await runCli(['sync-adopt', '--root', root], createIo(), environment), 0);
+    const fresh = previewBodies();
+    assert.equal(fresh.length, 2);
+    for (const body of fresh) assert.equal(Object.hasOwn(body, 'base_remote_revision_id'), false);
+
+    // sync-adopt recorded the hosted head as the cursor; both callers send it.
+    assert.equal((await readCursor(tempDir))?.last_successful_remote_revision, ADOPTED_HEAD);
+    assert.equal(await runCli(['pull-preview', '--root', root], createIo(), environment), 0);
+    assert.equal(await runCli(['sync-adopt', '--root', root], createIo(), environment), 0);
+    const withCursor = previewBodies().slice(2);
+    assert.equal(withCursor.length, 2);
+    for (const body of withCursor) assert.equal(body.base_remote_revision_id, ADOPTED_HEAD);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
