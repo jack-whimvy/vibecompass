@@ -82,4 +82,4 @@ export {
   inspectLaneBrief,
   laneBriefPath,
 } from './brief-lifecycle.js';
-export { validateBriefSettings } from './brief-settings.js';
+export { readBriefSettingsForRoot, validateBriefSettings } from './brief-settings.js';

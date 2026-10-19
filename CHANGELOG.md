@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.5 - 2026-10-18
+
+A small API release for the MCP server's opt-in `get_brief` (D-386). The brief
+engine and every command behave as before, and the lane brief stays opt-in
+(D-368).
+
+- `readBriefSettingsForRoot(rootDir)` is now exported. It reads a root's
+  `project.yaml` `brief:` settings with the parser the brief and lifecycle
+  generation already use, and returns
+  `{ enabled, enabledDeclared, exclude, problems, repos }`. `vibecompass-mcp`
+  0.1.8 reads it to offer `get_brief` only on a root that sets
+  `brief.enabled: true`, so the server and the lifecycle never parse the
+  setting two ways.
+
 ## 0.17.4 - 2026-10-17
 
 A small sync fix: `pull-preview` and `sync-adopt` work on a root that has never

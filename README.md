@@ -404,6 +404,7 @@ import {
   getDecisionLineage,
   buildSessionBrief,
   renderBrief,
+  readBriefSettingsForRoot,
   detectChangelogShapedLines,
   ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
 } from "@vibecompass/vibecompass";
@@ -442,6 +443,15 @@ result (status, packed units, omitted units, follow-up reads, gaps, and the
 estimated size), and `renderBrief(result)` turns it into markdown. It never
 writes to the root, and it never reads a path the root's `project.yaml`
 `brief.exclude` names.
+
+`readBriefSettingsForRoot(rootDir)` reads the root's `project.yaml` `brief:`
+settings with the same parser the brief and lifecycle generation use. It
+returns `{ enabled, enabledDeclared, exclude, problems, repos }`: `enabled` is
+true only when `brief.enabled` is the boolean `true`, and any entry in
+`problems` (an unreadable `project.yaml`, an unknown field, a malformed
+`exclude`) means the brief fails closed and reads no canonical document.
+`repos` is the root's `repos:` list. The MCP server reads it to decide whether
+to offer `get_brief` (D-386).
 
 ## More Documentation
 

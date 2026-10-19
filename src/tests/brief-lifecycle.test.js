@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildSessionBrief, continueProjectSession, renderBrief, scanProjectMemory, startProjectSession } from '../index.js';
+import { buildSessionBrief, continueProjectSession, readBriefSettingsForRoot, renderBrief, scanProjectMemory, startProjectSession } from '../index.js';
 import { generateLaneBrief, inspectLaneBrief, laneBriefPath } from '../brief-lifecycle.js';
 import { compileBriefExclusions, validateBriefSettings, validateExcludePattern } from '../brief-settings.js';
 import { runCli } from '../cli.js';
@@ -196,6 +196,26 @@ test('brief.exclude globs: validation and matching (D-364)', () => {
   assert.match(validateBriefSettings({ excludes: ['a.md'] }).problems[0], /unknown field "brief\.excludes"/, 'a misspelled field fails closed instead of silently excluding nothing');
   assert.match(validateBriefSettings({ enabled: 'no' }).problems[0], /true or false/);
   assert.match(validateBriefSettings(['a.md']).problems[0], /must be a mapping/);
+});
+
+test('readBriefSettingsForRoot is public: it reads a root\'s brief settings, and an unreadable project.yaml is a problem (D-386)', async (t) => {
+  const { rootDir } = await makeWorkspace(t, { brief: { enabled: true, exclude: ['decisions/eval-*.md'] } });
+  const settings = await readBriefSettingsForRoot(rootDir);
+  assert.deepEqual(
+    { enabled: settings.enabled, enabledDeclared: settings.enabledDeclared, exclude: settings.exclude, problems: settings.problems },
+    { enabled: true, enabledDeclared: true, exclude: ['decisions/eval-*.md'], problems: [] },
+  );
+  assert.deepEqual(settings.repos.map((repo) => repo.id), ['app', 'core']);
+
+  await writeProjectYaml(rootDir, { raw: ['brief:', '  enabled: "true"'] });
+  const quoted = await readBriefSettingsForRoot(rootDir);
+  assert.equal(quoted.enabled, false, 'only a boolean true opts in');
+  assert.match(quoted.problems[0], /true or false/);
+
+  await rm(path.join(rootDir, 'project.yaml'));
+  const missing = await readBriefSettingsForRoot(rootDir);
+  assert.equal(missing.enabled, false);
+  assert.match(missing.problems[0], /project\.yaml could not be read/);
 });
 
 test('an excluded document is never opened and contributes nothing to selection, ranking, propagation, or output (D-364)', async (t) => {
