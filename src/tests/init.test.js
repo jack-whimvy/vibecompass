@@ -11,6 +11,7 @@ import { buildDocsReviewAnchorContext } from '../docs-review.js';
 import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
+import { getGeneratedWorkflowFiles } from '../workflows/registry.js';
 
 const docsReviewFixtureDir = fileURLToPath(new URL('fixtures/docs-review-output/', import.meta.url));
 
@@ -256,7 +257,9 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     );
     assert.match(startingWithoutPlan, /\*\*Offer a short project manager lane that writes the plan\*\* in the plan format, gathering the tasks from the project's existing scope docs\. A plan is a consequential recommendation, so it follows the review rule/);
     assert.match(startingWithoutPlan, /\*\*A doc that holds tasks only in prose isn't a plan\.\*\* The new plan links to it rather than copying it\./);
-    assert.match(startingWithoutPlan, /prompts name tasks in words, or with IDs marked "proposed".*The plan then keeps those exact IDs and lists those sessions in its session map/);
+    assert.match(startingWithoutPlan, /prompts name tasks in words, or with IDs marked "proposed".*The plan then keeps those exact IDs and lists those sessions in its session map, so the notes that cited them can be read later: a note that names no plan reaches the plan through the session-map step of the bare-ID lookup \(Plan format\)\./);
+    // D-393's ordered bare-ID lookup: the first step that names any plan decides.
+    assert.match(projectManagerWorkflow, /look outward from the occurrence and stop at the first step that names any plan: a plan named in the same sentence or list item; then the plans the note or decision names; then, for a note, the plan whose session map lists it, and for a decision, the plans named by the note that lists it under `## Decisions made`\. If exactly one plan at that step has a task line for the ID, the ID is that task\. If none or several do, it is ambiguous, and the reader says so instead of guessing; a later step never overrides or repairs an earlier one\./);
     assert.match(startingWithoutPlan, /\*\*Lanes already open when the role starts\*\* are listed in the session map once the plan exists\. They aren't reopened\./);
     assert.match(projectManagerWorkflow, /- \*\*local-only:\*\*[\s\S]*- \*\*local-primary with a hosted binding:\*\*[\s\S]*- \*\*hosted-only:\*\*/);
     // The generic role carries no project's specifics.
@@ -291,6 +294,24 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'AGENTS.md')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('the project manager guide names the memory root in every command, `--root .` included (D-392)', () => {
+  for (const rootRelativePath of ['.', 'docs-memory']) {
+    const guide = getGeneratedWorkflowFiles({ rootRelativePath })
+      .find((file) => file.kind === 'workflow-project-manager').content;
+    // The header's refresh hint is the shared generated-guide sentinel line, not a command to follow.
+    const commands = [...guide.matchAll(/`(vibecompass [^`]+)`/g)]
+      .map((match) => match[1])
+      .filter((command) => command !== 'vibecompass refresh-workflow --apply');
+    assert.deepEqual(
+      commands.map((command) => command.split(' ')[1]),
+      ['list-sessions', 'start-session', 'start-session', 'list-sessions', 'list-sessions', 'connect-hosted', 'push'],
+    );
+    for (const command of commands) {
+      assert.ok(command.includes(` --root ${rootRelativePath} `) || command.endsWith(` --root ${rootRelativePath}`), `${command} names --root ${rootRelativePath}`);
+    }
   }
 });
 

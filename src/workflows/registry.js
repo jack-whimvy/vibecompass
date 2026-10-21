@@ -163,7 +163,9 @@ function renderProjectManagerWorkflow(options = {}) {
   const contextPath = joinRootRelative(rootRelativePath, 'context.md');
   const projectYamlPath = joinRootRelative(rootRelativePath, 'project.yaml');
   const architecturePath = joinRootRelative(rootRelativePath, 'architecture/');
-  const rootFlag = !rootRelativePath || rootRelativePath === '.' ? '' : ` --root ${rootRelativePath}`;
+  // Every command names the root, `--root .` included: outside a lane
+  // worktree an omitted --root means .compass, not this root.
+  const rootFlag = ` --root ${rootRelativePath || '.'}`;
 
   return `# VibeCompass Workflow — project manager
 
@@ -206,7 +208,7 @@ The project manager never edits another lane's scratch files and never writes in
 ## Build prompts
 
 The project manager writes each build lane's prompt, and the owner gives it to a builder. Every prompt has seven parts:
-1. **Start:** \`start session\` and the exact \`vibecompass start-session --id <lane-id> --working-on "<task IDs>" --architecture-doc <doc>\` line, plus \`--branch <name> --repo <id> --worktree\` for code in Git repositories (binding is opt-in; lanes work without Git). On a root that opts into briefs, read \`brief.md\` as a starting point.
+1. **Start:** \`start session\` and the exact \`vibecompass start-session${rootFlag} --id <lane-id> --working-on "<task IDs>" --architecture-doc <doc>\` line, plus \`--branch <name> --repo <id> --worktree\` for code in Git repositories (binding is opt-in; lanes work without Git). On a root that opts into briefs, read \`brief.md\` as a starting point.
 2. **Parallel-lane rules:** an explicit \`--session <lane-id>\` on lane commands while other lanes are open; stage only the lane's own files; the shared files or lines another open lane owns; timestamps from \`date\`; any files the lane must never open.
 3. **Context:** the plan lines, docs, decisions, notes, and code the lane needs, with paths.
 4. **Scope:** the task IDs, what is out of scope, and an exit point if the lane runs long.
@@ -246,14 +248,14 @@ Otherwise write a follow-up prompt for the same task, or escalate to the owner.
 - **Owner actions.** A labeled group in the plan's \`## Next steps\` holding the owner's current actions and the standing steps each release needs, including steps no repository prompts, such as a client configuration that sits outside every repository. An owner step that is planned work gets a task line with an ID; the rest are plain bullets.
 - **Naming a task outside its plan:** \`<plan-path>#<ID>\`, with the plan's memory-root-relative path, such as \`architecture/<domain>/<feature>/<plan>.md#PM3\`. Commands and stored records always use this form. Prose may shorten it to the file name and the ID while that file name is unique under \`architecture/\`. Inside its own plan a task is cited bare. There is no root-wide ID registry.
 - **Moving a task** to another plan keeps its ID unless the destination already uses it, and its line names the origin: \`(moved from <old-plan-path>#<ID>)\`.
-- **IDs already written bare** elsewhere are never rewritten. A bare ID is a plan's task only when its context yields exactly one plan with a task line for that ID; otherwise it is ambiguous, and the reader says so instead of guessing. An ID presented as a review finding is a finding, not a task.
+- **IDs already written bare** elsewhere are never rewritten. In its own plan, a bare ID is that plan's task. Elsewhere, look outward from the occurrence and stop at the first step that names any plan: a plan named in the same sentence or list item; then the plans the note or decision names; then, for a note, the plan whose session map lists it, and for a decision, the plans named by the note that lists it under \`## Decisions made\`. If exactly one plan at that step has a task line for the ID, the ID is that task. If none or several do, it is ambiguous, and the reader says so instead of guessing; a later step never overrides or repairs an earlier one. An ID presented as a review finding is a finding, not a task. No command resolves a bare ID.
 
 ## Starting without a plan
 
 When the project has no plan yet, no architecture doc whose \`## Next steps\` holds task lines, writing one is the first job:
 - **Offer a short project manager lane that writes the plan** in the plan format, gathering the tasks from the project's existing scope docs. A plan is a consequential recommendation, so it follows the review rule before the owner adopts it.
 - **A doc that holds tasks only in prose isn't a plan.** The new plan links to it rather than copying it.
-- **Until the plan exists,** prompts name tasks in words, or with IDs marked "proposed", such as \`DOC1 (proposed)\`. The plan then keeps those exact IDs and lists those sessions in its session map, so the notes that cited them can be read later: a bare ID in a note is read through the plan whose session map lists that note (D-393).
+- **Until the plan exists,** prompts name tasks in words, or with IDs marked "proposed", such as \`DOC1 (proposed)\`. The plan then keeps those exact IDs and lists those sessions in its session map, so the notes that cited them can be read later: a note that names no plan reaches the plan through the session-map step of the bare-ID lookup (Plan format).
 - **Lanes already open when the role starts** are listed in the session map once the plan exists. They aren't reopened.
 
 ## Operating rules
@@ -268,7 +270,7 @@ When the project has no plan yet, no architecture doc whose \`## Next steps\` ho
 ## Publication
 
 Beyond the Git publish step that \`${projectYamlPath}\` › \`metadata.workflow.close_session\` configures, close-out publication depends on the project's mode:
-- **local-only:** no hosted push, unless the project is later connected with \`vibecompass connect-hosted\`.
+- **local-only:** no hosted push, unless the project is later connected with \`vibecompass connect-hosted${rootFlag}\`.
 - **local-primary with a hosted binding:** once canonical files are final, \`vibecompass push${rootFlag}\` refreshes the hosted dashboard. Push reads files from disk, not commits, so check \`git status\` first: another lane's uncommitted edits would go too. Without a binding there is nothing to push.
 - **hosted-only:** no authoritative local push. Confirm the hosted state was updated, or record it as deferred.
 
