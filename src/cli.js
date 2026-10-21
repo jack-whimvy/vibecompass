@@ -149,6 +149,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
     });
     io.stdout.write(`Started session ${result.sessionDate}-${result.sessionNumber}\n`);
+    io.stdout.write(`Role: ${result.role}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Created ${result.wipFilePath}\n`);
     io.stdout.write(`Created ${result.handoffFilePath}\n`);
@@ -448,6 +449,10 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       // Text mode.
       io.stdout.write(`Continued lane ${result.sessionId} (session ${result.sessionDate}-${result.sessionNumber}, resume #${result.resumeCount}${result.laneAgeDays != null ? `, opened ${result.laneAgeDays} day${result.laneAgeDays === 1 ? '' : 's'} ago` : ''}; selected via ${result.selectionSource})\n`);
       io.stdout.write(`Working on: ${result.workingOn}${result.workingOnUpdated ? ' (updated)' : ''}\n`);
+      // D-392: the lane resumes in its recorded role, so say which.
+      io.stdout.write(result.role === 'project-manager'
+        ? 'Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes\' scratch alone (D-392).\n'
+        : `Role: ${result.role}\n`);
       io.stdout.write(`Updated ${result.claudePath}\n`);
       io.stdout.write('Read next:\n');
       io.stdout.write(`- ${result.wipFilePath}\n`);
@@ -1227,6 +1232,9 @@ function parseStartSessionArgs(argv) {
         break;
       case '--id':
         parsed.sessionId = value;
+        break;
+      case '--role':
+        parsed.role = value;
         break;
       case '--feature':
         parsed.features = [...(parsed.features ?? []), value];
@@ -2379,6 +2387,8 @@ function parseContinueSessionArgs(argv) {
       case '--next-session-should':
         parsed.nextSessionShould = value;
         break;
+      case '--role':
+        throw new Error('continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it (D-392).');
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -3172,7 +3182,7 @@ function usageText() {
     '                                        Read-only session brief: relevant memory, packed into an estimated token budget',
     '  vibecompass brief --write|--check [--session <lane-id>] [--source-root <path> [--source-session <lane-id>]] [--budget <n>] [--json] [options]',
     '                                        Regenerate the lane\'s sessions/active/<lane-id>/brief.md, or report whether it is stale (D-364)',
-    '  vibecompass start-session --id <lane-id> --working-on <text> [--branch <name> [--worktree]] [--no-brief] [options]',
+    '  vibecompass start-session --id <lane-id> --working-on <text> [--role <builder|project-manager>] [--branch <name> [--worktree]] [--no-brief] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
     '  vibecompass continue-session [<lane-id>] [--session <lane-id>] [--working-on <text>] [--no-brief | --source-root <path>] [--json] [options]',
@@ -3290,6 +3300,7 @@ function usageText() {
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --working-on <text>                  Required active-session summary',
     '  --id <lane-id>                       Required active session lane ID',
+    '  --role <builder|project-manager>     The lane\'s role, recorded in session.yaml (default builder; D-392). A project manager opens its own short lanes with --role project-manager; a lane keeps its role, and continue-session resumes it in that role',
     '  --feature <slug>                     Repeatable feature slug for the lane',
     '  --repo <id>                          Repeatable repo ID for the lane',
     '  --claim <path>                       Repeatable path claim for overlap warnings',
@@ -3350,7 +3361,7 @@ function usageText() {
     'List/switch-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
-    '  --json                               list-sessions: print the lane inventory as JSON',
+    '  --json                               list-sessions: print the lane inventory as JSON (every lane carries its role; D-392)',
     '',
     'Rebuild-active-index options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',

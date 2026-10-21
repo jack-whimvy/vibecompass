@@ -45,6 +45,10 @@ import { writeStateManifest } from './manifest.js';
 const CURRENT_SESSION_REQUIRED_FIELDS = ['Date:', 'Working on:', 'Last thing completed:', 'Blockers:', 'Next session should:'];
 const WIP_HEADER_PATTERN = /^# WIP — (\d{4}-\d{2}-\d{2}) \(session (\d+)\)$/m;
 const SESSION_FILENAME_PATTERN = /^(\d{4}-\d{2}-\d{2})-(\d+)-([a-z0-9-]+)\.md$/i;
+// D-392: a lane records the role it was opened with. A lane without the field
+// (every lane opened before roles existed) is a builder lane.
+export const LANE_ROLES = ['builder', 'project-manager'];
+export const DEFAULT_LANE_ROLE = 'builder';
 const DOCUMENT_MAINTENANCE_STATUSES = new Set(['updated', 'not-needed', 'deferred']);
 const DOCUMENT_MAINTENANCE_FIELDS = [
   {
@@ -145,6 +149,7 @@ export async function inferToolingRootForMemoryRoot(rootDir) {
 async function startProjectSessionLocked(normalized, options, markerContext) {
   await assertLaneMarkerSnapshotCurrent(markerContext);
   const workingOn = requireNonEmptyString(options?.workingOn, 'start-session requires a non-empty workingOn value.');
+  const role = normalizeStartSessionRole(options?.role);
   const sessionDate = normalizeSessionDate(options?.date);
 
   await ensureInitializedProjectMemory(normalized.rootDir);
@@ -290,6 +295,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     lanePaths.sessionFilePath,
     renderLaneMetadata({
       sessionId,
+      role,
       sessionDate,
       sessionNumber: nextSessionNumber,
       workingOn,
@@ -415,6 +421,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     toolingRootDir: normalized.toolingRootDir,
     claudePath: normalized.claudePath,
     sessionId,
+    role,
     sessionFilePath: lanePaths.sessionFilePath,
     wipFilePath: lanePaths.wipFilePath,
     handoffFilePath: lanePaths.handoffFilePath,
@@ -1181,6 +1188,9 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
     toolingRootDir: normalized.toolingRootDir,
     claudePath: normalized.claudePath,
     sessionId: lane.id,
+    // D-392: the lane resumes in the role it was opened with; nothing here
+    // can change it.
+    role: lane.role,
     selectionSource: selection.source,
     sessionFilePath: lanePaths.sessionFilePath,
     wipFilePath: lanePaths.wipFilePath,
@@ -1241,6 +1251,7 @@ function buildLaneInventory(lanes, current) {
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((lane) => ({
         id: lane.id,
+        role: lane.role ?? DEFAULT_LANE_ROLE,
         workingOn: lane.workingOn ?? null,
         sessionDate: lane.sessionDate ?? null,
         sessionNumber: lane.sessionNumber || null,
@@ -1269,6 +1280,11 @@ export function renderLaneInventoryLines(inventory) {
     const marker = lane.isCurrentHint ? '*' : '-';
     lines.push(`${marker} ${lane.id}: ${lane.workingOn ?? 'No summary recorded'}${lane.isCurrentHint ? ' [current hint]' : ''}`);
     const facts = [];
+    // D-392: builder is the default and goes unlabeled; any other role is
+    // named so a reader never resumes it as a builder lane by mistake.
+    if (lane.role && lane.role !== DEFAULT_LANE_ROLE) {
+      facts.push(`role ${lane.role}`);
+    }
     if (lane.sessionDate) {
       facts.push(`opened ${lane.sessionDate}${lane.sessionNumber ? ` (session ${lane.sessionNumber})` : ''}`);
     }
@@ -1992,6 +2008,7 @@ async function listActiveSessionLanes(normalized) {
       lanes.push({
         id: sessionId,
         status: metadata.status ?? 'active',
+        role: metadata.role,
         workingOn: metadata.workingOn ?? null,
         features: metadata.features,
         repos: metadata.repos,
@@ -2043,6 +2060,7 @@ async function readLaneMetadata(sessionFilePath) {
     const data = parseSimpleYaml(content, { sourceName: sessionFilePath });
     return {
       status: normalizeOptionalString(data.status),
+      role: readLaneRole(data.role),
       workingOn: normalizeOptionalString(data.working_on),
       features: normalizeStringArray(data.feature_slugs),
       repos: normalizeStringArray(data.repos),
@@ -2081,6 +2099,7 @@ async function readLaneMetadata(sessionFilePath) {
   } catch (error) {
     return {
       status: null,
+      role: DEFAULT_LANE_ROLE,
       workingOn: null,
       features: [],
       repos: [],
@@ -2345,6 +2364,7 @@ function renderLaneMetadata(options) {
   return [
     `id: ${options.sessionId}`,
     'status: active',
+    `role: ${quoteYamlString(options.role ?? DEFAULT_LANE_ROLE)}`,
     `session_date: ${options.sessionDate}`,
     `session_number: ${options.sessionNumber}`,
     `working_on: ${quoteYamlString(options.workingOn)}`,
@@ -2792,6 +2812,34 @@ function formatLocalDateTime(date) {
     String(date.getSeconds()).padStart(2, '0'),
     offset,
   ].join('');
+}
+
+/**
+ * D-392: `start-session --role`. Omitted means builder; anything other than a
+ * known role fails before the first write, so a typo never opens a lane.
+ */
+function normalizeStartSessionRole(value) {
+  if (value === undefined || value === null) {
+    return DEFAULT_LANE_ROLE;
+  }
+
+  const role = typeof value === 'string' ? value.trim() : '';
+  if (!LANE_ROLES.includes(role)) {
+    throw new Error(
+      `Unknown lane role ${JSON.stringify(typeof value === 'string' ? value : String(value))}. --role takes ${LANE_ROLES.join(' or ')} (default ${DEFAULT_LANE_ROLE}; D-392).`,
+    );
+  }
+
+  return role;
+}
+
+/**
+ * Readers never fail on the role: a missing field is a builder lane (every
+ * lane opened before roles existed), and so is any value start-session would
+ * not have written, since only a project-manager lane resumes in another role.
+ */
+function readLaneRole(value) {
+  return typeof value === 'string' && LANE_ROLES.includes(value.trim()) ? value.trim() : DEFAULT_LANE_ROLE;
 }
 
 function requireNonEmptyString(value, message) {

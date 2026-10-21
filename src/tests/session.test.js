@@ -2309,3 +2309,201 @@ test('unknown-id refusal and start-session resume warning both render the lane i
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('start-session --role records the lane role in session.yaml; builder is the default (D-392)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-start-');
+
+  try {
+    const builder = await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'build-lane', workingOn: 'Build.', date: '2026-04-20' });
+    assert.equal(builder.role, 'builder');
+    const builderYaml = await readFile(path.join(rootDir, 'sessions/active/build-lane/session.yaml'), 'utf8');
+    assert.match(builderYaml, /^role: "builder"$/m);
+
+    const manager = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'plan-refresh',
+      workingOn: 'Refresh the plan.',
+      role: 'project-manager',
+      date: '2026-04-20',
+    });
+    assert.equal(manager.role, 'project-manager');
+    const managerYaml = await readFile(path.join(rootDir, 'sessions/active/plan-refresh/session.yaml'), 'utf8');
+    assert.match(managerYaml, /^role: "project-manager"$/m);
+    assert.equal((managerYaml.match(/^role:/gm) ?? []).length, 1);
+
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(listed.lanes.map((lane) => [lane.id, lane.role]), [['build-lane', 'builder'], ['plan-refresh', 'project-manager']]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session refuses an unknown --role before any write (D-392)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-invalid-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    const indexBefore = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    const claudeBefore = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+
+    for (const role of ['reviewer', 'Project-Manager', '']) {
+      await assert.rejects(
+        startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', role, date: '2026-04-20' }),
+        /Unknown lane role .*--role takes builder or project-manager \(default builder; D-392\)/,
+      );
+    }
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/lane-b')));
+    assert.equal(await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8'), indexBefore);
+    assert.equal(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'), claudeBefore);
+
+    const stderr = [];
+    await assert.rejects(
+      runCli(
+        ['start-session', '--root', rootDir, '--id', 'lane-c', '--working-on', 'Lane C.', '--role', 'owner'],
+        { stdout: { write() {} }, stderr: { write(chunk) { stderr.push(chunk); } } },
+        { cwd: tempDir },
+      ),
+      /Unknown lane role "owner"/,
+    );
+    await assert.rejects(() => access(path.join(rootDir, 'sessions/active/lane-c')));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a lane without a role field is a builder lane in the inventory and on resume (D-392)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-legacy-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'legacy-lane', workingOn: 'Opened before roles.', date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/legacy-lane/session.yaml');
+    await writeFile(sessionFilePath, (await readFile(sessionFilePath, 'utf8')).replace(/^role: .*\n/m, ''), 'utf8');
+    assert.doesNotMatch(await readFile(sessionFilePath, 'utf8'), /^role:/m);
+
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.equal(listed.lanes[0].role, 'builder');
+    assert.equal(listed.inventory.lanes[0].role, 'builder');
+
+    const resumed = await continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21' });
+    assert.equal(resumed.role, 'builder');
+    // Resume writes its bookkeeping and never adds or changes a role.
+    assert.doesNotMatch(await readFile(sessionFilePath, 'utf8'), /^role:/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('list-sessions names a project-manager lane\'s role in text and gives every lane a role in JSON (D-392)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-inventory-');
+  const stdout = [];
+  const io = {
+    stdout: { write(chunk) { stdout.push(chunk); } },
+    stderr: { write() {} },
+  };
+
+  try {
+    assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'build-lane', '--working-on', 'Build.', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /^Role: builder$/m);
+    stdout.length = 0;
+    assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'plan-refresh', '--working-on', 'Refresh the plan.', '--role', 'project-manager', '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /^Role: project-manager$/m);
+
+    stdout.length = 0;
+    assert.equal(await runCli(['list-sessions', '--root', rootDir], io, { cwd: tempDir }), 0);
+    const text = stdout.join('');
+    assert.match(text, /^- build-lane: Build\.\n {4}opened 2026-04-20 \(session 1\); port 3100$/m);
+    assert.match(text, /^\* plan-refresh: Refresh the plan\. \[current hint\]\n {4}role project-manager; opened 2026-04-20 \(session 2\); port 3101$/m);
+
+    stdout.length = 0;
+    assert.equal(await runCli(['list-sessions', '--root', rootDir, '--json'], io, { cwd: tempDir }), 0);
+    const inventory = JSON.parse(stdout.join(''));
+    assert.deepEqual(inventory.lanes.map((lane) => [lane.id, lane.role]), [['build-lane', 'builder'], ['plan-refresh', 'project-manager']]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continue-session prints the role it resumed and takes no --role (D-392)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-resume-');
+  const stdout = [];
+  const io = {
+    stdout: { write(chunk) { stdout.push(chunk); } },
+    stderr: { write() {} },
+  };
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'plan-refresh', workingOn: 'Refresh the plan.', role: 'project-manager', date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/plan-refresh/session.yaml');
+
+    assert.equal(await runCli(['continue-session', '--root', rootDir, '--date', '2026-04-21'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /^Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes' scratch alone \(D-392\)\.$/m);
+
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, '--date', '2026-04-22', '--json'], io, { cwd: tempDir }), 0);
+    assert.equal(JSON.parse(stdout.join('')).role, 'project-manager');
+
+    await assert.rejects(
+      runCli(['continue-session', '--root', rootDir, '--role', 'builder'], io, { cwd: tempDir }),
+      /continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it \(D-392\)/,
+    );
+    const sessionYaml = await readFile(sessionFilePath, 'utf8');
+    assert.match(sessionYaml, /^role: "project-manager"$/m);
+    assert.match(sessionYaml, /^resume_count: 2$/m);
+
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'build-lane', workingOn: 'Build.', date: '2026-04-21' });
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, 'build-lane', '--date', '2026-04-22'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), /^Role: builder$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('resume selects a lane by --session or worktree marker whatever its role, and refuses without a selection (D-392, D-277)', async () => {
+  const { tempDir, rootDir } = await createContinueSessionRoot('vibecompass-role-selection-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'build-lane', workingOn: 'Build.', date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'plan-refresh', workingOn: 'Refresh the plan.', role: 'project-manager', date: '2026-04-20' });
+
+    // One builder lane and one project-manager lane, nothing selected: the
+    // command refuses and prints the inventory with the manager lane's role.
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21' }),
+      (error) => {
+        assert.match(error.message, /Multiple active session lanes exist; continue-session will not guess/);
+        assert.match(error.message, /^- build-lane: Build\.\n {4}opened 2026-04-20 \(session 1\); port 3100$/m);
+        assert.match(error.message, /^\* plan-refresh: Refresh the plan\. \[current hint\]\n {4}role project-manager; opened 2026-04-20 \(session 2\); port 3101$/m);
+        return true;
+      },
+    );
+    for (const laneId of ['build-lane', 'plan-refresh']) {
+      const sessionYaml = await readFile(path.join(rootDir, `sessions/active/${laneId}/session.yaml`), 'utf8');
+      assert.doesNotMatch(sessionYaml, /resume_count/, 'the refusal wrote nothing');
+    }
+
+    // An explicit --session selects either lane, in its recorded role.
+    const manager = await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'plan-refresh', date: '2026-04-21' });
+    assert.deepEqual([manager.sessionId, manager.role, manager.selectionSource], ['plan-refresh', 'project-manager', 'flag']);
+    const builder = await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'build-lane', date: '2026-04-21' });
+    assert.deepEqual([builder.sessionId, builder.role, builder.selectionSource], ['build-lane', 'builder', 'flag']);
+
+    // A worktree marker selects the lane it binds, whatever its role.
+    for (const [laneId, role] of [['plan-refresh', 'project-manager'], ['build-lane', 'builder']]) {
+      const markedDir = path.join(tempDir, 'worktrees', laneId, 'docs');
+      await mkdir(markedDir, { recursive: true });
+      await writeLaneMarkerForSession({ cwd: tempDir, rootDir, sessionId: laneId, dir: markedDir });
+      const resumed = await continueProjectSession({ cwd: markedDir, date: '2026-04-22' });
+      assert.deepEqual([resumed.sessionId, resumed.role, resumed.selectionSource], [laneId, role, 'marker']);
+    }
+
+    // The explicit flag still wins over the marker.
+    const markedManagerDir = path.join(tempDir, 'worktrees', 'plan-refresh', 'docs');
+    const overridden = await continueProjectSession({ cwd: markedManagerDir, sessionId: 'build-lane', date: '2026-04-22' });
+    assert.deepEqual([overridden.sessionId, overridden.role, overridden.selectionSource], ['build-lane', 'builder', 'flag']);
+    assert.match(overridden.warnings.join('\n'), /--session build-lane overrides the lane marker/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
