@@ -5,17 +5,31 @@ export const WORKFLOW_REGISTRY = [
     id: 'session-lifecycle',
     title: 'Session lifecycle',
     detailPath: 'context.md',
-    summary: 'Builder/reviewer lane lifecycle, handoffs, planning mode, and close-out.',
+    summary: 'Builder/reviewer/project-manager lane lifecycle, handoffs, planning mode, and close-out.',
     promptCommands: [
-      { trigger: 'start session', summary: 'builder role trigger; opens a new named lane — if a lane is already active, resume it with `continue session` instead of opening a duplicate' },
-      { trigger: 'continue session', summary: 'builder resumes an already-open lane with `vibecompass continue-session [<lane-id>]` (D-353); with multiple active lanes name the lane explicitly: `continue session <lane-id>` — the agent presents the lane inventory and asks rather than guessing' },
+      { trigger: 'start session', summary: 'builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane (D-392)' },
+      { trigger: 'continue session', summary: 'resumes an already-open lane with `vibecompass continue-session [<lane-id>]` (D-353), in the role the lane records: builder, or project manager for a lane opened with `--role project-manager` (D-392); with multiple active lanes name the lane explicitly: `continue session <lane-id>` — the agent presents the lane inventory and asks rather than guessing' },
       { trigger: 'join as reviewer', summary: 'reviewer role trigger' },
+      // The trigger is a session-lifecycle entry (D-392); the generated guide
+      // it points to belongs to the project-manager entry below.
+      { trigger: 'join as project manager', summary: 'project manager role trigger (D-392), with the plan to run: `join as project manager <plan-path>`; opens and selects no lane, reads the session startup steps 1–3, then the project manager workflow, then the plan, and with no plan named asks which plan to run or offers to write one', detailPath: 'workflows/project-manager.md' },
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
-      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and appends findings; with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
+      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and records findings in `wip.md` › `## Review log` and `handoff.md` › `## Reviewer → Builder`, the only two sections a pass writes (D-392); with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
       { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files' },
       { trigger: 'docs update', summary: 'builder runs a targeted session-delta documentation maintenance plan with `vibecompass docs-update --session <lane-id>`' },
-      { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases' },
+      { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases; a project manager closes its own lanes the same way' },
     ],
+  },
+  {
+    id: 'project-manager',
+    title: 'Project manager',
+    detailPath: 'workflows/project-manager.md',
+    summary: 'Plan tasks, write build prompts, check close reports, and decide when to move on (D-392, D-393).',
+    // Entered through the session-lifecycle trigger above; this entry owns
+    // only the generated guide.
+    promptCommands: [],
+    generatedFileKind: 'workflow-project-manager',
+    renderFile: renderProjectManagerWorkflow,
   },
   {
     id: 'docs-review',
@@ -36,7 +50,7 @@ export function getPromptCommands() {
       ...command,
       workflowId: workflow.id,
       workflowTitle: workflow.title,
-      detailPath: workflow.detailPath,
+      detailPath: command.detailPath ?? workflow.detailPath,
     })),
   );
 }
@@ -138,6 +152,124 @@ If the user explicitly wants to rerun docs-review for a focused architecture-doc
 - Follow the canonical review prompt for evidence, blindspot, and decision-recommendation constraints.
 - Treat the package-owned prompt as the source of truth. Tool-specific skills may wrap this workflow, but should not define a divergent docs-review protocol.
 - Do not edit generated agent files directly. Update VibeCompass project memory or rerun package commands instead.
+`;
+}
+
+// The generic role (D-392) and plan format (D-393). Project-specific practice
+// (who the owner is, which tools build and review, owner-only steps) belongs
+// in the project's own docs, never here.
+function renderProjectManagerWorkflow(options = {}) {
+  const rootRelativePath = options.rootRelativePath ?? '.';
+  const contextPath = joinRootRelative(rootRelativePath, 'context.md');
+  const projectYamlPath = joinRootRelative(rootRelativePath, 'project.yaml');
+  const architecturePath = joinRootRelative(rootRelativePath, 'architecture/');
+  const rootFlag = !rootRelativePath || rootRelativePath === '.' ? '' : ` --root ${rootRelativePath}`;
+
+  return `# VibeCompass Workflow — project manager
+
+Generated by VibeCompass. This file is a package-owned workflow guide and may be refreshed by \`vibecompass refresh-workflow --apply\`.
+
+## Prompt trigger
+
+When the user says \`join as project manager <plan-path>\`, take the project manager role for that plan (D-392). The trigger opens no lane and selects none. Read \`${contextPath}\` › Session startup steps 1–3 (\`project.yaml\`, the latest finalized session note, and the lane inventory), then this file, then the plan. A plan path is relative to the project-memory root, such as \`architecture/<domain>/<feature>/<plan>.md\`. With no plan named, ask which plan to run, or offer to write one (Plan format).
+
+## The role
+
+One person and three session roles:
+- **Owner:** the person who brings the idea, makes the decisions, and does the steps only a person can, such as releases, credentials, and spending. The owner is not a session role.
+- **Project manager:** plans tasks, writes each build lane's prompt, checks each close report against primary sources, decides when the plan moves to the next task, and escalates to the owner with options and a recommendation. It doesn't write product code and doesn't stand in for the reviewer.
+- **Builder** (\`start session\`) does the work in a lane, and **reviewer** (\`join as reviewer\`, \`review handoff\`) evaluates it. Their contracts are in \`${contextPath}\`.
+
+The project manager works in a standing conversation, not a lane: status reports, prompts, and report checks need no lane.
+
+## Inputs and outputs
+
+Inputs: the owner's idea, goals, and decisions; project memory (\`context.md\`, the plan, architecture docs, decisions, finalized notes); the lane inventory (\`vibecompass list-sessions${rootFlag}\`) and other lanes' \`wip.md\`, \`handoff.md\`, and \`brief.md\`, read only; and builders' close reports with the primary sources that confirm them: git heads and tags, pull requests, package registries, and the live product.
+
+Outputs:
+- **The plan** (Plan format) and **build prompts** (Build prompts).
+- **Status reports:** done, next, blocked, and the owner's actions, each checked against a primary source rather than relayed.
+- **The session map** and **the owner actions** (Plan format).
+- **Move-on calls and escalations.** An escalation states the options and recommends one.
+
+## Writing project memory: lanes of its own
+
+The project manager changes canonical memory (plans, architecture docs, decisions) only inside short lanes of its own:
+1. Open one with \`vibecompass start-session${rootFlag} --id <lane-id> --working-on "..." --role project-manager\`. The lane records \`role: project-manager\` in its \`session.yaml\`.
+2. Work it with the builder's lane mechanics: keep \`wip.md\` and \`handoff.md\` current, and append each decision before acting on it.
+3. Close it with \`close session\` in the same sitting.
+
+A lane keeps the role it was opened with. If a sitting ends before the close, \`continue session <lane-id>\` resumes the lane as project manager, with this role's write limits; \`start session\` never resumes a project-manager lane.
+
+The project manager never edits another lane's scratch files and never writes into a closed lane; feedback for a closed lane goes to the owner or into the next prompt. It never hand-edits package output: \`context.md\`, \`workflows/\`, the generated READMEs, \`state/\`, and the agent files' managed blocks.
+
+## Build prompts
+
+The project manager writes each build lane's prompt, and the owner gives it to a builder. Every prompt has seven parts:
+1. **Start:** \`start session\` and the exact \`vibecompass start-session --id <lane-id> --working-on "<task IDs>" --architecture-doc <doc>\` line, plus \`--branch <name> --repo <id> --worktree\` for code in Git repositories (binding is opt-in; lanes work without Git). On a root that opts into briefs, read \`brief.md\` as a starting point.
+2. **Parallel-lane rules:** an explicit \`--session <lane-id>\` on lane commands while other lanes are open; stage only the lane's own files; the shared files or lines another open lane owns; timestamps from \`date\`; any files the lane must never open.
+3. **Context:** the plan lines, docs, decisions, notes, and code the lane needs, with paths.
+4. **Scope:** the task IDs, what is out of scope, and an exit point if the lane runs long.
+5. **Quality bar:** tests, checks, browser verification, and the docs to update.
+6. **Review and release:** reviewer passes under the review rule, and what may merge, publish, or release, on whose go.
+7. **Close-out:** plan ticks (only when merged and verified, otherwise annotated), the finalized note with its review summary, the consistency checks, publication, and what the report back must contain.
+
+## The review rule
+
+A build lane closes only after:
+- **At least one recorded reviewer pass,** even when it finds nothing. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
+- **Findings drive more passes.** After \`address review\`, the reviewer's next pass checks each response. The loop ends at a pass that leaves no finding open: each one fixed and confirmed, rejected with evidence the reviewer accepts, or deferred with a scoped reason.
+- **A cap of 3 rounds,** where a round is one reviewer pass and the builder's response. If findings are still open after the third, the builder stops and reports, and the project manager escalates to the owner, who chooses: another round, a scoped deferral whose reason the session note carries, or leaving the lane open. A cap never marks a finding resolved.
+
+Close deletes the lane's scratch files, so the finalized note keeps the review summary, with each deferred finding and its reason among the note's next steps.
+
+## Checking a close report
+
+Check each claim against its primary source before accepting it: \`vibecompass list-sessions${rootFlag}\` (the lane closed), the finalized note and its review summary, git heads and tags, the pull request, the registry version and checksum, and the live page. For a lane still open, read its latest \`wip.md\` log lines too, since a handoff can lag the work. A claim that doesn't hold goes back to the lane while it is open, or to the owner once it has closed.
+
+## When to move on
+
+Move the plan to the next task when:
+- the close report checks out against primary sources;
+- the review rule is met, as the note's review summary shows;
+- the plan's ticks match the evidence, with anything not merged or verified annotated rather than ticked;
+- the owner's steps for the task are done, or listed with what waits on them.
+
+Otherwise write a follow-up prompt for the same task, or escalate to the owner.
+
+## Plan format (D-393)
+
+- **Where plans live.** A plan is an architecture doc under \`${architecturePath}\`, beside the feature it plans. Nothing else marks it: a doc is a plan when its \`## Next steps\` holds task lines. A finished plan moves to \`archive/\` once its open items live in another doc.
+- **Task lines.** A task is a top-level item under \`## Next steps\`: \`- [ ] <ID> — <scope>\`, ticked \`- [x] <ID> — <scope>\` once done. \`<ID>\` matches \`[A-Z]{1,6}[0-9]{1,3}\`: capital letters for the track, then a number, such as \`PM3\` or \`DOC2\`, with no dot, hyphen, space, or lowercase letter. An ID is unique within its plan and never reused there, even after its task is removed. Bold group labels may separate tracks; subtasks are nested bullets or checkboxes without IDs. The scope says whether the task is reviewed. A ticked task keeps one dated done line naming its lane or note.
+- **Order, owner decisions, assumption changes, and costs.** The plan's \`## Details\` give the order of the tasks, the decisions each step needs from the owner (a table once decided), every assumption change called out explicitly, and the costs.
+- **Session map.** A \`### Session map\` table under the plan's \`## Details\`, with the columns Session, Lane, Tasks, Note, and Outcome and evidence. Add a row only after checking it against primary sources. When the map outgrows the plan, move it to a companion doc named in the plan's Retrieval guidance.
+- **Owner actions.** A labeled group in the plan's \`## Next steps\` holding the owner's current actions and the standing steps each release needs, including steps no repository prompts, such as a client configuration that sits outside every repository. An owner step that is planned work gets a task line with an ID; the rest are plain bullets.
+- **Naming a task outside its plan:** \`<plan-path>#<ID>\`, with the plan's memory-root-relative path, such as \`architecture/<domain>/<feature>/<plan>.md#PM3\`. Commands and stored records always use this form. Prose may shorten it to the file name and the ID while that file name is unique under \`architecture/\`. Inside its own plan a task is cited bare. There is no root-wide ID registry.
+- **Moving a task** to another plan keeps its ID unless the destination already uses it, and its line names the origin: \`(moved from <old-plan-path>#<ID>)\`.
+- **IDs already written bare** elsewhere are never rewritten. A bare ID is a plan's task only when its context yields exactly one plan with a task line for that ID; otherwise it is ambiguous, and the reader says so instead of guessing. An ID presented as a review finding is a finding, not a task.
+
+## Operating rules
+
+- **Change canonical memory only in short lanes of your own** (Writing project memory, above).
+- **In Git, stage only your own files,** or your own hunks in a shared doc such as the plan. Never \`git add -A\`, stash, or \`--autostash\` while other lanes are open; if the remote moved, merge rather than rebase.
+- **Check before editing or reporting.** Two project-manager sessions can run at once. Before an edit, a status report, or a question to the owner, run \`vibecompass list-sessions${rootFlag}\` and \`git status\`, and read the notes finalized since your last look and open lanes' latest scratch files. Build lanes report only their own status.
+- **Check interpretive claims against the code,** not only a doc's tables or summary, in close reports and in your own docs.
+- **Send consequential recommendations through a reviewed lane** before the owner decides (a plan, a reorder, a protocol change), and flag every assumption change explicitly.
+- **Take timestamps from \`date\`.**
+
+## Publication
+
+Beyond the Git publish step that \`${projectYamlPath}\` › \`metadata.workflow.close_session\` configures, close-out publication depends on the project's mode:
+- **local-only:** no hosted push, unless the project is later connected with \`vibecompass connect-hosted\`.
+- **local-primary with a hosted binding:** once canonical files are final, \`vibecompass push${rootFlag}\` refreshes the hosted dashboard. Push reads files from disk, not commits, so check \`git status\` first: another lane's uncommitted edits would go too. Without a binding there is nothing to push.
+- **hosted-only:** no authoritative local push. Confirm the hosted state was updated, or record it as deferred.
+
+Which lanes may publish without asking is the owner's call, recorded in the project's working agreements.
+
+## Rules
+
+- This file is the generic role. A project may keep its own role doc under \`architecture/\` with its specifics, such as who the owner is, which tools build and review, and the steps only the owner takes; read it as well.
+- Do not edit generated files directly. Update project memory or rerun package commands instead.
 `;
 }
 

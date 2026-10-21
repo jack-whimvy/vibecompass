@@ -130,6 +130,7 @@ npx -y @vibecompass/vibecompass@latest status --root .compass
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "Auth flow"
 npx -y @vibecompass/vibecompass@latest list-sessions --root .compass            # --json for the machine-readable lane inventory
 npx -y @vibecompass/vibecompass@latest continue-session --root .compass         # resume the open lane (D-353); name it with 2+ lanes: continue-session auth-flow
+npx -y @vibecompass/vibecompass@latest start-session --root .compass --id plan-refresh --working-on "Refresh the plan" --role project-manager   # a project manager's own lane (D-392); --role defaults to builder
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
@@ -141,6 +142,9 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # plus resume-staleness warnings. With two or more active lanes and no worktree
 # marker it fails closed and prints the lane inventory instead of guessing;
 # start-session --id <existing-lane> fails closed and points at continue-session.
+# A lane keeps the role it was opened with (D-392): continue-session prints it and
+# takes no --role, list-sessions names a project-manager lane's role, and
+# list-sessions --json gives every lane's. A lane without the field is a builder lane.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
 
 # Session brief in the lane (D-359, D-364), opt-in (D-368): with
@@ -248,13 +252,28 @@ AGENTS.md
 After setup, use these phrases inside your AI coding tool:
 
 - `start session`
+- `continue session`
 - `join as reviewer`
+- `join as project manager <plan-path>`
 - `planning mode`
 - `review handoff`
 - `address review`
 - `docs update`
 - `close session` / `end session`
 - `docs review`
+
+Three session roles share a project (D-392). The builder (`start session`,
+`continue session`) works in a lane. Before it runs or hands over a release,
+merge, publish, or push command, and before it asks the owner to decide, it
+re-reads the notes finalized since its lane opened and other open lanes'
+scratch files. The reviewer (`join as reviewer`, `review handoff`) evaluates the
+work, and a pass writes only the lane's `wip.md` › `## Review log` and
+`handoff.md` › `## Reviewer → Builder`. The project manager (`join as project
+manager <plan-path>`) plans tasks, writes each build lane's prompt, and checks
+close reports, following the generated `workflows/project-manager.md`. It needs
+no lane for that, and changes project memory only in short lanes of its own,
+opened with `start-session --role project-manager`. A lane resumes in the role
+it was opened with, and `start session` never resumes a project-manager lane.
 
 The npm package owns the file mechanics. Your AI session owns reading the
 workflow files, updating handoffs, and applying reviewed changes. Use

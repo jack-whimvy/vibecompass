@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- Project manager role (D-392, D-393): a third session role beside builder
+  and reviewer, entered with the prompt command
+  `join as project manager <plan-path>`. The trigger opens and selects no lane;
+  the agent reads `context.md`'s session startup steps 1–3, then the new
+  generated `workflows/project-manager.md`, then the plan, and with no plan
+  named asks which one to run or offers to write one. The workflow file holds
+  the generic role: inputs and outputs, the seven-part build prompt, the review
+  rule, checking close reports, when to move on, the plan format (task lines
+  `- [ ] <ID> — <scope>`, `<plan-path>#<ID>` outside the plan, the session map,
+  the owner actions), operating rules, and publication by mode. `init` writes
+  it; `refresh-workflow` creates it on an existing root, updates a generated
+  copy, and leaves a file it did not generate alone.
+- `start-session --role builder|project-manager` records the lane's role in
+  `session.yaml` (`role: "builder"` by default). An unknown value fails before
+  anything is written. A lane without the field, such as every lane opened
+  before this release, is a builder lane, and no command changes a lane's
+  role. `list-sessions` names a project-manager lane's role, `--json` gives
+  every lane a `role`, and `continue-session` prints the role it resumed
+  (`role` in `--json`) and refuses `--role`.
+- `context.md`: the Session roles table gains the project manager row, and its
+  `continue session` row names the lane's recorded role; a Project manager
+  workflow section; the Open, resume, or choose rules count only builder lanes
+  for `start session`'s automatic resume, so one builder lane beside one
+  project-manager lane is resumed by id and a root with only project-manager
+  lanes gets a new builder lane; the builder workflow re-reads finalized notes
+  and other open lanes' scratch before any release, merge, publish, or push
+  step and before asking the owner to decide; and the reviewer workflow,
+  handback text, and `reviewer handback` default name the only two sections a
+  pass writes, `wip.md` › `## Review log` and `handoff.md` ›
+  `## Reviewer → Builder`.
+- Managed agent blocks: the `join as project manager` prompt command, the
+  `start session`, `continue session`, `review handoff`, and `close session`
+  summaries updated for roles, and two Hard Rules lines, the builder's re-read
+  and the reviewer's write boundary. An existing root gets all of this at its
+  next `refresh-workflow --apply` (D-257); until then its agents follow the
+  context they have.
+
 ## 0.17.5 - 2026-10-18
 
 A small API release for the MCP server's opt-in `get_brief` (D-386). The brief

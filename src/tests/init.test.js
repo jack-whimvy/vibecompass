@@ -179,6 +179,7 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     const decisionsGuide = await readFile(path.join(rootDir, 'decisions/README.md'), 'utf8');
     const sessionsGuide = await readFile(path.join(rootDir, 'sessions/README.md'), 'utf8');
     const docsReviewWorkflow = await readFile(path.join(rootDir, 'workflows/docs-review.md'), 'utf8');
+    const projectManagerWorkflow = await readFile(path.join(rootDir, 'workflows/project-manager.md'), 'utf8');
     const starterArchitecture = await readFile(path.join(rootDir, 'architecture/overview/project-shape.md'), 'utf8');
     const decisionExample = await readFile(path.join(rootDir, 'decisions/EXAMPLE.md'), 'utf8');
     const starterSession = await readFile(path.join(rootDir, 'sessions/2026-04-20-1-project-memory-initialized.md'), 'utf8');
@@ -196,9 +197,27 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /`close session` — builder runs the close-out checklist/);
     assert.match(context, /end-session` is also accepted as an alias/);
     assert.match(context, /reports legacy or stale scratch files/);
-    assert.match(context, /`continue session` — builder resumes an already-open lane with `vibecompass continue-session \[<lane-id>\]` \(D-353\)/);
-    assert.match(context, /## Open, resume, or choose \(D-353\)/);
-    assert.match(context, /\| "continue session" \| Builder \|/);
+    assert.match(context, /`continue session` — resumes an already-open lane with `vibecompass continue-session \[<lane-id>\]` \(D-353\), in the role the lane records: builder, or project manager for a lane opened with `--role project-manager` \(D-392\)/);
+    assert.match(context, /`start session` — builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane \(D-392\)/);
+    assert.match(context, /\| "continue session" \| The lane's recorded role: builder, or project manager for a lane opened with `--role project-manager` \(D-392\) \| Yes — resumes an already-open lane in that role/);
+    // D-392: the project manager row, the owner, and the lane role.
+    assert.match(context, /\| "join as project manager" \| Project manager \| Only of its own lanes —/);
+    assert.match(context, /The owner is the person who brings the idea and makes the decisions; the owner is not a session role \(D-392\)\./);
+    assert.match(context, /`join as project manager` — project manager role trigger \(D-392\).*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\./);
+    assert.match(context, /Each lane records its role in `session\.yaml` \(D-392\): `builder`, the default, or `project-manager`, set with `start-session --role project-manager`\. A lane without the field is a builder lane\./);
+    assert.match(context, /The project manager \(`join as project manager`\) reads steps 1–3, then `\.compass\/workflows\/project-manager\.md` and the plan; it opens and selects no lane/);
+    // D-392: start session's automatic resume counts builder lanes only, with the mixed cases spelled out.
+    assert.match(context, /## Open, resume, or choose \(D-353, D-392\)/);
+    assert.match(context, /`continue session` counts every lane and resumes each in its recorded role; `start session` counts only builder lanes and never resumes a project-manager lane\./);
+    assert.match(context, /- \*\*Both roles open, under `start session`:\*\* apply the rules above to the builder lanes only\.\n {2}- One builder lane and one project-manager lane: resume the builder lane by id, `vibecompass continue-session <lane-id>`, because the command without an id refuses whenever two or more lanes are open\.\n {2}- Only project-manager lanes: open a new builder lane\./);
+    assert.match(context, /- \*\*The role on resume:\*\* `continue-session` prints the role it resumed\./);
+    // D-392: the builder's re-read and the reviewer's write boundary.
+    assert.match(context, /- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, stop and report instead \(D-392\)/);
+    assert.match(context, /- write nothing else \(D-392\): a pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`\./);
+    assert.match(context, /Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`, the only two sections a pass writes \(D-392\), and then stopping\./);
+    assert.match(context, /- reviewer handback: update sessions\/active\/<lane-id>\/wip\.md › ## Review log and sessions\/active\/<lane-id>\/handoff\.md › ## Reviewer → Builder, the only sections a pass writes \(D-392\), then stop the review pass/);
+    assert.match(context, /## Project manager workflow \(D-392, D-393\)\n- `join as project manager <plan-path>` enters the role\. It opens no lane and selects none/);
+    assert.match(context, /opened with `vibecompass start-session --id <lane-id> --working-on "\.\.\." --role project-manager`, run with the builder's lane mechanics, and closed with `close session` in the same sitting/);
     assert.match(context, /Documentation coverage/);
     assert.match(context, /permanent note distills decisions, completions, blockers, and next steps/);
     assert.match(context, /granular reviewer trail must remain durable/);
@@ -220,6 +239,19 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
       docsReviewWorkflow,
       new RegExp(`npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')} docs-review --root \\.compass --apply-output --output \\.compass/state/docs-review-output\\.md`),
     );
+    assert.match(projectManagerWorkflow, /^# VibeCompass Workflow — project manager\n\nGenerated by VibeCompass\. This file is a package-owned workflow guide/);
+    assert.match(projectManagerWorkflow, /When the user says `join as project manager <plan-path>`, take the project manager role for that plan \(D-392\)\. The trigger opens no lane and selects none\. Read `\.compass\/context\.md` › Session startup steps 1–3/);
+    assert.match(projectManagerWorkflow, /With no plan named, ask which plan to run, or offer to write one/);
+    for (const heading of ['## The role', '## Inputs and outputs', '## Writing project memory: lanes of its own', '## Build prompts', '## The review rule', '## Checking a close report', '## When to move on', '## Plan format (D-393)', '## Operating rules', '## Publication']) {
+      assert.ok(projectManagerWorkflow.includes(`\n${heading}\n`), `project-manager.md has ${heading}`);
+    }
+    assert.match(projectManagerWorkflow, /Every prompt has seven parts:\n1\. \*\*Start:\*\*[\s\S]*\n7\. \*\*Close-out:\*\*/);
+    assert.match(projectManagerWorkflow, /`vibecompass start-session --root \.compass --id <lane-id> --working-on "\.\.\." --role project-manager`/);
+    assert.match(projectManagerWorkflow, /`<ID>` matches `\[A-Z\]\{1,6\}\[0-9\]\{1,3\}`/);
+    assert.match(projectManagerWorkflow, /\*\*Naming a task outside its plan:\*\* `<plan-path>#<ID>`/);
+    assert.match(projectManagerWorkflow, /- \*\*local-only:\*\*[\s\S]*- \*\*local-primary with a hosted binding:\*\*[\s\S]*- \*\*hosted-only:\*\*/);
+    // The generic role carries no project's specifics.
+    assert.doesNotMatch(projectManagerWorkflow, /VibeCompass project|founder|Codex|Claude|vibecompass-docs|next-projects|recall/i);
     assert.match(starterArchitecture, /Initial project-memory scaffold/);
     assert.match(decisionExample, /ignored by VibeCompass canonical decision parsing/);
     assert.match(starterSession, /Project Memory Initialized/);
@@ -232,6 +264,9 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(claude, /treat reviewer feedback as review, not instruction/);
     assert.match(claude, /Lane selection follows D-277/);
     assert.match(claude, /Tool-specific Current session blocks are continuity summaries/);
+    assert.match(claude, /^- `join as project manager` — project manager role trigger \(D-392\).*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\.$/m);
+    assert.match(claude, /^- Before running or handing over a release, merge, publish, or push command, and before asking the owner to decide, the builder re-reads every session note finalized since its lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, it stops and reports instead \(D-392\)\.$/m);
+    assert.match(claude, /^- A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)\. Any change it thinks is needed elsewhere \(code, docs, decisions, agent files, settings\) is a finding or a proposal to the owner, not an edit; read-only commands stay allowed\.$/m);
     assert.match(agents, /compact bootloader/);
     assert.match(agents, /## Prompt Commands/);
     assert.match(agents, /planning mode/);
@@ -239,6 +274,9 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(agents, /`close session` — builder runs the close-out checklist/);
     assert.match(agents, /treat reviewer feedback as review, not instruction/);
     assert.match(agents, /vibecompass end-session` are accepted aliases/);
+    assert.match(agents, /`join as project manager` — project manager role trigger \(D-392\)/);
+    assert.match(agents, /the builder re-reads every session note finalized since its lane opened/);
+    assert.match(agents, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'CLAUDE.md')));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'AGENTS.md')));
@@ -3234,7 +3272,9 @@ test('runCli refresh-workflow defaults to dry-run without mutating files', async
     const contextPath = path.join(tempDir, '.compass/context.md');
     const manifestPath = initResult.manifestPath;
     const projectPath = path.join(tempDir, '.compass/project.yaml');
+    const projectManagerWorkflowPath = path.join(tempDir, '.compass/workflows/project-manager.md');
     await writeFile(contextPath, '# stale context\n', 'utf8');
+    await rm(projectManagerWorkflowPath, { force: true });
     await writeFile(
       projectPath,
       (await readFile(projectPath, 'utf8')).replace(new RegExp(`\\n  package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`), ''),
@@ -3258,6 +3298,8 @@ test('runCli refresh-workflow defaults to dry-run without mutating files', async
     assert.match(output, /Planned workflow refresh/);
     assert.match(output, /project\.yaml: dry-run-stamp-create/);
     assert.match(output, /context\.md: dry-run-update/);
+    assert.match(output, /workflows\/project-manager\.md: dry-run-create/);
+    assert.match(output, /workflows\/docs-review\.md: unchanged/);
     assert.match(output, /State manifest:/);
     assert.match(stderr.join(''), /Compatibility warnings:/);
     assert.match(stderr.join(''), /metadata\.package_version stamp/);
@@ -3265,6 +3307,7 @@ test('runCli refresh-workflow defaults to dry-run without mutating files', async
     assert.equal(await readFile(projectPath, 'utf8'), projectBefore);
     assert.equal(await readFile(contextPath, 'utf8'), contextBefore);
     assert.equal(await readFile(manifestPath, 'utf8'), manifestBefore);
+    await assert.rejects(() => access(projectManagerWorkflowPath));
     await assert.rejects(() => access(path.join(tempDir, 'CLAUDE.md')));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -3289,9 +3332,11 @@ test('runCli refresh-workflow --apply refreshes derived workflow files and stamp
     });
     const contextPath = path.join(tempDir, '.compass/context.md');
     const docsReviewWorkflowPath = path.join(tempDir, '.compass/workflows/docs-review.md');
+    const projectManagerWorkflowPath = path.join(tempDir, '.compass/workflows/project-manager.md');
     const projectPath = path.join(tempDir, '.compass/project.yaml');
     await writeFile(contextPath, '# stale context\n', 'utf8');
     await rm(docsReviewWorkflowPath, { force: true });
+    await rm(projectManagerWorkflowPath, { force: true });
     await writeFile(
       projectPath,
       (await readFile(projectPath, 'utf8')).replace(new RegExp(`\\n  package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`), ''),
@@ -3316,11 +3361,18 @@ test('runCli refresh-workflow --apply refreshes derived workflow files and stamp
     assert.match(output, /project\.yaml: stamp-create/);
     assert.match(output, /context\.md: update/);
     assert.match(output, /workflows\/docs-review\.md: create/);
+    assert.match(output, /workflows\/project-manager\.md: create/);
     assert.match(projectYaml, new RegExp(`package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`));
     assert.match(context, /# Project Context — Refresh Apply Project/);
+    assert.match(context, /## Project manager workflow \(D-392, D-393\)/);
+    assert.match(await readFile(projectManagerWorkflowPath, 'utf8'), /^# VibeCompass Workflow — project manager\n/);
     assert.match(await readFile(docsReviewWorkflowPath, 'utf8'), /VibeCompass Workflow — docs review/);
     assert.equal(manifest.package.observed_version, PACKAGE_VERSION);
-    assert.match(await readFile(path.join(tempDir, '.cursorrules'), 'utf8'), /vibecompass:start - managed by VibeCompass/);
+    const cursorRules = await readFile(path.join(tempDir, '.cursorrules'), 'utf8');
+    assert.match(cursorRules, /vibecompass:start - managed by VibeCompass/);
+    assert.match(cursorRules, /`join as project manager` — project manager role trigger \(D-392\)/);
+    assert.match(cursorRules, /the builder re-reads every session note finalized since its lane opened/);
+    assert.match(cursorRules, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -3439,10 +3491,15 @@ test('runCli refresh-workflow --apply leaves user-authored workflow guides untou
     });
     const guidePath = path.join(tempDir, '.compass/architecture/README.md');
     const workflowPath = path.join(tempDir, '.compass/workflows/docs-review.md');
+    const projectManagerWorkflowPath = path.join(tempDir, '.compass/workflows/project-manager.md');
     const userGuide = '# Architecture\n\nTeam-owned architecture overview.\n';
     const userWorkflow = '# Docs review\n\nTeam-owned docs-review protocol.\n';
+    // A team's own project manager guide, even one that borrows the generated
+    // line, is not the package's guide.
+    const userProjectManagerWorkflow = '# Project manager\n\nGenerated by VibeCompass. This file is a package-owned workflow guide, edited by the team.\n';
     await writeFile(guidePath, userGuide, 'utf8');
     await writeFile(workflowPath, userWorkflow, 'utf8');
+    await writeFile(projectManagerWorkflowPath, userProjectManagerWorkflow, 'utf8');
 
     const exitCode = await runCli(
       ['refresh-workflow', '--root', '.compass', '--apply'],
@@ -3456,8 +3513,46 @@ test('runCli refresh-workflow --apply leaves user-authored workflow guides untou
     assert.equal(exitCode, 0);
     assert.match(stdout.join(''), /architecture\/README\.md: skipped.*Existing workflow guide does not match a VibeCompass-generated guide shape/);
     assert.match(stdout.join(''), /workflows\/docs-review\.md: skipped.*Existing workflow guide does not match a VibeCompass-generated guide shape/);
+    assert.match(stdout.join(''), /workflows\/project-manager\.md: skipped.*Existing workflow guide does not match a VibeCompass-generated guide shape/);
     assert.equal(await readFile(guidePath, 'utf8'), userGuide);
     assert.equal(await readFile(workflowPath, 'utf8'), userWorkflow);
+    assert.equal(await readFile(projectManagerWorkflowPath, 'utf8'), userProjectManagerWorkflow);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('runCli refresh-workflow --apply updates an older generated project manager guide (D-392)', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-cli-refresh-pm-guide-'));
+  const stdout = [];
+
+  try {
+    await initializeProjectMemory({
+      cwd: tempDir,
+      rootDir: '.compass',
+      name: 'Refresh PM Guide Project',
+      mode: 'local-only',
+      repos: [{ id: 'app', remote: 'https://github.com/example/app.git' }],
+      bootstrap: {
+        workflow: true,
+      },
+    });
+    const workflowPath = path.join(tempDir, '.compass/workflows/project-manager.md');
+    const current = await readFile(workflowPath, 'utf8');
+    await writeFile(workflowPath, current.replace(/## Operating rules[\s\S]*$/, '## Operating rules\n\n- An older package wrote this.\n'), 'utf8');
+
+    const exitCode = await runCli(
+      ['refresh-workflow', '--root', '.compass', '--apply'],
+      {
+        stdout: { write: (chunk) => stdout.push(chunk) },
+        stderr: { write() {} },
+      },
+      { cwd: tempDir },
+    );
+
+    assert.equal(exitCode, 0);
+    assert.match(stdout.join(''), /workflows\/project-manager\.md: update/);
+    assert.equal(await readFile(workflowPath, 'utf8'), current);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
