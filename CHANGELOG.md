@@ -11,7 +11,9 @@
   the generic role: inputs and outputs, the seven-part build prompt, the review
   rule, checking close reports, when to move on, the plan format (task lines
   `- [ ] <ID> — <scope>`, `<plan-path>#<ID>` outside the plan, the session map,
-  the owner actions), operating rules, and publication by mode. `init` writes
+  the owner actions), starting on a project with no plan (a reviewed lane that
+  writes one; tasks named in words or as "proposed" IDs until then, which the
+  plan keeps), operating rules, and publication by mode. `init` writes
   it; `refresh-workflow` creates it on an existing root, updates a generated
   copy, and leaves a file it did not generate alone.
 - `start-session --role builder|project-manager` records the lane's role in
