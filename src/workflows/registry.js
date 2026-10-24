@@ -14,8 +14,8 @@ export const WORKFLOW_REGISTRY = [
       // it points to belongs to the project-manager entry below.
       { trigger: 'join as project manager', summary: 'project manager role trigger (D-392), with the plan to run: `join as project manager <plan-path>`; opens and selects no lane, reads the session startup steps 1–3, then the project manager workflow, then the plan, and with no plan named asks which plan to run or offers to write one', detailPath: 'workflows/project-manager.md' },
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
-      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and records findings in `wip.md` › `## Review log` and `handoff.md` › `## Reviewer → Builder`, the only two sections a pass writes (D-392); with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
-      { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files' },
+      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and records the pass as record lines in `wip.md` › `## Review log` (D-394) and a summary in `handoff.md` › `## Reviewer → Builder`, the only two sections a pass writes (D-392); with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
+      { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files and answers each pass with a response line in `wip.md` › `## Review log` (D-394)' },
       { trigger: 'docs update', summary: 'builder runs a targeted session-delta documentation maintenance plan with `vibecompass docs-update --session <lane-id>`' },
       { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases; a project manager closes its own lanes the same way' },
     ],
@@ -219,15 +219,17 @@ The project manager writes each build lane's prompt, and the owner gives it to a
 ## The review rule
 
 A build lane closes only after:
-- **At least one recorded reviewer pass,** even when it finds nothing. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
+- **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\` (D-398). An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
 - **Findings drive more passes.** After \`address review\`, the reviewer's next pass checks each response. The loop ends at a pass that leaves no finding open: each one fixed and confirmed, rejected with evidence the reviewer accepts, or deferred with a scoped reason.
-- **A cap of 3 rounds,** where a round is one reviewer pass and the builder's response. If findings are still open after the third, the builder stops and reports, and the project manager escalates to the owner, who chooses: another round, a scoped deferral whose reason the session note carries, or leaving the lane open. A cap never marks a finding resolved.
+- **A cap of 3 rounds** (\`metadata.workflow.review.round_cap\`), where a round is one reviewer pass and the builder's response. If findings are still open after the third, the builder stops and reports, and the project manager escalates to the owner, who chooses: another round, a scoped deferral whose reason the session note carries, or leaving the lane open. A cap never marks a finding resolved.
 
-Close deletes the lane's scratch files, so the finalized note keeps the review summary, with each deferred finding and its reason among the note's next steps.
+Passes, responses, and owner choices are record lines in \`wip.md\` › \`## Review log\` (${contextPath} › Review log format, D-394). \`close-session\` checks the record before it writes and puts the outcome in the finalized note's \`## Review\` section: the \`Check:\` line, the passes and their reviewers, one line per finding, and each owner line. Each deferred finding and its reason join the note's next steps. \`vibecompass review-check${rootFlag} --session <lane-id>\` runs the same check on an open lane. Work the owner accepts without an independent pass closes with \`--review-override "<the owner's reason>"\`, which the note's \`Check:\` line shows; it is not a pass.
 
 ## Checking a close report
 
 Check each claim against its primary source before accepting it: \`vibecompass list-sessions${rootFlag}\` (the lane closed), the finalized note and its review summary, git heads and tags, the pull request, the registry version and checksum, and the live page. For a lane still open, read its latest \`wip.md\` log lines too, since a handoff can lag the work. A claim that doesn't hold goes back to the lane while it is open, or to the owner once it has closed.
+
+Read the note's \`## Review\` section against the review rule (D-394, D-398). Its \`Check:\` line says whether the record passed, failed, or was overridden, and why. Compare each reviewer on its \`Passes:\` line with the reviewer the build prompt named and any reviewer the owner has named to you since. A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer. It goes to the owner when nothing does, or when the record shows the builder launched or directed the run, whatever the pass line names. The builder's own account doesn't establish who started a reviewer.
 
 ## When to move on
 
@@ -264,7 +266,7 @@ When the project has no plan yet, no architecture doc whose \`## Next steps\` ho
 - **In Git, stage only your own files,** or your own hunks in a shared doc such as the plan. Never \`git add -A\`, stash, or \`--autostash\` while other lanes are open; if the remote moved, merge rather than rebase.
 - **Check before editing or reporting.** Two project-manager sessions can run at once. Before an edit, a status report, or a question to the owner, run \`vibecompass list-sessions${rootFlag}\` and \`git status\`, and read the notes finalized since your last look and open lanes' latest scratch files. Build lanes report only their own status.
 - **Check interpretive claims against the code,** not only a doc's tables or summary, in close reports and in your own docs.
-- **Send consequential recommendations through a reviewed lane** before the owner decides (a plan, a reorder, a protocol change), and flag every assumption change explicitly.
+- **Send consequential recommendations through a reviewed lane** before the owner decides (a plan, a reorder, a protocol change): one that meets the review rule, with passes by reviewers the owner started (D-398). Flag every assumption change explicitly.
 - **Take timestamps from \`date\`.**
 
 ## Publication

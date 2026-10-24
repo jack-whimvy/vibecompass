@@ -1,5 +1,6 @@
 import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { DEFAULT_REVIEW_CHECK, DEFAULT_ROUND_CAP } from './review-log.js';
 import { resolveWorkflowSettings } from './workflow.js';
 import { getGeneratedWorkflowFiles, renderPromptCommandLines } from './workflows/registry.js';
 import { renderManagedBlock } from './generators/agent-files/markers.js';
@@ -263,7 +264,7 @@ The owner is the person who brings the idea and makes the decisions; the owner i
 ${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`, the only two sections a pass writes (D-392), and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\` plus document-maintenance checkpoint statuses, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` › \`## Review log\` (record lines in the Review log format below, D-394) and \`handoff.md\` › \`## Reviewer → Builder\`, the only two sections a pass writes (D-392), and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\` plus document-maintenance checkpoint statuses, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is also accepted as an alias for \`vibecompass close-session\`; the canonical command name remains \`close-session\`.
 
 ## Workflow defaults
@@ -353,6 +354,8 @@ During the session:
 - use \`vibecompass list-sessions\` (\`--json\` for the machine-readable inventory) to inspect active lanes, \`vibecompass continue-session [<lane-id>]\` to resume one at the start of a sitting, and \`vibecompass switch-session <lane-id>\` to move the continuity pointer without recording a resume
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
+- answer each pass in \`wip.md\` › \`## Review log\` with a response line and one finding line per finding, its status the classification and its reason why (Review log format); when the owner chooses at the cap or defers a finding, write an owner line with the owner's choice and the reason in the owner's words (D-394)
+- a review pass counts only when a reviewer the owner started runs it (D-398): a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in \`## Log\`, never as pass lines, and never write a pass line yourself
 - before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest \`wip.md\` and \`handoff.md\` of every other open lane; if one records an unmet gate on that step, stop and report instead (D-392)
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
 - record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them; \`vibecompass append-decision\` allocates the D-number at write time and refreshes the grouped \`decisions/INDEX.md\` when the lane context is resolvable (D-283); run \`vibecompass refresh-decision-index\` after hand-appends
@@ -370,8 +373,8 @@ At session close:
 - close-session prints the same targeted docs-update plan — including the pre-close staleness set (new decisions since lane start, stale base revisions, newer finalized notes touching this lane's scope, claim overlap with other active lanes) — before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
 - document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship — architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale (D-292, D-293)
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
-- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; the permanent note distills decisions, completions, blockers, and next steps rather than preserving the full \`## Review log\`
-- if a granular reviewer trail must remain durable, summarize it explicitly in the session note inputs or create a separate finalized session note before close-session deletes lane scratch files
+- run \`vibecompass review-check --session <lane-id>\` before close-session: it runs the check close-session runs (Review log format) and prints each finding's state; resolve what it reports, or take it to the owner
+- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; close-session writes the note's \`## Review\` section after \`## Models used\` from the record (its \`Check:\` and \`Passes:\` lines, one line per finding, and each owner line) and adds each deferred finding to the next steps unless a \`--next-step\` names its id, so the review needs no \`--completed\` line; add context with \`--review-note "<text>"\` (repeatable), and pass \`--review-override "<reason>"\` only on the owner's instruction, with the owner's reason in the owner's words (D-394)
 - close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, the container, and the lane temp dir when they are safely removable; leftover pieces come with printed guidance
 - refresh any affected architecture/decision docs by folding changes into their current-state contract prose — do not append session chronology; distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs (D-292, D-293)
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
@@ -379,12 +382,42 @@ At session close:
 
 ## Reviewer workflow
 - use \`review handoff\` when you want the reviewer to run the next review pass
+- you are the lane's reviewer only when the owner started you and pointed you at the lane with \`review handoff <lane-id>\` (D-398); an agent the builder launched or directed does the builder's own checks: it reports to the builder and writes no pass line
 - read the latest finalized session note, then the selected lane's \`wip.md\`, then \`handoff.md\`
 - inspect the relevant code/docs diffs
-- append findings under \`## Review log\` in \`wip.md\`
+- append the pass to \`wip.md\` › \`## Review log\` as record lines (Review log format): a pass line, then a finding line for each new finding (\`open\`) and a verdict on each finding the builder answered (\`confirmed\`, \`reopened\`, or \`withdrawn\`), with detail and evidence on continuation lines; \`<reviewer>\` names your tool and model
 - write a concise baton-pass summary into \`handoff.md\` › \`## Reviewer → Builder\`
 - write nothing else (D-392): a pass writes only the selected lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`. A change you think is needed anywhere else (code, docs, decisions, agent files, settings) is a finding or a proposal to the owner, not an edit. Read-only commands stay allowed
 - end the review pass after those file updates; there is no separate reviewer-exit step
+
+## Review log format (D-394, D-398)
+A lane's \`wip.md\` › \`## Review log\` holds only record lines, finding lines, continuation lines, and blank lines: no prose, headings, or code fences. Fields are separated by \` | \` (space, bar, space), and the last field takes the rest of the line.
+- **Pass line** (reviewer): \`- pass <n> | <time> | <reviewer> | <scope> | <outcome>\`. Passes are numbered 1, 2, 3… within the lane. \`<outcome>\` is \`no findings\` when the pass opens and reopens nothing, and \`findings\` otherwise.
+- **Response line** (builder): \`- response <n> | <time> | <builder>\`, answering pass \`<n>\`.
+- **Owner line** (written by the builder, or the owner, in the owner's words): \`- owner | <time> | <owner> | <choice> | <reason>\`. \`<choice>\` is \`another round\`, \`defer <id>[, <id>…]\`, or \`leave open\`.
+- **Finding line**, indented two spaces under a pass or response line: \`  - <id> | <severity> | <status> | <reason>\`. Under a pass line, \`<status>\` is \`open\` (a new finding), \`confirmed\`, \`reopened\`, or \`withdrawn\`; under a response line, \`accepted\`, \`accepted with qualification\`, \`deferred\`, or \`rejected\`. \`<reason>\` is never empty: on \`open\` it states the finding, and otherwise it says why.
+- **Continuation lines**, indented four or more spaces under a finding line, carry detail and evidence. The check ignores them.
+- \`<time>\` is \`YYYY-MM-DD HH:MM\` taken from \`date\`, optionally followed by a zone (\`PDT\`, \`+07:00\`). \`<reviewer>\`, \`<builder>\`, and \`<owner>\` name a person, or a tool and model (\`Codex (GPT-6)\`). \`<scope>\` names what the pass read. \`<id>\` is \`R<p>.<k>\`: the pass that opened the finding and its number in that pass (\`R1.1\`); a reopened finding keeps its id. \`<severity>\` is \`P1\` (fix before the work ships), \`P2\` (fix before close), or \`P3\` (minor).
+- Nobody edits or deletes an earlier line while the lane is open. A line in the record format that doesn't parse was never a record, and the role that wrote it may correct it in place; free text is never rewritten into records.
+
+\`\`\`
+## Review log
+- pass 1 | 2026-10-20 10:42 PDT | Codex (GPT-6) | the four draft decisions | findings
+  - R1.1 | P2 | open | the owner line doesn't say who writes it
+  - R1.2 | P3 | open | \`leave open\` changes nothing the check can see
+- response 1 | 2026-10-20 11:05 PDT | Claude Opus 5.5
+  - R1.1 | P2 | accepted | item 2 now says the builder writes it in the owner's words
+  - R1.2 | P3 | rejected | it records the owner's choice for the note; the check ignores it on purpose
+- pass 2 | 2026-10-20 11:40 PDT | Codex (GPT-6) | pass 1 responses; the docs | no findings
+  - R1.1 | P2 | confirmed | fixed in item 2
+  - R1.2 | P3 | confirmed | accepts the reason
+\`\`\`
+
+A finding is resolved when its latest line is the reviewer's \`confirmed\` or \`withdrawn\`; a confirmed \`deferred\` is resolved as a deferral, and the note carries the builder's reason. An owner \`defer\` line keeps a finding unresolved but out of the check's failures until the reviewer's next line for it.
+
+**Who counts as a reviewer (D-398).** A pass is a run by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`: an agent session the owner opened, or a person the owner asked. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) is not a reviewer, whatever its model: its checks are builder work, recorded in \`## Log\`, and the builder writes no pass line. The check can't see who started a run, so the project manager compares each pass's reviewer with the reviewer the build prompt or the owner named. When the owner accepts work with no independent pass, the builder closes with \`--review-override "<reason>"\` in the owner's words; that is not a pass.
+
+**The check.** \`close-session\` runs it after reading \`wip.md\` and before writing anything, and \`vibecompass review-check --session <lane-id>\` runs it on an open lane without closing it. It fails when the log has no pass line; when the log is malformed (the message names the first bad line, and a malformed log has no parseable pass); when a finding is open and not deferred by the owner; or when pass \`<n>\` beyond the cap has fewer than \`<n>\` minus the cap owner \`another round\` lines before it. It covers every builder lane, and a project-manager lane once its log has a pass line. \`metadata.workflow.review.check\` sets what a failure does (Workflow defaults).
 
 ## Project manager workflow (D-392, D-393)
 - \`join as project manager <plan-path>\` enters the role. It opens no lane and selects none: read Session startup steps 1–3, then \`${rootRelativePath}/workflows/project-manager.md\` (the role in full: inputs and outputs, build prompts, checking close reports, when to move on, the plan format, operating rules, and publication), then the plan. With no plan named, ask which plan to run, or offer to write one.
@@ -392,6 +425,7 @@ At session close:
 - It reads all of project memory, plus other lanes' \`wip.md\`, \`handoff.md\`, and \`brief.md\`, read only. Status reports, prompts, and report checks need no lane.
 - It changes canonical memory (plans, architecture docs, decisions) only inside short lanes of its own: opened with \`vibecompass start-session --id <lane-id> --working-on "..." --role project-manager\`, run with the builder's lane mechanics, and closed with \`close session\` in the same sitting. \`continue session <lane-id>\` resumes such a lane as project manager.
 - It never edits another lane's scratch files, never writes into a closed lane, and never hand-edits package output.
+- When it checks a close report, it reads the note's \`## Review\` section: the \`Check:\` line, and the reviewers on the \`Passes:\` line, compared with the reviewer the build prompt named and any the owner has named since (D-398). A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer; it goes to the owner when nothing does or the record shows the builder launched or directed the run, whatever the pass line names.
 
 ## Tooling note
 \`CLAUDE.md\` and \`AGENTS.md\` are developer-owned starter files. If they exist,
@@ -683,6 +717,8 @@ function renderWorkflowDefaults(workflow) {
     '- close-session: require document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch',
     '- close-session: refresh any relevant architecture docs before finalizing the session, folding changes into their current-state contract prose (D-292)',
     '- close-session: refresh any relevant decision files before finalizing the session',
+    `- review check: \`metadata.workflow.review.check\` is \`${workflow.review.check}\`${workflow.review.check === DEFAULT_REVIEW_CHECK ? ' (the default)' : ''}; on a failed check, \`warn\` closes and records the failures in the note, \`block\` refuses to close and writes nothing, and \`off\` skips the check (D-394)`,
+    `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; a pass beyond it needs an owner \`another round\` line before it (D-394)`,
   ];
 
   if (workflow.closeSession.gitPublish) {

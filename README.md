@@ -133,6 +133,7 @@ npx -y @vibecompass/vibecompass@latest continue-session --root .compass         
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id plan-refresh --working-on "Refresh the plan" --role project-manager   # a project manager's own lane (D-392); --role defaults to builder
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
+npx -y @vibecompass/vibecompass@latest review-check --root .compass --session auth-flow   # parse and check the lane's review log without closing (D-394); --json; exits 1 on a failed check
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
 
 # Resuming (D-353): an active lane is an open session, not a crash. continue-session
@@ -268,7 +269,9 @@ merge, publish, or push command, and before it asks the owner to decide, it
 re-reads the notes finalized since its lane opened and other open lanes'
 scratch files. The reviewer (`join as reviewer`, `review handoff`) evaluates the
 work, and a pass writes only the lane's `wip.md` › `## Review log` and
-`handoff.md` › `## Reviewer → Builder`. The project manager (`join as project
+`handoff.md` › `## Reviewer → Builder`. A pass counts only when a reviewer the
+owner started runs it; an agent the builder launches or directs does the
+builder's own checks (D-398). The project manager (`join as project
 manager <plan-path>`) plans tasks, writes each build lane's prompt, and checks
 close reports, following the generated `workflows/project-manager.md`. It needs
 no lane for that, and changes project memory only in short lanes of its own,
@@ -280,6 +283,42 @@ workflow files, updating handoffs, and applying reviewed changes. Use
 `docs review` for the broad baseline and scoped deepening work; use
 `docs update` / `vibecompass docs-update` for ordinary session-delta
 maintenance tied to the current lane.
+
+## Review Record (D-394)
+
+Passes, responses, and the owner's choices are line records in the lane's
+`wip.md` › `## Review log`; `context.md` › Review log format has the grammar
+and a worked example:
+
+```text
+## Review log
+- pass 1 | 2026-10-20 10:42 PDT | Codex (GPT-6) | the four draft decisions | findings
+  - R1.1 | P2 | open | the owner line doesn't say who writes it
+- response 1 | 2026-10-20 11:05 PDT | Claude Opus 5.5
+  - R1.1 | P2 | accepted | item 2 now says the builder writes it in the owner's words
+- pass 2 | 2026-10-20 11:40 PDT | Codex (GPT-6) | pass 1 responses; the docs | no findings
+  - R1.1 | P2 | confirmed | fixed in item 2
+```
+
+`close-session` checks the record before it writes anything: at least one pass,
+no malformed line, no open finding the owner hasn't deferred, and no pass past
+the cap without an owner `another round` line. `project.yaml` ›
+`metadata.workflow.review` sets what a failure does and the cap:
+
+```yaml
+metadata:
+  workflow:
+    review:
+      check: warn     # warn (default): close and record the failures; block: refuse to close; off: skip
+      round_cap: 3    # 1 to 10, default 3
+```
+
+The finalized note gets a `## Review` section with the check line, the passes
+and reviewers, one line per finding, and the owner's choices, and each deferred
+finding joins its next steps. `vibecompass review-check --session <lane-id>`
+runs the same check on an open lane. Only the owner closes past a failed check:
+`close-session --review-override "<the owner's reason>"`, which the note
+records.
 
 ## Session Brief (opt-in)
 

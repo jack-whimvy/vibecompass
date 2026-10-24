@@ -3,6 +3,12 @@ import { access, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writeFile 
 import path from 'node:path';
 import { refreshLaneBriefForLifecycle } from './brief-lifecycle.js';
 import { scanProjectMemory } from './project-memory.js';
+import {
+  buildDeferredFindingNextSteps,
+  evaluateReviewRecord,
+  formatReviewFailure,
+  renderReviewSection,
+} from './review-log.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import { buildCloseSessionGuidance, resolveWorkflowSettings } from './workflow.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -475,6 +481,8 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   const nextSteps = normalizeStringArray(options?.nextSteps);
   const decisions = normalizeStringArray(options?.decisions);
   const blockers = normalizeStringArray(options?.blockers);
+  const reviewNotes = normalizeStringArray(options?.reviewNotes);
+  const reviewOverride = normalizeReviewOverride(options?.reviewOverride);
 
   if (completed.length === 0) {
     throw new Error('session close requires at least one completed item.');
@@ -533,6 +541,17 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
 
   const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
   const activeSession = parseActiveSession(wipContent, lanePaths.wipFilePath);
+  // D-394 item 6: the review check runs after wip.md is read and before
+  // anything is written; in block mode a failure refuses the close here.
+  const review = evaluateReviewRecord(wipContent, {
+    settings: workflowSettings.review,
+    role: closingLaneMetadata?.role ?? DEFAULT_LANE_ROLE,
+    laneId: sessionId,
+    override: reviewOverride,
+  });
+  if (review.status === 'failed' && !reviewOverride && review.settings.check === 'block') {
+    throw new Error(renderReviewBlockRefusal(review, sessionId));
+  }
   const currentSession = parseCurrentSessionBlock(claude.content, { optional: true });
   const workedOn =
     normalizeOptionalString(options?.workedOn) ??
@@ -559,6 +578,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     );
   }
 
+  const deferredFindingSteps = buildDeferredFindingNextSteps(review, nextSteps);
   await writeFile(
     sessionFilePath,
     renderSessionNote({
@@ -569,9 +589,10 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       completed,
       decisions,
       models: models.length > 0 ? models : ['Not recorded.'],
+      review: renderReviewSection(review, reviewNotes),
       documentMaintenance,
       blockers,
-      nextSteps,
+      nextSteps: [...nextSteps, ...deferredFindingSteps],
     }),
     'utf8',
   );
@@ -726,6 +747,15 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
     documentMaintenance,
+    review: {
+      check: review.settings.check,
+      roundCap: review.settings.roundCap,
+      outcome: review.outcome,
+      checkLine: review.checkLine,
+      passesLine: review.passesLine,
+      failures: review.failures.map(formatReviewFailure),
+      deferredFindingSteps,
+    },
     docsUpdatePlan: docsUpdate.plan,
     workflowGuidance: buildCloseSessionGuidance(workflowSettings, {
       projectConfig,
@@ -736,6 +766,10 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     warnings: [
       ...markerContext.warnings,
       ...laneSelection.warnings,
+      ...review.settings.warnings,
+      ...(review.status === 'failed' && !reviewOverride
+        ? review.failures.map((failure) => `Review check failed (warn; D-394): ${formatReviewFailure(failure)}`)
+        : []),
       ...markerCleanupWarnings,
       // A:192 (D-281): the pre-close staleness set computed by docs-update is
       // re-emitted at close as warnings, so the closer sees it even when the
@@ -917,6 +951,59 @@ export async function readLaneEnvironment(options = {}) {
         context: 'lane-env',
       }),
     ],
+  };
+}
+
+/**
+ * D-394 item 10: `review-check` runs close-session's parse and check on an
+ * open lane without closing it. Read-only: it takes no lock and writes nothing.
+ */
+export async function checkProjectSessionReview(options = {}) {
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const lanes = await listActiveSessionLanes(normalized);
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  const selection = resolveLaneSelection({
+    explicitSessionId: explicitId ? validateLaneId(explicitId) : null,
+    marker: markerContext.marker,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose: 'check the review record of',
+  });
+
+  if (!selection.sessionId) {
+    throw new Error('No active session lane exists, so there is no review log to check. Run `vibecompass start-session` first.');
+  }
+
+  const lane = lanes.find((item) => item.id === selection.sessionId);
+  const lanePaths = getLanePaths(normalized, selection.sessionId);
+  if (!(await fileExists(lanePaths.wipFilePath))) {
+    throw new Error(`Lane "${selection.sessionId}" has no wip.md at ${lanePaths.wipFilePath}, so there is no review log to check.`);
+  }
+
+  const projectConfig = await readProjectConfig(normalized.projectFilePath);
+  const workflowSettings = resolveWorkflowSettings(projectConfig);
+  const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
+  const review = evaluateReviewRecord(wipContent, {
+    settings: workflowSettings.review,
+    role: lane.role ?? DEFAULT_LANE_ROLE,
+    laneId: selection.sessionId,
+  });
+
+  return {
+    rootDir: normalized.rootDir,
+    sessionId: selection.sessionId,
+    wipFilePath: lanePaths.wipFilePath,
+    role: review.role,
+    check: review.settings.check,
+    roundCap: review.settings.roundCap,
+    status: review.status,
+    ok: review.status !== 'failed',
+    checkLine: review.checkLine,
+    passesLine: review.passesLine,
+    parsed: review.parsed,
+    failures: review.failures,
+    warnings: [...markerContext.warnings, ...selection.warnings, ...review.settings.warnings],
   };
 }
 
@@ -2464,6 +2551,9 @@ ${renderBulletList(options.decisions, 'No new decisions were logged in this sess
 ## Models used
 ${renderBulletList(options.models)}
 
+## Review
+${options.review}
+
 ## Document maintenance checkpoint
 ${renderDocumentMaintenanceCheckpoint(options.documentMaintenance)}
 
@@ -2506,6 +2596,32 @@ function slugifyTitle(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * D-394 item 8: `--review-override "<reason>"` carries the owner's reason in
+ * the owner's words, so an empty reason is refused before anything else.
+ */
+function normalizeReviewOverride(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const reason = normalizeOptionalString(value);
+  if (!reason) {
+    throw new Error('--review-override needs the owner\'s reason, in the owner\'s words (D-394 item 8).');
+  }
+
+  return reason;
+}
+
+function renderReviewBlockRefusal(review, sessionId) {
+  const laneRef = sessionId ?? '<lane-id>';
+  return [
+    `close-session refused: the review check failed and project.yaml sets metadata.workflow.review.check to block (D-394). Nothing was written or deleted.`,
+    ...review.failures.map((failure) => `- ${formatReviewFailure(failure)}`),
+    `Run \`vibecompass review-check --session ${laneRef}\` to see the record. Only the owner closes past a failed check: --review-override "<the owner's reason>".`,
+  ].join('\n');
 }
 
 function normalizeStringArray(value) {

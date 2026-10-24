@@ -40,6 +40,57 @@
   and the reviewer's write boundary. An existing root gets all of this at its
   next `refresh-workflow --apply` (D-257); until then its agents follow the
   context they have.
+- Review record and check (D-394): a lane's `wip.md` › `## Review log` holds
+  line records, `- pass <n> | <time> | <reviewer> | <scope> | <outcome>`,
+  `- response <n> | <time> | <builder>`, and
+  `- owner | <time> | <owner> | <choice> | <reason>`, with finding lines
+  `  - <id> | <severity> | <status> | <reason>` under passes and responses and
+  continuation lines under findings. `close-session` parses the record after it
+  reads `wip.md` and before it writes anything, and checks it: a pass line, no
+  malformed line (the message names the first one), no open finding the owner
+  hasn't deferred, and no pass past the cap without the owner's
+  `another round` lines. It covers every builder lane, and a project-manager
+  lane once its log has a pass line.
+- `project.yaml` › `metadata.workflow.review` takes `check` (`warn`, the
+  default, closes and records the failures; `block` refuses to close, writing
+  and deleting nothing; `off` skips the check) and `round_cap` (1 to 10,
+  default 3). An unknown key or value warns at close and falls back to that
+  key's default. `init` and `refresh-workflow` write no `review:` block, so
+  every install gets `warn` and upgrading blocks no close.
+- `close-session --review-override "<reason>"` closes despite a failed check,
+  block mode included, on the owner's instruction and in the owner's words;
+  `--review-note "<text>"` (repeatable) adds lines to the note's review section.
+  `close-session` prints the check line.
+- Finalized notes gain a `## Review` section after `## Models used`: a `Check:`
+  line (`passed`, `failed (warn): …`, `overridden by the owner: …; failures: …`,
+  `off`, or `not required (project-manager lane)`), a `Passes:` line with the
+  count against the cap and the reviewers, one line per finding with the
+  builder's last disposition and the reviewer's last verdict, each owner line,
+  and the `--review-note` lines; a malformed record gets
+  `No parseable review record: <the first bad line>` instead. Each deferred
+  finding joins the note's next steps with the builder's or the owner's reason,
+  unless a `--next-step` names its id.
+- `vibecompass review-check [--session <lane-id>] [--json]` runs the same parse
+  and check on an open lane without closing it or writing anything: each
+  finding's state, the passes against the cap, the owner lines, and the
+  result; it exits 0 when the check passes and 1 when it fails.
+- Independent review (D-398): a pass counts only when a reviewer the owner
+  started runs it, pointed at the lane with `review handoff <lane-id>`. An
+  agent the builder launched or directed (a subagent, a second model, a review
+  tool run on its own work) does the builder's own checks, recorded in
+  `## Log`, never as pass lines. The check can't verify who started a run, so
+  the rule is in the text each role reads: `context.md` gains a Review log
+  format section (the grammar, D-394's worked example, who counts as a
+  reviewer, and the check), and its builder, reviewer, and project manager
+  workflows carry the rule; the builder runs `review-check` before
+  `close-session`, and the close-out text no longer says the note drops the
+  review log. `workflows/project-manager.md`'s review rule, close-report check,
+  and reviewed-lane rule compare each pass's reviewer with the one the build
+  prompt or the owner named. The managed blocks gain a Hard Rules line, and the
+  `review handoff` and `address review` summaries name the record lines.
+  `context.md`'s Workflow defaults name both review keys and their effective
+  values. An existing root gets this text at its next
+  `refresh-workflow --apply` (D-257).
 
 ## 0.17.5 - 2026-10-18
 

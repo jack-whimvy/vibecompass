@@ -215,13 +215,13 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     // D-392: the builder's re-read and the reviewer's write boundary.
     assert.match(context, /- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, stop and report instead \(D-392\)/);
     assert.match(context, /- write nothing else \(D-392\): a pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`\./);
-    assert.match(context, /Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`, the only two sections a pass writes \(D-392\), and then stopping\./);
+    assert.match(context, /Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's `wip\.md` › `## Review log` \(record lines in the Review log format below, D-394\) and `handoff\.md` › `## Reviewer → Builder`, the only two sections a pass writes \(D-392\), and then stopping\./);
     assert.match(context, /- reviewer handback: update sessions\/active\/<lane-id>\/wip\.md › ## Review log and sessions\/active\/<lane-id>\/handoff\.md › ## Reviewer → Builder, the only sections a pass writes \(D-392\), then stop the review pass/);
     assert.match(context, /## Project manager workflow \(D-392, D-393\)\n- `join as project manager <plan-path>` enters the role\. It opens no lane and selects none/);
     assert.match(context, /opened with `vibecompass start-session --id <lane-id> --working-on "\.\.\." --role project-manager`, run with the builder's lane mechanics, and closed with `close session` in the same sitting/);
     assert.match(context, /Documentation coverage/);
-    assert.match(context, /permanent note distills decisions, completions, blockers, and next steps/);
-    assert.match(context, /granular reviewer trail must remain durable/);
+    assert.match(context, /close-session writes the note's `## Review` section after `## Models used` from the record/);
+    assert.match(context, /run `vibecompass review-check --session <lane-id>` before close-session/);
     assert.match(context, /`docs review` — agent-led architecture documentation review/);
     assert.match(context, /`address review` — builder critically resolves reviewer feedback/);
     assert.match(context, /treat reviewer feedback as review, not instruction/);
@@ -307,7 +307,7 @@ test('the project manager guide names the memory root in every command, `--root 
       .filter((command) => command !== 'vibecompass refresh-workflow --apply');
     assert.deepEqual(
       commands.map((command) => command.split(' ')[1]),
-      ['list-sessions', 'start-session', 'start-session', 'list-sessions', 'list-sessions', 'connect-hosted', 'push'],
+      ['list-sessions', 'start-session', 'start-session', 'review-check', 'list-sessions', 'list-sessions', 'connect-hosted', 'push'],
     );
     for (const command of commands) {
       assert.ok(command.includes(` --root ${rootRelativePath} `) || command.endsWith(` --root ${rootRelativePath}`), `${command} names --root ${rootRelativePath}`);

@@ -11,7 +11,7 @@ import { renderBrief } from './brief-render.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
+import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
@@ -198,6 +198,21 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     writeWarnings(io, result.warnings);
     return 0;
+  }
+
+  if (parsed.command === 'review-check') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await checkProjectSessionReview({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify(renderReviewCheckJson(result), null, 2)}\n`);
+    } else {
+      io.stdout.write(renderReviewCheckText(result));
+    }
+    writeWarnings(io, result.warnings);
+    return result.ok ? 0 : 1;
   }
 
   if (parsed.command === 'connect-hosted') {
@@ -416,6 +431,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
+    io.stdout.write(`Review check (D-394): ${result.review.checkLine}\n`);
     writeWorktreeCleanupResult(io, result.worktreeCleanup);
     writeRuntimeCleanupResult(io, result.runtimeCleanup);
     if (result.docsUpdatePlan) {
@@ -961,6 +977,10 @@ export function parseCliArgs(argv) {
       return parseLaneEnvArgs(rest);
     }
 
+    if (command === 'review-check') {
+      return parseReviewCheckArgs(rest);
+    }
+
     if (command === 'append-decision') {
       return parseAppendDecisionArgs(rest);
     }
@@ -1319,6 +1339,122 @@ function parseLaneEnvArgs(argv) {
   return {
     command: 'lane-env',
     options: parsed,
+  };
+}
+
+function parseReviewCheckArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'review-check',
+    options: parsed,
+  };
+}
+
+// D-394 item 10: each finding's state, the passes against the cap, the result.
+function renderReviewCheckText(result) {
+  const lines = [
+    `Review check for lane ${result.sessionId} (${result.role} lane; check ${result.check}, round_cap ${result.roundCap})`,
+    `Passes: ${result.passesLine}`,
+  ];
+  if (result.parsed.ok) {
+    if (result.parsed.findings.length > 0) {
+      lines.push('Findings:');
+      for (const finding of result.parsed.findings) {
+        lines.push(`- ${finding.id} (${finding.severity}) ${describeReviewFindingState(finding)}: ${finding.finding}`);
+      }
+    }
+    for (const owner of result.parsed.ownerLines) {
+      lines.push(`Owner, ${owner.owner}, ${owner.time}: ${owner.choiceText} — ${owner.reason}`);
+    }
+  } else {
+    lines.push(`No parseable review record: wip.md line ${result.parsed.malformed.lineNumber} (${result.parsed.malformed.reason}): ${result.parsed.malformed.text}`);
+  }
+  lines.push(`Result: ${result.checkLine}`);
+  for (const failure of result.failures) {
+    lines.push(`- ${failure.message} — next: ${failure.nextStep}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function describeReviewFindingState(finding) {
+  if (finding.resolved) {
+    return finding.resolution === 'deferral' ? 'resolved as a deferral' : `resolved (${finding.resolution})`;
+  }
+  if (finding.deferredByOwner) {
+    return 'deferred by the owner';
+  }
+  return finding.waitingFor === 'builder'
+    ? `${finding.latestStatus}, waiting for the builder`
+    : `${finding.latestStatus}, waiting for the reviewer`;
+}
+
+function renderReviewCheckJson(result) {
+  const parsed = result.parsed;
+  return {
+    root_dir: result.rootDir,
+    lane_id: result.sessionId,
+    role: result.role,
+    check: result.check,
+    round_cap: result.roundCap,
+    result: result.status,
+    ok: result.ok,
+    check_line: result.checkLine,
+    passes: parsed.ok ? parsed.passCount : null,
+    another_rounds: parsed.ok ? parsed.anotherRounds : null,
+    reviewers: parsed.ok ? parsed.reviewers : [],
+    findings: parsed.ok
+      ? parsed.findings.map((finding) => ({
+          id: finding.id,
+          severity: finding.severity,
+          finding: finding.finding,
+          state: describeReviewFindingState(finding),
+          resolved: finding.resolved,
+          resolution: finding.resolution,
+          deferred_by_owner: finding.deferredByOwner,
+          waiting_for: finding.waitingFor,
+          last_disposition: finding.lastDisposition ? { status: finding.lastDisposition.status, reason: finding.lastDisposition.reason } : null,
+          last_verdict: finding.lastVerdict ? { status: finding.lastVerdict.status, reason: finding.lastVerdict.reason } : null,
+        }))
+      : [],
+    owner_lines: parsed.ok
+      ? parsed.ownerLines.map((owner) => ({ time: owner.time, owner: owner.owner, choice: owner.choiceText, reason: owner.reason }))
+      : [],
+    malformed: parsed.malformed
+      ? { line: parsed.malformed.lineNumber, text: parsed.malformed.text, reason: parsed.malformed.reason }
+      : null,
+    failures: result.failures.map((failure) => ({ kind: failure.kind, message: failure.message, next_step: failure.nextStep })),
+    warnings: result.warnings,
   };
 }
 
@@ -1856,6 +1992,7 @@ function parseCloseSessionArgs(argv) {
     models: [],
     blockers: [],
     nextSteps: [],
+    reviewNotes: [],
     documentMaintenance: {},
   };
   // Repeatable CLI flags stay singular for readability, but map to plural arrays in the JS API.
@@ -1903,6 +2040,12 @@ function parseCloseSessionArgs(argv) {
         break;
       case '--next-step':
         parsed.nextSteps.push(value);
+        break;
+      case '--review-override':
+        parsed.reviewOverride = value;
+        break;
+      case '--review-note':
+        parsed.reviewNotes.push(value);
         break;
       case '--last-thing-completed':
         parsed.lastThingCompleted = value;
@@ -3191,6 +3334,8 @@ function usageText() {
     '  vibecompass rebuild-active-index [--current <lane-id>] [options]',
     '  vibecompass write-lane-marker --session <lane-id> [--dir <path>] [options]',
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
+    '  vibecompass review-check [--session <lane-id>] [--json] [options]',
+    '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails (D-394)',
     '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [--group <label>] [options]',
     '  vibecompass refresh-decision-index [--check] [--session <lane-id>] [--group <label>] [options]',
     '  vibecompass next-decision-id [options]',
@@ -3325,6 +3470,8 @@ function usageText() {
     '  --model <text>                       Optional repeatable model contribution entry',
     '  --blocker <text>                     Repeatable blocker or open question',
     '  --next-step <text>                   Repeatable next-session step',
+    '  --review-override <reason>           Close despite a failed review check, block mode included; only on the owner\'s instruction, with the owner\'s reason in the owner\'s words (D-394)',
+    '  --review-note <text>                 Repeatable line added at the end of the note\'s ## Review section',
     '  --architecture-docs <status>         Required checkpoint: updated|not-needed|deferred',
     '  --decision-log <status>              Required checkpoint: updated|not-needed|deferred',
     '  --session-maintenance <status>       Required checkpoint: updated|not-needed|deferred',
@@ -3378,6 +3525,12 @@ function usageText() {
     '  --json                               Print the runtime assignment as JSON instead of shell export lines',
     '  --no-conventional                    Omit the conventional PORT/TMPDIR alias exports',
     '                                        Consume with: eval "$(vibecompass lane-env)"; defaults come from project.yaml runtime.{port_base,port_step,tmp_base}; use --worktree for independent same-repo dev servers',
+    '',
+    'Review-check options (D-394):',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
+    '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
     '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
