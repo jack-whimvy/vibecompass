@@ -1,3 +1,5 @@
+import { stepFence } from './markdown-sections.js';
+
 // D-394: the review record in a lane's `wip.md` › `## Review log`, its parse,
 // and the check close-session and review-check run on it. The check reads only
 // the record: who started a reviewer (D-398) is a rule in the role text, since
@@ -74,17 +76,22 @@ export function resolveReviewSettings(rawReview) {
 
 /**
  * The lines of `## Review log` with their `wip.md` line numbers, up to the
- * next level-2 heading. A missing section reads as an empty log.
+ * next level-1 or level-2 heading. Fence-aware, so an example of the section
+ * in `## Log` is not the section; a fence inside the real section is still a
+ * line the record can't hold. A missing section reads as an empty log.
  */
 export function extractReviewLogLines(wipContent) {
   const lines = wipContent.split('\n');
   const collected = [];
   let inSection = false;
   let found = false;
+  let fence = null;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index].replace(/\r$/, '');
-    if (/^##\s+/.test(line)) {
+    const wasInFence = Boolean(fence);
+    fence = stepFence(fence, line).fence;
+    if (!wasInFence && /^#{1,2}\s/.test(line)) {
       if (inSection) {
         break;
       }

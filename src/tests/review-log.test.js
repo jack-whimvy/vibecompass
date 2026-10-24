@@ -165,6 +165,33 @@ test('each malformed shape fails and names its first bad line (D-394 item 6)', (
   }
 });
 
+test('a fenced example of the section in ## Log is not the review log; a fence inside the real one is malformed', () => {
+  const wip = [
+    '# WIP — 2026-10-23 (session 1)',
+    '',
+    '## Log',
+    '- the format, for reference:',
+    '```',
+    '## Review log',
+    ...CLEAN_PASS,
+    '```',
+    '',
+    '## Review log',
+    ...OPEN_FINDING,
+    '',
+  ].join('\n');
+  const real = evaluateReviewRecord(wip);
+  assert.equal(real.parsed.ok, true);
+  assert.equal(real.status, 'failed');
+  assert.deepEqual(real.parsed.findings.map((finding) => [finding.id, finding.severity]), [['R1.1', 'P2']]);
+  assert.match(real.failures[0].message, /^R1\.1 \(P2\) is open/);
+
+  const fencedRecord = evaluate(['```', ...CLEAN_PASS, '```']);
+  assert.equal(fencedRecord.parsed.ok, false);
+  assert.equal(fencedRecord.parsed.malformed.lineNumber, 7);
+  assert.equal(fencedRecord.parsed.malformed.text, '```');
+});
+
 test('review settings: defaults, valid values, and fallbacks with warnings (D-394 item 7)', () => {
   assert.deepEqual(resolveReviewSettings(undefined), { check: 'warn', roundCap: 3, warnings: [] });
   assert.deepEqual(resolveReviewSettings({ check: 'block', round_cap: 10 }), { check: 'block', roundCap: 10, warnings: [] });
@@ -499,6 +526,10 @@ test('init and refresh-workflow write no review: block; refresh keeps one the ow
   const customContext = await readFile(path.join(root.rootDir, 'context.md'), 'utf8');
   assert.match(customContext, /- review check: `metadata\.workflow\.review\.check` is `block`; on a failed check/);
   assert.match(customContext, /- review round cap: `metadata\.workflow\.review\.round_cap` is 5; a pass beyond it/);
+  // The generated guide names the setting rather than a number, so a non-default cap never contradicts it.
+  const customGuide = await readFile(path.join(root.rootDir, 'workflows/project-manager.md'), 'utf8');
+  assert.match(customGuide, /- \*\*A cap on rounds,\*\* where a round is one reviewer pass and the builder's response\. The cap is `metadata\.workflow\.review\.round_cap`, 3 by default; `\.compass\/context\.md` › Workflow defaults gives this project's value\. If findings are still open after the last round the cap allows/);
+  assert.doesNotMatch(customGuide, /cap of 3|after the third/);
 
   const metadata = buildWorkflowMetadata({ workflow: { review: { check: 'block', round_cap: 5 }, reviewer_handback: 'handoff-file' } });
   assert.deepEqual(metadata.workflow.review, { check: 'block', round_cap: 5 });
