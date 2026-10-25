@@ -43,6 +43,7 @@ import {
   validateLaneId,
 } from './lane-marker.js';
 import { PACKAGE_VERSION } from './version.js';
+import { formatPlanTaskRef, resolvePlanTaskRefs, splitPlanTaskRef } from './plan-tasks.js';
 // This lazy-only cycle is intentional: manifest.js reads lane state from this
 // module, and session command handlers rewrite the derived manifest after
 // lane mutations. Keep both sides free of top-level calls into the other.
@@ -175,6 +176,19 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     throw new Error(
       `Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work (D-353).`,
     );
+  }
+  // D-395: every --plan-task is validated before the first write, and each
+  // plan's path joins architecture_docs so the brief and the overlap
+  // warnings below see the plan.
+  const planTaskResolution = await resolvePlanTaskRefs({
+    rootDir: normalized.rootDir,
+    refs: Array.isArray(options?.planTasks) ? options.planTasks : [],
+  });
+  const planTasks = planTaskResolution.tasks.map((task) => task.ref);
+  for (const task of planTaskResolution.tasks) {
+    if (!architectureDocs.includes(task.plan)) {
+      architectureDocs.push(task.plan);
+    }
   }
   const priorIndex = await readActiveSessionIndex(normalized);
   const resumeAlternativeWarnings = buildResumeAlternativeWarnings(
@@ -309,6 +323,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       repos,
       claims,
       architectureDocs,
+      planTasks,
       decisionDomainFiles,
       baseRevisions: baseRevisionCapture.baseRevisions,
       runtime: laneRuntime,
@@ -428,6 +443,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
     claudePath: normalized.claudePath,
     sessionId,
     role,
+    planTasks,
     sessionFilePath: lanePaths.sessionFilePath,
     wipFilePath: lanePaths.wipFilePath,
     handoffFilePath: lanePaths.handoffFilePath,
@@ -442,6 +458,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       ...baseRevisionCapture.warnings,
       ...runtimeSettings.warnings,
       ...(gitBinding?.warnings ?? []),
+      ...planTaskResolution.warnings,
       ...manifestRefresh.warnings,
       ...auditWarnings,
       ...brief.warnings,
@@ -586,6 +603,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       sessionNumber: activeSession.sessionNumber,
       title,
       workedOn,
+      planTasks: closingLaneMetadata?.planTasks ?? [],
       completed,
       decisions,
       models: models.length > 0 ? models : ['Not recorded.'],
@@ -747,6 +765,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
     documentMaintenance,
+    planTasks: closingLaneMetadata?.planTasks ?? [],
     review: {
       check: review.settings.check,
       roundCap: review.settings.roundCap,
@@ -1191,19 +1210,44 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
   const workingOn = workingOnUpdate ?? lane.workingOn ?? 'No summary recorded';
   const otherLanes = lanes.filter((item) => item.id !== lane.id);
 
-  const updatedSessionContent = upsertTopLevelYamlScalars(
-    sessionContent,
+  // D-395: --plan-task adds links, and nothing removes one. New refs are
+  // validated before the first write, each plan's path joins
+  // architecture_docs when it is missing, and both lists are rewritten from
+  // their stored values so every other field stays as it is.
+  const planTaskResolution = await resolvePlanTaskRefs({
+    rootDir: normalized.rootDir,
+    refs: Array.isArray(options?.planTasks) ? options.planTasks : [],
+  });
+  const storedLaneData = parseSimpleYaml(sessionContent, { sourceName: lanePaths.sessionFilePath });
+  const storedPlanTasks = Array.isArray(storedLaneData.plan_tasks) ? storedLaneData.plan_tasks : [];
+  const storedArchitectureDocs = Array.isArray(storedLaneData.architecture_docs) ? storedLaneData.architecture_docs : [];
+  const planTasksAdded = planTaskResolution.tasks
+    .map((task) => task.ref)
+    .filter((ref) => !(lane.planTasks ?? []).includes(ref));
+  const planDocsAdded = [...new Set(planTaskResolution.tasks.map((task) => task.plan))]
+    .filter((plan) => !(lane.architectureDocs ?? []).includes(plan));
+  const planTasks = [...(lane.planTasks ?? []), ...planTasksAdded];
+
+  const updatedSessionContent = upsertTopLevelYamlLists(
+    upsertTopLevelYamlScalars(
+      sessionContent,
+      {
+        ...(workingOnUpdate ? { working_on: quoteYamlString(workingOnUpdate) } : {}),
+        resumed_at: resumedAt,
+        resume_count: String(resumeCount),
+      },
+      lanePaths.sessionFilePath,
+    ),
     {
-      ...(workingOnUpdate ? { working_on: quoteYamlString(workingOnUpdate) } : {}),
-      resumed_at: resumedAt,
-      resume_count: String(resumeCount),
+      ...(planTasksAdded.length > 0 ? { plan_tasks: [...storedPlanTasks, ...planTasksAdded] } : {}),
+      ...(planDocsAdded.length > 0 ? { architecture_docs: [...storedArchitectureDocs, ...planDocsAdded] } : {}),
     },
     lanePaths.sessionFilePath,
   );
   const otherLaneNote = otherLanes.length > 0
     ? `; ${otherLanes.length} other active lane${otherLanes.length === 1 ? '' : 's'}: ${otherLanes.map((item) => item.id).join(', ')}`
     : '';
-  const logLine = `- Resumed lane on ${resumeDate} (continue-session #${resumeCount}${otherLaneNote})${workingOnUpdate ? `. Working on updated: ${workingOnUpdate}` : ''}`;
+  const logLine = `- Resumed lane on ${resumeDate} (continue-session #${resumeCount}${otherLaneNote})${workingOnUpdate ? `. Working on updated: ${workingOnUpdate}` : ''}${planTasksAdded.length > 0 ? `. Plan tasks linked: ${planTasksAdded.join(', ')}` : ''}`;
   const updatedWipContent = appendWipLogLine(
     workingOnUpdate ? replaceWipSectionBody(wipContent, 'Working on', workingOnUpdate) : wipContent,
     logLine,
@@ -1290,6 +1334,8 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
     resumeCount,
     workingOn,
     workingOnUpdated: Boolean(workingOnUpdate),
+    planTasks,
+    planTasksAdded,
     startedAt: lane.startedAt ?? null,
     laneAgeDays: computeLaneAgeDays(sessionDate, resumeDate),
     runtime: lane.runtime ?? null,
@@ -1317,6 +1363,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
         hasWorktree: Boolean(lane.worktreeContainer),
         context: 'continue-session',
       }),
+      ...planTaskResolution.warnings,
       ...docsUpdate.warnings,
       ...manifestRefresh.warnings,
       ...brief.warnings,
@@ -1349,6 +1396,8 @@ function buildLaneInventory(lanes, current) {
         worktreeContainer: lane.worktreeContainer ?? null,
         worktreeRepos: Object.keys(lane.worktrees ?? {}),
         runtimePort: lane.runtime?.port ?? null,
+        // D-395: `{ plan, id }` per linked task, empty when the lane has none.
+        planTasks: (lane.planTasks ?? []).map(splitPlanTaskRef),
         lastLogEntry: lane.lastLogEntry ?? null,
         isCurrentHint: current != null && lane.id === current,
         warnings: lane.warnings ?? [],
@@ -1386,6 +1435,9 @@ export function renderLaneInventoryLines(inventory) {
     }
     if (facts.length > 0) {
       lines.push(`    ${facts.join('; ')}`);
+    }
+    if (lane.planTasks?.length > 0) {
+      lines.push(`    tasks: ${lane.planTasks.map(formatPlanTaskRef).join(', ')}`);
     }
     if (lane.lastLogEntry) {
       lines.push(`    last log: ${lane.lastLogEntry}`);
@@ -1442,6 +1494,64 @@ function upsertTopLevelYamlScalars(content, scalars, sourceName = 'session.yaml'
     throw new Error(
       `continue-session refused to write ${sourceName}: the updated lane metadata would not parse (${error instanceof Error ? error.message : String(error)}). Nothing was written.`,
     );
+  }
+
+  return next;
+}
+
+/**
+ * The list counterpart of upsertTopLevelYamlScalars (D-395): replaces a
+ * top-level key and its block of items (indented lines, column-0 `- ` items,
+ * and blank or comment lines between them), or appends the key when it is
+ * missing, and leaves every other line as it was. The line ending follows the
+ * file's. The result must parse and hold exactly the values written, or
+ * nothing is written.
+ */
+function upsertTopLevelYamlLists(content, lists, sourceName = 'session.yaml') {
+  let next = content;
+  for (const [key, values] of Object.entries(lists)) {
+    const eol = next.includes('\r\n') ? '\r\n' : '\n';
+    const rendered = renderYamlArray(key, values).split('\n');
+    const lines = next.split(/\r?\n/);
+    const trailingNewline = lines.length > 0 && lines[lines.length - 1] === '';
+    if (trailingNewline) {
+      lines.pop();
+    }
+    const keyPattern = new RegExp(`^${key}[ \\t]*:`);
+    const start = lines.findIndex((line) => keyPattern.test(line));
+    if (start === -1) {
+      lines.push(...rendered);
+    } else {
+      let end = start;
+      for (let index = start + 1; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (/^\s*$/.test(line) || /^\s*#/.test(line)) {
+          continue;
+        }
+        if (/^[ \t]/.test(line) || line.startsWith('- ') || line === '-') {
+          end = index;
+          continue;
+        }
+        break;
+      }
+      lines.splice(start, end - start + 1, ...rendered);
+    }
+    next = `${lines.join(eol)}${eol}`;
+  }
+
+  let parsed;
+  try {
+    parsed = parseSimpleYaml(next, { sourceName });
+  } catch (error) {
+    throw new Error(
+      `continue-session refused to write ${sourceName}: the updated lane metadata would not parse (${error instanceof Error ? error.message : String(error)}). Nothing was written.`,
+    );
+  }
+  for (const [key, values] of Object.entries(lists)) {
+    const stored = Array.isArray(parsed[key]) ? parsed[key] : [];
+    if (JSON.stringify(stored) !== JSON.stringify(values)) {
+      throw new Error(`continue-session refused to write ${sourceName}: ${key} would not read back as written. Nothing was written.`);
+    }
   }
 
   return next;
@@ -2101,6 +2211,7 @@ async function listActiveSessionLanes(normalized) {
         repos: metadata.repos,
         claims: metadata.claims,
         architectureDocs: metadata.architectureDocs,
+        planTasks: metadata.planTasks,
         decisionDomainFiles: metadata.decisionDomainFiles,
         startedAt: metadata.startedAt,
         resumedAt: metadata.resumedAt ?? null,
@@ -2153,6 +2264,9 @@ async function readLaneMetadata(sessionFilePath) {
       repos: normalizeStringArray(data.repos),
       claims: normalizeStringArray(data.claimed_paths),
       architectureDocs: normalizeStringArray(data.architecture_docs).map(normalizeArchitectureDocPath),
+      // D-395: absent on lanes opened before plan task links existed, which
+      // have no links.
+      planTasks: normalizeStringArray(data.plan_tasks),
       decisionDomainFiles: normalizeStringArray(data.decision_domain_files).map(normalizeDecisionDomainFile),
       startedAt: normalizeOptionalString(data.started_at),
       // D-353 resume bookkeeping; absent on lanes opened before continue-session existed.
@@ -2192,6 +2306,7 @@ async function readLaneMetadata(sessionFilePath) {
       repos: [],
       claims: [],
       architectureDocs: [],
+      planTasks: [],
       decisionDomainFiles: [],
       startedAt: null,
       resumedAt: null,
@@ -2459,6 +2574,8 @@ function renderLaneMetadata(options) {
     renderYamlArray('repos', options.repos),
     renderYamlArray('claimed_paths', options.claims),
     renderYamlArray('architecture_docs', options.architectureDocs),
+    // D-395: the lane's plan task links, as `<plan-path>#<ID>` refs.
+    renderYamlArray('plan_tasks', options.planTasks),
     renderYamlArray('decision_domain_files', options.decisionDomainFiles),
     `started_at: ${formatLocalDateTime(new Date())}`,
     // D-282: the runtime assignment travels with the lane record (local-only
@@ -2541,7 +2658,7 @@ function renderSessionNote(options) {
 
 ## What we worked on
 ${options.workedOn}
-
+${renderPlanTasksSection(options.planTasks)}
 ## Completed
 ${renderBulletList(options.completed)}
 
@@ -2563,6 +2680,16 @@ ${renderBulletList(options.blockers, 'No blocker remains.')}
 ## Next session should start with
 ${renderOrderedList(options.nextSteps)}
 `;
+}
+
+// D-395: written only when the lane links plan tasks, one bullet per ref, so
+// a note from an unlinked lane is unchanged.
+function renderPlanTasksSection(planTasks) {
+  if (!planTasks || planTasks.length === 0) {
+    return '';
+  }
+
+  return `\n## Plan tasks\n${renderBulletList(planTasks)}\n`;
 }
 
 function renderDocumentMaintenanceCheckpoint(documentMaintenance) {

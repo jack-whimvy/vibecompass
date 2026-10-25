@@ -2507,3 +2507,322 @@ test('resume selects a lane by --session or worktree marker whatever its role, a
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// D-395: the lane–task link. A plan is an architecture doc whose ## Next steps
+// holds D-393 task lines.
+const PLAN_TASK_PLAN = 'architecture/platform/plan.md';
+const PLAN_TASK_OTHER_PLAN = 'architecture/platform/other-plan.md';
+
+async function createPlanTaskRoot(prefix) {
+  const root = await createContinueSessionRoot(prefix);
+  await mkdir(path.join(root.rootDir, 'architecture/platform'), { recursive: true });
+  await writeFile(path.join(root.rootDir, PLAN_TASK_PLAN), [
+    '---',
+    'domain: Platform',
+    'feature: Plans',
+    'component: Plan',
+    'status: In progress',
+    '---',
+    '',
+    '## Description',
+    'A plan.',
+    '',
+    '## Next steps',
+    '**Track (a bold label)**',
+    '- [x] PM1 — Done.',
+    '  *Done 2026-10-21.*',
+    '- [ ] PM2 — Open:',
+    '  - [ ] PM9 — a nested subtask',
+    '- [ ] PM3 — Also open.',
+    '',
+  ].join('\n'), 'utf8');
+  await writeFile(path.join(root.rootDir, PLAN_TASK_OTHER_PLAN), [
+    '---',
+    'domain: Platform',
+    'feature: Plans',
+    'component: Other plan',
+    'status: In progress',
+    '---',
+    '',
+    '## Description',
+    'Another plan whose IDs collide with the first.',
+    '',
+    '## Next steps',
+    '- [ ] PM2 — The other plan\'s PM2.',
+    '',
+  ].join('\n'), 'utf8');
+  await writeFile(path.join(root.rootDir, 'decisions/plan.md'), '## Next steps\n- [ ] PM2 — not under architecture/\n', 'utf8');
+  return root;
+}
+
+function captureIo() {
+  const stdout = [];
+  const stderr = [];
+  return {
+    stdout,
+    stderr,
+    io: { stdout: { write(chunk) { stdout.push(chunk); } }, stderr: { write(chunk) { stderr.push(chunk); } } },
+  };
+}
+
+test('start-session --plan-task links plan tasks: plan_tasks in session.yaml, the plan joins architecture_docs, a repeat is stored once (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-start-');
+
+  try {
+    const result = await startProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'pm-lane',
+      workingOn: 'Build PM2 and PM3.',
+      planTasks: [`${PLAN_TASK_PLAN}#PM2`, `${PLAN_TASK_PLAN}#PM3`, `./${PLAN_TASK_PLAN}#PM2`, `${PLAN_TASK_OTHER_PLAN}#PM2`],
+      architectureDocs: [PLAN_TASK_PLAN],
+      date: '2026-04-20',
+    });
+    assert.deepEqual(result.planTasks, [`${PLAN_TASK_PLAN}#PM2`, `${PLAN_TASK_PLAN}#PM3`, `${PLAN_TASK_OTHER_PLAN}#PM2`]);
+    assert.ok(!result.warnings.some((warning) => /--plan-task/.test(warning)), 'no ticked task, no warning');
+
+    const yaml = await readFile(path.join(rootDir, 'sessions/active/pm-lane/session.yaml'), 'utf8');
+    assert.match(yaml, new RegExp(`^plan_tasks:\\n  - "${PLAN_TASK_PLAN}#PM2"\\n  - "${PLAN_TASK_PLAN}#PM3"\\n  - "${PLAN_TASK_OTHER_PLAN}#PM2"\\n`, 'm'));
+    // The plan named with --architecture-doc isn't repeated; the other plan joins.
+    assert.match(yaml, new RegExp(`^architecture_docs:\\n  - "${PLAN_TASK_PLAN}"\\n  - "${PLAN_TASK_OTHER_PLAN}"\\n`, 'm'));
+
+    // A lane with no links records an empty list, and the brief's inputs and
+    // the overlap warnings see the plan through architecture_docs.
+    const second = await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'docs-lane', workingOn: 'Docs.', planTasks: [`${PLAN_TASK_PLAN}#PM3`], date: '2026-04-20' });
+    assert.ok(second.warnings.some((warning) => warning.includes(PLAN_TASK_PLAN) && /pm-lane/.test(warning)), 'the plan overlaps the first lane');
+    const plain = await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'plain-lane', workingOn: 'No links.', date: '2026-04-20' });
+    assert.deepEqual(plain.planTasks, []);
+    assert.match(await readFile(path.join(rootDir, 'sessions/active/plain-lane/session.yaml'), 'utf8'), /^plan_tasks: \[\]$/m);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session --plan-task on a ticked task warns and keeps the link (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-ticked-');
+  const { stdout, stderr, io } = captureIo();
+
+  try {
+    assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'follow-up', '--working-on', 'Follow up PM1.', '--plan-task', `${PLAN_TASK_PLAN}#PM1`, '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
+    const text = stdout.join('');
+    assert.match(text, new RegExp(`^Plan tasks: ${PLAN_TASK_PLAN}#PM1$`, 'm'));
+    assert.match(stderr.join(''), new RegExp(`^Warning: --plan-task "${PLAN_TASK_PLAN}#PM1" names a ticked task: PM1 is marked done in ${PLAN_TASK_PLAN}\\. The link is kept, since a follow-up lane on a done task is fine \\(D-395\\)\\.$`, 'm'));
+    assert.match(await readFile(path.join(rootDir, 'sessions/active/follow-up/session.yaml'), 'utf8'), new RegExp(`^plan_tasks:\\n  - "${PLAN_TASK_PLAN}#PM1"$`, 'm'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('start-session refuses a bad --plan-task before any write and names the problem (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-refuse-');
+  const { io } = captureIo();
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-a', workingOn: 'Lane A.', date: '2026-04-20' });
+    const indexBefore = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+    const claudeBefore = await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8');
+
+    const refusals = [
+      ['an unknown path', 'architecture/platform/missing.md#PM2', /architecture\/platform\/missing\.md doesn't exist in the project-memory root/],
+      ['a path outside architecture/', 'decisions/plan.md#PM2', /decisions\/plan\.md is outside architecture\/\. A plan is an architecture doc \(D-393, D-395\)/],
+      ['an unknown ID', `${PLAN_TASK_PLAN}#PM7`, /has no task line for PM7 under ## Next steps\. Its task IDs: PM1, PM2, PM3\./],
+      ['a nested subtask', `${PLAN_TASK_PLAN}#PM9`, /has no task line for PM9 under ## Next steps/],
+      ['an ID with a bad shape', `${PLAN_TASK_PLAN}#pm2`, /"pm2" isn't a task ID\. An ID is 1–6 capital letters, then 1–3 digits/],
+      ['no ID', PLAN_TASK_PLAN, /has no #<ID>/],
+    ];
+    for (const [label, ref, pattern] of refusals) {
+      await assert.rejects(
+        startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', planTasks: [`${PLAN_TASK_PLAN}#PM2`, ref], date: '2026-04-20' }),
+        pattern,
+        label,
+      );
+      await assert.rejects(
+        runCli(['start-session', '--root', rootDir, '--id', 'lane-c', '--working-on', 'Lane C.', '--plan-task', ref], io, { cwd: tempDir }),
+        pattern,
+        `${label} (CLI)`,
+      );
+    }
+    for (const laneId of ['lane-b', 'lane-c']) {
+      await assert.rejects(() => access(path.join(rootDir, 'sessions/active', laneId)), `${laneId} was not created`);
+    }
+    assert.equal(await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8'), indexBefore);
+    assert.equal(await readFile(path.join(tempDir, 'CLAUDE.md'), 'utf8'), claudeBefore);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continue-session --plan-task adds links in place, keeps every other field, and refuses a bad ref before any write (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-resume-');
+  const { stdout, io } = captureIo();
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'pm-lane', workingOn: 'Build PM2.', planTasks: [`${PLAN_TASK_PLAN}#PM2`], date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/pm-lane/session.yaml');
+    const wipFilePath = path.join(rootDir, 'sessions/active/pm-lane/wip.md');
+    // A key this package doesn't know, which the in-place update must keep.
+    await writeFile(sessionFilePath, `${await readFile(sessionFilePath, 'utf8')}future_field: "kept"\n`, 'utf8');
+    const yamlBefore = await readFile(sessionFilePath, 'utf8');
+    const wipBefore = await readFile(wipFilePath, 'utf8');
+    const indexBefore = await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8');
+
+    await assert.rejects(
+      runCli(['continue-session', '--root', rootDir, '--plan-task', `${PLAN_TASK_PLAN}#PM3`, '--plan-task', `${PLAN_TASK_PLAN}#PM8`], io, { cwd: tempDir }),
+      /has no task line for PM8 under ## Next steps/,
+    );
+    assert.equal(await readFile(sessionFilePath, 'utf8'), yamlBefore, 'the refusal wrote nothing to session.yaml');
+    assert.equal(await readFile(wipFilePath, 'utf8'), wipBefore, 'or wip.md');
+    assert.equal(await readFile(path.join(rootDir, 'sessions/active/index.yaml'), 'utf8'), indexBefore, 'or the index');
+
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, '--plan-task', `${PLAN_TASK_PLAN}#PM2`, '--plan-task', `${PLAN_TASK_OTHER_PLAN}#PM2`, '--date', '2026-04-21'], io, { cwd: tempDir }), 0);
+    assert.match(stdout.join(''), new RegExp(`^Plan tasks: ${PLAN_TASK_PLAN}#PM2, ${PLAN_TASK_OTHER_PLAN}#PM2 \\(added\\)$`, 'm'));
+
+    const yamlAfter = await readFile(sessionFilePath, 'utf8');
+    assert.match(yamlAfter, new RegExp(`^plan_tasks:\\n  - "${PLAN_TASK_PLAN}#PM2"\\n  - "${PLAN_TASK_OTHER_PLAN}#PM2"\\n`, 'm'));
+    assert.match(yamlAfter, new RegExp(`^architecture_docs:\\n  - "${PLAN_TASK_PLAN}"\\n  - "${PLAN_TASK_OTHER_PLAN}"\\n`, 'm'));
+    // Every other line is as it was, in order, apart from the resume bookkeeping.
+    const withoutChanges = (content) => content
+      .split('\n')
+      .filter((line) => !line.includes(PLAN_TASK_OTHER_PLAN) && !/^(resumed_at|resume_count):/.test(line));
+    assert.deepEqual(withoutChanges(yamlAfter), withoutChanges(yamlBefore));
+    assert.match(yamlAfter, /^future_field: "kept"$/m);
+    assert.match(await readFile(wipFilePath, 'utf8'), new RegExp(`^- Resumed lane on 2026-04-21 \\(continue-session #1\\)\\. Plan tasks linked: ${PLAN_TASK_OTHER_PLAN}#PM2$`, 'm'));
+
+    // A resume with nothing new rewrites neither list.
+    const json = await continueProjectSession({ cwd: tempDir, rootDir, planTasks: [`${PLAN_TASK_OTHER_PLAN}#PM2`], date: '2026-04-22' });
+    assert.deepEqual(json.planTasks, [`${PLAN_TASK_PLAN}#PM2`, `${PLAN_TASK_OTHER_PLAN}#PM2`]);
+    assert.deepEqual(json.planTasksAdded, []);
+    assert.deepEqual(withoutChanges(await readFile(sessionFilePath, 'utf8')), withoutChanges(yamlAfter));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('continue-session --plan-task keeps a CRLF session.yaml\'s line endings (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-crlf-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'crlf-lane', workingOn: 'CRLF.', date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/crlf-lane/session.yaml');
+    await writeFile(sessionFilePath, (await readFile(sessionFilePath, 'utf8')).replace(/\n/g, '\r\n'), 'utf8');
+
+    const resumed = await continueProjectSession({ cwd: tempDir, rootDir, planTasks: [`${PLAN_TASK_PLAN}#PM3`], date: '2026-04-21' });
+    assert.deepEqual(resumed.planTasksAdded, [`${PLAN_TASK_PLAN}#PM3`]);
+    const yaml = await readFile(sessionFilePath, 'utf8');
+    assert.doesNotMatch(yaml, /[^\r]\n/, 'every line ends in CRLF');
+    assert.match(yaml, new RegExp(`plan_tasks:\\r\\n  - "${PLAN_TASK_PLAN}#PM3"\\r\\n`));
+    assert.match(yaml, new RegExp(`architecture_docs:\\r\\n  - "${PLAN_TASK_PLAN}"\\r\\n`));
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(listed.lanes[0].planTasks, [`${PLAN_TASK_PLAN}#PM3`]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a lane whose session.yaml has no plan_tasks has no links, and a resume can add the first (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-legacy-');
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'older-lane', workingOn: 'Opened before PM6.', date: '2026-04-20' });
+    const sessionFilePath = path.join(rootDir, 'sessions/active/older-lane/session.yaml');
+    await writeFile(sessionFilePath, (await readFile(sessionFilePath, 'utf8')).replace(/^plan_tasks: \[\]\n/m, ''), 'utf8');
+    assert.doesNotMatch(await readFile(sessionFilePath, 'utf8'), /^plan_tasks:/m);
+
+    const listed = await listProjectSessions({ cwd: tempDir, rootDir });
+    assert.deepEqual(listed.lanes[0].planTasks, []);
+    assert.deepEqual(listed.inventory.lanes[0].planTasks, []);
+
+    const resumed = await continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21' });
+    assert.deepEqual(resumed.planTasks, []);
+    assert.doesNotMatch(await readFile(sessionFilePath, 'utf8'), /^plan_tasks:/m, 'a resume without --plan-task adds no field');
+
+    const linked = await continueProjectSession({ cwd: tempDir, rootDir, planTasks: [`${PLAN_TASK_PLAN}#PM2`], date: '2026-04-22' });
+    assert.deepEqual(linked.planTasksAdded, [`${PLAN_TASK_PLAN}#PM2`]);
+    assert.match(await readFile(sessionFilePath, 'utf8'), new RegExp(`^plan_tasks:\\n  - "${PLAN_TASK_PLAN}#PM2"$`, 'm'));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('list-sessions and continue-session\'s inventory print a tasks line under a linked lane; --json gives every lane planTasks (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-inventory-');
+  const { stdout, io } = captureIo();
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'linked-lane', workingOn: 'Linked.', planTasks: [`${PLAN_TASK_PLAN}#PM2`, `${PLAN_TASK_OTHER_PLAN}#PM2`], date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'plain-lane', workingOn: 'Plain.', date: '2026-04-20' });
+
+    assert.equal(await runCli(['list-sessions', '--root', rootDir], io, { cwd: tempDir }), 0);
+    const text = stdout.join('');
+    assert.match(text, new RegExp(`^- linked-lane: Linked\\.\\n {4}opened 2026-04-20 \\(session 1\\); port 3100\\n {4}tasks: ${PLAN_TASK_PLAN}#PM2, ${PLAN_TASK_OTHER_PLAN}#PM2\\n`, 'm'));
+    assert.match(text, /^\* plain-lane: Plain\. \[current hint\]\n {4}opened 2026-04-20 \(session 2\); port 3101$/m);
+    assert.equal((text.match(/tasks:/g) ?? []).length, 1, 'an unlinked lane has no tasks line');
+
+    stdout.length = 0;
+    assert.equal(await runCli(['list-sessions', '--root', rootDir, '--json'], io, { cwd: tempDir }), 0);
+    const inventory = JSON.parse(stdout.join(''));
+    assert.deepEqual(inventory.lanes.map((lane) => [lane.id, lane.planTasks]), [
+      ['linked-lane', [{ plan: PLAN_TASK_PLAN, id: 'PM2' }, { plan: PLAN_TASK_OTHER_PLAN, id: 'PM2' }]],
+      ['plain-lane', []],
+    ]);
+
+    // The inventory continue-session prints when it won't guess carries the line too.
+    await assert.rejects(
+      continueProjectSession({ cwd: tempDir, rootDir, date: '2026-04-21' }),
+      (error) => {
+        assert.match(error.message, new RegExp(`^ {4}tasks: ${PLAN_TASK_PLAN}#PM2, ${PLAN_TASK_OTHER_PLAN}#PM2$`, 'm'));
+        return true;
+      },
+    );
+    stdout.length = 0;
+    assert.equal(await runCli(['continue-session', '--root', rootDir, 'plain-lane', '--json', '--date', '2026-04-21'], io, { cwd: tempDir }), 0);
+    const resumed = JSON.parse(stdout.join(''));
+    assert.deepEqual(resumed.planTasks, []);
+    assert.deepEqual(resumed.otherLanes[0].planTasks, [{ plan: PLAN_TASK_PLAN, id: 'PM2' }, { plan: PLAN_TASK_OTHER_PLAN, id: 'PM2' }]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('close-session writes ## Plan tasks after ## What we worked on, prints the tick reminder, and ticks nothing (D-395)', async () => {
+  const { tempDir, rootDir } = await createPlanTaskRoot('vibecompass-plan-task-close-');
+  const { stdout, io } = captureIo();
+  const closeArgs = (laneId, title) => ['close-session', '--root', rootDir, '--session', laneId, '--title', title, '--completed', 'Done.', '--next-step', 'Next.', ...CLI_DOCUMENT_MAINTENANCE_UPDATED];
+
+  try {
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'linked-lane', workingOn: 'Build PM2.', planTasks: [`${PLAN_TASK_PLAN}#PM2`], date: '2026-04-20' });
+    await continueProjectSession({ cwd: tempDir, rootDir, sessionId: 'linked-lane', planTasks: [`${PLAN_TASK_PLAN}#PM1`], date: '2026-04-20' });
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'plain-lane', workingOn: 'No links.', date: '2026-04-20' });
+    const planBefore = await readFile(path.join(rootDir, PLAN_TASK_PLAN), 'utf8');
+
+    assert.equal(await runCli(closeArgs('linked-lane', 'Linked Lane'), io, { cwd: tempDir }), 0);
+    const text = stdout.join('');
+    assert.match(text, new RegExp(`^Plan tasks \\(D-395\\): the note's ## Plan tasks lists the tasks this lane linked\\. close-session ticks nothing: tick each one in its plan once its work is merged and verified, or annotate it:\\n- ${PLAN_TASK_PLAN}#PM2\\n- ${PLAN_TASK_PLAN}#PM1\\n`, 'm'));
+    const note = await readFile(path.join(rootDir, 'sessions/2026-04-20-1-linked-lane.md'), 'utf8');
+    assert.match(note, new RegExp(`\\n## What we worked on\\nBuild PM2\\.\\n\\n## Plan tasks\\n- ${PLAN_TASK_PLAN}#PM2\\n- ${PLAN_TASK_PLAN}#PM1\\n\\n## Completed\\n`));
+    assert.equal(await readFile(path.join(rootDir, PLAN_TASK_PLAN), 'utf8'), planBefore, 'close-session ticks nothing');
+
+    stdout.length = 0;
+    assert.equal(await runCli(closeArgs('plain-lane', 'Plain Lane'), io, { cwd: tempDir }), 0);
+    assert.doesNotMatch(stdout.join(''), /Plan tasks/);
+    const plainNote = await readFile(path.join(rootDir, 'sessions/2026-04-20-2-plain-lane.md'), 'utf8');
+    assert.doesNotMatch(plainNote, /## Plan tasks/);
+    assert.match(plainNote, /\n## What we worked on\nNo links\.\n\n## Completed\n/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('help lists --plan-task for start-session and continue-session, and append-decision\'s --session (D-395)', async () => {
+  const { stdout, io } = captureIo();
+  assert.equal(await runCli(['--help'], io, {}), 0);
+  const help = stdout.join('');
+  assert.match(help, /vibecompass start-session --id <lane-id> --working-on <text> \[--role <builder\|project-manager>\] \[--plan-task "<plan-path>#<ID>"\.\.\.\]/);
+  assert.match(help, /vibecompass continue-session \[<lane-id>\] \[--session <lane-id>\] \[--working-on <text>\] \[--plan-task "<plan-path>#<ID>"\.\.\.\]/);
+  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable plan task the lane works on \(D-395\).*quote it, since # is a glob character in zsh$/m);
+  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable: link another plan task, validated as start-session does \(D-395\); links are only added, never removed$/m);
+  assert.match(help, /planTasks, a list of \{ plan, id \}, D-395/);
+  const decisionLog = help.slice(help.indexOf('Decision-log options'), help.indexOf('Refresh-decision-index options'));
+  assert.match(decisionLog, /^ {2}--session <lane-id> {18}append-decision: lane whose date\/session\/id labels the index group/m);
+});

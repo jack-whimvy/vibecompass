@@ -91,6 +91,37 @@
   `context.md`'s Workflow defaults name both review keys and their effective
   values. An existing root gets this text at its next
   `refresh-workflow --apply` (D-257).
+- Plan task links (D-395): `start-session --plan-task "<plan-path>#<ID>"`,
+  repeatable, links a lane to the plan tasks it works on. Before anything is
+  written, each reference is checked: the plan is a root-relative `.md` file
+  under `architecture/`, and the ID has D-393's shape (`[A-Z]{1,6}[0-9]{1,3}`)
+  and names a task line in that file's `## Next steps` (a top-level
+  `- [ ] <ID> — <scope>` or `- [x] <ID> — <scope>` item; bold labels, nested
+  subtasks, and fenced lines are not tasks). A failure names the problem, and
+  an unknown ID lists the plan's task IDs. A ticked task warns and the link is
+  kept; a repeated reference is stored once. Links are stored as `plan_tasks`
+  in `session.yaml`, a list of quoted refs, and the plan's path joins the
+  lane's `architecture_docs` when it is missing, so the brief and the overlap
+  warnings see it. Quote the reference: `#` is a glob character in zsh.
+- `continue-session --plan-task` adds links, validated the same way, and
+  nothing removes one. It updates `plan_tasks` and `architecture_docs` in
+  place and leaves every other field as it is. A lane without `plan_tasks`,
+  such as every lane opened before this release, has no links.
+- `list-sessions`, and the inventory `continue-session` prints when it won't
+  guess, show `    tasks: <ref>[, <ref>…]` under a linked lane; `--json` gives
+  every lane `planTasks`, a list of `{ plan, id }`, empty when there are none.
+  `start-session` and `continue-session` print the lane's links.
+- `close-session` writes a `## Plan tasks` section after `## What we worked on`,
+  one bullet per link, and prints a reminder to tick each linked task once it
+  is merged and verified, or to annotate it. It ticks nothing. Notes from
+  unlinked lanes are unchanged.
+- `context.md` and `workflows/project-manager.md`: a build prompt's
+  `start-session` line carries one quoted `--plan-task` per task, the builder's
+  start line names the flag, and the project manager compares the note's
+  `## Plan tasks` with the prompt and the session map. An existing root gets
+  this text at its next `refresh-workflow --apply` (D-257).
+- The help's decision-log options list `append-decision --session`, which the
+  command already accepted.
 
 ## 0.17.5 - 2026-10-18
 

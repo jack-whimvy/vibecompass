@@ -247,6 +247,13 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
       assert.ok(projectManagerWorkflow.includes(`\n${heading}\n`), `project-manager.md has ${heading}`);
     }
     assert.match(projectManagerWorkflow, /Every prompt has seven parts:\n1\. \*\*Start:\*\*[\s\S]*\n7\. \*\*Close-out:\*\*/);
+    // D-395: build prompts link lanes to tasks with a quoted --plan-task, and the note lists the links.
+    assert.match(projectManagerWorkflow, /1\. \*\*Start:\*\* `start session` and the exact `vibecompass start-session --root \.compass --id <lane-id> --working-on "<task IDs>" --plan-task "<plan-path>#<ID>" --architecture-doc <doc>` line, with one `--plan-task` per task and each reference quoted, since `#` is a glob character in zsh \(D-395\)/);
+    assert.match(projectManagerWorkflow, /The note's `## Plan tasks` section lists the tasks the lane linked with `--plan-task` \(D-395\); compare it with the prompt and the session map row\. Close ticks nothing/);
+    assert.match(projectManagerWorkflow, /Commands and stored records always use this form, as `start-session --plan-task` does \(D-395\)\./);
+    assert.match(context, /- A lane may link the plan tasks it works on \(D-395\): `start-session --plan-task "<plan-path>#<ID>"`, repeatable and quoted, since `#` is a glob character in zsh\./);
+    assert.match(context, /and `--plan-task "<plan-path>#<ID>"` for each plan task the lane works on \(D-395\)\./);
+    assert.match(context, /- Each build prompt's `start-session` line links the lane to its tasks with `--plan-task "<plan-path>#<ID>"`, one per task, with the reference quoted, since `#` is a glob character in zsh \(D-395\); `--working-on` stays free text\./);
     assert.match(projectManagerWorkflow, /`vibecompass start-session --root \.compass --id <lane-id> --working-on "\.\.\." --role project-manager`/);
     assert.match(projectManagerWorkflow, /`<ID>` matches `\[A-Z\]\{1,6\}\[0-9\]\{1,3\}`/);
     assert.match(projectManagerWorkflow, /\*\*Naming a task outside its plan:\*\* `<plan-path>#<ID>`/);

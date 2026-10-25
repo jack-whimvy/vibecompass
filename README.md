@@ -131,6 +131,7 @@ npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-f
 npx -y @vibecompass/vibecompass@latest list-sessions --root .compass            # --json for the machine-readable lane inventory
 npx -y @vibecompass/vibecompass@latest continue-session --root .compass         # resume the open lane (D-353); name it with 2+ lanes: continue-session auth-flow
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id plan-refresh --working-on "Refresh the plan" --role project-manager   # a project manager's own lane (D-392); --role defaults to builder
+npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "AUTH2" --plan-task "architecture/auth/auth-plan.md#AUTH2"   # link the lane to a plan task (D-395); quote it, # is a zsh glob character
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest review-check --root .compass --session auth-flow   # parse and check the lane's review log without closing (D-394); --json; exits 1 on a failed check
@@ -147,6 +148,16 @@ npx -y @vibecompass/vibecompass@latest close-session --root .compass --session a
 # takes no --role, list-sessions names a project-manager lane's role, and
 # list-sessions --json gives every lane's. A lane without the field is a builder lane.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
+
+# Plan task links (D-395): --plan-task "<plan-path>#<ID>" (repeatable) names a task
+# line in a plan's ## Next steps (`- [ ] <ID> — <scope>`, D-393). start-session
+# validates every link before it writes anything, stores them as plan_tasks in
+# session.yaml, and adds the plan to the lane's architecture_docs; a ticked task
+# warns and is kept. continue-session --plan-task adds links, and nothing removes
+# one. list-sessions prints a "tasks:" line under a linked lane (planTasks in
+# --json), and close-session writes the note's ## Plan tasks section and reminds
+# you to tick each task once it is merged and verified. It ticks nothing itself.
+npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --plan-task "architecture/auth/auth-plan.md#AUTH3"
 
 # Session brief in the lane (D-359, D-364), opt-in (D-368): with
 # project.yaml `brief: { enabled: true }`, start-session and continue-session
@@ -277,6 +288,9 @@ close reports, following the generated `workflows/project-manager.md`. It needs
 no lane for that, and changes project memory only in short lanes of its own,
 opened with `start-session --role project-manager`. A lane resumes in the role
 it was opened with, and `start session` never resumes a project-manager lane.
+Each build prompt links its lane to the plan's tasks with
+`start-session --plan-task "<plan-path>#<ID>"`, and the finalized note lists
+them under `## Plan tasks`.
 
 The npm package owns the file mechanics. Your AI session owns reading the
 workflow files, updating handoffs, and applying reviewed changes. Use
