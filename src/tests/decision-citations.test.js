@@ -11,15 +11,17 @@ import { runCli } from '../cli.js';
 // decisions by number. A number names a decision only in the root that
 // allocated it (D-276), so in another project it points at that project's own
 // log. Each citation lives in a code comment at the text instead (comments
-// aren't scanned here), and format examples that show the install's own
-// numbering, such as the `### D-001 — Example decision` headings, are allowed.
-const ALLOWED_EXAMPLES = new Set(['D-001']);
+// aren't scanned here). The one exception is a format example that shows the
+// install's own numbering: the `### D-001 — Example decision` heading in the
+// decisions README and its `… title` form in decisions/EXAMPLE.md. Any other
+// D-001, such as "follows D-001", is a citation like the rest.
+const EXAMPLE_HEADING = /^### D-001 — Example decision(?: title)?$/gm;
 const CITATION = /D-\d{3,}/g;
 const PACKAGE_DIR = fileURLToPath(new URL('../../', import.meta.url));
 const FIRST_UNNUMBERED_RELEASE = [0, 18, 0];
 
 function citationsIn(text) {
-  return (text.match(CITATION) ?? []).filter((id) => !ALLOWED_EXAMPLES.has(id));
+  return text.replace(EXAMPLE_HEADING, '').match(CITATION) ?? [];
 }
 
 function captureIo() {
@@ -44,17 +46,22 @@ const REGEX_AFTER_WORD = new Set([
  * The text of every string and template literal in a JavaScript source, with
  * its line: comments, regular expression literals, and code are skipped, and a
  * template's `${…}` expressions are read as code (nested templates included).
+ * `balanced` is false when the source ends inside a string, template, regex,
+ * comment, or `${…}`, which is how a misread token shows itself.
  */
-function stringLiterals(source) {
+function lexSource(source) {
   const literals = [];
   const braceDepths = [];
   let i = 0;
   let previous = null;
+  let balanced = true;
 
   const lineAt = (index) => source.slice(0, index).split('\n').length;
   const regexMayStart = () => {
     if (!previous) return true;
-    if (previous.kind === 'punct') return ![')', ']', '}'].includes(previous.value);
+    // A slash after `)`, `]`, `}`, or postfix `++`/`--` divides; a regex
+    // literal can't follow `++` or `--` in either position.
+    if (previous.kind === 'punct') return ![')', ']', '}', '++', '--'].includes(previous.value);
     if (previous.kind === 'word') return REGEX_AFTER_WORD.has(previous.value);
     return false;
   };
@@ -79,6 +86,7 @@ function stringLiterals(source) {
       }
     }
     literals.push({ text: source.slice(start), line: lineAt(start) });
+    balanced = false;
   };
 
   while (i < source.length) {
@@ -88,6 +96,7 @@ function stringLiterals(source) {
       while (i < source.length && source[i] !== '\n') i += 1;
     } else if (char === '/' && next === '*') {
       const end = source.indexOf('*/', i + 2);
+      if (end < 0) balanced = false;
       i = end < 0 ? source.length : end + 2;
     } else if (char === '#' && next === '!' && i === 0) {
       while (i < source.length && source[i] !== '\n') i += 1;
@@ -98,6 +107,7 @@ function stringLiterals(source) {
         i += source[i] === '\\' ? 2 : 1;
       }
       literals.push({ text: source.slice(start, i), line: lineAt(start) });
+      if (source[i] !== char) balanced = false;
       i += 1;
       previous = { kind: 'literal' };
     } else if (char === '`') {
@@ -112,6 +122,7 @@ function stringLiterals(source) {
         else if (source[i] === ']') inClass = false;
         i += 1;
       }
+      if (source[i] !== '/') balanced = false;
       i += 1;
       while (i < source.length && /[a-z]/i.test(source[i])) i += 1;
       previous = { kind: 'literal' };
@@ -138,16 +149,19 @@ function stringLiterals(source) {
     } else if (/[0-9]/.test(char)) {
       while (i < source.length && /[\w.]/.test(source[i])) i += 1;
       previous = { kind: 'number' };
+    } else if ((char === '+' || char === '-') && next === char) {
+      previous = { kind: 'punct', value: char + next };
+      i += 2;
     } else {
       previous = { kind: 'punct', value: char };
       i += 1;
     }
   }
-  return literals;
+  return { literals, balanced: balanced && braceDepths.length === 0 };
 }
 
 function citationsInSource(source) {
-  return stringLiterals(source).flatMap(({ text, line }) => citationsIn(text).map((id) => ({ id, line })));
+  return lexSource(source).literals.flatMap(({ text, line }) => citationsIn(text).map((id) => ({ id, line })));
 }
 
 async function listJsFiles(directory, recursive) {
@@ -195,6 +209,29 @@ test('the citation check catches a number planted in a string or template litera
     { id: 'D-395', line: 2 },
   ]);
   assert.deepEqual(citationsIn('Lane selection follows D-277.\n### D-001 — Example decision'), ['D-277']);
+});
+
+test('a slash after postfix ++ or -- is division, so the literals after it are still read', () => {
+  const source = [
+    'const up = `${used++ / total} D-277`; const later = \'then D-282\';',
+    'const down = `${left-- / total} D-353`; const after = "and D-392";',
+  ].join('\n');
+  assert.deepEqual(citationsInSource(source), [
+    { id: 'D-277', line: 1 },
+    { id: 'D-282', line: 1 },
+    { id: 'D-353', line: 2 },
+    { id: 'D-392', line: 2 },
+  ]);
+  assert.equal(lexSource(source).balanced, true);
+  assert.equal(lexSource('const open = `${count').balanced, false, 'a source that ends inside ${…} is unbalanced');
+});
+
+test('only the example decision headings may show D-001; any other D-001 is a citation', () => {
+  assert.deepEqual(citationsIn('### D-001 — Example decision\n**Timestamp:** YYYY-MM-DD HH:MM TZ'), []);
+  assert.deepEqual(citationsIn('```md\n### D-001 — Example decision title\n```'), []);
+  assert.deepEqual(citationsIn('Lane selection follows D-001.'), ['D-001']);
+  assert.deepEqual(citationsInSource("console.log('Follow D-001.');"), [{ id: 'D-001', line: 1 }]);
+  assert.deepEqual(citationsIn('See ### D-001 — Example decision for the format.'), ['D-001'], 'the heading counts only on its own line');
 });
 
 test('rendered installed text names no package decision number: context.md, the guides, the READMEs, and every managed block', async () => {
@@ -252,13 +289,41 @@ test('string literals in the shipped source name no package decision number', as
   const files = await shippedSourceFiles();
   assert.ok(files.includes('src/cli.js') && files.includes('src/workflows/registry.js') && files.includes('src/generators/agent-files/template.js'));
   const found = [];
+  const unbalanced = [];
   for (const file of files) {
     const source = await readFile(path.join(PACKAGE_DIR, file), 'utf8');
+    if (!lexSource(source).balanced) unbalanced.push(file);
     for (const { id, line } of citationsInSource(source)) found.push(`${file}:${line} ${id}`);
   }
+  assert.deepEqual(unbalanced, [], 'the lexer misread these files, so their literals were not checked');
   assert.deepEqual(found, [], 'move each citation into a code comment at its text and state the rule');
 });
 
+// README.md and CHANGELOG.md are Markdown, and a comment at their text would
+// ship the number to their readers, so the citations PKG1 removed from them
+// are kept here, each beside a quote of the text it was in (D-399 items 1, 4).
+// README.md, the session workflow block:
+// - "resume the open lane" D-353; "a project manager's own lane" D-392; "link
+//   the lane to a plan task" D-395; review-check "without closing" D-394.
+// - "Resuming:" D-353; "A lane keeps the role it was opened with" D-392.
+// - "Plan task links:" D-395; the task-line shape `- [ ] <ID> — <scope>` D-393.
+// - "Session brief in the lane" D-359, D-364; its "opt-in" D-368.
+// - "Optional git binding for a lane" D-281; "Per-lane runtime isolation"
+//   D-282; "from the lane context (structure-preserving" D-283.
+// README.md, prose:
+// - "Three session roles share a project" D-392; "does the builder's own
+//   checks" D-398.
+// - "## Review Record" D-394; "an experiment you turn on" D-368; "### Where the
+//   token lives" D-355; "the same advisory detector" D-292; "to offer
+//   `get_brief`" D-386.
+// CHANGELOG.md, ## Unreleased (the entries 0.18.0 releases):
+// - "Project manager role" D-392, D-393; the managed blocks' "at its next
+//   `refresh-workflow --apply`" D-257.
+// - "Review record and check" D-394.
+// - "Independent review" D-398; its "a worked example" D-394 and "at its next
+//   `refresh-workflow --apply`" D-257.
+// - "Plan task links" D-395 and "the task-ID shape" D-393; the build-prompt
+//   entry's "at its next `refresh-workflow --apply`" D-257.
 test('the README and CHANGELOG entries from 0.18.0 name no package decision number; older entries keep theirs under the note', async () => {
   const readme = await readFile(path.join(PACKAGE_DIR, 'README.md'), 'utf8');
   assert.deepEqual(citationsIn(readme), [], 'README.md names a package decision by number');

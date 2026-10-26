@@ -139,15 +139,16 @@ package's installed text, command output, and help do.
   theirs, such as `context.md` › Review log format and
   `workflows/project-manager.md` › Plan format. Numbers read from your own log
   stay: the managed block's latest decision, decision index messages, the
-  brief's units and excerpts, lineage output, and the `### D-001` examples.
-  Nothing else changes: no flag, file format, exit code, or check. Help,
+  brief's units and excerpts, and lineage output; so do the example decision
+  headings in the decisions README and `decisions/EXAMPLE.md`, which show your
+  own numbering. Nothing else changes: no flag, file format, exit code, or check. Help,
   command output, and the managed block change on upgrade (the block at the
   next lifecycle command); `context.md` and the generated guides change at the
   root's next `refresh-workflow --apply`; a `brief.md`, Current session block,
   or `state/promoted-root.json` a command wrote earlier changes when it is next
   written. A test fails when a decision number appears in rendered installed
   text, help, a string literal in the shipped source, the README, or a
-  CHANGELOG entry from 0.18.0 on, outside format examples such as `D-001`.
+  CHANGELOG entry from 0.18.0 on, outside the example decision headings.
 
 ## 0.17.5 - 2026-10-18
 
