@@ -36,7 +36,7 @@ export function resolveReviewSettings(rawReview) {
 
   if (!isPlainObject(rawReview)) {
     warnings.push(
-      `project.yaml metadata.workflow.review is not a mapping; using check ${DEFAULT_REVIEW_CHECK} and round_cap ${DEFAULT_ROUND_CAP} (D-394).`,
+      `project.yaml metadata.workflow.review is not a mapping; using check ${DEFAULT_REVIEW_CHECK} and round_cap ${DEFAULT_ROUND_CAP}.`, // D-394
     );
     return settings;
   }
@@ -44,7 +44,7 @@ export function resolveReviewSettings(rawReview) {
   for (const key of Object.keys(rawReview)) {
     if (!REVIEW_SETTING_KEYS.includes(key)) {
       warnings.push(
-        `project.yaml metadata.workflow.review has an unknown key "${key}", which is ignored; the keys are check and round_cap (D-394).`,
+        `project.yaml metadata.workflow.review has an unknown key "${key}", which is ignored; the keys are check and round_cap.`, // D-394
       );
     }
   }
@@ -55,7 +55,7 @@ export function resolveReviewSettings(rawReview) {
       settings.check = value;
     } else {
       warnings.push(
-        `project.yaml metadata.workflow.review.check is ${JSON.stringify(rawReview.check)}, not warn, block, or off; using ${DEFAULT_REVIEW_CHECK} (D-394).`,
+        `project.yaml metadata.workflow.review.check is ${JSON.stringify(rawReview.check)}, not warn, block, or off; using ${DEFAULT_REVIEW_CHECK}.`, // D-394
       );
     }
   }
@@ -66,7 +66,7 @@ export function resolveReviewSettings(rawReview) {
       settings.roundCap = value;
     } else {
       warnings.push(
-        `project.yaml metadata.workflow.review.round_cap is ${JSON.stringify(value)}, not a whole number from ${MIN_ROUND_CAP} to ${MAX_ROUND_CAP}; using ${DEFAULT_ROUND_CAP} (D-394).`,
+        `project.yaml metadata.workflow.review.round_cap is ${JSON.stringify(value)}, not a whole number from ${MIN_ROUND_CAP} to ${MAX_ROUND_CAP}; using ${DEFAULT_ROUND_CAP}.`, // D-394
       );
     }
   }
@@ -326,7 +326,7 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
       lineNumber: parsed.malformed.lineNumber,
       message: `the review log is malformed at wip.md line ${parsed.malformed.lineNumber} (${parsed.malformed.reason}): ${parsed.malformed.text}`,
       nextStep:
-        'the role that wrote a record-format line corrects it in place; a free-text or legacy log stays malformed, and only the owner can close past it with --review-override (D-394 items 5 and 12)',
+        'the role that wrote a record-format line corrects it in place; a free-text or legacy log stays malformed, and only the owner can close past it with --review-override', // D-394 items 5 and 12
     });
     return { status: 'failed', failures };
   }
@@ -335,7 +335,7 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
     failures.push({
       kind: 'no-pass',
       message: 'the review log has no pass line',
-      nextStep: `ask the owner to start a reviewer with \`review handoff ${laneRef}\`; a check the builder runs itself is not a pass (D-398)`,
+      nextStep: `ask the owner to start a reviewer with \`review handoff ${laneRef}\`; a check the builder runs itself is not a pass`, // D-398
     });
   }
 
@@ -353,7 +353,7 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
       nextStep: waitingOnBuilder
         ? 'answer it with a response line (`address review`)'
         : parsed.passCount >= allowedPasses
-          ? `the lane has used its ${allowedPasses} passes (cap ${roundCap}): stop and report; the owner chooses another round, defer ${finding.id}, or leave open (D-394 item 8)`
+          ? `the lane has used its ${allowedPasses} passes (cap ${roundCap}): stop and report; the owner chooses another round, defer ${finding.id}, or leave open` // D-394 item 8
           : `ask the owner for the reviewer's next pass (\`review handoff ${laneRef}\`)`,
     });
   }
@@ -365,7 +365,7 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
         kind: 'cap',
         lineNumber: pass.line.lineNumber,
         message: `pass ${pass.number} runs past the cap of ${roundCap} with ${pass.anotherRoundsBefore} owner "another round" line${pass.anotherRoundsBefore === 1 ? '' : 's'} before it; it needs ${needed}`,
-        nextStep: 'escalate to the owner, whose choice goes in an owner line; only the owner continues a lane past the cap (D-394 item 8)',
+        nextStep: 'escalate to the owner, whose choice goes in an owner line; only the owner continues a lane past the cap', // D-394 item 8
       });
     }
   }

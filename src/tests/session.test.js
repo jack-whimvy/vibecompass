@@ -334,7 +334,7 @@ test('closeProjectSession finalizes the session note and removes scratch files',
     assert.match(claude, /Working on: Session closed\. Ready for the next builder session\./);
     assert.match(claude, /Last thing completed: Closed session 1 and wrote `sessions\/2026-04-20-1-workflow-parity-commands\.md`\./);
     assert.ok(result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'));
-    assert.ok(result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).'));
+    assert.ok(result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close.'));
     assert.ok(result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'));
     assert.ok(result.workflowGuidance.includes('This workflow includes a Git publish step after close-session; review, commit, and push to origin.'));
     assert.ok(result.workflowGuidance.includes('Use commit message format: docs(session): YYYY-MM-DD-N — <summary>'));
@@ -402,7 +402,7 @@ test('closeProjectSession falls back to default workflow guidance when project.y
         result.workflowGuidance.includes('Refresh any relevant architecture docs before finalizing the session.'),
       );
       assert.ok(
-        result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).'),
+        result.workflowGuidance.includes('Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close.'),
       );
       assert.ok(
         result.workflowGuidance.includes('Refresh any relevant decision files before finalizing the session.'),
@@ -2350,7 +2350,7 @@ test('start-session refuses an unknown --role before any write (D-392)', async (
     for (const role of ['reviewer', 'Project-Manager', '']) {
       await assert.rejects(
         startProjectSession({ cwd: tempDir, rootDir, sessionId: 'lane-b', workingOn: 'Lane B.', role, date: '2026-04-20' }),
-        /Unknown lane role .*--role takes builder or project-manager \(default builder; D-392\)/,
+        /Unknown lane role .*--role takes builder or project-manager \(default builder\)/,
       );
     }
     await assert.rejects(() => access(path.join(rootDir, 'sessions/active/lane-b')));
@@ -2437,7 +2437,7 @@ test('continue-session prints the role it resumed and takes no --role (D-392)', 
     const sessionFilePath = path.join(rootDir, 'sessions/active/plan-refresh/session.yaml');
 
     assert.equal(await runCli(['continue-session', '--root', rootDir, '--date', '2026-04-21'], io, { cwd: tempDir }), 0);
-    assert.match(stdout.join(''), /^Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes' scratch alone \(D-392\)\.$/m);
+    assert.match(stdout.join(''), /^Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes' scratch alone\.$/m);
 
     stdout.length = 0;
     assert.equal(await runCli(['continue-session', '--root', rootDir, '--date', '2026-04-22', '--json'], io, { cwd: tempDir }), 0);
@@ -2445,7 +2445,7 @@ test('continue-session prints the role it resumed and takes no --role (D-392)', 
 
     await assert.rejects(
       runCli(['continue-session', '--root', rootDir, '--role', 'builder'], io, { cwd: tempDir }),
-      /continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it \(D-392\)/,
+      /continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it/,
     );
     const sessionYaml = await readFile(sessionFilePath, 'utf8');
     assert.match(sessionYaml, /^role: "project-manager"$/m);
@@ -2606,7 +2606,7 @@ test('start-session --plan-task on a ticked task warns and keeps the link (D-395
     assert.equal(await runCli(['start-session', '--root', rootDir, '--id', 'follow-up', '--working-on', 'Follow up PM1.', '--plan-task', `${PLAN_TASK_PLAN}#PM1`, '--date', '2026-04-20'], io, { cwd: tempDir }), 0);
     const text = stdout.join('');
     assert.match(text, new RegExp(`^Plan tasks: ${PLAN_TASK_PLAN}#PM1$`, 'm'));
-    assert.match(stderr.join(''), new RegExp(`^Warning: --plan-task "${PLAN_TASK_PLAN}#PM1" names a ticked task: PM1 is marked done in ${PLAN_TASK_PLAN}\\. The link is kept, since a follow-up lane on a done task is fine \\(D-395\\)\\.$`, 'm'));
+    assert.match(stderr.join(''), new RegExp(`^Warning: --plan-task "${PLAN_TASK_PLAN}#PM1" names a ticked task: PM1 is marked done in ${PLAN_TASK_PLAN}\\. The link is kept, since a follow-up lane on a done task is fine\\.$`, 'm'));
     assert.match(await readFile(path.join(rootDir, 'sessions/active/follow-up/session.yaml'), 'utf8'), new RegExp(`^plan_tasks:\\n  - "${PLAN_TASK_PLAN}#PM1"$`, 'm'));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -2624,7 +2624,7 @@ test('start-session refuses a bad --plan-task before any write and names the pro
 
     const refusals = [
       ['an unknown path', 'architecture/platform/missing.md#PM2', /architecture\/platform\/missing\.md doesn't exist in the project-memory root/],
-      ['a path outside architecture/', 'decisions/plan.md#PM2', /decisions\/plan\.md is outside architecture\/\. A plan is an architecture doc \(D-393, D-395\)/],
+      ['a path outside architecture/', 'decisions/plan.md#PM2', /decisions\/plan\.md is outside architecture\/\. A plan is an architecture doc/],
       ['an unknown ID', `${PLAN_TASK_PLAN}#PM7`, /has no task line for PM7 under ## Next steps\. Its task IDs: PM1, PM2, PM3\./],
       ['a nested subtask', `${PLAN_TASK_PLAN}#PM9`, /has no task line for PM9 under ## Next steps/],
       ['an ID with a bad shape', `${PLAN_TASK_PLAN}#pm2`, /"pm2" isn't a task ID\. An ID is 1–6 capital letters, then 1–3 digits/],
@@ -2798,7 +2798,7 @@ test('close-session writes ## Plan tasks after ## What we worked on, prints the 
 
     assert.equal(await runCli(closeArgs('linked-lane', 'Linked Lane'), io, { cwd: tempDir }), 0);
     const text = stdout.join('');
-    assert.match(text, new RegExp(`^Plan tasks \\(D-395\\): the note's ## Plan tasks lists the tasks this lane linked\\. close-session ticks nothing: tick each one in its plan once its work is merged and verified, or annotate it:\\n- ${PLAN_TASK_PLAN}#PM2\\n- ${PLAN_TASK_PLAN}#PM1\\n`, 'm'));
+    assert.match(text, new RegExp(`^Plan tasks: the note's ## Plan tasks lists the tasks this lane linked\\. close-session ticks nothing: tick each one in its plan once its work is merged and verified, or annotate it:\\n- ${PLAN_TASK_PLAN}#PM2\\n- ${PLAN_TASK_PLAN}#PM1\\n`, 'm'));
     const note = await readFile(path.join(rootDir, 'sessions/2026-04-20-1-linked-lane.md'), 'utf8');
     assert.match(note, new RegExp(`\\n## What we worked on\\nBuild PM2\\.\\n\\n## Plan tasks\\n- ${PLAN_TASK_PLAN}#PM2\\n- ${PLAN_TASK_PLAN}#PM1\\n\\n## Completed\\n`));
     assert.equal(await readFile(path.join(rootDir, PLAN_TASK_PLAN), 'utf8'), planBefore, 'close-session ticks nothing');
@@ -2820,9 +2820,9 @@ test('help lists --plan-task for start-session and continue-session, and append-
   const help = stdout.join('');
   assert.match(help, /vibecompass start-session --id <lane-id> --working-on <text> \[--role <builder\|project-manager>\] \[--plan-task "<plan-path>#<ID>"\.\.\.\]/);
   assert.match(help, /vibecompass continue-session \[<lane-id>\] \[--session <lane-id>\] \[--working-on <text>\] \[--plan-task "<plan-path>#<ID>"\.\.\.\]/);
-  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable plan task the lane works on \(D-395\).*quote it, since # is a glob character in zsh$/m);
-  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable: link another plan task, validated as start-session does \(D-395\); links are only added, never removed$/m);
-  assert.match(help, /planTasks, a list of \{ plan, id \}, D-395/);
+  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable plan task the lane works on.*quote it, since # is a glob character in zsh$/m);
+  assert.match(help, /^ {2}--plan-task "<plan-path>#<ID>" {7}Repeatable: link another plan task, validated as start-session does; links are only added, never removed$/m);
+  assert.match(help, /every lane carries its role and planTasks, a list of \{ plan, id \}\)/);
   const decisionLog = help.slice(help.indexOf('Decision-log options'), help.indexOf('Refresh-decision-index options'));
   assert.match(decisionLog, /^ {2}--session <lane-id> {18}append-decision: lane whose date\/session\/id labels the index group/m);
 });

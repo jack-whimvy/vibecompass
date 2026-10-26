@@ -293,7 +293,7 @@ export async function adoptRemoteHead(options = {}, environment = {}) {
   const conflicts = Array.isArray(response.conflicts) ? response.conflicts : [];
   if ((proposals.length > 0 || conflicts.length > 0) && options.acceptDivergence !== true) {
     throw new Error(
-      `Refusing to adopt the hosted head: ${proposals.length} pending proposal${proposals.length === 1 ? '' : 's'} and ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'} exist for this project (D-215: inspect divergence before choosing a baseline). Review with vibecompass pull-preview, then re-run sync-adopt --accept-divergence to adopt anyway.`,
+      `Refusing to adopt the hosted head: ${proposals.length} pending proposal${proposals.length === 1 ? '' : 's'} and ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'} exist for this project (inspect divergence before choosing a baseline). Review with vibecompass pull-preview, then re-run sync-adopt --accept-divergence to adopt anyway.`, // D-215
     );
   }
 

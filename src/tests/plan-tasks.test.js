@@ -123,13 +123,13 @@ test('resolvePlanTaskRefs validates against the root: the file, its ## Next step
 
     const duplicate = await resolvePlanTaskRefs({ rootDir, refs: ['architecture/plans/dup.md#PM1'] });
     assert.equal(duplicate.tasks[0].ticked, false, 'the first task line wins');
-    assert.match(duplicate.warnings[0], /has 2 task lines for PM1 \(lines 2, 3\); an ID is unique within its plan \(D-393\)/);
+    assert.match(duplicate.warnings[0], /has 2 task lines for PM1 \(lines 2, 3\); an ID is unique within its plan/);
 
     const refusals = [
       ['architecture/plans/missing.md#PM1', /architecture\/plans\/missing\.md doesn't exist in the project-memory root/],
       ['architecture/plans/plan.md/x.md#PM1', /doesn't exist in the project-memory root/],
       ['architecture/plans/folder.md#PM1', /architecture\/plans\/folder\.md is not a file/],
-      ['architecture/plans/prose.md#PM1', /architecture\/plans\/prose\.md has no ## Next steps section, so it holds no task lines \(D-393\)/],
+      ['architecture/plans/prose.md#PM1', /architecture\/plans\/prose\.md has no ## Next steps section, so it holds no task lines/],
       ['architecture/plans/plan.md#PM9', /has no task line for PM9 under ## Next steps\. Its task IDs: PM1, PM2, DOC12, ABCDEF123\./],
       ['architecture/plans/plan.md#PM7', /has no task line for PM7 under ## Next steps/],
       ['architecture/plans/linked.md#PM1', /architecture\/plans\/linked\.md resolves outside the root's architecture\//],

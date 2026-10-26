@@ -1,8 +1,13 @@
 # Changelog
 
+Entries before 0.18.0 cite decisions by number. Those decisions are in the
+VibeCompass project's own decision log, which is private, not in your
+project's log. From 0.18.0 on, entries state each rule without a number, as the
+package's installed text, command output, and help do.
+
 ## Unreleased
 
-- Project manager role (D-392, D-393): a third session role beside builder
+- Project manager role: a third session role beside builder
   and reviewer, entered with the prompt command
   `join as project manager <plan-path>`. The trigger opens and selects no lane;
   the agent reads `context.md`'s session startup steps 1–3, then the new
@@ -38,9 +43,9 @@
   `start session`, `continue session`, `review handoff`, and `close session`
   summaries updated for roles, and two Hard Rules lines, the builder's re-read
   and the reviewer's write boundary. An existing root gets all of this at its
-  next `refresh-workflow --apply` (D-257); until then its agents follow the
+  next `refresh-workflow --apply`; until then its agents follow the
   context they have.
-- Review record and check (D-394): a lane's `wip.md` › `## Review log` holds
+- Review record and check: a lane's `wip.md` › `## Review log` holds
   line records, `- pass <n> | <time> | <reviewer> | <scope> | <outcome>`,
   `- response <n> | <time> | <builder>`, and
   `- owner | <time> | <owner> | <choice> | <reason>`, with finding lines
@@ -74,13 +79,13 @@
   and check on an open lane without closing it or writing anything: each
   finding's state, the passes against the cap, the owner lines, and the
   result; it exits 0 when the check passes and 1 when it fails.
-- Independent review (D-398): a pass counts only when a reviewer the owner
+- Independent review: a pass counts only when a reviewer the owner
   started runs it, pointed at the lane with `review handoff <lane-id>`. An
   agent the builder launched or directed (a subagent, a second model, a review
   tool run on its own work) does the builder's own checks, recorded in
   `## Log`, never as pass lines. The check can't verify who started a run, so
   the rule is in the text each role reads: `context.md` gains a Review log
-  format section (the grammar, D-394's worked example, who counts as a
+  format section (the grammar, a worked example, who counts as a
   reviewer, and the check), and its builder, reviewer, and project manager
   workflows carry the rule; the builder runs `review-check` before
   `close-session`, and the close-out text no longer says the note drops the
@@ -90,11 +95,11 @@
   `review handoff` and `address review` summaries name the record lines.
   `context.md`'s Workflow defaults name both review keys and their effective
   values. An existing root gets this text at its next
-  `refresh-workflow --apply` (D-257).
-- Plan task links (D-395): `start-session --plan-task "<plan-path>#<ID>"`,
+  `refresh-workflow --apply`.
+- Plan task links: `start-session --plan-task "<plan-path>#<ID>"`,
   repeatable, links a lane to the plan tasks it works on. Before anything is
   written, each reference is checked: the plan is a root-relative `.md` file
-  under `architecture/`, and the ID has D-393's shape (`[A-Z]{1,6}[0-9]{1,3}`)
+  under `architecture/`, and the ID has the task-ID shape (`[A-Z]{1,6}[0-9]{1,3}`)
   and names a task line in that file's `## Next steps` (a top-level
   `- [ ] <ID> — <scope>` or `- [x] <ID> — <scope>` item; bold labels, nested
   subtasks, and fenced lines are not tasks). A failure names the problem, and
@@ -119,9 +124,30 @@
   `start-session` line carries one quoted `--plan-task` per task, the builder's
   start line names the flag, and the project manager compares the note's
   `## Plan tasks` with the prompt and the session map. An existing root gets
-  this text at its next `refresh-workflow --apply` (D-257).
+  this text at its next `refresh-workflow --apply`.
 - The help's decision-log options list `append-decision --session`, which the
   command already accepted.
+- Decision numbers: the text the package installs or prints names none of the
+  package's own decisions by number. Those numbers belong to the VibeCompass
+  project's private decision log, so in any other project they pointed at that
+  project's own decisions. `context.md`, the generated guides
+  (`workflows/project-manager.md`, `workflows/docs-review.md`, and the
+  `architecture/`, `decisions/`, and `sessions/` READMEs), the managed agent
+  blocks, command output (including the `brief.md` header, the Current session
+  block's next step, and `state/promoted-root.json`'s note), help, and the
+  README state each rule where its number was, and section headings drop
+  theirs, such as `context.md` › Review log format and
+  `workflows/project-manager.md` › Plan format. Numbers read from your own log
+  stay: the managed block's latest decision, decision index messages, the
+  brief's units and excerpts, lineage output, and the `### D-001` examples.
+  Nothing else changes: no flag, file format, exit code, or check. Help,
+  command output, and the managed block change on upgrade (the block at the
+  next lifecycle command); `context.md` and the generated guides change at the
+  root's next `refresh-workflow --apply`; a `brief.md`, Current session block,
+  or `state/promoted-root.json` a command wrote earlier changes when it is next
+  written. A test fails when a decision number appears in rendered installed
+  text, help, a string literal in the shipped source, the README, or a
+  CHANGELOG entry from 0.18.0 on, outside format examples such as `D-001`.
 
 ## 0.17.5 - 2026-10-18
 

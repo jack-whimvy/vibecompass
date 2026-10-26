@@ -129,28 +129,28 @@ npx -y @vibecompass/vibecompass@latest status --root .compass
 # Session workflow
 npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "Auth flow"
 npx -y @vibecompass/vibecompass@latest list-sessions --root .compass            # --json for the machine-readable lane inventory
-npx -y @vibecompass/vibecompass@latest continue-session --root .compass         # resume the open lane (D-353); name it with 2+ lanes: continue-session auth-flow
-npx -y @vibecompass/vibecompass@latest start-session --root .compass --id plan-refresh --working-on "Refresh the plan" --role project-manager   # a project manager's own lane (D-392); --role defaults to builder
-npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "AUTH2" --plan-task "architecture/auth/auth-plan.md#AUTH2"   # link the lane to a plan task (D-395); quote it, # is a zsh glob character
+npx -y @vibecompass/vibecompass@latest continue-session --root .compass         # resume the open lane; name it with 2+ lanes: continue-session auth-flow
+npx -y @vibecompass/vibecompass@latest start-session --root .compass --id plan-refresh --working-on "Refresh the plan" --role project-manager   # a project manager's own lane; --role defaults to builder
+npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-flow --working-on "AUTH2" --plan-task "architecture/auth/auth-plan.md#AUTH2"   # link the lane to a plan task; quote it, # is a zsh glob character
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
-npx -y @vibecompass/vibecompass@latest review-check --root .compass --session auth-flow   # parse and check the lane's review log without closing (D-394); --json; exits 1 on a failed check
+npx -y @vibecompass/vibecompass@latest review-check --root .compass --session auth-flow   # parse and check the lane's review log without closing; --json; exits 1 on a failed check
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
 
-# Resuming (D-353): an active lane is an open session, not a crash. continue-session
+# Resuming: an active lane is an open session, not a crash. continue-session
 # keeps the lane's opening date and session number, records resumed_at/resume_count
 # in session.yaml, appends a dated "Resumed" line to wip.md, moves the index current
 # hint and the Current session block to the lane, and prints the files to read next
 # plus resume-staleness warnings. With two or more active lanes and no worktree
 # marker it fails closed and prints the lane inventory instead of guessing;
 # start-session --id <existing-lane> fails closed and points at continue-session.
-# A lane keeps the role it was opened with (D-392): continue-session prints it and
+# A lane keeps the role it was opened with: continue-session prints it and
 # takes no --role, list-sessions names a project-manager lane's role, and
 # list-sessions --json gives every lane's. A lane without the field is a builder lane.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --working-on "Auth flow, phase 2"
 
-# Plan task links (D-395): --plan-task "<plan-path>#<ID>" (repeatable) names a task
-# line in a plan's ## Next steps (`- [ ] <ID> — <scope>`, D-393). start-session
+# Plan task links: --plan-task "<plan-path>#<ID>" (repeatable) names a task
+# line in a plan's ## Next steps (`- [ ] <ID> — <scope>`). start-session
 # validates every link before it writes anything, stores them as plan_tasks in
 # session.yaml, and adds the plan to the lane's architecture_docs; a ticked task
 # warns and is kept. continue-session --plan-task adds links, and nothing removes
@@ -159,7 +159,7 @@ npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compas
 # you to tick each task once it is merged and verified. It ticks nothing itself.
 npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compass --plan-task "architecture/auth/auth-plan.md#AUTH3"
 
-# Session brief in the lane (D-359, D-364), opt-in (D-368): with
+# Session brief in the lane, opt-in: with
 # project.yaml `brief: { enabled: true }`, start-session and continue-session
 # write sessions/active/<lane-id>/brief.md — the memory the lane's task should
 # start from, with a YAML header binding the inputs it read. continue-session
@@ -170,7 +170,7 @@ npx -y @vibecompass/vibecompass@latest continue-session auth-flow --root .compas
 npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --write   # write or regenerate it
 npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --check   # current or stale, and why
 
-# Optional git binding for a lane (D-281): create/reuse a branch in each bound
+# Optional git binding for a lane: create/reuse a branch in each bound
 # repo; --worktree provisions per-repo worktrees under
 # <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
 # container, so commands run from inside a worktree need no --root/--session.
@@ -194,7 +194,7 @@ npx -y @vibecompass/vibecompass@latest start-session \
   --branch feature/auth \
   --worktree
 
-# Per-lane runtime isolation (D-282): every lane gets its own port and temp
+# Per-lane runtime isolation: every lane gets its own port and temp
 # dir at start (recorded in the lane's session.yaml; defaults configurable
 # under project.yaml runtime: port_base/port_step/tmp_base). Export them into
 # a shell — includes conventional PORT/TMPDIR aliases so unmodified dev
@@ -208,7 +208,7 @@ npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 
 # Decision log maintenance: append-decision allocates the D-number at write
 # time and refreshes the grouped decisions/INDEX.md when it can label the
-# group from the lane context (D-283, structure-preserving — hand-authored
+# group from the lane context (structure-preserving — hand-authored
 # session group headings are preserved verbatim; unparseable structure fails
 # closed). refresh-decision-index --check validates the index against the
 # canonical decision files without writing.
@@ -274,7 +274,7 @@ After setup, use these phrases inside your AI coding tool:
 - `close session` / `end session`
 - `docs review`
 
-Three session roles share a project (D-392). The builder (`start session`,
+Three session roles share a project. The builder (`start session`,
 `continue session`) works in a lane. Before it runs or hands over a release,
 merge, publish, or push command, and before it asks the owner to decide, it
 re-reads the notes finalized since its lane opened and other open lanes'
@@ -282,7 +282,7 @@ scratch files. The reviewer (`join as reviewer`, `review handoff`) evaluates the
 work, and a pass writes only the lane's `wip.md` › `## Review log` and
 `handoff.md` › `## Reviewer → Builder`. A pass counts only when a reviewer the
 owner started runs it; an agent the builder launches or directs does the
-builder's own checks (D-398). The project manager (`join as project
+builder's own checks. The project manager (`join as project
 manager <plan-path>`) plans tasks, writes each build lane's prompt, and checks
 close reports, following the generated `workflows/project-manager.md`. It needs
 no lane for that, and changes project memory only in short lanes of its own,
@@ -298,7 +298,7 @@ workflow files, updating handoffs, and applying reviewed changes. Use
 `docs update` / `vibecompass docs-update` for ordinary session-delta
 maintenance tied to the current lane.
 
-## Review Record (D-394)
+## Review Record
 
 Passes, responses, and the owner's choices are line records in the lane's
 `wip.md` › `## Review log`; `context.md` › Review log format has the grammar
@@ -349,7 +349,7 @@ reads that share the task's other words. If decision lineage cannot be read
 from a file, the brief shows no decisions or docs: it is `incomplete` and lists
 that file, the overview, and the decision index to read first.
 
-The brief in a session lane is an experiment you turn on (D-368):
+The brief in a session lane is an experiment you turn on:
 
 ```yaml
 # .compass/project.yaml
@@ -416,7 +416,7 @@ hosted dashboard could not build from your files, such as a file whose decision
 links could not be read. The push itself succeeded; the note names the file so
 you can check it.
 
-### Where the token lives (D-355)
+### Where the token lives
 
 Hosted commands look for the token in this order:
 
@@ -487,7 +487,7 @@ local VibeCompass project-memory root.
 
 `detectChangelogShapedLines(body)` takes architecture-doc body text (frontmatter
 already stripped) and returns the changelog-shaped lines it matched — the same
-D-292 advisory detector the scanner and `docs-review --apply-output` use, shared
+advisory detector the scanner and `docs-review --apply-output` use, shared
 so external validators (for example the hosted proposal parser) stay in parity.
 `ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES` is the byte-valued soft size budget
 (12000) both docs-review apply warnings and the docs-update size advisory read.
@@ -523,7 +523,7 @@ true only when `brief.enabled` is the boolean `true`, and any entry in
 `problems` (an unreadable `project.yaml`, an unknown field, a malformed
 `exclude`) means the brief fails closed and reads no canonical document.
 `repos` is the root's `repos:` list. The MCP server reads it to decide whether
-to offer `get_brief` (D-386).
+to offer `get_brief`.
 
 ## More Documentation
 

@@ -356,7 +356,7 @@ test('preflightGitBinding enforces the D-266 memory-fork guard in both direction
         existingLanes: [],
         containerDir: path.join(repoDir, 'worktrees', 'lane-a'),
       }),
-      /would fork shared memory \(D-266\)/,
+      /would fork shared memory/,
     );
 
     // Inverse: a repo work tree inside the memory root.
@@ -374,7 +374,7 @@ test('preflightGitBinding enforces the D-266 memory-fork guard in both direction
         existingLanes: [],
         containerDir: path.join(tempDir, 'root', 'worktrees', 'lane-a'),
       }),
-      /code never lives in package memory \(D-278\)/,
+      /code never lives in package memory/,
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -668,7 +668,7 @@ test('write-lane-marker refuses to rebind a lane with a provisioned worktree con
     await mkdir(elsewhere, { recursive: true });
     await assert.rejects(
       writeLaneMarkerForSession({ cwd: tempDir, sessionId: 'lane-a', dir: elsewhere }),
-      /provisioned worktree container .*orphan the worktree-removal guard \(D-281\)/s,
+      /provisioned worktree container .*orphan the worktree-removal guard/s,
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -766,7 +766,7 @@ test('close-session CLI renders the worktree cleanup summary (D-281 S3-3)', asyn
     assert.ok(output.includes(`- app: removed ${worktreePath}`));
     assert.match(output, /- lane marker removed \(token-matched\)/);
     assert.match(output, /- container removed \(empty\)/);
-    assert.match(output, /- branch "feat" left in place \(close-session never deletes branches; D-281\)/);
+    assert.match(output, /- branch "feat" left in place \(close-session never deletes branches\)/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -799,7 +799,7 @@ test('close-session keeps dirty worktrees, the marker, and the container, with g
     assert.equal(existsSync(markerPath), true, 'marker kept while a recorded worktree survives');
     assert.equal(existsSync(container), true);
     assert.ok(result.warnings.some((warning) => /uncommitted changes/.test(warning) && warning.includes(`git -C ${appDir} worktree remove ${worktreePath}`)));
-    assert.ok(result.warnings.some((warning) => /kept as a breadcrumb \(D-281\)/.test(warning)));
+    assert.ok(result.warnings.some((warning) => /kept as a breadcrumb/.test(warning)));
     assert.equal(existsSync(path.join(rootDir, 'sessions/active/lane-a')), false, 'lane scratch is still finalized');
     assert.deepEqual((await listProjectSessions({ rootDir })).lanes, []);
   } finally {
@@ -1870,7 +1870,7 @@ test('close-session CLI renders surviving worktree entries and the kept marker (
     assert.equal(exitCode, 0);
     const output = stdout.join('');
     assert.ok(output.includes(`- app: kept ${worktreePath} (uncommitted changes)`));
-    assert.match(output, /- lane marker kept while worktrees survive \(D-281\)/);
+    assert.match(output, /- lane marker kept while worktrees survive/);
     assert.match(output, /- branch "feat" left in place/);
     assert.doesNotMatch(output, /container removed/);
   } finally {

@@ -179,14 +179,14 @@ export async function preflightGitBinding(options) {
     if (enclosingGitDir) {
       throw new Error(
         `Cannot provision worktrees: the inferred workspace ${options.workspaceDir} sits inside the git work tree at ${enclosingGitDir}. ` +
-          'The <workspace>/worktrees container must live outside every repository (D-279/D-281). Run without --worktree, or pass --root pointing at a shared memory root whose parent is not a repository.',
+          'The <workspace>/worktrees container must live outside every repository. Run without --worktree, or pass --root pointing at a shared memory root whose parent is not a repository.', // D-279, D-281
       );
     }
 
     await assertMarkerTargetDisjoint(options.containerDir, options.rootDir);
     if (await pathExists(options.containerDir)) {
       throw new Error(
-        `Cannot provision worktrees: ${options.containerDir} already exists. Remove it or close the lane that owns it first (D-279: provisioning never adopts existing paths).`,
+        `Cannot provision worktrees: ${options.containerDir} already exists. Remove it or close the lane that owns it first (provisioning never adopts existing paths).`, // D-279
       );
     }
   }
@@ -224,14 +224,14 @@ export async function preflightGitBinding(options) {
     const realTop = await canonicalizePathReal(sourceDir);
     if (isPathEqualOrInsideReal(realRoot, realTop)) {
       throw new Error(
-        `Cannot git-bind repo "${repoId}": the project-memory root ${options.rootDir} sits inside its work tree at ${sourceDir}, so a per-lane worktree would fork shared memory (D-266). ` +
+        `Cannot git-bind repo "${repoId}": the project-memory root ${options.rootDir} sits inside its work tree at ${sourceDir}, so a per-lane worktree would fork shared memory. ` + // D-266
           'Run without --branch/--worktree, or pass --root pointing at this project\'s initialized shared memory root outside the repository. ' +
           '(An untracked .compass inside the repository is refused conservatively as well.)',
       );
     }
     if (isPathEqualOrInsideReal(realTop, realRoot)) {
       throw new Error(
-        `Cannot git-bind repo "${repoId}": its work tree ${sourceDir} sits inside the project-memory root ${options.rootDir} — code never lives in package memory (D-278).`,
+        `Cannot git-bind repo "${repoId}": its work tree ${sourceDir} sits inside the project-memory root ${options.rootDir} — code never lives in package memory.`, // D-278
       );
     }
 
@@ -294,7 +294,7 @@ export async function preflightGitBinding(options) {
     }
 
     warnings.push(
-      `Active lane "${lane.id}" binds branch "${lane.branch}" in shared repo(s) ${sharedRepos.join(', ')}; diverging branches on the same repo reconcile through normal git merge (D-266).`,
+      `Active lane "${lane.id}" binds branch "${lane.branch}" in shared repo(s) ${sharedRepos.join(', ')}; diverging branches on the same repo reconcile through normal git merge.`, // D-266
     );
   }
 
@@ -443,7 +443,7 @@ export async function removeLaneWorktreesAtClose(options) {
     // resolve it against the source repo, so the validated path and the
     // removed path could differ (D-279: arbitrary path removal is refused).
     if (!path.isAbsolute(worktreePath)) {
-      keep({ repoId, worktreePath }, 'not-absolute', 'its recorded path is not absolute, so the guards and the removal command could resolve to different locations (D-279: arbitrary path removal is refused).');
+      keep({ repoId, worktreePath }, 'not-absolute', 'its recorded path is not absolute, so the guards and the removal command could resolve to different locations (arbitrary path removal is refused).'); // D-279
       continue;
     }
     if (await pathExists(worktreePath)) {
@@ -461,7 +461,7 @@ export async function removeLaneWorktreesAtClose(options) {
   const containerGuardFailure = await describeContainerGuardFailure(options);
   if (containerGuardFailure) {
     for (const entry of existingEntries) {
-      keep(entry, 'container-unverified', `${containerGuardFailure} (D-280/D-281: only marker-verified container contents are removable).`);
+      keep(entry, 'container-unverified', `${containerGuardFailure} (only marker-verified container contents are removable).`); // D-280, D-281
     }
     return { attempted: true, removed, surviving, warnings };
   }
@@ -471,21 +471,21 @@ export async function removeLaneWorktreesAtClose(options) {
   for (const entry of existingEntries) {
     const realWorktree = await canonicalizePathReal(entry.worktreePath);
     if (realWorktree === realContainer || !isPathEqualOrInsideReal(realWorktree, realContainer)) {
-      keep(entry, 'outside-container', `its recorded path sits outside the lane's worktree container ${options.worktreeContainer} (D-279: arbitrary path removal is refused).`);
+      keep(entry, 'outside-container', `its recorded path sits outside the lane's worktree container ${options.worktreeContainer} (arbitrary path removal is refused).`); // D-279
       continue;
     }
     if (isPathEqualOrInsideReal(realCwd, realWorktree)) {
-      keep(entry, 'cwd-inside', 'the current working directory is inside it (D-281). cd out of the worktree first.');
+      keep(entry, 'cwd-inside', 'the current working directory is inside it. cd out of the worktree first.'); // D-281
       continue;
     }
 
     const cleanliness = await readWorktreeCleanliness(entry.worktreePath);
     if (cleanliness === 'dirty') {
-      keep(entry, 'dirty', 'it has uncommitted changes and close-session never forces removal (D-281). Commit or discard them first.');
+      keep(entry, 'dirty', 'it has uncommitted changes and close-session never forces removal. Commit or discard them first.'); // D-281
       continue;
     }
     if (cleanliness === 'unknown') {
-      keep(entry, 'status-unknown', 'its cleanliness could not be determined — a status failure counts as unknown, not clean (D-281). Inspect it first.');
+      keep(entry, 'status-unknown', 'its cleanliness could not be determined — a status failure counts as unknown, not clean. Inspect it first.'); // D-281
       continue;
     }
 

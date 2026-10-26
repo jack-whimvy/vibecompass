@@ -228,7 +228,7 @@ test('with lineage unavailable the brief abstains: incomplete, no units, the fai
 
   const result = await withPhases(failingEntryParse, () => buildSessionBrief({ rootDir, task: TASK }));
   assert.equal(result.status, 'incomplete');
-  assert.match(result.retrieval_error, /decision lineage is unavailable \(D-371\)/);
+  assert.match(result.retrieval_error, /decision lineage is unavailable/);
   assert.match(result.retrieval_error, /decisions\/platform\.md/);
   assert.deepEqual(result.units, []);
   assert.deepEqual(

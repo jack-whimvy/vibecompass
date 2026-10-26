@@ -62,7 +62,7 @@ test('start-session fails closed end-to-end in a primary-repo layout (D-266)', a
         repos: ['primary'],
         branch: 'd266-probe',
       }),
-      /would fork shared memory \(D-266\)/,
+      /would fork shared memory/,
     );
 
     // Worktree mode hits the placement guard first (the workspace itself sits

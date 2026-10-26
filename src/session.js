@@ -174,7 +174,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
   // before any preflight so the root stays untouched.
   if (existingLanes.some((lane) => lane.id === sessionId)) {
     throw new Error(
-      `Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work (D-353).`,
+      `Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work.`, // D-353
     );
   }
   // D-395: every --plan-task is validated before the first write, and each
@@ -298,14 +298,14 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
   // parent namespace dirs left behind by a failure are benign).
   await mkdir(laneRuntime.tmpDir, { recursive: true }).catch((error) => {
     throw new Error(
-      `Could not create the lane temp directory ${laneRuntime.tmpDir}: ${error instanceof Error ? error.message : String(error)} (D-282). Configure project.yaml runtime.tmp_base if the default namespace is not writable.`,
+      `Could not create the lane temp directory ${laneRuntime.tmpDir}: ${error instanceof Error ? error.message : String(error)}. Configure project.yaml runtime.tmp_base if the default namespace is not writable.`, // D-282
     );
   });
 
   await mkdir(normalized.activeSessionsDir, { recursive: true });
   await mkdir(lanePaths.laneDir, { recursive: false }).catch((error) => {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST') {
-      throw new Error(`Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work (D-353).`);
+      throw new Error(`Active session lane "${sessionId}" already exists. Resume it with \`vibecompass continue-session ${sessionId}\`, or choose a different --id for new work.`); // D-353
     }
 
     throw error;
@@ -516,7 +516,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     throw new Error(
       `close-session is blocked: duplicate decision IDs detected — ${duplicateDecisionIds
         .map((duplicate) => `${formatDecisionId(duplicate.id)} (${duplicate.occurrences.join(', ')})`)
-        .join('; ')}. Repair the canonical decision files by hand before closing (D-276); duplicates are never auto-renumbered.`,
+        .join('; ')}. Repair the canonical decision files by hand before closing; duplicates are never auto-renumbered.`, // D-276
     );
   }
 
@@ -535,7 +535,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
   // stale marker (D-281).
   if (closingLaneMetadata && closingLaneMetadata.warnings.length > 0) {
     throw new Error(
-      `Lane "${sessionId}"'s session.yaml could not be parsed (${closingLaneMetadata.warnings[0]}); refusing to close — a null-degraded parse would hide recorded worktrees and closing would destroy the removal-guard records while the worktrees survive (D-281). Repair the lane metadata first, then rerun close-session.`,
+      `Lane "${sessionId}"'s session.yaml could not be parsed (${closingLaneMetadata.warnings[0]}); refusing to close — a null-degraded parse would hide recorded worktrees and closing would destroy the removal-guard records while the worktrees survive. Repair the lane metadata first, then rerun close-session.`, // D-281
     );
   }
   const documentMaintenance = normalizeDocumentMaintenanceCheckpoint(options?.documentMaintenance);
@@ -649,7 +649,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       if (closingLaneMetadata?.laneMarker?.path && (await fileExists(closingLaneMetadata.laneMarker.path))) {
         markerKept = true;
         markerCleanupWarnings.push(
-          `Lane "${sessionId}" closed with ${removal.surviving.length} surviving worktree(s); the container marker at ${closingLaneMetadata.laneMarker.path} was kept as a breadcrumb (D-281). After removing the worktrees, delete the marker and the container directory manually.`,
+          `Lane "${sessionId}" closed with ${removal.surviving.length} surviving worktree(s); the container marker at ${closingLaneMetadata.laneMarker.path} was kept as a breadcrumb. After removing the worktrees, delete the marker and the container directory manually.`, // D-281
         );
       }
     } else {
@@ -734,7 +734,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
             blockers: blockers.length > 0 ? summarizeList(blockers) : 'No blocker remains.',
             nextSessionShould:
               normalizeOptionalString(options?.nextSessionShould) ??
-              'Pick the next lane explicitly (D-277: no implicit current-lane fallback while multiple lanes are active).',
+              'Pick the next lane explicitly (no implicit current-lane fallback while multiple lanes are active).', // D-277
           }
         : {
             date: `${activeSession.sessionDate} (session ${activeSession.sessionNumber})`,
@@ -787,7 +787,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       ...laneSelection.warnings,
       ...review.settings.warnings,
       ...(review.status === 'failed' && !reviewOverride
-        ? review.failures.map((failure) => `Review check failed (warn; D-394): ${formatReviewFailure(failure)}`)
+        ? review.failures.map((failure) => `Review check failed (warn): ${formatReviewFailure(failure)}`) // D-394
         : []),
       ...markerCleanupWarnings,
       // A:192 (D-281): the pre-close staleness set computed by docs-update is
@@ -822,7 +822,7 @@ async function removeEmptyWorktreeContainer(containerDir, cwd) {
     return {
       removed: false,
       warnings: [
-        `Worktree container ${containerDir} was left in place: the current working directory is inside it (D-281). cd out of the container, then delete it manually.`,
+        `Worktree container ${containerDir} was left in place: the current working directory is inside it. cd out of the container, then delete it manually.`, // D-281
       ],
     };
   }
@@ -838,7 +838,7 @@ async function removeEmptyWorktreeContainer(containerDir, cwd) {
     return {
       removed: false,
       warnings: [
-        `Worktree container ${containerDir} was left in place: it is not empty (close-session only removes an empty container; D-281). Inspect and delete it manually.`,
+        `Worktree container ${containerDir} was left in place: it is not empty (close-session only removes an empty container). Inspect and delete it manually.`, // D-281
       ],
     };
   }
@@ -923,7 +923,7 @@ export async function readLaneEnvironment(options = {}) {
   });
 
   if (!selection.sessionId) {
-    throw new Error('No active session lane exists. Run `vibecompass start-session` first (D-282: runtime assignments are per-lane).');
+    throw new Error('No active session lane exists. Run `vibecompass start-session` first (runtime assignments are per-lane).'); // D-282
   }
 
   const lane = lanes.find((item) => item.id === selection.sessionId);
@@ -935,7 +935,7 @@ export async function readLaneEnvironment(options = {}) {
 
   if (!lane.runtime || !Number.isInteger(lane.runtime.port) || !lane.runtime.tmpDir) {
     throw new Error(
-      `Lane "${selection.sessionId}" has no recorded runtime assignment (lanes started before D-282 have none). Close and re-open the lane to assign one.`,
+      `Lane "${selection.sessionId}" has no recorded runtime assignment (lanes started before per-lane runtime assignments existed have none). Close and re-open the lane to assign one.`, // D-282
     );
   }
 
@@ -1136,7 +1136,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
 
   if (lanes.length === 0) {
     throw new Error(
-      'No active session lane exists to continue. Open one with `vibecompass start-session --id <lane-id> --working-on "..."` (D-353).',
+      'No active session lane exists to continue. Open one with `vibecompass start-session --id <lane-id> --working-on "..."`.', // D-353
     );
   }
 
@@ -1144,7 +1144,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
   if (!explicitId && !markerContext.marker && lanes.length > 1) {
     throw new Error(
       [
-        `Multiple active session lanes exist; continue-session will not guess which one to resume (D-277/D-353).`,
+        `Multiple active session lanes exist; continue-session will not guess which one to resume.`, // D-277, D-353
         ...renderLaneInventoryLines(inventory),
         'Choose explicitly: `vibecompass continue-session <lane-id>`, or run the command from a directory bound to the intended lane (worktree lane marker).',
         'The `current` pointer above is a continuity hint, not a selection.',
@@ -1459,7 +1459,7 @@ function buildResumeAlternativeWarnings(existingLanes, currentHint = null) {
   const inventoryLines = renderLaneInventoryLines(buildLaneInventory(existingLanes, currentHint)).map((line) => `  ${line}`);
   return [
     [
-      `${ids.length} lane${ids.length === 1 ? ' is' : 's are'} already active (${ids.join(', ')}). Opening a second lane is fine for new work; to resume existing work instead, run \`vibecompass continue-session <lane-id>\` (D-353).`,
+      `${ids.length} lane${ids.length === 1 ? ' is' : 's are'} already active (${ids.join(', ')}). Opening a second lane is fine for new work; to resume existing work instead, run \`vibecompass continue-session <lane-id>\`.`, // D-353
       ...inventoryLines,
     ].join('\n'),
   ];
@@ -1687,7 +1687,7 @@ export async function rebuildActiveSessionIndex(options = {}) {
 
     if (!current) {
       throw new Error(
-        'rebuild-active-index needs an explicit --current <lane-id> because more than one lane is active and the existing pointer is not valid (D-277: the current lane is an explicit selection, not a derived default).',
+        'rebuild-active-index needs an explicit --current <lane-id> because more than one lane is active and the existing pointer is not valid (the current lane is an explicit selection, not a derived default).', // D-277
       );
     }
 
@@ -1749,7 +1749,7 @@ async function writeLaneMarkerForSessionLocked(normalized, options, markerContex
   const targetStat = await stat(targetDir).catch(() => null);
   if (!targetStat) {
     throw new Error(
-      `write-lane-marker target directory ${targetDir} does not exist. Create it first; markers are never provisioned implicitly (D-280).`,
+      `write-lane-marker target directory ${targetDir} does not exist. Create it first; markers are never provisioned implicitly.`, // D-280
     );
   }
   if (!targetStat.isDirectory()) {
@@ -1760,7 +1760,7 @@ async function writeLaneMarkerForSessionLocked(normalized, options, markerContex
   const gitDir = await findEnclosingGitDir(targetDir);
   if (gitDir) {
     warnings.push(
-      `Marker target ${targetDir} sits inside a git work tree (${gitDir}); lane markers are local-only (D-278) — make sure ${LANE_MARKER_FILENAME} is git-ignored there.`,
+      `Marker target ${targetDir} sits inside a git work tree (${gitDir}); lane markers are local-only — make sure ${LANE_MARKER_FILENAME} is git-ignored there.`, // D-278
     );
   }
 
@@ -1782,7 +1782,7 @@ async function writeLaneMarkerForSessionLocked(normalized, options, markerContex
   // removal guard (D-281).
   if (laneMetadata.warnings.length > 0) {
     throw new Error(
-      `Lane "${sessionId}"'s session.yaml could not be parsed (${laneMetadata.warnings[0]}); refusing to rebind its marker — a provisioned worktree container would be undetectable (D-281). Repair the lane metadata first.`,
+      `Lane "${sessionId}"'s session.yaml could not be parsed (${laneMetadata.warnings[0]}); refusing to rebind its marker — a provisioned worktree container would be undetectable. Repair the lane metadata first.`, // D-281
     );
   }
   // D-281: a provisioned lane's container marker is what authorizes guarded
@@ -1790,7 +1790,7 @@ async function writeLaneMarkerForSessionLocked(normalized, options, markerContex
   // the worktrees permanently.
   if (laneMetadata.worktreeContainer) {
     throw new Error(
-      `Lane "${sessionId}" has a provisioned worktree container at ${laneMetadata.worktreeContainer}; its marker is managed by start/close-session and rebinding it would orphan the worktree-removal guard (D-281). Close the lane to remove the worktrees instead.`,
+      `Lane "${sessionId}" has a provisioned worktree container at ${laneMetadata.worktreeContainer}; its marker is managed by start/close-session and rebinding it would orphan the worktree-removal guard. Close the lane to remove the worktrees instead.`, // D-281
     );
   }
   if (laneMetadata.laneMarker?.path && path.resolve(laneMetadata.laneMarker.path) !== markerPath) {
@@ -1853,7 +1853,7 @@ async function removeRecordedLaneMarker(recorded) {
     }
 
     warnings.push(
-      `Lane marker at ${recorded.path} left in place: its token does not match the lane's recorded marker (D-280: only token-matched markers are removed).`,
+      `Lane marker at ${recorded.path} left in place: its token does not match the lane's recorded marker (only token-matched markers are removed).`, // D-280
     );
   } catch (error) {
     warnings.push(
@@ -2736,7 +2736,7 @@ function normalizeReviewOverride(value) {
 
   const reason = normalizeOptionalString(value);
   if (!reason) {
-    throw new Error('--review-override needs the owner\'s reason, in the owner\'s words (D-394 item 8).');
+    throw new Error('--review-override needs the owner\'s reason, in the owner\'s words.'); // D-394 item 8
   }
 
   return reason;
@@ -2745,7 +2745,7 @@ function normalizeReviewOverride(value) {
 function renderReviewBlockRefusal(review, sessionId) {
   const laneRef = sessionId ?? '<lane-id>';
   return [
-    `close-session refused: the review check failed and project.yaml sets metadata.workflow.review.check to block (D-394). Nothing was written or deleted.`,
+    `close-session refused: the review check failed and project.yaml sets metadata.workflow.review.check to block. Nothing was written or deleted.`, // D-394
     ...review.failures.map((failure) => `- ${formatReviewFailure(failure)}`),
     `Run \`vibecompass review-check --session ${laneRef}\` to see the record. Only the owner closes past a failed check: --review-override "<the owner's reason>".`,
   ].join('\n');
@@ -3069,7 +3069,7 @@ function normalizeStartSessionRole(value) {
   const role = typeof value === 'string' ? value.trim() : '';
   if (!LANE_ROLES.includes(role)) {
     throw new Error(
-      `Unknown lane role ${JSON.stringify(typeof value === 'string' ? value : String(value))}. --role takes ${LANE_ROLES.join(' or ')} (default ${DEFAULT_LANE_ROLE}; D-392).`,
+      `Unknown lane role ${JSON.stringify(typeof value === 'string' ? value : String(value))}. --role takes ${LANE_ROLES.join(' or ')} (default ${DEFAULT_LANE_ROLE}).`, // D-392
     );
   }
 

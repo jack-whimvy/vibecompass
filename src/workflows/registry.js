@@ -7,15 +7,15 @@ export const WORKFLOW_REGISTRY = [
     detailPath: 'context.md',
     summary: 'Builder/reviewer/project-manager lane lifecycle, handoffs, planning mode, and close-out.',
     promptCommands: [
-      { trigger: 'start session', summary: 'builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane (D-392)' },
-      { trigger: 'continue session', summary: 'resumes an already-open lane with `vibecompass continue-session [<lane-id>]` (D-353), in the role the lane records: builder, or project manager for a lane opened with `--role project-manager` (D-392); with multiple active lanes name the lane explicitly: `continue session <lane-id>` — the agent presents the lane inventory and asks rather than guessing' },
+      { trigger: 'start session', summary: 'builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane' }, // D-392
+      { trigger: 'continue session', summary: 'resumes an already-open lane with `vibecompass continue-session [<lane-id>]`, in the role the lane records: builder, or project manager for a lane opened with `--role project-manager`; with multiple active lanes name the lane explicitly: `continue session <lane-id>` — the agent presents the lane inventory and asks rather than guessing' }, // D-353, D-392
       { trigger: 'join as reviewer', summary: 'reviewer role trigger' },
       // The trigger is a session-lifecycle entry (D-392); the generated guide
       // it points to belongs to the project-manager entry below.
-      { trigger: 'join as project manager', summary: 'project manager role trigger (D-392), with the plan to run: `join as project manager <plan-path>`; opens and selects no lane, reads the session startup steps 1–3, then the project manager workflow, then the plan, and with no plan named asks which plan to run or offers to write one', detailPath: 'workflows/project-manager.md' },
+      { trigger: 'join as project manager', summary: 'project manager role trigger, with the plan to run: `join as project manager <plan-path>`; opens and selects no lane, reads the session startup steps 1–3, then the project manager workflow, then the plan, and with no plan named asks which plan to run or offers to write one', detailPath: 'workflows/project-manager.md' }, // D-392
       { trigger: 'planning mode', summary: 'optional prompt-level mode for scoping work before implementation' },
-      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and records the pass as record lines in `wip.md` › `## Review log` (D-394) and a summary in `handoff.md` › `## Reviewer → Builder`, the only two sections a pass writes (D-392); with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' },
-      { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files and answers each pass with a response line in `wip.md` › `## Review log` (D-394)' },
+      { trigger: 'review handoff', summary: 'reviewer reads the selected lane handoff and records the pass as record lines in `wip.md` › `## Review log` and a summary in `handoff.md` › `## Reviewer → Builder`, the only two sections a pass writes; with multiple active lanes name the lane explicitly: `review handoff <lane-id>`' }, // D-394, D-392
+      { trigger: 'address review', summary: 'builder critically resolves reviewer feedback from the selected lane scratch files and answers each pass with a response line in `wip.md` › `## Review log`' }, // D-394
       { trigger: 'docs update', summary: 'builder runs a targeted session-delta documentation maintenance plan with `vibecompass docs-update --session <lane-id>`' },
       { trigger: 'close session', summary: 'builder runs the close-out checklist and ends with `vibecompass close-session --session <lane-id>` plus required document-maintenance checkpoint statuses; `end session` and `vibecompass end-session` are accepted aliases; a project manager closes its own lanes the same way' },
     ],
@@ -24,7 +24,7 @@ export const WORKFLOW_REGISTRY = [
     id: 'project-manager',
     title: 'Project manager',
     detailPath: 'workflows/project-manager.md',
-    summary: 'Plan tasks, write build prompts, check close reports, and decide when to move on (D-392, D-393).',
+    summary: 'Plan tasks, write build prompts, check close reports, and decide when to move on.', // D-392, D-393
     // Entered through the session-lifecycle trigger above; this entry owns
     // only the generated guide.
     promptCommands: [],
@@ -98,6 +98,7 @@ export function renderPromptCommandLines(options = {}) {
   });
 }
 
+// Steps, item 6 (current-state docs): D-292, D-293.
 function renderDocsReviewWorkflow(options = {}) {
   const rootRelativePath = options.rootRelativePath ?? '.';
   const projectYamlPath = joinRootRelative(rootRelativePath, 'project.yaml');
@@ -137,7 +138,7 @@ The first pass is breadth-first: establish an honest project denominator, compac
 3. Run \`vibecompass docs-review --guided --llm <tool-name> --model <model-name>\` to record the review marker and print the canonical docs-review contract. Use the current AI tool name and model when known.
 4. Present the evidence inventory, completeness inventory with accepted/deferred/missing accounting, topology, chosen taxonomy axis, prior-doc reuse/update/split/merge/defer/replace classifications, coverage plan, backbone outputs (core feature inventory, user journey map, project systems map, coverage/quality summary), proposed architecture docs, blindspots, token-budget risks, quality report, and any decision candidates before generating accepted output. At this gate, ask whether to apply the compact baseline now, adjust the plan, or spend a follow-up pass deepening specific high-risk areas. If you stop here for user approval, state clearly that no architecture docs have been applied yet and do not label proposed areas as accepted.
 5. Draft only output the user accepts. After approval, the accepted plan must be fenced as \`vibecompass-coverage-plan version=1\` and should preserve each area's \`run_scope\` as \`baseline\` or \`deepening\`. Accepted architecture docs must be fenced as \`vibecompass-architecture-doc path=architecture/domain/feature/component.md\` blocks and must include required frontmatter: \`domain\`, \`feature\`, \`component\`, and \`status\`. Feature docs may include compact prose-only surface matrices; surface/platform ownership docs stay under the existing \`architecture/platform/<surface>/<component>.md\` shape rather than a new top-level systems tree. The accepted \`architecture/overview/project-shape.md\` doc should include compact backbone sections and exactly one \`vibecompass-project-map version=1\` JSON block with journey-facing features, entry points, evidence-backed relationships, and minimal optional derived \`systems[]\` metadata. Accepted local decisions may be fenced as \`vibecompass-decision-recommendation target=decisions/domain.md\` blocks without D-numbers.
-6. Keep each generated architecture doc focused and retrieval-oriented. Soft budget: under 12000 bytes per doc unless the extra detail is necessary and called out in review metadata or retrieval guidance. Write every doc as a current-state contract (D-292): updates rewrite the affected sections in place or create a new focused doc — never append dated session/audit sections. Keep the durable plan and rollout state in the doc; work/ship chronology belongs in session notes, and decision entries record accepted choices (D-293).
+6. Keep each generated architecture doc focused and retrieval-oriented. Soft budget: under 12000 bytes per doc unless the extra detail is necessary and called out in review metadata or retrieval guidance. Write every doc as a current-state contract: updates rewrite the affected sections in place or create a new focused doc — never append dated session/audit sections. Keep the durable plan and rollout state in the doc; work/ship chronology belongs in session notes, and decision entries record accepted choices.
 7. Write the accepted fenced blocks verbatim to \`${outputPath}\`.
 8. Run \`${applyCommand}\` to validate and apply the accepted blocks. If \`vibecompass\` is not installed on PATH, run \`${npxApplyCommand}\` instead. Only report docs-review as applied after this command succeeds. If accepted docs were written manually outside the output file, run \`vibecompass docs-review --root ${rootRelativePath} --complete\` after confirming the marker should be completed.
 9. Run \`vibecompass status\` to confirm the docs-review marker is complete and not drifted. Report the applied architecture paths, coverage projection, baseline/deepening split, decision recommendations, parser warnings such as oversized docs or missing review metadata, and any blindspots or deepening candidates documented in the accepted docs-review output.
@@ -158,6 +159,14 @@ If the user explicitly wants to rerun docs-review for a focused architecture-doc
 // The generic role (D-392) and plan format (D-393). Project-specific practice
 // (who the owner is, which tools build and review, owner-only steps) belongs
 // in the project's own docs, never here.
+// The decisions behind each section's rules:
+// - Prompt trigger: the role D-392.
+// - Build prompts: quoting --plan-task D-395.
+// - The review rule: who counts as a reviewer D-398; the record lines D-394.
+// - Checking a close report: the note's Plan tasks D-395; the note's Review
+//   D-394, D-398.
+// - Plan format: D-393; naming a task outside its plan D-395.
+// - Operating rules: reviewed recommendations D-398.
 function renderProjectManagerWorkflow(options = {}) {
   const rootRelativePath = options.rootRelativePath ?? '.';
   const contextPath = joinRootRelative(rootRelativePath, 'context.md');
@@ -173,7 +182,7 @@ Generated by VibeCompass. This file is a package-owned workflow guide and may be
 
 ## Prompt trigger
 
-When the user says \`join as project manager <plan-path>\`, take the project manager role for that plan (D-392). The trigger opens no lane and selects none. Read \`${contextPath}\` › Session startup steps 1–3 (\`project.yaml\`, the latest finalized session note, and the lane inventory), then this file, then the plan. A plan path is relative to the project-memory root, such as \`architecture/<domain>/<feature>/<plan>.md\`. With no plan named, ask which plan to run, or offer to write one (Starting without a plan).
+When the user says \`join as project manager <plan-path>\`, take the project manager role for that plan. The trigger opens no lane and selects none. Read \`${contextPath}\` › Session startup steps 1–3 (\`project.yaml\`, the latest finalized session note, and the lane inventory), then this file, then the plan. A plan path is relative to the project-memory root, such as \`architecture/<domain>/<feature>/<plan>.md\`. With no plan named, ask which plan to run, or offer to write one (Starting without a plan).
 
 ## The role
 
@@ -208,7 +217,7 @@ The project manager never edits another lane's scratch files and never writes in
 ## Build prompts
 
 The project manager writes each build lane's prompt, and the owner gives it to a builder. Every prompt has seven parts:
-1. **Start:** \`start session\` and the exact \`vibecompass start-session${rootFlag} --id <lane-id> --working-on "<task IDs>" --plan-task "<plan-path>#<ID>" --architecture-doc <doc>\` line, with one \`--plan-task\` per task and each reference quoted, since \`#\` is a glob character in zsh (D-395), plus \`--branch <name> --repo <id> --worktree\` for code in Git repositories (binding is opt-in; lanes work without Git). The command refuses a reference that names no task line in the plan, so a mistyped ID is caught while the prompt is at hand. On a root that opts into briefs, read \`brief.md\` as a starting point.
+1. **Start:** \`start session\` and the exact \`vibecompass start-session${rootFlag} --id <lane-id> --working-on "<task IDs>" --plan-task "<plan-path>#<ID>" --architecture-doc <doc>\` line, with one \`--plan-task\` per task and each reference quoted, since \`#\` is a glob character in zsh, plus \`--branch <name> --repo <id> --worktree\` for code in Git repositories (binding is opt-in; lanes work without Git). The command refuses a reference that names no task line in the plan, so a mistyped ID is caught while the prompt is at hand. On a root that opts into briefs, read \`brief.md\` as a starting point.
 2. **Parallel-lane rules:** an explicit \`--session <lane-id>\` on lane commands while other lanes are open; stage only the lane's own files; the shared files or lines another open lane owns; timestamps from \`date\`; any files the lane must never open.
 3. **Context:** the plan lines, docs, decisions, notes, and code the lane needs, with paths.
 4. **Scope:** the task IDs, what is out of scope, and an exit point if the lane runs long.
@@ -219,19 +228,19 @@ The project manager writes each build lane's prompt, and the owner gives it to a
 ## The review rule
 
 A build lane closes only after:
-- **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\` (D-398). An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
+- **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
 - **Findings drive more passes.** After \`address review\`, the reviewer's next pass checks each response. The loop ends at a pass that leaves no finding open: each one fixed and confirmed, rejected with evidence the reviewer accepts, or deferred with a scoped reason.
 - **A cap on rounds,** where a round is one reviewer pass and the builder's response. The cap is \`metadata.workflow.review.round_cap\`, 3 by default; \`${contextPath}\` › Workflow defaults gives this project's value. If findings are still open after the last round the cap allows, the builder stops and reports, and the project manager escalates to the owner, who chooses: another round, a scoped deferral whose reason the session note carries, or leaving the lane open. Each pass past the cap needs one more owner \`another round\` line before it. A cap never marks a finding resolved.
 
-Passes, responses, and owner choices are record lines in \`wip.md\` › \`## Review log\` (${contextPath} › Review log format, D-394). \`close-session\` checks the record before it writes and puts the outcome in the finalized note's \`## Review\` section: the \`Check:\` line, the passes and their reviewers, one line per finding, and each owner line. Each deferred finding and its reason join the note's next steps. \`vibecompass review-check${rootFlag} --session <lane-id>\` runs the same check on an open lane. Work the owner accepts without an independent pass closes with \`--review-override "<the owner's reason>"\`, which the note's \`Check:\` line shows; it is not a pass.
+Passes, responses, and owner choices are record lines in \`wip.md\` › \`## Review log\` (${contextPath} › Review log format). \`close-session\` checks the record before it writes and puts the outcome in the finalized note's \`## Review\` section: the \`Check:\` line, the passes and their reviewers, one line per finding, and each owner line. Each deferred finding and its reason join the note's next steps. \`vibecompass review-check${rootFlag} --session <lane-id>\` runs the same check on an open lane. Work the owner accepts without an independent pass closes with \`--review-override "<the owner's reason>"\`, which the note's \`Check:\` line shows; it is not a pass.
 
 ## Checking a close report
 
 Check each claim against its primary source before accepting it: \`vibecompass list-sessions${rootFlag}\` (the lane closed), the finalized note and its review summary, git heads and tags, the pull request, the registry version and checksum, and the live page. For a lane still open, read its latest \`wip.md\` log lines too, since a handoff can lag the work. A claim that doesn't hold goes back to the lane while it is open, or to the owner once it has closed.
 
-The note's \`## Plan tasks\` section lists the tasks the lane linked with \`--plan-task\` (D-395); compare it with the prompt and the session map row. Close ticks nothing, so check that each linked task is ticked only once its work is merged and verified, and annotated otherwise.
+The note's \`## Plan tasks\` section lists the tasks the lane linked with \`--plan-task\`; compare it with the prompt and the session map row. Close ticks nothing, so check that each linked task is ticked only once its work is merged and verified, and annotated otherwise.
 
-Read the note's \`## Review\` section against the review rule (D-394, D-398). Its \`Check:\` line says whether the record passed, failed, or was overridden, and why. Compare each reviewer on its \`Passes:\` line with the reviewer the build prompt named and any reviewer the owner has named to you since. A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer. It goes to the owner when nothing does, or when the record shows the builder launched or directed the run, whatever the pass line names. The builder's own account doesn't establish who started a reviewer.
+Read the note's \`## Review\` section against the review rule. Its \`Check:\` line says whether the record passed, failed, or was overridden, and why. Compare each reviewer on its \`Passes:\` line with the reviewer the build prompt named and any reviewer the owner has named to you since. A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer. It goes to the owner when nothing does, or when the record shows the builder launched or directed the run, whatever the pass line names. The builder's own account doesn't establish who started a reviewer.
 
 ## When to move on
 
@@ -243,14 +252,14 @@ Move the plan to the next task when:
 
 Otherwise write a follow-up prompt for the same task, or escalate to the owner.
 
-## Plan format (D-393)
+## Plan format
 
 - **Where plans live.** A plan is an architecture doc under \`${architecturePath}\`, beside the feature it plans. Nothing else marks it: a doc is a plan when its \`## Next steps\` holds task lines. A finished plan moves to \`archive/\` once its open items live in another doc.
 - **Task lines.** A task is a top-level item under \`## Next steps\`: \`- [ ] <ID> — <scope>\`, ticked \`- [x] <ID> — <scope>\` once done. \`<ID>\` matches \`[A-Z]{1,6}[0-9]{1,3}\`: capital letters for the track, then a number, such as \`PM3\` or \`DOC2\`, with no dot, hyphen, space, or lowercase letter. An ID is unique within its plan and never reused there, even after its task is removed. Bold group labels may separate tracks; subtasks are nested bullets or checkboxes without IDs. The scope says whether the task is reviewed. A ticked task keeps one dated done line naming its lane or note.
 - **Order, owner decisions, assumption changes, and costs.** The plan's \`## Details\` give the order of the tasks, the decisions each step needs from the owner (a table once decided), every assumption change called out explicitly, and the costs.
 - **Session map.** A \`### Session map\` table under the plan's \`## Details\`, with the columns Session, Lane, Tasks, Note, and Outcome and evidence. Add a row only after checking it against primary sources. When the map outgrows the plan, move it to a companion doc named in the plan's Retrieval guidance.
 - **Owner actions.** A labeled group in the plan's \`## Next steps\` holding the owner's current actions and the standing steps each release needs, including steps no repository prompts, such as a client configuration that sits outside every repository. An owner step that is planned work gets a task line with an ID; the rest are plain bullets.
-- **Naming a task outside its plan:** \`<plan-path>#<ID>\`, with the plan's memory-root-relative path, such as \`architecture/<domain>/<feature>/<plan>.md#PM3\`. Commands and stored records always use this form, as \`start-session --plan-task\` does (D-395). Prose may shorten it to the file name and the ID while that file name is unique under \`architecture/\`. Inside its own plan a task is cited bare. There is no root-wide ID registry.
+- **Naming a task outside its plan:** \`<plan-path>#<ID>\`, with the plan's memory-root-relative path, such as \`architecture/<domain>/<feature>/<plan>.md#PM3\`. Commands and stored records always use this form, as \`start-session --plan-task\` does. Prose may shorten it to the file name and the ID while that file name is unique under \`architecture/\`. Inside its own plan a task is cited bare. There is no root-wide ID registry.
 - **Moving a task** to another plan keeps its ID unless the destination already uses it, and its line names the origin: \`(moved from <old-plan-path>#<ID>)\`.
 - **IDs already written bare** elsewhere are never rewritten. In its own plan, a bare ID is that plan's task. Elsewhere, look outward from the occurrence and stop at the first step that names any plan: a plan named in the same sentence or list item; then the plans the note or decision names; then, for a note, the plan whose session map lists it, and for a decision, the plans named by the note that lists it under \`## Decisions made\`. If exactly one plan at that step has a task line for the ID, the ID is that task. If none or several do, it is ambiguous, and the reader says so instead of guessing; a later step never overrides or repairs an earlier one. An ID presented as a review finding is a finding, not a task. No command resolves a bare ID.
 
@@ -268,7 +277,7 @@ When the project has no plan yet, no architecture doc whose \`## Next steps\` ho
 - **In Git, stage only your own files,** or your own hunks in a shared doc such as the plan. Never \`git add -A\`, stash, or \`--autostash\` while other lanes are open; if the remote moved, merge rather than rebase.
 - **Check before editing or reporting.** Two project-manager sessions can run at once. Before an edit, a status report, or a question to the owner, run \`vibecompass list-sessions${rootFlag}\` and \`git status\`, and read the notes finalized since your last look and open lanes' latest scratch files. Build lanes report only their own status.
 - **Check interpretive claims against the code,** not only a doc's tables or summary, in close reports and in your own docs.
-- **Send consequential recommendations through a reviewed lane** before the owner decides (a plan, a reorder, a protocol change): one that meets the review rule, with passes by reviewers the owner started (D-398). Flag every assumption change explicitly.
+- **Send consequential recommendations through a reviewed lane** before the owner decides (a plan, a reorder, a protocol change): one that meets the review rule, with passes by reviewers the owner started. Flag every assumption change explicitly.
 - **Take timestamps from \`date\`.**
 
 ## Publication

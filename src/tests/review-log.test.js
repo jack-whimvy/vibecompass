@@ -214,7 +214,7 @@ test('no pass: warn closes, records the failure, and names the next step', async
   const note = await readFile(result.sessionFilePath, 'utf8');
   assert.match(note, /## Models used\n- Not recorded\.\n\n## Review\n- Check: failed \(warn\): the review log has no pass line\n- Passes: 0 against a cap of 3\n\n## Document maintenance checkpoint/);
   assert.equal(result.review.outcome, 'failed');
-  assert.ok(result.warnings.some((warning) => /^Review check failed \(warn; D-394\): the review log has no pass line — next: ask the owner to start a reviewer with `review handoff no-pass`; a check the builder runs itself is not a pass \(D-398\)$/.test(warning)));
+  assert.ok(result.warnings.some((warning) => /^Review check failed \(warn\): the review log has no pass line — next: ask the owner to start a reviewer with `review handoff no-pass`; a check the builder runs itself is not a pass$/.test(warning)));
 });
 
 test('a clean pass passes, with the reviewer on the Passes line', async (t) => {
@@ -250,7 +250,7 @@ test('open findings: warn closes with the failure; block refuses and writes or d
   await assert.rejects(
     () => close(blockRoot, 'open-block'),
     (error) => {
-      assert.match(error.message, /^close-session refused: the review check failed and project\.yaml sets metadata\.workflow\.review\.check to block \(D-394\)\. Nothing was written or deleted\./);
+      assert.match(error.message, /^close-session refused: the review check failed and project\.yaml sets metadata\.workflow\.review\.check to block\. Nothing was written or deleted\./);
       assert.match(error.message, /\n- R1\.1 \(P2\) is open, waiting for the builder's response — next: answer it/);
       assert.match(error.message, /vibecompass review-check --session open-block/);
       assert.match(error.message, /--review-override "<the owner's reason>"/);
@@ -499,7 +499,7 @@ test('close-session and review-check on the command line', async (t) => {
     '--review-note', 'First note.', '--review-note', 'Second note.',
   ], closing.io, { cwd: root.tempDir });
   assert.equal(exitCode, 0);
-  assert.match(closing.stdout(), /\nReview check \(D-394\): overridden by the owner: I reviewed this one myself\.; failures: R1\.1 \(P2\) is open, waiting for the builder's response\n/);
+  assert.match(closing.stdout(), /\nReview check: overridden by the owner: I reviewed this one myself\.; failures: R1\.1 \(P2\) is open, waiting for the builder's response\n/);
   const notePath = closing.stdout().match(/^Wrote (.+)$/m)[1];
   assert.match(notePath, /-cli-close\.md$/);
   assert.match(reviewSection(await readFile(notePath, 'utf8')), /\n- First note\.\n- Second note\.$/);
@@ -511,8 +511,8 @@ test('init and refresh-workflow write no review: block; refresh keeps one the ow
   const projectPath = path.join(root.rootDir, 'project.yaml');
   assert.doesNotMatch(await readFile(projectPath, 'utf8'), /\n\s+review:/);
   const context = await readFile(path.join(root.rootDir, 'context.md'), 'utf8');
-  assert.match(context, /- review check: `metadata\.workflow\.review\.check` is `warn` \(the default\); on a failed check, `warn` closes and records the failures in the note, `block` refuses to close and writes nothing, and `off` skips the check \(D-394\)/);
-  assert.match(context, /- review round cap: `metadata\.workflow\.review\.round_cap` is 3 \(the default\); a pass beyond it needs an owner `another round` line before it \(D-394\)/);
+  assert.match(context, /- review check: `metadata\.workflow\.review\.check` is `warn` \(the default\); on a failed check, `warn` closes and records the failures in the note, `block` refuses to close and writes nothing, and `off` skips the check/);
+  assert.match(context, /- review round cap: `metadata\.workflow\.review\.round_cap` is 3 \(the default\); a pass beyond it needs an owner `another round` line before it/);
 
   const io = captureIo();
   assert.equal(await runCli(['refresh-workflow', '--root', root.rootDir, '--apply'], io.io, { cwd: root.tempDir }), 0);
@@ -543,25 +543,25 @@ test('context.md, the managed block, and workflows/project-manager.md carry the 
   const guide = await readFile(path.join(root.rootDir, 'workflows/project-manager.md'), 'utf8');
 
   // context.md: the format section with item 3's worked example, and the rule in each role's text.
-  assert.match(context, /## Review log format \(D-394, D-398\)\n/);
+  assert.match(context, /## Review log format\n/);
   assert.match(context, /- \*\*Pass line\*\* \(reviewer\): `- pass <n> \| <time> \| <reviewer> \| <scope> \| <outcome>`/);
   assert.match(context, /```\n## Review log\n- pass 1 \| 2026-10-20 10:42 PDT \| Codex \(GPT-6\) \| the four draft decisions \| findings\n  - R1\.1 \| P2 \| open \| the owner line doesn't say who writes it\n[\s\S]*?  - R1\.2 \| P3 \| confirmed \| accepts the reason\n```/);
-  assert.match(context, /\*\*Who counts as a reviewer \(D-398\)\.\*\* A pass is a run by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>`/);
-  assert.match(context, /- a review pass counts only when a reviewer the owner started runs it \(D-398\): a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in `## Log`, never as pass lines, and never write a pass line yourself/);
+  assert.match(context, /\*\*Who counts as a reviewer\.\*\* A pass is a run by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>`/);
+  assert.match(context, /- a review pass counts only when a reviewer the owner started runs it: a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in `## Log`, never as pass lines, and never write a pass line yourself/);
   assert.match(context, /- answer each pass in `wip\.md` › `## Review log` with a response line/);
-  assert.match(context, /- you are the lane's reviewer only when the owner started you and pointed you at the lane with `review handoff <lane-id>` \(D-398\)/);
+  assert.match(context, /- you are the lane's reviewer only when the owner started you and pointed you at the lane with `review handoff <lane-id>`/);
   assert.match(context, /- run `vibecompass review-check --session <lane-id>` before close-session/);
   assert.match(context, /close-session writes the note's `## Review` section after `## Models used` from the record/);
   assert.doesNotMatch(context, /rather than preserving the full `## Review log`/);
   assert.doesNotMatch(context, /if a granular reviewer trail must remain durable/);
-  assert.match(context, /- When it checks a close report, it reads the note's `## Review` section: the `Check:` line, and the reviewers on the `Passes:` line, compared with the reviewer the build prompt named and any the owner has named since \(D-398\)/);
+  assert.match(context, /- When it checks a close report, it reads the note's `## Review` section: the `Check:` line, and the reviewers on the `Passes:` line, compared with the reviewer the build prompt named and any the owner has named since/);
 
   // The managed block's Hard Rules.
-  assert.match(managed, /- A review pass counts only when a reviewer the owner started runs it, pointed at the lane with `review handoff <lane-id>` \(D-398\)\. An agent the builder launched or directed \(a subagent, a second model, a review tool\) does the builder's own checks: record them in `wip\.md` › `## Log`, never as pass lines\./);
+  assert.match(managed, /- A review pass counts only when a reviewer the owner started runs it, pointed at the lane with `review handoff <lane-id>`\. An agent the builder launched or directed \(a subagent, a second model, a review tool\) does the builder's own checks: record them in `wip\.md` › `## Log`, never as pass lines\./);
 
   // The generic project manager guide: The review rule, Checking a close report, Operating rules.
-  assert.match(guide, /- \*\*At least one recorded reviewer pass,\*\* even when it finds nothing, by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>` \(D-398\)\. An agent the builder launched or directed/);
-  assert.match(guide, /## Checking a close report\n[\s\S]*?Read the note's `## Review` section against the review rule \(D-394, D-398\)\.[\s\S]*?The builder's own account doesn't establish who started a reviewer\.\n\n## When to move on/);
+  assert.match(guide, /- \*\*At least one recorded reviewer pass,\*\* even when it finds nothing, by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>`\. An agent the builder launched or directed/);
+  assert.match(guide, /## Checking a close report\n[\s\S]*?Read the note's `## Review` section against the review rule\.[\s\S]*?The builder's own account doesn't establish who started a reviewer\.\n\n## When to move on/);
   assert.match(guide, /`vibecompass review-check --root \.compass --session <lane-id>` runs the same check on an open lane/);
-  assert.match(guide, /- \*\*Send consequential recommendations through a reviewed lane\*\* before the owner decides \(a plan, a reorder, a protocol change\): one that meets the review rule, with passes by reviewers the owner started \(D-398\)\./);
+  assert.match(guide, /- \*\*Send consequential recommendations through a reviewed lane\*\* before the owner decides \(a plan, a reorder, a protocol change\): one that meets the review rule, with passes by reviewers the owner started\./);
 });

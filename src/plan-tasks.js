@@ -69,41 +69,41 @@ export function parsePlanTaskLines(content) {
 export function parsePlanTaskRef(value) {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) {
-    throw new Error('--plan-task needs a reference, "<plan-path>#<ID>" (D-395).');
+    throw new Error('--plan-task needs a reference, "<plan-path>#<ID>".'); // D-395
   }
 
   const hashIndex = raw.lastIndexOf('#');
   if (hashIndex === -1) {
     throw new Error(
-      `--plan-task "${raw}" has no #<ID>. Use "<plan-path>#<ID>", such as "architecture/<domain>/<feature>/<plan>.md#PM3" (D-395).`,
+      `--plan-task "${raw}" has no #<ID>. Use "<plan-path>#<ID>", such as "architecture/<domain>/<feature>/<plan>.md#PM3".`, // D-395
     );
   }
 
   const rawPath = raw.slice(0, hashIndex).trim();
   const id = raw.slice(hashIndex + 1).trim();
   if (!rawPath) {
-    throw new Error(`--plan-task "${raw}" names no plan before #${id}. Use "<plan-path>#<ID>" (D-395).`);
+    throw new Error(`--plan-task "${raw}" names no plan before #${id}. Use "<plan-path>#<ID>".`); // D-395
   }
   if (rawPath.startsWith('/') || rawPath.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(rawPath)) {
     throw new Error(
-      `--plan-task "${raw}": the plan path must be relative to the project-memory root, such as "architecture/<domain>/<feature>/<plan>.md" (D-395).`,
+      `--plan-task "${raw}": the plan path must be relative to the project-memory root, such as "architecture/<domain>/<feature>/<plan>.md".`, // D-395
     );
   }
 
   const segments = rawPath.replace(/\\/g, '/').split('/').filter((segment) => segment !== '' && segment !== '.');
   if (segments.includes('..')) {
-    throw new Error(`--plan-task "${raw}": the plan path must stay inside the project-memory root; ".." isn't allowed (D-395).`);
+    throw new Error(`--plan-task "${raw}": the plan path must stay inside the project-memory root; ".." isn't allowed.`); // D-395
   }
   const plan = segments.join('/');
   if (segments[0] !== 'architecture' || segments.length < 2) {
-    throw new Error(`--plan-task "${raw}": ${plan} is outside architecture/. A plan is an architecture doc (D-393, D-395).`);
+    throw new Error(`--plan-task "${raw}": ${plan} is outside architecture/. A plan is an architecture doc.`); // D-393, D-395
   }
   if (!plan.endsWith('.md')) {
-    throw new Error(`--plan-task "${raw}": ${plan} is not a .md file. A plan is an architecture doc (D-393, D-395).`);
+    throw new Error(`--plan-task "${raw}": ${plan} is not a .md file. A plan is an architecture doc.`); // D-393, D-395
   }
   if (!PLAN_TASK_ID_PATTERN.test(id)) {
     throw new Error(
-      `--plan-task "${raw}": "${id}" isn't a task ID. An ID is 1–6 capital letters, then 1–3 digits, such as PM3 or DOC2, with no dot, hyphen, space, or lowercase letter (D-393).`,
+      `--plan-task "${raw}": "${id}" isn't a task ID. An ID is 1–6 capital letters, then 1–3 digits, such as PM3 or DOC2, with no dot, hyphen, space, or lowercase letter.`, // D-393
     );
   }
 
@@ -153,7 +153,7 @@ export async function resolvePlanTaskRefs({ rootDir, refs }) {
     }
     const parsed = plans.get(plan);
     if (!parsed.hasNextSteps) {
-      throw new Error(`--plan-task "${ref}": ${plan} has no ## Next steps section, so it holds no task lines (D-393).`);
+      throw new Error(`--plan-task "${ref}": ${plan} has no ## Next steps section, so it holds no task lines.`); // D-393
     }
 
     const matches = parsed.tasks.filter((task) => task.id === id);
@@ -162,11 +162,11 @@ export async function resolvePlanTaskRefs({ rootDir, refs }) {
     }
     if (matches.length > 1) {
       warnings.push(
-        `--plan-task "${ref}": ${plan} has ${matches.length} task lines for ${id} (lines ${matches.map((task) => task.lineNumber).join(', ')}); an ID is unique within its plan (D-393). The link is kept.`,
+        `--plan-task "${ref}": ${plan} has ${matches.length} task lines for ${id} (lines ${matches.map((task) => task.lineNumber).join(', ')}); an ID is unique within its plan. The link is kept.`, // D-393
       );
     }
     if (matches[0].ticked) {
-      warnings.push(`--plan-task "${ref}" names a ticked task: ${id} is marked done in ${plan}. The link is kept, since a follow-up lane on a done task is fine (D-395).`);
+      warnings.push(`--plan-task "${ref}" names a ticked task: ${id} is marked done in ${plan}. The link is kept, since a follow-up lane on a done task is fine.`); // D-395
     }
 
     resolved.push({ ref, plan, id, ticked: matches[0].ticked });
@@ -184,10 +184,10 @@ async function readPlanTasks(rootDir, plan, ref) {
     throw error;
   });
   if (!stats) {
-    throw new Error(`--plan-task "${ref}": ${plan} doesn't exist in the project-memory root ${rootDir} (D-395).`);
+    throw new Error(`--plan-task "${ref}": ${plan} doesn't exist in the project-memory root ${rootDir}.`); // D-395
   }
   if (!stats.isFile()) {
-    throw new Error(`--plan-task "${ref}": ${plan} is not a file (D-395).`);
+    throw new Error(`--plan-task "${ref}": ${plan} is not a file.`); // D-395
   }
 
   // The lexical check in parsePlanTaskRef can't see symlinks; the plan must
@@ -195,7 +195,7 @@ async function readPlanTasks(rootDir, plan, ref) {
   const architectureDir = await realpath(path.join(rootDir, 'architecture'));
   const relative = path.relative(architectureDir, await realpath(filePath));
   if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new Error(`--plan-task "${ref}": ${plan} resolves outside the root's architecture/ (D-395).`);
+    throw new Error(`--plan-task "${ref}": ${plan} resolves outside the root's architecture/.`); // D-395
   }
 
   return parsePlanTaskLines(await readFile(filePath, 'utf8'));
@@ -203,7 +203,7 @@ async function readPlanTasks(rootDir, plan, ref) {
 
 function describeTaskIds(tasks) {
   if (tasks.length === 0) {
-    return 'It has no task lines: a task line is a top-level `- [ ] <ID> — <scope>` item (D-393).';
+    return 'It has no task lines: a task line is a top-level `- [ ] <ID> — <scope>` item.'; // D-393
   }
 
   const ids = tasks.map((task) => task.id);

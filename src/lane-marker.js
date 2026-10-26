@@ -264,7 +264,7 @@ export function resolveLaneSelection(options) {
     if (!laneIds.includes(marker.laneId)) {
       throw new Error(
         `Lane marker at ${marker.markerPath} names lane "${marker.laneId}", which is not an active lane in ${options.rootDir ?? 'the project-memory root'}. ` +
-          'Remove the stale marker or recreate it with `vibecompass write-lane-marker`, or pass --session explicitly (D-280: stale markers fail closed).',
+          'Remove the stale marker or recreate it with `vibecompass write-lane-marker`, or pass --session explicitly (stale markers fail closed).', // D-280
       );
     }
 
@@ -297,19 +297,19 @@ export async function assertMarkerTargetDisjoint(targetDir, rootDir) {
 
   if (target === root) {
     throw new Error(
-      `write-lane-marker refuses ${targetDir}: the target equals the project-memory root. Markers must be path-disjoint from the memory root (D-280).`,
+      `write-lane-marker refuses ${targetDir}: the target equals the project-memory root. Markers must be path-disjoint from the memory root.`, // D-280
     );
   }
 
   if (isPathInside(root, target)) {
     throw new Error(
-      `write-lane-marker refuses ${targetDir}: the target contains the project-memory root, so the marker would govern the shared workspace tree (D-280).`,
+      `write-lane-marker refuses ${targetDir}: the target contains the project-memory root, so the marker would govern the shared workspace tree.`, // D-280
     );
   }
 
   if (isPathInside(target, root)) {
     throw new Error(
-      `write-lane-marker refuses ${targetDir}: the target is inside the project-memory root; lane markers are local working state and never live in package memory (D-278/D-280).`,
+      `write-lane-marker refuses ${targetDir}: the target is inside the project-memory root; lane markers are local working state and never live in package memory.`, // D-278, D-280
     );
   }
 }

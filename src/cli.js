@@ -172,7 +172,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     if (result.runtime) {
       io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
-      io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (D-282; pass --session <lane-id> when multiple lanes are active; use --worktree for independently runnable same-repo lanes).\n');
+      io.stdout.write('Export into a shell with: eval "$(vibecompass lane-env)" (pass --session <lane-id> when multiple lanes are active; use --worktree for independently runnable same-repo lanes).\n'); // D-282
     }
     writeLifecycleBriefResult(io, result.brief);
     writeWarnings(io, result.warnings);
@@ -434,11 +434,11 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
-    io.stdout.write(`Review check (D-394): ${result.review.checkLine}\n`);
+    io.stdout.write(`Review check: ${result.review.checkLine}\n`); // D-394
     if (result.planTasks.length > 0) {
       // D-395: the note records the links; ticking stays with the plan's
       // author, once the work is merged and verified.
-      io.stdout.write('Plan tasks (D-395): the note\'s ## Plan tasks lists the tasks this lane linked. close-session ticks nothing: tick each one in its plan once its work is merged and verified, or annotate it:\n');
+      io.stdout.write('Plan tasks: the note\'s ## Plan tasks lists the tasks this lane linked. close-session ticks nothing: tick each one in its plan once its work is merged and verified, or annotate it:\n'); // D-395
       for (const ref of result.planTasks) {
         io.stdout.write(`- ${ref}\n`);
       }
@@ -478,7 +478,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`Working on: ${result.workingOn}${result.workingOnUpdated ? ' (updated)' : ''}\n`);
       // D-392: the lane resumes in its recorded role, so say which.
       io.stdout.write(result.role === 'project-manager'
-        ? 'Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes\' scratch alone (D-392).\n'
+        ? 'Role: project-manager — resume as project manager: change canonical memory only in this lane, write no product code, and leave other lanes\' scratch alone.\n' // D-392
         : `Role: ${result.role}\n`);
       if (result.planTasks.length > 0) {
         const added = new Set(result.planTasksAdded);
@@ -500,7 +500,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       }
       if (result.runtime) {
         io.stdout.write(`Runtime: port ${result.runtime.port}, temp dir ${result.runtime.tmpDir}\n`);
-        io.stdout.write(`Export into a shell with: eval "$(vibecompass lane-env${result.otherLanes.length > 0 ? ` --session ${result.sessionId}` : ''})" (D-282).\n`);
+        io.stdout.write(`Export into a shell with: eval "$(vibecompass lane-env${result.otherLanes.length > 0 ? ` --session ${result.sessionId}` : ''})".\n`); // D-282
       }
       if (result.otherLanes.length > 0) {
         io.stdout.write(`Other active lanes (${result.otherLanes.length}) — pass --session ${result.sessionId} to lane-scoped commands, or run them from this lane's worktree:\n`);
@@ -529,9 +529,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       io.stdout.write(`${line}\n`);
     }
     if (result.inventory.lanes.length > 1) {
-      io.stdout.write('Multiple lanes are active: resume one with `vibecompass continue-session <lane-id>`; the current hint is not a selection (D-277/D-353).\n');
+      io.stdout.write('Multiple lanes are active: resume one with `vibecompass continue-session <lane-id>`; the current hint is not a selection.\n'); // D-277, D-353
     } else if (result.inventory.lanes.length === 1) {
-      io.stdout.write(`Resume with \`vibecompass continue-session\` (single active lane resolves implicitly; D-353).\n`);
+      io.stdout.write(`Resume with \`vibecompass continue-session\` (single active lane resolves implicitly).\n`); // D-353
     }
     return 0;
   }
@@ -884,7 +884,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     const result = await refreshGroupedDecisionIndex({ rootDir, groupLabel: labelResult.label });
     writeWarnings(io, uniqueStrings([...markerContext.warnings, ...labelResult.warnings, ...result.warnings]));
     if (result.problems.length > 0) {
-      io.stderr.write(`Grouped decision index refresh refused for ${result.indexPath} (D-283 fail-closed):\n`);
+      io.stderr.write(`Grouped decision index refresh refused for ${result.indexPath} (fail-closed):\n`); // D-283
       for (const problem of result.problems) {
         io.stderr.write(`- ${problem}\n`);
       }
@@ -893,7 +893,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     if (result.upToDate) {
       io.stdout.write(`decisions/INDEX.md is up to date (nothing missing).\n`);
     } else {
-      io.stdout.write(`Refreshed ${result.indexPath} (structure-preserving, D-283)\n`);
+      io.stdout.write(`Refreshed ${result.indexPath} (structure-preserving)\n`); // D-283
       io.stdout.write(`Added under "## ${result.groupLabel}":\n`);
       for (const decision of result.added) {
         io.stdout.write(`- ${formatDecisionId(decision.id)} | ${decision.title} | ${decision.domain}.md\n`);
@@ -908,7 +908,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     const nextId = await readNextDecisionId(rootDir);
     io.stdout.write(`Advisory next decision ID: ${formatDecisionId(nextId)}\n`);
     io.stdout.write(
-      'Allocation happens at write time under the memory-root lock (D-276). Use `vibecompass append-decision`, or re-read the log immediately before appending by hand.\n',
+      'Allocation happens at write time under the memory-root lock. Use `vibecompass append-decision`, or re-read the log immediately before appending by hand.\n', // D-276
     );
     return 0;
   }
@@ -1242,7 +1242,7 @@ function parseStartSessionArgs(argv) {
       continue;
     }
     if (token.startsWith('--worktree=')) {
-      throw new Error('Flag "--worktree" takes no value; the worktree container is fixed to <workspace>/worktrees/<lane-id> (D-279).');
+      throw new Error('Flag "--worktree" takes no value; the worktree container is fixed to <workspace>/worktrees/<lane-id>.'); // D-279
     }
     if (token === '--no-brief') {
       parsed.brief = false;
@@ -2552,7 +2552,7 @@ function parseContinueSessionArgs(argv) {
         parsed.nextSessionShould = value;
         break;
       case '--role':
-        throw new Error('continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it (D-392).');
+        throw new Error('continue-session takes no --role: a lane keeps the role it was opened with, and no command changes it.'); // D-392
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -3202,13 +3202,13 @@ function writeWorktreeCleanupResult(io, worktreeCleanup) {
   if (worktreeCleanup.markerRemoved) {
     io.stdout.write('- lane marker removed (token-matched)\n');
   } else if (worktreeCleanup.markerKept) {
-    io.stdout.write('- lane marker kept while worktrees survive (D-281)\n');
+    io.stdout.write('- lane marker kept while worktrees survive\n'); // D-281
   }
   if (worktreeCleanup.containerRemoved) {
     io.stdout.write('- container removed (empty)\n');
   }
   if (worktreeCleanup.branch) {
-    io.stdout.write(`- branch "${worktreeCleanup.branch}" left in place (close-session never deletes branches; D-281)\n`);
+    io.stdout.write(`- branch "${worktreeCleanup.branch}" left in place (close-session never deletes branches)\n`); // D-281
   }
 }
 
@@ -3345,7 +3345,7 @@ function usageText() {
     '  vibecompass brief --task <text> [--files <repo:path>...] [--feature <slug>] [--claim <path>] [--session <lane-id>] [--budget <n>] [--json] [options]',
     '                                        Read-only session brief: relevant memory, packed into an estimated token budget',
     '  vibecompass brief --write|--check [--session <lane-id>] [--source-root <path> [--source-session <lane-id>]] [--budget <n>] [--json] [options]',
-    '                                        Regenerate the lane\'s sessions/active/<lane-id>/brief.md, or report whether it is stale (D-364)',
+    '                                        Regenerate the lane\'s sessions/active/<lane-id>/brief.md, or report whether it is stale', // D-364
     '  vibecompass start-session --id <lane-id> --working-on <text> [--role <builder|project-manager>] [--plan-task "<plan-path>#<ID>"...] [--branch <name> [--worktree]] [--no-brief] [options]',
     '  vibecompass close-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]',
     '  vibecompass end-session --title <text> --completed <text> --architecture-docs <status> --decision-log <status> --session-maintenance <status> [options]  # alias',
@@ -3356,7 +3356,7 @@ function usageText() {
     '  vibecompass write-lane-marker --session <lane-id> [--dir <path>] [options]',
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
     '  vibecompass review-check [--session <lane-id>] [--json] [options]',
-    '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails (D-394)',
+    '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails', // D-394
     '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [--group <label>] [options]',
     '  vibecompass refresh-decision-index [--check] [--session <lane-id>] [--group <label>] [options]',
     '  vibecompass next-decision-id [options]',
@@ -3407,7 +3407,7 @@ function usageText() {
     '  --token-stdin                        Store the sync token read from stdin (first non-empty line)',
     '  --no-store                           Do not store a token; rely on the env var only',
     '  --credential-store <auto|keychain|file>',
-    '                                        Where to keep the token (D-355). auto prefers the OS keychain',
+    '                                        Where to keep the token. auto prefers the OS keychain', // D-355
     '                                        Without --target, replaces any existing flat project.yaml sync binding',
     '',
     'Sync-target options:',
@@ -3415,7 +3415,7 @@ function usageText() {
     '  vibecompass sync-target <name>       Switch the default sync target (re-mirrors flat sync fields)',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '',
-    'Login options (recommended path, D-355/D-356):',
+    'Login options (recommended path):', // D-355, D-356
     '  vibecompass login                    Sign in from the terminal: opens the dashboard, you approve a short code, the sync token is stored locally',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --sync-target <name>                 Sign in for a named sync target (add --api-url to create a new one)',
@@ -3428,7 +3428,7 @@ function usageText() {
     '  --poll-timeout <seconds>             Stop waiting for approval after this long. Defaults to the code lifetime',
     '  --no-browser                         Print the link without opening a browser',
     '',
-    'Sync-credential options (advanced, D-355):',
+    'Sync-credential options (advanced):', // D-355
     '  vibecompass sync-credential set      Store a dashboard token for the bound project (hidden prompt, --token-stdin, or --from-env)',
     '  vibecompass sync-credential remove   Forget the stored token for the bound project',
     '  vibecompass sync-credential list     List stored tokens (metadata only, never values)',
@@ -3457,7 +3457,7 @@ function usageText() {
     '',
     'Docs-update options:',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
-    '  --session <lane-id>                  Active session lane to inspect. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --session <lane-id>                  Active session lane to inspect. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --changed <repo:path|path>           Repeatable explicit changed path; defaults to git status when omitted',
     '  --json                               Print the typed docs-update plan as JSON',
     '',
@@ -3466,35 +3466,35 @@ function usageText() {
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --working-on <text>                  Required active-session summary',
     '  --id <lane-id>                       Required active session lane ID',
-    '  --role <builder|project-manager>     The lane\'s role, recorded in session.yaml (default builder; D-392). A project manager opens its own short lanes with --role project-manager; a lane keeps its role, and continue-session resumes it in that role',
+    '  --role <builder|project-manager>     The lane\'s role, recorded in session.yaml (default builder). A project manager opens its own short lanes with --role project-manager; a lane keeps its role, and continue-session resumes it in that role', // D-392
     '  --feature <slug>                     Repeatable feature slug for the lane',
     '  --repo <id>                          Repeatable repo ID for the lane',
     '  --claim <path>                       Repeatable path claim for overlap warnings',
     '  --architecture-doc <path>            Repeatable architecture doc path the lane expects to edit',
-    '  --plan-task "<plan-path>#<ID>"       Repeatable plan task the lane works on (D-395), such as "architecture/<domain>/<feature>/<plan>.md#PM3"; quote it, since # is a glob character in zsh',
-    '                                        The plan must be a root-relative .md file under architecture/ whose ## Next steps has a task line for <ID> (D-393); otherwise nothing is written',
+    '  --plan-task "<plan-path>#<ID>"       Repeatable plan task the lane works on, such as "architecture/<domain>/<feature>/<plan>.md#PM3"; quote it, since # is a glob character in zsh', // D-395
+    '                                        The plan must be a root-relative .md file under architecture/ whose ## Next steps has a task line for <ID> (- [ ] <ID> — <scope>); otherwise nothing is written', // D-393
     '                                        A ticked task warns and is kept. Stored as plan_tasks in session.yaml; the plan joins architecture_docs; close-session lists the links in the note',
     '  --decision-domain-file <domain.md>   Repeatable decision domain file the lane expects to edit (alias: --decision-domain)',
-    '  --branch <name>                      Opt-in git binding (D-281): create or reuse this branch in every bound --repo; requires at least one --repo',
-    '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> (D-279) and write the lane marker into the container',
+    '  --branch <name>                      Opt-in git binding: create or reuse this branch in every bound --repo; requires at least one --repo', // D-281
+    '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> and write the lane marker into the container', // D-279
     '  --date <YYYY-MM-DD>                  Optional explicit session date',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
-    '  --no-brief                           Skip the lane brief for this command (sessions/active/<lane-id>/brief.md; D-359, D-364); lifecycle commands write it only when project.yaml sets brief.enabled: true (opt-in, D-368)',
+    '  --no-brief                           Skip the lane brief for this command (sessions/active/<lane-id>/brief.md); lifecycle commands write it only when project.yaml sets brief.enabled: true (opt-in)', // D-359, D-364, D-368
     '',
     'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
     '  --title <text>                       Required display title for the finalized session note',
     '  --worked-on <text>                   Optional override for "What we worked on"',
-    '  --session <lane-id>                  Active session lane to close. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --session <lane-id>                  Active session lane to close. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --completed <text>                   Repeatable completed item',
     '  --decision <text>                    Repeatable decision reference or summary',
     '  --model <text>                       Optional repeatable model contribution entry',
     '  --blocker <text>                     Repeatable blocker or open question',
     '  --next-step <text>                   Repeatable next-session step',
-    '  --review-override <reason>           Close despite a failed review check, block mode included; only on the owner\'s instruction, with the owner\'s reason in the owner\'s words (D-394)',
+    '  --review-override <reason>           Close despite a failed review check, block mode included; only on the owner\'s instruction, with the owner\'s reason in the owner\'s words', // D-394
     '  --review-note <text>                 Repeatable line added at the end of the note\'s ## Review section',
     '  --architecture-docs <status>         Required checkpoint: updated|not-needed|deferred',
     '  --decision-log <status>              Required checkpoint: updated|not-needed|deferred',
@@ -3502,72 +3502,72 @@ function usageText() {
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md completed summary',
     '  --next-session-should <text>         Optional override for the CLAUDE.md next-session summary',
     '',
-    'Continue-session options (D-353):',
+    'Continue-session options:', // D-353
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root',
-    '  --session <lane-id>                  Lane to resume; positional ID is also accepted. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes fail closed and print the lane inventory (D-277)',
+    '  --session <lane-id>                  Lane to resume; positional ID is also accepted. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes fail closed and print the lane inventory', // D-277
     '  --working-on <text>                  Optional refreshed lane scope; rewrites working_on in session.yaml, the index, wip.md, and CLAUDE.md',
-    '  --plan-task "<plan-path>#<ID>"       Repeatable: link another plan task, validated as start-session does (D-395); links are only added, never removed',
+    '  --plan-task "<plan-path>#<ID>"       Repeatable: link another plan task, validated as start-session does; links are only added, never removed', // D-395
     '  --date <YYYY-MM-DD>                  Optional explicit resume date (the lane keeps its opening date and session number)',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
     '  --blockers <text>                    Optional current blockers summary',
     '  --next-session-should <text>         Optional current-session handoff summary',
     '  --json                               Print the resume result (lane, paths, runtime, other lanes, brief, warnings) as JSON',
-    '  --no-brief                           Leave the lane brief as it is; with project.yaml brief.enabled: true (opt-in, D-368) resume keeps a current brief and regenerates a missing or stale one',
-    '  --source-root <path>                 D-255 dual-root dogfood: build the brief from this memory root\'s matching lane (same id, session date, and number) and write it only into this lane; the source root is only read',
+    '  --no-brief                           Leave the lane brief as it is; with project.yaml brief.enabled: true (opt-in) resume keeps a current brief and regenerates a missing or stale one', // D-368
+    '  --source-root <path>                 Dual-root dogfood: build the brief from this memory root\'s matching lane (same id, session date, and number) and write it only into this lane; the source root is only read', // D-255
     '  --source-session <lane-id>           With --source-root: the source lane id, which must equal the resumed lane',
     '',
     'Brief options:',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
-    '  --session <lane-id>                  Lane to brief. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --session <lane-id>                  Lane to brief. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --task <text>                        Task text (print mode). Omitted: the lane\'s working-on',
     '  --files <repo:path>...               Files the task touches (print mode)',
     '  --feature <slug>, --claim <path>     Repeatable feature slug and path claim (print mode)',
     '  --budget <n>                         Estimated-token budget (default 6000, minimum 800)',
     '  --write                              Regenerate the lane\'s brief.md from its working-on, claims, and feature slugs, under the root lock',
     '  --check                              Report whether the lane\'s brief.md is current or stale against its header bindings; writes nothing',
-    '  --source-root <path>                 With --write/--check: read this memory root\'s matching lane instead (D-255 dogfood); never written',
+    '  --source-root <path>                 With --write/--check: read this memory root\'s matching lane instead (dual-root dogfood); never written', // D-255
     '  --source-session <lane-id>           With --source-root: the source lane id, which must equal the lane being briefed',
     '  --json                               Print the result as JSON',
     '',
     'List/switch-session options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
-    '  --json                               list-sessions: print the lane inventory as JSON (every lane carries its role, D-392, and planTasks, a list of { plan, id }, D-395)',
+    '  --json                               list-sessions: print the lane inventory as JSON (every lane carries its role and planTasks, a list of { plan, id })', // D-392, D-395
     '',
     'Rebuild-active-index options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --current <lane-id>                  Explicit current-lane selection; required when multiple lanes are active and the existing pointer is invalid',
     '',
-    'Write-lane-marker options (D-280):',
+    'Write-lane-marker options:', // D-280
     '  --session <lane-id>                  Required active lane the marker binds to',
     '  --dir <path>                         Marker target directory; defaults to cwd. Must be path-disjoint from the memory root',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '',
-    'Lane-env options (D-282):',
+    'Lane-env options:', // D-282
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
-    '  --session <lane-id>                  Lane to export. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --session <lane-id>                  Lane to export. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --json                               Print the runtime assignment as JSON instead of shell export lines',
     '  --no-conventional                    Omit the conventional PORT/TMPDIR alias exports',
     '                                        Consume with: eval "$(vibecompass lane-env)"; defaults come from project.yaml runtime.{port_base,port_step,tmp_base}; use --worktree for independent same-repo dev servers',
     '',
-    'Review-check options (D-394):',
+    'Review-check options:', // D-394
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
-    '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker (D-277)',
+    '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
     '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
     '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --target <domain.md>                 Decision domain file under decisions/ (e.g. cross-cutting.md); never INDEX.md',
-    '  --entry <path>                       Staged entry file starting with "### D-NEXT — <title>"; the D-number is allocated atomically at write time (D-276)',
-    '  --group <label>                      Grouped index group label for the D-283 refresh (e.g. "2026-07-03 — Session 3 (lane-x lane)"); defaults to the resolvable lane context',
-    '  --session <lane-id>                  append-decision: lane whose date/session/id labels the index group; defaults to the D-277 lane resolution. A --session naming a lane that is not active fails before anything is appended',
+    '  --entry <path>                       Staged entry file starting with "### D-NEXT — <title>"; the D-number is allocated atomically at write time', // D-276
+    '  --group <label>                      Grouped index group label for the index refresh (e.g. "2026-07-03 — Session 3 (lane-x lane)"); defaults to the resolvable lane context', // D-283
+    '  --session <lane-id>                  append-decision: lane whose date/session/id labels the index group; defaults to the nearest worktree lane marker, else the single active lane. A --session naming a lane that is not active fails before anything is appended', // D-277
     '',
-    'Refresh-decision-index options (D-283):',
+    'Refresh-decision-index options:', // D-283
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --check                              Validate the grouped index against canonical decision entries without writing',
-    '  --session <lane-id>                  Lane whose date/session/id labels a new group; defaults to the D-277 lane resolution',
+    '  --session <lane-id>                  Lane whose date/session/id labels a new group; defaults to the nearest worktree lane marker, else the single active lane', // D-277
     '  --group <label>                      Explicit group label for appended rows; wins over the lane-derived label',
     '                                        Structure-preserving: existing groups/rows are kept verbatim; unparseable structure fails closed',
     '',

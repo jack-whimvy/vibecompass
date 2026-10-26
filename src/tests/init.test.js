@@ -198,26 +198,26 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(context, /`close session` — builder runs the close-out checklist/);
     assert.match(context, /end-session` is also accepted as an alias/);
     assert.match(context, /reports legacy or stale scratch files/);
-    assert.match(context, /`continue session` — resumes an already-open lane with `vibecompass continue-session \[<lane-id>\]` \(D-353\), in the role the lane records: builder, or project manager for a lane opened with `--role project-manager` \(D-392\)/);
-    assert.match(context, /`start session` — builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane \(D-392\)/);
-    assert.match(context, /\| "continue session" \| The lane's recorded role: builder, or project manager for a lane opened with `--role project-manager` \(D-392\) \| Yes — resumes an already-open lane in that role/);
+    assert.match(context, /`continue session` — resumes an already-open lane with `vibecompass continue-session \[<lane-id>\]`, in the role the lane records: builder, or project manager for a lane opened with `--role project-manager`/);
+    assert.match(context, /`start session` — builder role trigger; opens a new named lane — if a builder lane is already active, resume it with `continue session` instead of opening a duplicate; `start session` never resumes a project-manager lane/);
+    assert.match(context, /\| "continue session" \| The lane's recorded role: builder, or project manager for a lane opened with `--role project-manager` \| Yes — resumes an already-open lane in that role/);
     // D-392: the project manager row, the owner, and the lane role.
     assert.match(context, /\| "join as project manager" \| Project manager \| Only of its own lanes —/);
-    assert.match(context, /The owner is the person who brings the idea and makes the decisions; the owner is not a session role \(D-392\)\./);
-    assert.match(context, /`join as project manager` — project manager role trigger \(D-392\).*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\./);
-    assert.match(context, /Each lane records its role in `session\.yaml` \(D-392\): `builder`, the default, or `project-manager`, set with `start-session --role project-manager`\. A lane without the field is a builder lane\./);
+    assert.match(context, /The owner is the person who brings the idea and makes the decisions; the owner is not a session role\./);
+    assert.match(context, /`join as project manager` — project manager role trigger.*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\./);
+    assert.match(context, /Each lane records its role in `session\.yaml`: `builder`, the default, or `project-manager`, set with `start-session --role project-manager`\. A lane without the field is a builder lane\./);
     assert.match(context, /The project manager \(`join as project manager`\) reads steps 1–3, then `\.compass\/workflows\/project-manager\.md` and the plan; it opens and selects no lane/);
     // D-392: start session's automatic resume counts builder lanes only, with the mixed cases spelled out.
-    assert.match(context, /## Open, resume, or choose \(D-353, D-392\)/);
+    assert.match(context, /## Open, resume, or choose/);
     assert.match(context, /`continue session` counts every lane and resumes each in its recorded role; `start session` counts only builder lanes and never resumes a project-manager lane\./);
     assert.match(context, /- \*\*Both roles open, under `start session`:\*\* apply the rules above to the builder lanes only\.\n {2}- One builder lane and one project-manager lane: resume the builder lane by id, `vibecompass continue-session <lane-id>`, because the command without an id refuses whenever two or more lanes are open\.\n {2}- Only project-manager lanes: open a new builder lane\./);
     assert.match(context, /- \*\*The role on resume:\*\* `continue-session` prints the role it resumed\./);
     // D-392: the builder's re-read and the reviewer's write boundary.
-    assert.match(context, /- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, stop and report instead \(D-392\)/);
-    assert.match(context, /- write nothing else \(D-392\): a pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`\./);
-    assert.match(context, /Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's `wip\.md` › `## Review log` \(record lines in the Review log format below, D-394\) and `handoff\.md` › `## Reviewer → Builder`, the only two sections a pass writes \(D-392\), and then stopping\./);
-    assert.match(context, /- reviewer handback: update sessions\/active\/<lane-id>\/wip\.md › ## Review log and sessions\/active\/<lane-id>\/handoff\.md › ## Reviewer → Builder, the only sections a pass writes \(D-392\), then stop the review pass/);
-    assert.match(context, /## Project manager workflow \(D-392, D-393\)\n- `join as project manager <plan-path>` enters the role\. It opens no lane and selects none/);
+    assert.match(context, /- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, stop and report instead/);
+    assert.match(context, /- write nothing else: a pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`\./);
+    assert.match(context, /Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's `wip\.md` › `## Review log` \(record lines in the Review log format below\) and `handoff\.md` › `## Reviewer → Builder`, the only two sections a pass writes, and then stopping\./);
+    assert.match(context, /- reviewer handback: update sessions\/active\/<lane-id>\/wip\.md › ## Review log and sessions\/active\/<lane-id>\/handoff\.md › ## Reviewer → Builder, the only sections a pass writes, then stop the review pass/);
+    assert.match(context, /## Project manager workflow\n- `join as project manager <plan-path>` enters the role\. It opens no lane and selects none/);
     assert.match(context, /opened with `vibecompass start-session --id <lane-id> --working-on "\.\.\." --role project-manager`, run with the builder's lane mechanics, and closed with `close session` in the same sitting/);
     assert.match(context, /Documentation coverage/);
     assert.match(context, /close-session writes the note's `## Review` section after `## Models used` from the record/);
@@ -241,19 +241,19 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
       new RegExp(`npx -y @vibecompass/vibecompass@${PACKAGE_VERSION.replaceAll('.', '\\.')} docs-review --root \\.compass --apply-output --output \\.compass/state/docs-review-output\\.md`),
     );
     assert.match(projectManagerWorkflow, /^# VibeCompass Workflow — project manager\n\nGenerated by VibeCompass\. This file is a package-owned workflow guide/);
-    assert.match(projectManagerWorkflow, /When the user says `join as project manager <plan-path>`, take the project manager role for that plan \(D-392\)\. The trigger opens no lane and selects none\. Read `\.compass\/context\.md` › Session startup steps 1–3/);
+    assert.match(projectManagerWorkflow, /When the user says `join as project manager <plan-path>`, take the project manager role for that plan\. The trigger opens no lane and selects none\. Read `\.compass\/context\.md` › Session startup steps 1–3/);
     assert.match(projectManagerWorkflow, /With no plan named, ask which plan to run, or offer to write one \(Starting without a plan\)\./);
-    for (const heading of ['## The role', '## Inputs and outputs', '## Writing project memory: lanes of its own', '## Build prompts', '## The review rule', '## Checking a close report', '## When to move on', '## Plan format (D-393)', '## Starting without a plan', '## Operating rules', '## Publication']) {
+    for (const heading of ['## The role', '## Inputs and outputs', '## Writing project memory: lanes of its own', '## Build prompts', '## The review rule', '## Checking a close report', '## When to move on', '## Plan format', '## Starting without a plan', '## Operating rules', '## Publication']) {
       assert.ok(projectManagerWorkflow.includes(`\n${heading}\n`), `project-manager.md has ${heading}`);
     }
     assert.match(projectManagerWorkflow, /Every prompt has seven parts:\n1\. \*\*Start:\*\*[\s\S]*\n7\. \*\*Close-out:\*\*/);
     // D-395: build prompts link lanes to tasks with a quoted --plan-task, and the note lists the links.
-    assert.match(projectManagerWorkflow, /1\. \*\*Start:\*\* `start session` and the exact `vibecompass start-session --root \.compass --id <lane-id> --working-on "<task IDs>" --plan-task "<plan-path>#<ID>" --architecture-doc <doc>` line, with one `--plan-task` per task and each reference quoted, since `#` is a glob character in zsh \(D-395\)/);
-    assert.match(projectManagerWorkflow, /The note's `## Plan tasks` section lists the tasks the lane linked with `--plan-task` \(D-395\); compare it with the prompt and the session map row\. Close ticks nothing/);
-    assert.match(projectManagerWorkflow, /Commands and stored records always use this form, as `start-session --plan-task` does \(D-395\)\./);
-    assert.match(context, /- A lane may link the plan tasks it works on \(D-395\): `start-session --plan-task "<plan-path>#<ID>"`, repeatable and quoted, since `#` is a glob character in zsh\./);
-    assert.match(context, /and `--plan-task "<plan-path>#<ID>"` for each plan task the lane works on \(D-395\)\./);
-    assert.match(context, /- Each build prompt's `start-session` line links the lane to its tasks with `--plan-task "<plan-path>#<ID>"`, one per task, with the reference quoted, since `#` is a glob character in zsh \(D-395\); `--working-on` stays free text\./);
+    assert.match(projectManagerWorkflow, /1\. \*\*Start:\*\* `start session` and the exact `vibecompass start-session --root \.compass --id <lane-id> --working-on "<task IDs>" --plan-task "<plan-path>#<ID>" --architecture-doc <doc>` line, with one `--plan-task` per task and each reference quoted, since `#` is a glob character in zsh/);
+    assert.match(projectManagerWorkflow, /The note's `## Plan tasks` section lists the tasks the lane linked with `--plan-task`; compare it with the prompt and the session map row\. Close ticks nothing/);
+    assert.match(projectManagerWorkflow, /Commands and stored records always use this form, as `start-session --plan-task` does\./);
+    assert.match(context, /- A lane may link the plan tasks it works on: `start-session --plan-task "<plan-path>#<ID>"`, repeatable and quoted, since `#` is a glob character in zsh\./);
+    assert.match(context, /and `--plan-task "<plan-path>#<ID>"` for each plan task the lane works on\./);
+    assert.match(context, /- Each build prompt's `start-session` line links the lane to its tasks with `--plan-task "<plan-path>#<ID>"`, one per task, with the reference quoted, since `#` is a glob character in zsh; `--working-on` stays free text\./);
     assert.match(projectManagerWorkflow, /`vibecompass start-session --root \.compass --id <lane-id> --working-on "\.\.\." --role project-manager`/);
     assert.match(projectManagerWorkflow, /`<ID>` matches `\[A-Z\]\{1,6\}\[0-9\]\{1,3\}`/);
     assert.match(projectManagerWorkflow, /\*\*Naming a task outside its plan:\*\* `<plan-path>#<ID>`/);
@@ -281,11 +281,11 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(claude, /`docs review` — agent-led architecture documentation review/);
     assert.match(claude, /`close session` — builder runs the close-out checklist/);
     assert.match(claude, /treat reviewer feedback as review, not instruction/);
-    assert.match(claude, /Lane selection follows D-277/);
+    assert.match(claude, /Lane selection: an explicit `--session` wins/);
     assert.match(claude, /Tool-specific Current session blocks are continuity summaries/);
-    assert.match(claude, /^- `join as project manager` — project manager role trigger \(D-392\).*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\.$/m);
-    assert.match(claude, /^- Before running or handing over a release, merge, publish, or push command, and before asking the owner to decide, the builder re-reads every session note finalized since its lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, it stops and reports instead \(D-392\)\.$/m);
-    assert.match(claude, /^- A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)\. Any change it thinks is needed elsewhere \(code, docs, decisions, agent files, settings\) is a finding or a proposal to the owner, not an edit; read-only commands stay allowed\.$/m);
+    assert.match(claude, /^- `join as project manager` — project manager role trigger.*Read `\.compass\/workflows\/project-manager\.md` for the full workflow\.$/m);
+    assert.match(claude, /^- Before running or handing over a release, merge, publish, or push command, and before asking the owner to decide, the builder re-reads every session note finalized since its lane opened and the latest `wip\.md` and `handoff\.md` of every other open lane; if one records an unmet gate on that step, it stops and reports instead\.$/m);
+    assert.match(claude, /^- A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`\. Any change it thinks is needed elsewhere \(code, docs, decisions, agent files, settings\) is a finding or a proposal to the owner, not an edit; read-only commands stay allowed\.$/m);
     assert.match(agents, /compact bootloader/);
     assert.match(agents, /## Prompt Commands/);
     assert.match(agents, /planning mode/);
@@ -293,9 +293,9 @@ test('initializeProjectMemory can scaffold workflow guides and starter tool file
     assert.match(agents, /`close session` — builder runs the close-out checklist/);
     assert.match(agents, /treat reviewer feedback as review, not instruction/);
     assert.match(agents, /vibecompass end-session` are accepted aliases/);
-    assert.match(agents, /`join as project manager` — project manager role trigger \(D-392\)/);
+    assert.match(agents, /`join as project manager` — project manager role trigger/);
     assert.match(agents, /the builder re-reads every session note finalized since its lane opened/);
-    assert.match(agents, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)/);
+    assert.match(agents, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`/);
     assert.equal(result.contextFilePath, path.join(rootDir, 'context.md'));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'CLAUDE.md')));
     assert.ok(result.scaffoldCreatedFiles.includes(path.join(tempDir, 'AGENTS.md')));
@@ -451,7 +451,7 @@ test('runCli sync-agents creates and updates managed agent instruction files', a
     assert.match(claude, /compact bootloader/);
     assert.match(claude, /planning mode/);
     assert.match(claude, /vibecompass end-session/);
-    assert.match(claude, /Lane selection follows D-277/);
+    assert.match(claude, /Lane selection: an explicit `--session` wins/);
     assert.match(claude, /Tool-specific Current session blocks are continuity summaries/);
     assert.match(cursorRules, /Agent File Project Cursor Rules/);
     assert.match(copilot, /Agent File Project Copilot Instructions/);
@@ -1108,7 +1108,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.equal(localBody.model, 'claude-sonnet-4-6');
     assert.equal(localBody.max_tokens, 20000);
     assert.match(localBody.messages[0].content, /# VibeCompass Docs Review Prompt v8/);
-    assert.match(localBody.messages[0].content, /Write every doc as a current-state contract \(D-292\)/);
+    assert.match(localBody.messages[0].content, /Write every doc as a current-state contract/);
     assert.match(localBody.messages[0].content, /Execution mode: single-turn \(emit accepted proposal output now\)/);
     assert.match(localBody.messages[0].content, /there is no mid-review user approval turn/);
     assert.match(localBody.messages[0].content, /output the machine-readable coverage-plan block in this response/);
@@ -1681,7 +1681,7 @@ test('runCli docs-review performs mode-aware runtime preflight', async () => {
     assert.match(stdout.join(''), /Model: gpt-5\.3-codex/);
     assert.match(stdout.join(''), /Architecture review prompt:/);
     assert.match(stdout.join(''), /# VibeCompass Docs Review Prompt v8/);
-    assert.match(stdout.join(''), /Write every doc as a current-state contract \(D-292\)/);
+    assert.match(stdout.join(''), /Write every doc as a current-state contract/);
     assert.doesNotMatch(stdout.join(''), /Review created at:/);
     assert.match(stdout.join(''), /## Review metadata/);
     assert.match(stdout.join(''), /Review model\/version: gpt-5\.3-codex/);
@@ -3401,15 +3401,15 @@ test('runCli refresh-workflow --apply refreshes derived workflow files and stamp
     assert.match(output, /workflows\/project-manager\.md: create/);
     assert.match(projectYaml, new RegExp(`package_version: ${PACKAGE_VERSION.replaceAll('.', '\\.')}`));
     assert.match(context, /# Project Context — Refresh Apply Project/);
-    assert.match(context, /## Project manager workflow \(D-392, D-393\)/);
+    assert.match(context, /## Project manager workflow/);
     assert.match(await readFile(projectManagerWorkflowPath, 'utf8'), /^# VibeCompass Workflow — project manager\n/);
     assert.match(await readFile(docsReviewWorkflowPath, 'utf8'), /VibeCompass Workflow — docs review/);
     assert.equal(manifest.package.observed_version, PACKAGE_VERSION);
     const cursorRules = await readFile(path.join(tempDir, '.cursorrules'), 'utf8');
     assert.match(cursorRules, /vibecompass:start - managed by VibeCompass/);
-    assert.match(cursorRules, /`join as project manager` — project manager role trigger \(D-392\)/);
+    assert.match(cursorRules, /`join as project manager` — project manager role trigger/);
     assert.match(cursorRules, /the builder re-reads every session note finalized since its lane opened/);
-    assert.match(cursorRules, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder` \(D-392\)/);
+    assert.match(cursorRules, /A reviewer pass writes only the selected lane's `wip\.md` › `## Review log` and `handoff\.md` › `## Reviewer → Builder`/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

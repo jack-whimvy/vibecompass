@@ -55,12 +55,12 @@ export function resolveRuntimeSettings(projectConfig) {
   const runtimeValue = projectConfig?.runtime;
   const runtime = isPlainObject(runtimeValue) ? runtimeValue : {};
   if (runtimeValue !== undefined && runtimeValue !== null && !isPlainObject(runtimeValue)) {
-    warnings.push('project.yaml "runtime" is not a mapping; the D-282 runtime defaults apply.');
+    warnings.push('project.yaml "runtime" is not a mapping; the runtime defaults apply.'); // D-282
   }
 
   for (const key of Object.keys(runtime)) {
     if (!['port_base', 'port_step', 'tmp_base'].includes(key)) {
-      warnings.push(`Unknown project.yaml runtime field "${key}" (D-282 supports port_base, port_step, tmp_base).`);
+      warnings.push(`Unknown project.yaml runtime field "${key}" (runtime supports port_base, port_step, tmp_base).`); // D-282
     }
   }
 
@@ -130,7 +130,7 @@ export function assignLanePort(options) {
 
   throw new Error(
     `No free lane port at or above ${portBase} (step ${portStep}, max ${LANE_PORT_MAX}); ` +
-      'close unused lanes or configure project.yaml runtime.port_base / runtime.port_step (D-282).',
+      'close unused lanes or configure project.yaml runtime.port_base / runtime.port_step.', // D-282
   );
 }
 
@@ -175,7 +175,7 @@ export async function removeLaneTmpDirAtClose(options) {
       ...base,
       reason: 'not-absolute',
       warnings: [
-        `Lane temp dir ${recordedTmpDir} was left in place: the recorded path is not absolute (D-282 guarded removal). Inspect and delete it manually.`,
+        `Lane temp dir ${recordedTmpDir} was left in place: the recorded path is not absolute (guarded removal). Inspect and delete it manually.`, // D-282
       ],
     };
   }
@@ -191,7 +191,7 @@ export async function removeLaneTmpDirAtClose(options) {
       ...base,
       reason: 'outside-namespace',
       warnings: [
-        `Lane temp dir ${recordedTmpDir} was left in place: it is not inside this root's lane temp namespace (its parent segment is not the root key ${rootKey}) (D-282 guarded removal). Inspect and delete it manually.`,
+        `Lane temp dir ${recordedTmpDir} was left in place: it is not inside this root's lane temp namespace (its parent segment is not the root key ${rootKey}) (guarded removal). Inspect and delete it manually.`, // D-282
       ],
     };
   }
@@ -201,7 +201,7 @@ export async function removeLaneTmpDirAtClose(options) {
       ...base,
       reason: 'lane-id-mismatch',
       warnings: [
-        `Lane temp dir ${recordedTmpDir} was left in place: it does not end in the closing lane's id "${laneId}" (D-282 guarded removal). Inspect and delete it manually.`,
+        `Lane temp dir ${recordedTmpDir} was left in place: it does not end in the closing lane's id "${laneId}" (guarded removal). Inspect and delete it manually.`, // D-282
       ],
     };
   }
@@ -213,7 +213,7 @@ export async function removeLaneTmpDirAtClose(options) {
       ...base,
       reason: 'cwd-inside',
       warnings: [
-        `Lane temp dir ${recordedTmpDir} was left in place: the current working directory is inside it (D-282). cd out of the temp dir, then delete it manually.`,
+        `Lane temp dir ${recordedTmpDir} was left in place: the current working directory is inside it. cd out of the temp dir, then delete it manually.`, // D-282
       ],
     };
   }

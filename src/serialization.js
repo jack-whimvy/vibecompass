@@ -75,7 +75,7 @@ async function assertNotPromotedRoot(rootDir, label) {
     return;
   }
   throw new Error(
-    `This root was promoted to hosted-only${marker?.promoted_at ? ` on ${marker.promoted_at}` : ''}: the hosted app is canonical and local writes here can never sync back (D-288). `
+    `This root was promoted to hosted-only${marker?.promoted_at ? ` on ${marker.promoted_at}` : ''}: the hosted app is canonical and local writes here can never sync back. ` // D-288
     + 'Make changes on the hosted dashboard, run vibecompass demote-hosted to make this root canonical again, '
     + 'or set VIBECOMPASS_ALLOW_PROMOTED_ROOT_WRITES=1 to override deliberately.',
   );

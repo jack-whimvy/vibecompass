@@ -918,7 +918,7 @@ function buildRecommendations(options) {
   const recommendations = [];
 
   if (options.affectedArchitectureDocs.length > 0) {
-    recommendations.push('Fold the session changes into the affected architecture docs as current-state contracts — rewrite sections in place, keep the durable plan/next steps/rollout state in the doc, and move work/ship chronology to the session note (D-292, D-293) — then close with --architecture-docs updated.');
+    recommendations.push('Fold the session changes into the affected architecture docs as current-state contracts — rewrite sections in place, keep the durable plan/next steps/rollout state in the doc, and move work/ship chronology to the session note — then close with --architecture-docs updated.'); // D-292, D-293
   } else if (options.changedFiles.length > 0 && options.affectedArchitectureDocs.length === 0) {
     recommendations.push('No matching architecture doc was found for the session delta; create a focused doc written as a current-state contract, mark docs not-needed with evidence, or defer explicitly.');
   } else {

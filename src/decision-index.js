@@ -149,7 +149,7 @@ export async function collectCanonicalDecisions(rootDir) {
       const domain = path.basename(fileName, '.md');
       const previous = seen.get(id);
       if (previous) {
-        problems.push(`Canonical decision ${formatDecisionId(id)} appears in both ${previous} and ${fileName}; repair the duplicate before regenerating the index (D-276).`);
+        problems.push(`Canonical decision ${formatDecisionId(id)} appears in both ${previous} and ${fileName}; repair the duplicate before regenerating the index.`); // D-276
         continue;
       }
       seen.set(id, fileName);
@@ -260,7 +260,7 @@ async function refreshGroupedDecisionIndexLocked(rootDir, options) {
   const content = await readFile(indexPath, 'utf8').catch(() => null);
   if (content === null) {
     result.problems.push(
-      `No decisions/INDEX.md exists at ${indexPath}; the grouped generator preserves an existing index and never creates one from scratch (D-283).`,
+      `No decisions/INDEX.md exists at ${indexPath}; the grouped generator preserves an existing index and never creates one from scratch.`, // D-283
     );
     return result;
   }
@@ -291,7 +291,7 @@ async function refreshGroupedDecisionIndexLocked(rootDir, options) {
 
   if (!groupLabel) {
     result.problems.push(
-      `${diff.missing.length} decision(s) are missing from the index but no group label was determined; pass --group "<date> — Session <N> (<lane-id> lane)" or run with a resolvable lane (D-283).`,
+      `${diff.missing.length} decision(s) are missing from the index but no group label was determined; pass --group "<date> — Session <N> (<lane-id> lane)" or run with a resolvable lane.`, // D-283
     );
     return result;
   }

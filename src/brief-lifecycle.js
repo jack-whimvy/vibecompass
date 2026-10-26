@@ -98,7 +98,7 @@ export async function generateLaneBrief(options = {}) {
     };
 
     if (source.refusal) {
-      return failed('refused', `the dual-root source was refused: ${source.refusal}`, `Session brief refused (D-364): ${source.refusal}. Fix it, then run: ${briefCommand(frame, 'write')}`);
+      return failed('refused', `the dual-root source was refused: ${source.refusal}`, `Session brief refused: ${source.refusal}. Fix it, then run: ${briefCommand(frame, 'write')}`); // D-364
     }
 
     // The adapter reads another root, so the destination's exclusions apply
@@ -108,7 +108,7 @@ export async function generateLaneBrief(options = {}) {
     if (source.adapter) {
       const destinationSettings = await readBriefSettingsForRoot(destinationRoot);
       if (destinationSettings.problems.length > 0) {
-        const reason = `project.yaml brief settings in the destination root are invalid, so no canonical document was read (D-364): ${destinationSettings.problems.join('; ')}`;
+        const reason = `project.yaml brief settings in the destination root are invalid, so no canonical document was read: ${destinationSettings.problems.join('; ')}`; // D-364
         return failed('failed', reason, `Session brief incomplete: ${reason}`);
       }
       extraExclude = destinationSettings.exclude;
@@ -320,7 +320,7 @@ export async function refreshLaneBriefForLifecycle(options = {}) {
       reason: message,
       path: briefPath,
       warnings: [
-        `Session brief not written: ${message}. The ${trigger}-session result is unaffected; retry with: ${briefCommand(commandFrame, 'write')} (D-364).`,
+        `Session brief not written: ${message}. The ${trigger}-session result is unaffected; retry with: ${briefCommand(commandFrame, 'write')}.`, // D-364
       ],
     };
   }
@@ -360,7 +360,7 @@ export async function resolveBriefSource({ destinationRoot, laneId, sourceRootDi
     return refuse(`lane "${laneId}" has no readable session.yaml in the destination root ${destination}`);
   }
   if (!sourceIdentity) {
-    return refuse(`the source root ${sourceRoot} has no active lane "${laneId}"; mirror the lane there first (D-255)`);
+    return refuse(`the source root ${sourceRoot} has no active lane "${laneId}"; mirror the lane there first`); // D-255
   }
   if (sourceIdentity.id !== laneId || sourceIdentity.date !== destinationIdentity.date || sourceIdentity.number !== destinationIdentity.number) {
     return refuse(
@@ -451,7 +451,7 @@ function commandsFor(destinationRoot, laneId, source) {
 function assembleBriefDocument(commands, generatedAt, fields, body) {
   const lines = [
     '---',
-    '# Generated session brief (D-357, D-359, D-364); do not edit. It is stale once any binding below changes.',
+    '# Generated session brief; do not edit. It is stale once any binding below changes.', // D-357, D-359, D-364
     '# The token budget covers the brief body below this header; the header is metadata outside it.',
     `# Check: ${commands.check}`,
     `# Refresh: ${commands.write}`,

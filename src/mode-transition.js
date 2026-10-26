@@ -261,7 +261,7 @@ async function ensurePromotedMarker(rootDir, context) {
     promoted_at: new Date().toISOString(),
     api_url: context.binding.apiUrl,
     project_id: context.binding.projectId,
-    note: 'This root was promoted to hosted-only (D-288). The hosted app is canonical; local canonical writes refuse by default.',
+    note: 'This root was promoted to hosted-only. The hosted app is canonical; local canonical writes refuse by default.', // D-288
   };
   await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
 }

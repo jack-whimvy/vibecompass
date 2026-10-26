@@ -856,7 +856,7 @@ Updated 2026-01-01 (fenced example, must be masked):
     assert.equal(smellWarnings.length, 1);
     assert.match(smellWarnings[0].message, /3 changelog-shaped line\(s\)/);
     assert.match(smellWarnings[0].message, /Audit deepening — 2026-07-07/);
-    assert.match(smellWarnings[0].message, /current-state contracts \(D-292\)/);
+    assert.match(smellWarnings[0].message, /current-state contracts/);
   } finally {
     await fixture.cleanup();
   }

@@ -11,7 +11,7 @@ import { buildCloseSessionGuidance, resolveWorkflowSettings } from '../workflow.
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/changelog-calibration');
 const UNCONDITIONAL_CLOSE_LINE =
-  'Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close (D-292, D-293).';
+  'Architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state — fold changes in place, never dated session sections; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale; transient lane scratch drains into the session note at close.';
 
 test('changelog-calibration fixture matrix: six smelly docs warn once each, controls stay quiet', async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-calibration-'));
@@ -733,18 +733,18 @@ test('generated guidance surfaces carry the D-292/D-293 authorship rules', async
     });
 
     const context = await readFile(path.join(rootDir, 'context.md'), 'utf8');
-    assert.match(context, /mutable current-state layer, rewritten in place as contracts change \(D-292\)/);
+    assert.match(context, /mutable current-state layer, rewritten in place as contracts change/);
     assert.match(context, /Work\/ship chronology belongs in finalized session notes/);
     assert.match(context, /fold the changes into the doc's current-state sections/);
-    assert.match(context, /architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale \(D-292, D-293\)/);
-    assert.match(context, /distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs \(D-292, D-293\)/);
+    assert.match(context, /architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale/);
+    assert.match(context, /distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs/);
 
     const architectureGuide = await readFile(path.join(rootDir, 'architecture/README.md'), 'utf8');
-    assert.match(architectureGuide, /Docs are mutable current-state contracts \(D-292\)/);
+    assert.match(architectureGuide, /Docs are mutable current-state contracts/);
     assert.match(architectureGuide, /content_mode: chronological-ledger/);
 
     const docsReviewWorkflow = await readFile(path.join(rootDir, 'workflows/docs-review.md'), 'utf8');
-    assert.match(docsReviewWorkflow, /Write every doc as a current-state contract \(D-292\)/);
+    assert.match(docsReviewWorkflow, /Write every doc as a current-state contract/);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

@@ -92,7 +92,7 @@ export async function appendDecisionEntry(options) {
   if (!NEXT_ID_PLACEHOLDER_PATTERN.test(entrySource)) {
     throw new Error(
       'Staged decision entries must start with a "### D-NEXT — <title>" heading. ' +
-        'The D-number is allocated at write time (D-276); do not pre-assign one.',
+        'The D-number is allocated at write time; do not pre-assign one.', // D-276
     );
   }
 
@@ -149,19 +149,19 @@ export async function appendDecisionEntry(options) {
         refresh = await options.indexRefresher({ decisionId });
       } catch (error) {
         warnings.push(
-          `decisions/INDEX.md was not refreshed (D-283): the grouped index refresh failed after the canonical entry was appended — ${error instanceof Error ? error.message : String(error)}. The decision was recorded; do not re-run append-decision — refresh the index by hand with \`vibecompass refresh-decision-index\`.`,
+          `decisions/INDEX.md was not refreshed: the grouped index refresh failed after the canonical entry was appended — ${error instanceof Error ? error.message : String(error)}. The decision was recorded; do not re-run append-decision — refresh the index by hand with \`vibecompass refresh-decision-index\`.`, // D-283
         );
       }
       warnings.push(...(refresh?.warnings ?? []));
       if (refresh?.refreshed) {
-        indexReminder = `decisions/INDEX.md refreshed (structure-preserving, D-283): added ${refresh.added
+        indexReminder = `decisions/INDEX.md refreshed (structure-preserving): added ${refresh.added
           .map((decision) => formatDecisionId(decision.id))
-          .join(', ')} under "## ${refresh.groupLabel}".`;
+          .join(', ')} under "## ${refresh.groupLabel}".`; // D-283
       } else if (refresh?.upToDate) {
         indexReminder = 'decisions/INDEX.md already lists this entry (structure-preserving refresh found nothing missing).';
       } else if (refresh) {
         warnings.push(
-          `decisions/INDEX.md was not refreshed (D-283 fail-closed): ${refresh.problems[0] ?? 'unknown refusal'}`,
+          `decisions/INDEX.md was not refreshed (fail-closed): ${refresh.problems[0] ?? 'unknown refusal'}`, // D-283
         );
       }
     }

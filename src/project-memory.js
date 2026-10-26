@@ -373,7 +373,7 @@ function validateProjectData(data, relativePath) {
       warnings.push(
         createWarning(
           'project-runtime-invalid',
-          'project.yaml "runtime" must be a mapping of runtime-isolation settings (D-282); the defaults apply.',
+          'project.yaml "runtime" must be a mapping of runtime-isolation settings; the defaults apply.', // D-282
         ),
       );
     } else {
@@ -392,7 +392,7 @@ function validateProjectData(data, relativePath) {
       warnings.push(
         createWarning(
           'project-brief-invalid',
-          `project.yaml brief settings: ${problem}. Session briefs read no canonical document until this is fixed (D-364).`,
+          `project.yaml brief settings: ${problem}. Session briefs read no canonical document until this is fixed.`, // D-364
         ),
       );
     }
@@ -571,7 +571,7 @@ function parseArchitectureDocument(options) {
         warnings.push(
           createWarning(
             'architecture-changelog-smell',
-            `Architecture doc contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"). Architecture docs are current-state contracts (D-292): fold the change into the existing sections, keep the durable plan and rollout state in the doc, and move work/ship chronology to the session note — decisions record accepted choices (D-293). Intentionally dated ledgers/reports can declare content_mode: chronological-ledger.`,
+            `Architecture doc contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"). Architecture docs are current-state contracts: fold the change into the existing sections, keep the durable plan and rollout state in the doc, and move work/ship chronology to the session note — decisions record accepted choices. Intentionally dated ledgers/reports can declare content_mode: chronological-ledger.`, // D-292, D-293
           ),
         );
       }

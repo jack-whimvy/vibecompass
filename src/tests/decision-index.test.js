@@ -290,7 +290,7 @@ test('append-decision refreshes the grouped index with --group and via lane cont
       { cwd: tempDir },
     );
     assert.equal(exitCode, 0);
-    assert.match(stdout.join(''), /decisions\/INDEX\.md refreshed \(structure-preserving, D-283\): added D-005/);
+    assert.match(stdout.join(''), /decisions\/INDEX\.md refreshed \(structure-preserving\): added D-005/);
     const content = await readFile(indexPath, 'utf8');
     assert.ok(content.includes('## 2026-07-03 — Session 3 (gamma lane)'));
     assert.ok(content.includes('| D-005 | Fifth decision | [cross-cutting](cross-cutting.md) |'));
@@ -304,7 +304,7 @@ test('append-decision refreshes the grouped index with --group and via lane cont
     );
     const { io: laneIo, stdout: laneStdout } = createCaptureIo();
     await runCli(['append-decision', '--root', rootDir, '--target', 'cross-cutting.md', '--entry', stagedPath], laneIo, { cwd: tempDir });
-    assert.match(laneStdout.join(''), /refreshed \(structure-preserving, D-283\): added D-006/);
+    assert.match(laneStdout.join(''), /refreshed \(structure-preserving\): added D-006/);
     const laneLabel = `## ${started.sessionDate} — Session ${started.sessionNumber} (gamma lane)`;
     assert.ok((await readFile(indexPath, 'utf8')).includes(laneLabel), `expected group "${laneLabel}"`);
 

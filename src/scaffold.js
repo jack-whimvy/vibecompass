@@ -210,13 +210,37 @@ function generateContextMarkdown(options) {
     .map((repo) => `- \`${repo.id}\` → ${formatRepoDescriptor(repo)}`)
     .join('\n');
 
+  // The decisions behind each section's rules, one per place the text states
+  // one; the rendered text names none of the package's decision numbers:
+  // - Canonical files: architecture docs D-292.
+  // - Derived and scratch files: brief.md D-359, D-364, its opt-in D-368; the
+  //   lane marker D-280; INDEX.md D-283.
+  // - Session model: the brief's opt-in D-368 and brief.md D-359, D-364; lane
+  //   selection D-277; open sessions D-353; the lane's role D-392; plan tasks
+  //   D-395 and task lines D-393; git binding D-281; lane runtime D-282;
+  //   architecture docs D-292, D-293.
+  // - Session roles: continue session's role D-392; the owner D-392.
+  // - Session prompt commands: reviewer handback D-394, D-392.
+  // - Session startup: lane selection D-277.
+  // - Open, resume, or choose: D-353, D-392.
+  // - Builder workflow: --plan-task D-395; git binding D-281; lane-env D-282;
+  //   current-state docs D-292; response and owner lines D-394; who counts as
+  //   a reviewer D-398; re-reading before a release, merge, or push D-392;
+  //   append-decision D-283; an existing lane D-353.
+  // - At session close: what each doc keeps D-292, D-293; the note's Review
+  //   section D-394; folding pending work into docs D-292, D-293.
+  // - Reviewer workflow: who counts as a reviewer D-398; write nothing else
+  //   D-392.
+  // - Review log format: D-394, D-398; who counts as a reviewer D-398.
+  // - Project manager workflow: D-392, D-393; --plan-task D-395; checking the
+  //   note's Review section D-398.
   return `# Project Context — ${projectName}
 
 This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`.
 
 ## Canonical files
 - \`${rootRelativePath}/project.yaml\` — machine-oriented project metadata
-- \`${rootRelativePath}/architecture/\` — canonical architecture docs; the mutable current-state layer, rewritten in place as contracts change (D-292)
+- \`${rootRelativePath}/architecture/\` — canonical architecture docs; the mutable current-state layer, rewritten in place as contracts change
 - \`${rootRelativePath}/decisions/\` — append-only decision log for this project-memory root
 - \`${rootRelativePath}/sessions/\` — finalized session notes
 
@@ -227,26 +251,26 @@ This workspace uses VibeCompass project memory rooted at \`${rootRelativePath}\`
 - \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` — lane metadata (including the lane's \`role\` and the recorded \`lane_marker\` when one exists)
 - \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` — lane-local builder scratchpad
 - \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\` — lane-local builder/reviewer relay
-- \`${rootRelativePath}/sessions/active/<lane-id>/brief.md\` — generated session brief (D-359, D-364): the memory this lane should read first, written by \`start-session\` and \`continue-session\` when \`brief.enabled: true\` (opt-in, D-368) or on request with \`vibecompass brief --write\`; never hand-edit
-- \`.vibecompass-lane.yaml\` — worktree-local lane marker (D-280); lives outside the memory root, written only by \`vibecompass write-lane-marker\` or worktree provisioning, never synced
-- \`${rootRelativePath}/decisions/INDEX.md\` — derived grouped decision index; refresh with \`vibecompass refresh-decision-index\` (D-283, structure-preserving) instead of hand-editing rows
+- \`${rootRelativePath}/sessions/active/<lane-id>/brief.md\` — generated session brief: the memory this lane should read first, written by \`start-session\` and \`continue-session\` when \`brief.enabled: true\` (opt-in) or on request with \`vibecompass brief --write\`; never hand-edit
+- \`.vibecompass-lane.yaml\` — worktree-local lane marker; lives outside the memory root, written only by \`vibecompass write-lane-marker\` or worktree provisioning, never synced
+- \`${rootRelativePath}/decisions/INDEX.md\` — derived grouped decision index; refresh with \`vibecompass refresh-decision-index\` (structure-preserving) instead of hand-editing rows
 
 ## Session model
 - VibeCompass active builder sessions are named lanes. Use one lane per active feature or workstream.
 - \`vibecompass start-session\` requires \`--id <lane-id>\` so each active lane has a meaningful feature or workstream name.
 - The active lane scratch files live under \`${rootRelativePath}/sessions/active/<lane-id>/\`.
-- When \`${rootRelativePath}/project.yaml\` sets \`brief.enabled: true\` (opt-in, D-368), \`start-session\` and \`continue-session\` write the lane's generated \`brief.md\` (D-359, D-364): the task is the lane's working-on, the files its claims, and the features its feature slugs. A brief failure is reported as a warning or an incomplete brief and never fails the lifecycle command. \`--no-brief\` skips it for one command, \`vibecompass brief --session <lane-id> --write\` writes one on request whatever the setting, and \`brief.exclude\` lists root-relative globs the brief must never read.
-- Lane selection follows D-277: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
+- When \`${rootRelativePath}/project.yaml\` sets \`brief.enabled: true\` (opt-in), \`start-session\` and \`continue-session\` write the lane's generated \`brief.md\`: the task is the lane's working-on, the files its claims, and the features its feature slugs. A brief failure is reported as a warning or an incomplete brief and never fails the lifecycle command. \`--no-brief\` skips it for one command, \`vibecompass brief --session <lane-id> --write\` writes one on request whatever the setting, and \`brief.exclude\` lists root-relative globs the brief must never read.
+- Lane selection: an explicit \`--session\` wins, then the nearest worktree lane marker (\`.vibecompass-lane.yaml\`, walking up from cwd), then the single active lane. With two or more active lanes there is no implicit current-lane fallback.
 - \`${rootRelativePath}/sessions/active/index.yaml\` is the lane inventory; its \`current\` pointer and the tool-specific Current session block are human-readable continuity summaries, not the lane-selection source of truth.
-- An active lane directory is an open session, not an unclosed crash (D-353). Resume it with \`vibecompass continue-session [<lane-id>]\`: the lane keeps its opening date and session number; the command records \`resumed_at\`/\`resume_count\` in \`session.yaml\`, appends a dated \`Resumed\` line to \`wip.md\`, moves the index \`current\` hint and the Current session block to the lane, and re-emits runtime, git-binding, and staleness warnings. \`start-session --id <existing-lane>\` fails closed and names \`continue-session\`.
-- Each lane records its role in \`session.yaml\` (D-392): \`builder\`, the default, or \`project-manager\`, set with \`start-session --role project-manager\`. A lane without the field is a builder lane. No command changes a lane's role: \`continue-session\` resumes the lane in it and prints it, \`list-sessions\` names a project-manager lane's role, and \`list-sessions --json\` gives every lane's.
-- A lane may link the plan tasks it works on (D-395): \`start-session --plan-task "<plan-path>#<ID>"\`, repeatable and quoted, since \`#\` is a glob character in zsh. Each link must name a task line in the plan's \`## Next steps\` (D-393), or nothing is written; a ticked task warns and is kept. Links are stored as \`plan_tasks\` in \`session.yaml\`, and the plan joins the lane's \`architecture_docs\`. \`continue-session --plan-task\` adds links, and nothing removes one. \`list-sessions\` prints a linked lane's \`tasks:\` line (\`planTasks\` in \`--json\`), and \`close-session\` lists the links in the note's \`## Plan tasks\` section and ticks nothing.
-- Optional git binding (D-281): \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
+- An active lane directory is an open session, not an unclosed crash. Resume it with \`vibecompass continue-session [<lane-id>]\`: the lane keeps its opening date and session number; the command records \`resumed_at\`/\`resume_count\` in \`session.yaml\`, appends a dated \`Resumed\` line to \`wip.md\`, moves the index \`current\` hint and the Current session block to the lane, and re-emits runtime, git-binding, and staleness warnings. \`start-session --id <existing-lane>\` fails closed and names \`continue-session\`.
+- Each lane records its role in \`session.yaml\`: \`builder\`, the default, or \`project-manager\`, set with \`start-session --role project-manager\`. A lane without the field is a builder lane. No command changes a lane's role: \`continue-session\` resumes the lane in it and prints it, \`list-sessions\` names a project-manager lane's role, and \`list-sessions --json\` gives every lane's.
+- A lane may link the plan tasks it works on: \`start-session --plan-task "<plan-path>#<ID>"\`, repeatable and quoted, since \`#\` is a glob character in zsh. Each link must name a task line (\`- [ ] <ID> — <scope>\`) in the plan's \`## Next steps\`, or nothing is written; a ticked task warns and is kept. Links are stored as \`plan_tasks\` in \`session.yaml\`, and the plan joins the lane's \`architecture_docs\`. \`continue-session --plan-task\` adds links, and nothing removes one. \`list-sessions\` prints a linked lane's \`tasks:\` line (\`planTasks\` in \`--json\`), and \`close-session\` lists the links in the note's \`## Plan tasks\` section and ticks nothing.
+- Optional git binding: \`start-session --branch <name> --repo <id> [--worktree]\` creates or reuses the branch in every bound repo; \`--worktree\` additionally provisions per-repo worktrees under \`<workspace>/worktrees/<lane-id>/<repo-id>\` with the lane marker written into the container, so commands run from inside a worktree need neither \`--root\` nor \`--session\`. Binding is opt-in and git is never required for lanes.
 - At close, \`close-session\` removes a bound lane's recorded clean worktrees (guarded and never forced: dirty, in-use, or unverifiable worktrees survive with guidance, the lane marker is kept while any worktree survives, and branches are never deleted). Do not hand-remove provisioned worktrees; follow the printed guidance instead.
-- Every lane gets a per-lane runtime assignment at start (D-282): a lane port and temp dir recorded in \`session.yaml\` and exported with \`eval "$(vibecompass lane-env)"\` (includes conventional \`PORT\`/\`TMPDIR\` aliases), so parallel lanes never fight over dev-server ports or temp paths. Defaults are configurable under \`project.yaml\` \`runtime:\`; \`close-session\` removes the lane temp dir under guards.
+- Every lane gets a per-lane runtime assignment at start: a lane port and temp dir recorded in \`session.yaml\` and exported with \`eval "$(vibecompass lane-env)"\` (includes conventional \`PORT\`/\`TMPDIR\` aliases), so parallel lanes never fight over dev-server ports or temp paths. Defaults are configurable under \`project.yaml\` \`runtime:\`; \`close-session\` removes the lane temp dir under guards.
 - Finalized sessions are append-only notes named \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; multiple sessions on the same day increment \`N\`.
 - Decisions remain append-only and independent from session notes. A session note may reference decisions, but the decision entry in \`${rootRelativePath}/decisions/\` is the durable decision record for this root.
-- Architecture docs are the opposite of the append-only surfaces (D-292): they are current-state contracts, rewritten in place. Fold changes into the existing sections and keep the durable plan, unresolved next steps, and material rollout state in the doc. Work/ship chronology belongs in finalized session notes; decision entries record accepted choices and rationale; lane scratch holds only transient execution/review state, and anything still pending at close moves to the session note's next steps and, when durable, into architecture (D-293). Intentionally dated ledger/report docs may declare frontmatter \`content_mode: chronological-ledger\`.
+- Architecture docs are the opposite of the append-only surfaces: they are current-state contracts, rewritten in place. Fold changes into the existing sections and keep the durable plan, unresolved next steps, and material rollout state in the doc. Work/ship chronology belongs in finalized session notes; decision entries record accepted choices and rationale; lane scratch holds only transient execution/review state, and anything still pending at close moves to the session note's next steps and, when durable, into architecture. Intentionally dated ledger/report docs may declare frontmatter \`content_mode: chronological-ledger\`.
 
 ## Repos in scope
 ${repos}
@@ -255,17 +279,17 @@ ${repos}
 | Entry trigger | Role | Owns session lifecycle? |
 |---|---|---|
 | "start session" | Builder | Yes — opens a new lane, keeps scratch files current, and writes the final session note |
-| "continue session" | The lane's recorded role: builder, or project manager for a lane opened with \`--role project-manager\` (D-392) | Yes — resumes an already-open lane in that role and owns its lifecycle from there |
+| "continue session" | The lane's recorded role: builder, or project manager for a lane opened with \`--role project-manager\` | Yes — resumes an already-open lane in that role and owns its lifecycle from there |
 | "join as reviewer" | Reviewer | No — reviews the builder's work, appends findings, and updates handoff guidance |
 | "join as project manager" | Project manager | Only of its own lanes — plans tasks, writes build prompts, and checks close reports from a standing conversation with no lane; opens a short lane of its own (\`--role project-manager\`) only to change canonical memory, and closes it the way a builder does |
 
-The owner is the person who brings the idea and makes the decisions; the owner is not a session role (D-392).
+The owner is the person who brings the idea and makes the decisions; the owner is not a session role.
 
 ## Session prompt commands
 ${promptCommands}
 
 These are prompt commands for agent behavior, not \`vibecompass\` CLI subcommands.
-Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` › \`## Review log\` (record lines in the Review log format below, D-394) and \`handoff.md\` › \`## Reviewer → Builder\`, the only two sections a pass writes (D-392), and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\` plus document-maintenance checkpoint statuses, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
+Reviewer handback is explicit: the reviewer ends the pass by updating the selected lane's \`wip.md\` › \`## Review log\` (record lines in the Review log format below) and \`handoff.md\` › \`## Reviewer → Builder\`, the only two sections a pass writes, and then stopping. The \`close session\` prompt runs builder close-out and ends with \`vibecompass close-session --session <lane-id>\` plus document-maintenance checkpoint statuses, which follows the workflow defaults recorded in \`${rootRelativePath}/project.yaml\`.
 \`vibecompass end-session\` is also accepted as an alias for \`vibecompass close-session\`; the canonical command name remains \`close-session\`.
 
 ## Workflow defaults
@@ -281,7 +305,7 @@ ${renderWorkflowDefaults(workflow)}
 ## Session startup
 1. Read \`${rootRelativePath}/project.yaml\`.
 2. Read the latest finalized session note in \`${rootRelativePath}/sessions/\`.
-3. Inventory active lanes with \`vibecompass list-sessions\` (or read \`${rootRelativePath}/sessions/active/index.yaml\`), then follow the "Open, resume, or choose" protocol below to decide between opening a new lane and resuming one; select a lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane (D-277).
+3. Inventory active lanes with \`vibecompass list-sessions\` (or read \`${rootRelativePath}/sessions/active/index.yaml\`), then follow the "Open, resume, or choose" protocol below to decide between opening a new lane and resuming one; select a lane from an explicit \`--session\`, the nearest worktree lane marker, or the single active lane.
 4. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\`.
 5. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/handoff.md\`.
 6. If present, read \`${rootRelativePath}/sessions/active/<lane-id>/brief.md\` before planning: the generated session brief selects the architecture docs, decisions (with their declared successors), and notes for the lane's task. Its status line says whether it is complete, partial, incomplete (read the listed required reads first), or no-match; \`vibecompass brief --check\` reports whether it is stale.
@@ -289,7 +313,7 @@ ${renderWorkflowDefaults(workflow)}
 
 The project manager (\`join as project manager\`) reads steps 1–3, then \`${rootRelativePath}/workflows/project-manager.md\` and the plan; it opens and selects no lane (Project manager workflow).
 
-## Open, resume, or choose (D-353, D-392)
+## Open, resume, or choose
 Both \`start session\` and \`continue session\` begin with the active-lane inventory. Every lane has a role: builder, unless the inventory names \`role project-manager\`. \`continue session\` counts every lane and resumes each in its recorded role; \`start session\` counts only builder lanes and never resumes a project-manager lane. Then:
 - **No active lane:** open one with \`vibecompass start-session --id <lane-id> --working-on "..."\`. \`continue session\` with no lane reports that there is nothing to resume and hands off to \`start session\`.
 - **Exactly one active lane, or a cwd bound to a lane by a worktree marker:** resume it with \`vibecompass continue-session\` without asking. Open a second lane only when the user is clearly asking for separate new work; never re-open a lane that already exists.
@@ -303,7 +327,7 @@ Both \`start session\` and \`continue session\` begin with the active-lane inven
 - Run recovery (reconstruct a missing finalized note from git history) only when the Current session block date is in the past *and* no active lane exists *and* no finalized note covers that date. An active lane with a past date is simply resumable.
 
 ## Builder workflow
-At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--feature\`, \`--repo\`, \`--claim\`, \`--architecture-doc\`, and \`--decision-domain-file\` values when the lane's scope is known so overlap warnings can be precise, and \`--plan-task "<plan-path>#<ID>"\` for each plan task the lane works on (D-395). Add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees (D-281).
+At session start, prefer running \`vibecompass start-session --id <lane-id> --working-on "..." \`; add \`--feature\`, \`--repo\`, \`--claim\`, \`--architecture-doc\`, and \`--decision-domain-file\` values when the lane's scope is known so overlap warnings can be precise, and \`--plan-task "<plan-path>#<ID>"\` for each plan task the lane works on. Add \`--branch <name> --repo <id> [--worktree]\` when the lane should work on its own branch or in isolated worktrees.
 If you manage files manually, create \`${rootRelativePath}/sessions/active/<lane-id>/session.yaml\` and \`${rootRelativePath}/sessions/active/index.yaml\`, then create \`${rootRelativePath}/sessions/active/<lane-id>/wip.md\` if it does not exist:
 
 \`\`\`md
@@ -349,19 +373,19 @@ During the session:
 - keep \`handoff.md\` current after substantive work blocks
 - optionally list under \`wip.md\` \`## Context used\` the docs and decisions the lane actually relied on (path or D-number, and what for), so the brief's usefulness can be audited
 - refresh the lane brief with \`vibecompass brief --write\` after the lane's scope changes; \`vibecompass brief --check\` reports whether it is stale
-- run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used (D-282); do not hardcode ports in lane work
+- run \`eval "$(vibecompass lane-env)"\` in a lane shell before starting dev servers or build tools so the lane's assigned port and temp dir are used; do not hardcode ports in lane work
 - run \`vibecompass docs-update --session <lane-id>\` whenever you need an ad hoc targeted documentation-maintenance plan for the current session delta
-- after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh — fold the changes into the doc's current-state sections (rewrite in place; no dated "update" sections, lane names in headings, or completed-task chronology; D-292)
+- after substantive feature work, confirm affected architecture docs and decisions still match the implementation; if not, update them while the context is fresh — fold the changes into the doc's current-state sections (rewrite in place; no dated "update" sections, lane names in headings, or completed-task chronology)
 - use \`vibecompass list-sessions\` (\`--json\` for the machine-readable inventory) to inspect active lanes, \`vibecompass continue-session [<lane-id>]\` to resume one at the start of a sitting, and \`vibecompass switch-session <lane-id>\` to move the continuity pointer without recording a resume
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
-- answer each pass in \`wip.md\` › \`## Review log\` with a response line and one finding line per finding, its status the classification and its reason why (Review log format); when the owner chooses at the cap or defers a finding, write an owner line with the owner's choice and the reason in the owner's words (D-394)
-- a review pass counts only when a reviewer the owner started runs it (D-398): a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in \`## Log\`, never as pass lines, and never write a pass line yourself
-- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest \`wip.md\` and \`handoff.md\` of every other open lane; if one records an unmet gate on that step, stop and report instead (D-392)
+- answer each pass in \`wip.md\` › \`## Review log\` with a response line and one finding line per finding, its status the classification and its reason why (Review log format); when the owner chooses at the cap or defers a finding, write an owner line with the owner's choice and the reason in the owner's words
+- a review pass counts only when a reviewer the owner started runs it: a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in \`## Log\`, never as pass lines, and never write a pass line yourself
+- before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest \`wip.md\` and \`handoff.md\` of every other open lane; if one records an unmet gate on that step, stop and report instead
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
-- record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them; \`vibecompass append-decision\` allocates the D-number at write time and refreshes the grouped \`decisions/INDEX.md\` when the lane context is resolvable (D-283); run \`vibecompass refresh-decision-index\` after hand-appends
+- record architectural decisions in \`${rootRelativePath}/decisions/\` before implementing them; \`vibecompass append-decision\` allocates the D-number at write time and refreshes the grouped \`decisions/INDEX.md\` when the lane context is resolvable; run \`vibecompass refresh-decision-index\` after hand-appends
 
-If \`vibecompass start-session\` reports that the lane already exists, resume it with \`vibecompass continue-session <lane-id>\` instead (D-353). If it reports legacy or stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
+If \`vibecompass start-session\` reports that the lane already exists, resume it with \`vibecompass continue-session <lane-id>\` instead. If it reports legacy or stale scratch files, read the existing lane-local \`wip.md\` and \`handoff.md\` first. Either close that session normally, recover its useful notes into a finalized session note, or intentionally move/delete the stale scratch files before starting a new session.
 
 ## Optional planning mode
 - Use planning mode for risky, ambiguous, cross-file, or architectural work before implementation.
@@ -372,26 +396,26 @@ If \`vibecompass start-session\` reports that the lane already exists, resume it
 At session close:
 - prefer running \`vibecompass close-session --session <lane-id> --title "..." --completed "..." --architecture-docs updated|not-needed|deferred --decision-log updated|not-needed|deferred --session-maintenance updated|not-needed|deferred --next-step "..."\`; \`vibecompass end-session\` is a supported alias
 - close-session prints the same targeted docs-update plan — including the pre-close staleness set (new decisions since lane start, stale base revisions, newer finalized notes touching this lane's scope, claim overlap with other active lanes) — before the document-maintenance checkpoint; use it to decide whether affected \`architecture/\`, \`decisions/\`, and active-session scratch/final note inputs are updated, not-needed, or deferred
-- document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship — architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale (D-292, D-293)
+- document-maintenance checkpoint statuses are required before close-session writes the finalized note; the package validates the status values, while the closer owns semantic doc authorship — architecture docs keep current behavior plus the durable plan, unresolved next steps, and material rollout state; session notes keep work chronology and close-out next steps; decisions keep accepted choices and rationale
 - follow the stored close-session defaults from \`${rootRelativePath}/project.yaml\`
 - run \`vibecompass review-check --session <lane-id>\` before close-session: it runs the check close-session runs (Review log format) and prints each finding's state; resolve what it reports, or take it to the owner
-- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; close-session writes the note's \`## Review\` section after \`## Models used\` from the record (its \`Check:\` and \`Passes:\` lines, one line per finding, and each owner line) and adds each deferred finding to the next steps unless a \`--next-step\` names its id, so the review needs no \`--completed\` line; add context with \`--review-note "<text>"\` (repeatable), and pass \`--review-override "<reason>"\` only on the owner's instruction, with the owner's reason in the owner's words (D-394)
+- finalize the lane-local \`wip.md\` into \`${rootRelativePath}/sessions/YYYY-MM-DD-N-title.md\`; close-session writes the note's \`## Review\` section after \`## Models used\` from the record (its \`Check:\` and \`Passes:\` lines, one line per finding, and each owner line) and adds each deferred finding to the next steps unless a \`--next-step\` names its id, so the review needs no \`--completed\` line; add context with \`--review-note "<text>"\` (repeatable), and pass \`--review-override "<reason>"\` only on the owner's instruction, with the owner's reason in the owner's words
 - close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, the container, and the lane temp dir when they are safely removable; leftover pieces come with printed guidance
-- refresh any affected architecture/decision docs by folding changes into their current-state contract prose — do not append session chronology; distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs (D-292, D-293)
+- refresh any affected architecture/decision docs by folding changes into their current-state contract prose — do not append session chronology; distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
 - for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred
 
 ## Reviewer workflow
 - use \`review handoff\` when you want the reviewer to run the next review pass
-- you are the lane's reviewer only when the owner started you and pointed you at the lane with \`review handoff <lane-id>\` (D-398); an agent the builder launched or directed does the builder's own checks: it reports to the builder and writes no pass line
+- you are the lane's reviewer only when the owner started you and pointed you at the lane with \`review handoff <lane-id>\`; an agent the builder launched or directed does the builder's own checks: it reports to the builder and writes no pass line
 - read the latest finalized session note, then the selected lane's \`wip.md\`, then \`handoff.md\`
 - inspect the relevant code/docs diffs
 - append the pass to \`wip.md\` › \`## Review log\` as record lines (Review log format): a pass line, then a finding line for each new finding (\`open\`) and a verdict on each finding the builder answered (\`confirmed\`, \`reopened\`, or \`withdrawn\`), with detail and evidence on continuation lines; \`<reviewer>\` names your tool and model
 - write a concise baton-pass summary into \`handoff.md\` › \`## Reviewer → Builder\`
-- write nothing else (D-392): a pass writes only the selected lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`. A change you think is needed anywhere else (code, docs, decisions, agent files, settings) is a finding or a proposal to the owner, not an edit. Read-only commands stay allowed
+- write nothing else: a pass writes only the selected lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`. A change you think is needed anywhere else (code, docs, decisions, agent files, settings) is a finding or a proposal to the owner, not an edit. Read-only commands stay allowed
 - end the review pass after those file updates; there is no separate reviewer-exit step
 
-## Review log format (D-394, D-398)
+## Review log format
 A lane's \`wip.md\` › \`## Review log\` holds only record lines, finding lines, continuation lines, and blank lines: no prose, headings, or code fences. Fields are separated by \` | \` (space, bar, space), and the last field takes the rest of the line.
 - **Pass line** (reviewer): \`- pass <n> | <time> | <reviewer> | <scope> | <outcome>\`. Passes are numbered 1, 2, 3… within the lane. \`<outcome>\` is \`no findings\` when the pass opens and reopens nothing, and \`findings\` otherwise.
 - **Response line** (builder): \`- response <n> | <time> | <builder>\`, answering pass \`<n>\`.
@@ -416,18 +440,18 @@ A lane's \`wip.md\` › \`## Review log\` holds only record lines, finding lines
 
 A finding is resolved when its latest line is the reviewer's \`confirmed\` or \`withdrawn\`; a confirmed \`deferred\` is resolved as a deferral, and the note carries the builder's reason. An owner \`defer\` line keeps a finding unresolved but out of the check's failures until the reviewer's next line for it.
 
-**Who counts as a reviewer (D-398).** A pass is a run by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`: an agent session the owner opened, or a person the owner asked. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) is not a reviewer, whatever its model: its checks are builder work, recorded in \`## Log\`, and the builder writes no pass line. The check can't see who started a run, so the project manager compares each pass's reviewer with the reviewer the build prompt or the owner named. When the owner accepts work with no independent pass, the builder closes with \`--review-override "<reason>"\` in the owner's words; that is not a pass.
+**Who counts as a reviewer.** A pass is a run by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`: an agent session the owner opened, or a person the owner asked. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) is not a reviewer, whatever its model: its checks are builder work, recorded in \`## Log\`, and the builder writes no pass line. The check can't see who started a run, so the project manager compares each pass's reviewer with the reviewer the build prompt or the owner named. When the owner accepts work with no independent pass, the builder closes with \`--review-override "<reason>"\` in the owner's words; that is not a pass.
 
 **The check.** \`close-session\` runs it after reading \`wip.md\` and before writing anything, and \`vibecompass review-check --session <lane-id>\` runs it on an open lane without closing it. It fails when the log has no pass line; when the log is malformed (the message names the first bad line, and a malformed log has no parseable pass); when a finding is open and not deferred by the owner; or when pass \`<n>\` beyond the cap has fewer than \`<n>\` minus the cap owner \`another round\` lines before it. It covers every builder lane, and a project-manager lane once its log has a pass line. \`metadata.workflow.review.check\` sets what a failure does (Workflow defaults).
 
-## Project manager workflow (D-392, D-393)
+## Project manager workflow
 - \`join as project manager <plan-path>\` enters the role. It opens no lane and selects none: read Session startup steps 1–3, then \`${rootRelativePath}/workflows/project-manager.md\` (the role in full: inputs and outputs, build prompts, checking close reports, when to move on, the plan format, operating rules, and publication), then the plan. With no plan named, ask which plan to run, or offer to write one.
 - The project manager plans tasks, writes each build lane's prompt, checks each close report against primary sources, decides when the plan moves to the next task, and escalates to the owner with options and a recommendation. It doesn't write product code and doesn't stand in for the reviewer.
 - It reads all of project memory, plus other lanes' \`wip.md\`, \`handoff.md\`, and \`brief.md\`, read only. Status reports, prompts, and report checks need no lane.
 - It changes canonical memory (plans, architecture docs, decisions) only inside short lanes of its own: opened with \`vibecompass start-session --id <lane-id> --working-on "..." --role project-manager\`, run with the builder's lane mechanics, and closed with \`close session\` in the same sitting. \`continue session <lane-id>\` resumes such a lane as project manager.
 - It never edits another lane's scratch files, never writes into a closed lane, and never hand-edits package output.
-- Each build prompt's \`start-session\` line links the lane to its tasks with \`--plan-task "<plan-path>#<ID>"\`, one per task, with the reference quoted, since \`#\` is a glob character in zsh (D-395); \`--working-on\` stays free text. The lane's finalized note lists the links under \`## Plan tasks\`. close-session ticks nothing: the prompt's close-out says who ticks each task, only once its work is merged and verified, and who annotates it otherwise.
-- When it checks a close report, it reads the note's \`## Review\` section: the \`Check:\` line, and the reviewers on the \`Passes:\` line, compared with the reviewer the build prompt named and any the owner has named since (D-398). A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer; it goes to the owner when nothing does or the record shows the builder launched or directed the run, whatever the pass line names.
+- Each build prompt's \`start-session\` line links the lane to its tasks with \`--plan-task "<plan-path>#<ID>"\`, one per task, with the reference quoted, since \`#\` is a glob character in zsh; \`--working-on\` stays free text. The lane's finalized note lists the links under \`## Plan tasks\`. close-session ticks nothing: the prompt's close-out says who ticks each task, only once its work is merged and verified, and who annotates it otherwise.
+- When it checks a close report, it reads the note's \`## Review\` section: the \`Check:\` line, and the reviewers on the \`Passes:\` line, compared with the reviewer the build prompt named and any the owner has named since. A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer; it goes to the owner when nothing does or the record shows the builder launched or directed the run, whatever the pass line names.
 
 ## Tooling note
 \`CLAUDE.md\` and \`AGENTS.md\` are developer-owned starter files. If they exist,
@@ -572,6 +596,7 @@ function formatRepoDescriptor(repo) {
   return 'source not recorded';
 }
 
+// Shared quality bar, current-state docs: D-292, D-293.
 function generateArchitectureGuide(projectConfig) {
   return `# Architecture
 
@@ -603,12 +628,14 @@ architecture/<domain-slug>/<feature-slug>/<component>.md
 - Retrieval guidance should say when to consult the doc, what it does not cover, and which related docs or decisions matter.
 - Details should distinguish confirmed behavior from known gaps or open follow-up.
 - Involved files should use concrete \`repo:path\` references that match the affected implementation surface.
-- Docs are mutable current-state contracts (D-292): fold updates into the existing sections by rewriting them in place, keeping the durable plan, unresolved next steps, and material rollout state in the doc. Dated session headings, lane names, and completed-task chronology belong in session notes; decision entries record accepted choices and rationale (D-293). Docs whose artifact itself is dated (migration ledgers, incident/upstream reports) may declare frontmatter \`content_mode: chronological-ledger\` to suppress the changelog-shape advisory.
+- Docs are mutable current-state contracts: fold updates into the existing sections by rewriting them in place, keeping the durable plan, unresolved next steps, and material rollout state in the doc. Dated session headings, lane names, and completed-task chronology belong in session notes; decision entries record accepted choices and rationale. Docs whose artifact itself is dated (migration ledgers, incident/upstream reports) may declare frontmatter \`content_mode: chronological-ledger\` to suppress the changelog-shape advisory.
 
 Each component doc is canonical. This README is only a convenience guide.
 `;
 }
 
+// Conventions, INDEX.md: D-283. The example heading shows the install's own
+// numbering, not a package decision.
 function generateDecisionsGuide(projectConfig) {
   return `# Decisions
 
@@ -619,7 +646,7 @@ Append-only decision log for ${projectConfig.name}.
 - never edit or delete prior decision entries
 - use headings in the form \`### D-<number> — Title\` (em-dash; hyphen-only headings cannot be indexed)
 - include \`**Timestamp:**\`, \`**Decision:**\`, and \`**Rationale:**\`
-- \`INDEX.md\` is a derived grouped index: refresh it with \`vibecompass refresh-decision-index\` (structure-preserving, D-283) rather than hand-editing rows; \`vibecompass append-decision\` refreshes it automatically when it can label the session group
+- \`INDEX.md\` is a derived grouped index: refresh it with \`vibecompass refresh-decision-index\` (structure-preserving) rather than hand-editing rows; \`vibecompass append-decision\` refreshes it automatically when it can label the session group
 
 ## Example
 
@@ -634,6 +661,7 @@ This README is guidance only; canonical decision content lives in the domain fil
 `;
 }
 
+// Active-session scratch files: index.yaml D-277; brief.md D-359, D-364.
 function generateSessionsGuide(projectConfig) {
   return `# Sessions
 
@@ -652,11 +680,11 @@ Finalized session notes for ${projectConfig.name} live here.
 - \`## Next session should start with\`
 
 ## Active-session scratch files
-- \`active/index.yaml\` — active lane inventory and continuity pointer (not a resolver with 2+ lanes; D-277)
+- \`active/index.yaml\` — active lane inventory and continuity pointer (not a resolver with 2+ lanes)
 - \`active/<lane-id>/session.yaml\` — lane metadata, including the recorded \`lane_marker\` when one exists
 - \`active/<lane-id>/wip.md\` — builder scratchpad during an active lane
 - \`active/<lane-id>/handoff.md\` — reviewer/builder baton-pass during an active lane
-- \`active/<lane-id>/brief.md\` — generated session brief for the lane (D-359, D-364); regenerated, never hand-edited
+- \`active/<lane-id>/brief.md\` — generated session brief for the lane; regenerated, never hand-edited
 
 Those scratch files are session-scoped working artifacts, not finalized history.
 `;
@@ -717,10 +745,10 @@ function renderWorkflowDefaults(workflow) {
   const lines = [
     `- reviewer handback: ${describeReviewerHandback(workflow)}`,
     '- close-session: require document-maintenance checkpoint statuses for architecture docs, decision log, and session handoff/scratch',
-    '- close-session: refresh any relevant architecture docs before finalizing the session, folding changes into their current-state contract prose (D-292)',
+    '- close-session: refresh any relevant architecture docs before finalizing the session, folding changes into their current-state contract prose', // D-292
     '- close-session: refresh any relevant decision files before finalizing the session',
-    `- review check: \`metadata.workflow.review.check\` is \`${workflow.review.check}\`${workflow.review.check === DEFAULT_REVIEW_CHECK ? ' (the default)' : ''}; on a failed check, \`warn\` closes and records the failures in the note, \`block\` refuses to close and writes nothing, and \`off\` skips the check (D-394)`,
-    `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; a pass beyond it needs an owner \`another round\` line before it (D-394)`,
+    `- review check: \`metadata.workflow.review.check\` is \`${workflow.review.check}\`${workflow.review.check === DEFAULT_REVIEW_CHECK ? ' (the default)' : ''}; on a failed check, \`warn\` closes and records the failures in the note, \`block\` refuses to close and writes nothing, and \`off\` skips the check`, // D-394
+    `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; a pass beyond it needs an owner \`another round\` line before it`, // D-394
   ];
 
   if (workflow.closeSession.gitPublish) {
@@ -737,7 +765,7 @@ function renderWorkflowDefaults(workflow) {
 
 function describeReviewerHandback(workflow) {
   if (workflow.reviewerHandback === 'handoff-file') {
-    return 'update sessions/active/<lane-id>/wip.md › ## Review log and sessions/active/<lane-id>/handoff.md › ## Reviewer → Builder, the only sections a pass writes (D-392), then stop the review pass';
+    return 'update sessions/active/<lane-id>/wip.md › ## Review log and sessions/active/<lane-id>/handoff.md › ## Reviewer → Builder, the only sections a pass writes, then stop the review pass'; // D-392
   }
 
   return workflow.reviewerHandback;

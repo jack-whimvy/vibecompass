@@ -105,7 +105,7 @@ export async function buildSessionBrief(options = {}) {
   if (!retrievalError) {
     const settings = await readBriefSettingsForRoot(input.rootDir);
     if (settings.problems.length > 0) {
-      retrievalError = `project.yaml brief settings are invalid, so no canonical document was read (D-364): ${settings.problems.join('; ')}`;
+      retrievalError = `project.yaml brief settings are invalid, so no canonical document was read: ${settings.problems.join('; ')}`; // D-364
     } else {
       exclusions = compileBriefExclusions(uniqueStrings([...settings.exclude, ...input.exclude]));
     }
@@ -126,7 +126,7 @@ export async function buildSessionBrief(options = {}) {
   let lineageUnavailable = [];
   if (!retrievalError && loaded.readModel.decision_lineage.status === 'unavailable') {
     lineageUnavailable = loaded.readModel.decision_lineage.unavailable_sources;
-    retrievalError = `decision lineage is unavailable (D-371): it could not be extracted from ${describePaths(lineageUnavailable.map((source) => source.path))}, so no decision can be shown with its declared successors`;
+    retrievalError = `decision lineage is unavailable: it could not be extracted from ${describePaths(lineageUnavailable.map((source) => source.path))}, so no decision can be shown with its declared successors`; // D-371
   }
 
   const overviewExcluded = exclusions?.matches(BRIEF_OVERVIEW_PATH) ?? false;
@@ -1259,7 +1259,7 @@ function buildFollowUps(selection, context, included, omitted) {
         priority: 'required',
         path: source.path,
         heading: null,
-        reason: 'decision lineage could not be extracted from this file (D-371); read it directly',
+        reason: 'decision lineage could not be extracted from this file; read it directly', // D-371
       });
     }
     if (context.overview.exists) {

@@ -1517,7 +1517,7 @@ function createArchitectureDocQualityWarnings(blocks) {
       const changelogLines = detectChangelogShapedLines(body);
       if (changelogLines.length > 0) {
         const example = changelogLines[0].length > 80 ? `${changelogLines[0].slice(0, 77)}...` : changelogLines[0];
-        warnings.push(`changelog_shaped_architecture_doc: ${block.path} contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"); architecture docs are current-state contracts (D-292) — fold the content into the existing sections and move work/ship chronology to the session note; decisions record accepted choices (D-293). Intentionally dated ledgers/reports declare content_mode: chronological-ledger.`);
+        warnings.push(`changelog_shaped_architecture_doc: ${block.path} contains ${changelogLines.length} changelog-shaped line(s) (e.g. "${example}"); architecture docs are current-state contracts — fold the content into the existing sections and move work/ship chronology to the session note; decisions record accepted choices. Intentionally dated ledgers/reports declare content_mode: chronological-ledger.`); // D-292, D-293
       }
     }
   }
@@ -2150,7 +2150,7 @@ async function refreshDecisionIndex(rootDir) {
     return {
       refreshed: false,
       warnings: [
-        'decisions/INDEX.md uses the grouped session shape; --refresh-index (the flat D-209 generator) refuses to overwrite it. Use `vibecompass refresh-decision-index` (D-283) instead.',
+        'decisions/INDEX.md uses the grouped session shape; --refresh-index (the flat generator) refuses to overwrite it. Use `vibecompass refresh-decision-index` instead.', // D-209, D-283
       ],
     };
   }
@@ -2595,7 +2595,7 @@ function renderReviewPrompt(options) {
     '- Ensure `architecture/overview/project-shape.md` includes compact backbone sections for topology, core feature inventory, user journey map, project systems map, and coverage/quality summary.',
     '- Ensure `architecture/overview/project-shape.md` includes exactly one `vibecompass-project-map version=1` JSON fence that lists journey-facing features, supported feature relationships, and minimal optional derived `systems[]` metadata.',
     '- Keep docs concise and retrieval-oriented: explain contracts, flows, invariants, and ownership; do not rewrite source code or produce file-by-file walkthroughs.',
-    '- Write every doc as a current-state contract (D-292): when updating an existing doc, rewrite the affected sections in place or propose a new focused doc — never append dated session/audit sections (for example "Audit deepening — YYYY-MM-DD"). Keep the durable plan, unresolved next steps, and material rollout state in the doc; work/ship chronology belongs in session notes, and decision entries record accepted choices (D-293). Intentionally dated ledgers/reports declare frontmatter `content_mode: chronological-ledger`.',
+    '- Write every doc as a current-state contract: when updating an existing doc, rewrite the affected sections in place or propose a new focused doc — never append dated session/audit sections (for example "Audit deepening — YYYY-MM-DD"). Keep the durable plan, unresolved next steps, and material rollout state in the doc; work/ship chronology belongs in session notes, and decision entries record accepted choices. Intentionally dated ledgers/reports declare frontmatter `content_mode: chronological-ledger`.', // D-292, D-293
     `- Soft size budget: keep each generated architecture doc under ${ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES} bytes unless the extra detail is necessary and called out in Blindspots or Retrieval guidance.`,
     '- Include only the most important involved files; prefer representative entry points and owned contracts over exhaustive file lists.',
     '- Do not put transient apply-state instructions inside architecture docs, such as "this artifact has not been applied". Apply state belongs in the chat response and package marker, not canonical docs.',
