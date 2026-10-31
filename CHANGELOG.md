@@ -5,7 +5,25 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
-## Unreleased
+## 0.18.0 - 2026-10-31
+
+A session-protocol release: a project manager role, a review record that
+`close-session` checks, links from lanes to plan tasks, and installed text,
+command output, and help that name none of the package's own decisions by
+number.
+
+Upgrading: help, command output, the new flags, `review-check`, and the review
+check at close work as soon as you upgrade. The managed agent blocks change the
+next time a command renders them: `start-session`, `continue-session`,
+`switch-session`, `close-session`, `sync-agents`, or `refresh-workflow --apply`.
+`context.md` and the generated guides change only at the root's next
+`refresh-workflow --apply`, which also creates `workflows/project-manager.md`.
+Until then they keep their old text: they don't describe the project manager
+role, the Review log format, or plan task links, and their decision numbers
+name decisions in the VibeCompass project's own log, not in yours. The review
+check runs in `warn` mode unless `project.yaml` says otherwise, so upgrading
+blocks no close, but a lane whose `## Review log` has no pass line in the
+record format closes with a failed check line in its note.
 
 - Project manager role: a third session role beside builder
   and reviewer, entered with the prompt command
@@ -42,9 +60,8 @@ package's installed text, command output, and help do.
 - Managed agent blocks: the `join as project manager` prompt command, the
   `start session`, `continue session`, `review handoff`, and `close session`
   summaries updated for roles, and two Hard Rules lines, the builder's re-read
-  and the reviewer's write boundary. An existing root gets all of this at its
-  next `refresh-workflow --apply`; until then its agents follow the
-  context they have.
+  and the reviewer's write boundary. An existing root gets them the next time a
+  command renders its blocks (Upgrading, above).
 - Review record and check: a lane's `wip.md` › `## Review log` holds
   line records, `- pass <n> | <time> | <reviewer> | <scope> | <outcome>`,
   `- response <n> | <time> | <builder>`, and
@@ -55,7 +72,8 @@ package's installed text, command output, and help do.
   malformed line (the message names the first one), no open finding the owner
   hasn't deferred, and no pass past the cap without the owner's
   `another round` lines. It covers every builder lane, and a project-manager
-  lane once its log has a pass line.
+  lane once its log has a pass line. A `## Review log` heading inside a code
+  fence elsewhere in `wip.md`, such as an example in `## Log`, is not the log.
 - `project.yaml` › `metadata.workflow.review` takes `check` (`warn`, the
   default, closes and records the failures; `block` refuses to close, writing
   and deleting nothing; `off` skips the check) and `round_cap` (1 to 10,
@@ -94,8 +112,8 @@ package's installed text, command output, and help do.
   prompt or the owner named. The managed blocks gain a Hard Rules line, and the
   `review handoff` and `address review` summaries name the record lines.
   `context.md`'s Workflow defaults name both review keys and their effective
-  values. An existing root gets this text at its next
-  `refresh-workflow --apply`.
+  values. An existing root gets the managed blocks' lines the next time a
+  command renders them, and the rest at its next `refresh-workflow --apply`.
 - Plan task links: `start-session --plan-task "<plan-path>#<ID>"`,
   repeatable, links a lane to the plan tasks it works on. Before anything is
   written, each reference is checked: the plan is a root-relative `.md` file

@@ -329,7 +329,8 @@ metadata:
 
 The finalized note gets a `## Review` section with the check line, the passes
 and reviewers, one line per finding, and the owner's choices, and each deferred
-finding joins its next steps. `vibecompass review-check --session <lane-id>`
+finding joins its next steps; `close-session --review-note "<text>"`
+(repeatable) adds a line to that section. `vibecompass review-check --session <lane-id>`
 runs the same check on an open lane. Only the owner closes past a failed check:
 `close-session --review-override "<the owner's reason>"`, which the note
 records.
