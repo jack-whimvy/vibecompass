@@ -13,6 +13,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
+import { countPassesPastCap } from './review-log.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -1449,6 +1450,7 @@ function renderReviewCheckJson(result) {
     ok: result.ok,
     check_line: result.checkLine,
     passes: parsed.ok ? parsed.passCount : null,
+    passes_past_cap: countPassesPastCap(parsed, result.roundCap), // D-403 item 4
     another_rounds: parsed.ok ? parsed.anotherRounds : null,
     reviewers: parsed.ok ? parsed.reviewers : [],
     findings: parsed.ok

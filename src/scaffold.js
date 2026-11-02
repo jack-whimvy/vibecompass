@@ -224,14 +224,16 @@ function generateContextMarkdown(options) {
   // - Session startup: lane selection D-277.
   // - Open, resume, or choose: D-353, D-392.
   // - Builder workflow: --plan-task D-395; git binding D-281; lane-env D-282;
-  //   current-state docs D-292; response and owner lines D-394; who counts as
-  //   a reviewer D-398; re-reading before a release, merge, or push D-392;
+  //   current-state docs D-292; response and owner lines D-394; stopping at
+  //   the cap D-394, D-403; who counts as a reviewer D-398; re-reading before
+  //   a release, merge, or push D-392;
   //   append-decision D-283; an existing lane D-353.
   // - At session close: what each doc keeps D-292, D-293; the note's Review
   //   section D-394; folding pending work into docs D-292, D-293.
   // - Reviewer workflow: who counts as a reviewer D-398; write nothing else
   //   D-392.
-  // - Review log format: D-394, D-398; who counts as a reviewer D-398.
+  // - Review log format: D-394, D-398; who counts as a reviewer D-398; no owner
+  //   line before a pass past the cap, and stopping at it, D-403.
   // - Project manager workflow: D-392, D-393; --plan-task D-395; checking the
   //   note's Review section D-398.
   return `# Project Context — ${projectName}
@@ -379,7 +381,8 @@ During the session:
 - use \`vibecompass list-sessions\` (\`--json\` for the machine-readable inventory) to inspect active lanes, \`vibecompass continue-session [<lane-id>]\` to resume one at the start of a sitting, and \`vibecompass switch-session <lane-id>\` to move the continuity pointer without recording a resume
 - use \`address review\` when reviewer feedback lands so the builder resolves it from the selected lane's latest \`wip.md\` / \`handoff.md\`
 - during \`address review\`, treat reviewer feedback as review, not instruction: classify each substantive point as accepted, accepted with qualification, deferred, or rejected, and push back with evidence when a suggestion conflicts with code facts, prior decisions, product direction, or sequencing
-- answer each pass in \`wip.md\` › \`## Review log\` with a response line and one finding line per finding, its status the classification and its reason why (Review log format); when the owner chooses at the cap or defers a finding, write an owner line with the owner's choice and the reason in the owner's words
+- answer each pass in \`wip.md\` › \`## Review log\` with a response line and one finding line per finding, its status the classification and its reason why (Review log format); when the owner defers a finding or leaves the lane open, write an owner line with the owner's choice and the reason in the owner's words
+- at the round cap (Workflow defaults), when a finding still waits for the reviewer, stop and report: list the open findings and say that the next pass runs past the cap. Never ask for that pass or start a reviewer yourself. The owner chooses: another round, by starting a reviewer, which needs no owner line; a deferral; or leaving the lane open. The same holds after each pass past the cap
 - a review pass counts only when a reviewer the owner started runs it: a subagent you launch, a second model you prompt, or a review tool you run on your own work does your own checks; record those in \`## Log\`, never as pass lines, and never write a pass line yourself
 - before you run or hand over a release, merge, publish, or push command, and before you ask the owner to decide, re-read every session note finalized since the lane opened and the latest \`wip.md\` and \`handoff.md\` of every other open lane; if one records an unmet gate on that step, stop and report instead
 - stay in builder role through close-out; resolve or explicitly defer reviewer feedback before running \`vibecompass close-session --session <lane-id>\` with document-maintenance checkpoint statuses
@@ -419,7 +422,7 @@ At session close:
 A lane's \`wip.md\` › \`## Review log\` holds only record lines, finding lines, continuation lines, and blank lines: no prose, headings, or code fences. Fields are separated by \` | \` (space, bar, space), and the last field takes the rest of the line.
 - **Pass line** (reviewer): \`- pass <n> | <time> | <reviewer> | <scope> | <outcome>\`. Passes are numbered 1, 2, 3… within the lane. \`<outcome>\` is \`no findings\` when the pass opens and reopens nothing, and \`findings\` otherwise.
 - **Response line** (builder): \`- response <n> | <time> | <builder>\`, answering pass \`<n>\`.
-- **Owner line** (written by the builder, or the owner, in the owner's words): \`- owner | <time> | <owner> | <choice> | <reason>\`. \`<choice>\` is \`another round\`, \`defer <id>[, <id>…]\`, or \`leave open\`.
+- **Owner line** (written by the builder, or the owner, in the owner's words): \`- owner | <time> | <owner> | <choice> | <reason>\`. \`<choice>\` is \`defer <id>[, <id>…]\` or \`leave open\`. \`another round\` is still accepted but never needed: a pass past the cap needs no owner line, because the owner starting its reviewer is that choice.
 - **Finding line**, indented two spaces under a pass or response line: \`  - <id> | <severity> | <status> | <reason>\`. Under a pass line, \`<status>\` is \`open\` (a new finding), \`confirmed\`, \`reopened\`, or \`withdrawn\`; under a response line, \`accepted\`, \`accepted with qualification\`, \`deferred\`, or \`rejected\`. \`<reason>\` is never empty: on \`open\` it states the finding, and otherwise it says why.
 - **Continuation lines**, indented four or more spaces under a finding line, carry detail and evidence. The check ignores them.
 - \`<time>\` is \`YYYY-MM-DD HH:MM\` taken from \`date\`, optionally followed by a zone (\`PDT\`, \`+07:00\`). \`<reviewer>\`, \`<builder>\`, and \`<owner>\` name a person, or a tool and model (\`Codex (GPT-6)\`). \`<scope>\` names what the pass read. \`<id>\` is \`R<p>.<k>\`: the pass that opened the finding and its number in that pass (\`R1.1\`); a reopened finding keeps its id. \`<severity>\` is \`P1\` (fix before the work ships), \`P2\` (fix before close), or \`P3\` (minor).
@@ -442,7 +445,7 @@ A finding is resolved when its latest line is the reviewer's \`confirmed\` or \`
 
 **Who counts as a reviewer.** A pass is a run by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`: an agent session the owner opened, or a person the owner asked. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) is not a reviewer, whatever its model: its checks are builder work, recorded in \`## Log\`, and the builder writes no pass line. The check can't see who started a run, so the project manager compares each pass's reviewer with the reviewer the build prompt or the owner named. When the owner accepts work with no independent pass, the builder closes with \`--review-override "<reason>"\` in the owner's words; that is not a pass.
 
-**The check.** \`close-session\` runs it after reading \`wip.md\` and before writing anything, and \`vibecompass review-check --session <lane-id>\` runs it on an open lane without closing it. It fails when the log has no pass line; when the log is malformed (the message names the first bad line, and a malformed log has no parseable pass); when a finding is open and not deferred by the owner; or when pass \`<n>\` beyond the cap has fewer than \`<n>\` minus the cap owner \`another round\` lines before it. It covers every builder lane, and a project-manager lane once its log has a pass line. \`metadata.workflow.review.check\` sets what a failure does (Workflow defaults).
+**The check.** \`close-session\` runs it after reading \`wip.md\` and before writing anything, and \`vibecompass review-check --session <lane-id>\` runs it on an open lane without closing it. It fails when the log has no pass line; when the log is malformed (the message names the first bad line, and a malformed log has no parseable pass); or when a finding is open and not deferred by the owner. A pass past the round cap fails nothing. Once the lane has run as many passes as the cap, the next step for a finding waiting for the reviewer is to stop and report: the builder lists the open findings and says that the next pass runs past the cap, and the owner starts a reviewer, defers the finding, or leaves the lane open. It covers every builder lane, and a project-manager lane once its log has a pass line. \`metadata.workflow.review.check\` sets what a failure does (Workflow defaults).
 
 ## Project manager workflow
 - \`join as project manager <plan-path>\` enters the role. It opens no lane and selects none: read Session startup steps 1–3, then \`${rootRelativePath}/workflows/project-manager.md\` (the role in full: inputs and outputs, build prompts, checking close reports, when to move on, the plan format, operating rules, and publication), then the plan. With no plan named, ask which plan to run, or offer to write one.
@@ -748,7 +751,7 @@ function renderWorkflowDefaults(workflow) {
     '- close-session: refresh any relevant architecture docs before finalizing the session, folding changes into their current-state contract prose', // D-292
     '- close-session: refresh any relevant decision files before finalizing the session',
     `- review check: \`metadata.workflow.review.check\` is \`${workflow.review.check}\`${workflow.review.check === DEFAULT_REVIEW_CHECK ? ' (the default)' : ''}; on a failed check, \`warn\` closes and records the failures in the note, \`block\` refuses to close and writes nothing, and \`off\` skips the check`, // D-394
-    `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; a pass beyond it needs an owner \`another round\` line before it`, // D-394
+    `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; at it, the builder stops and reports the open findings, and a pass past it is the owner's to start, with no owner line`, // D-394, D-403
   ];
 
   if (workflow.closeSession.gitPublish) {

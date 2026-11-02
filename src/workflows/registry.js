@@ -162,7 +162,8 @@ If the user explicitly wants to rerun docs-review for a focused architecture-doc
 // The decisions behind each section's rules:
 // - Prompt trigger: the role D-392.
 // - Build prompts: quoting --plan-task D-395.
-// - The review rule: who counts as a reviewer D-398; the record lines D-394.
+// - The review rule: who counts as a reviewer D-398; the record lines D-394;
+//   stopping at the cap, with no owner line before a pass past it, D-403.
 // - Checking a close report: the note's Plan tasks D-395; the note's Review
 //   D-394, D-398.
 // - Plan format: D-393; naming a task outside its plan D-395.
@@ -230,7 +231,7 @@ The project manager writes each build lane's prompt, and the owner gives it to a
 A build lane closes only after:
 - **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
 - **Findings drive more passes.** After \`address review\`, the reviewer's next pass checks each response. The loop ends at a pass that leaves no finding open: each one fixed and confirmed, rejected with evidence the reviewer accepts, or deferred with a scoped reason.
-- **A cap on rounds,** where a round is one reviewer pass and the builder's response. The cap is \`metadata.workflow.review.round_cap\`, 3 by default; \`${contextPath}\` › Workflow defaults gives this project's value. If findings are still open after the last round the cap allows, the builder stops and reports, and the project manager escalates to the owner, who chooses: another round, a scoped deferral whose reason the session note carries, or leaving the lane open. Each pass past the cap needs one more owner \`another round\` line before it. A cap never marks a finding resolved.
+- **A cap on rounds,** where a round is one reviewer pass and the builder's response. The cap is \`metadata.workflow.review.round_cap\`, 3 by default; \`${contextPath}\` › Workflow defaults gives this project's value. If findings are still open once the lane has run as many rounds as the cap, the builder stops, reports them, and says that the next pass runs past the cap; it never asks for that pass or starts a reviewer. The project manager escalates to the owner, who chooses: another round, by starting a reviewer, which needs no owner line; a scoped deferral, recorded as an owner \`defer\` line whose reason the session note carries; or leaving the lane open. The same holds after each pass past the cap. A cap never marks a finding resolved.
 
 Passes, responses, and owner choices are record lines in \`wip.md\` › \`## Review log\` (${contextPath} › Review log format). \`close-session\` checks the record before it writes and puts the outcome in the finalized note's \`## Review\` section: the \`Check:\` line, the passes and their reviewers, one line per finding, and each owner line. Each deferred finding and its reason join the note's next steps. \`vibecompass review-check${rootFlag} --session <lane-id>\` runs the same check on an open lane. Work the owner accepts without an independent pass closes with \`--review-override "<the owner's reason>"\`, which the note's \`Check:\` line shows; it is not a pass.
 

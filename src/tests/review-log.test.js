@@ -92,6 +92,11 @@ async function writeReviewLog(wipPath, lines) {
   await writeFile(wipPath, `${wip.slice(0, at)}## Review log\n${lines.join('\n')}\n`, 'utf8');
 }
 
+async function writeLaneLog(root, sessionId, lines) {
+  await writeReviewLog(await openLane(root, sessionId), lines);
+  return sessionId;
+}
+
 async function close(root, sessionId, options = {}) {
   return closeProjectSession({ cwd: root.tempDir, rootDir: root.rootDir, sessionId, ...CLOSE_DEFAULTS, ...options });
 }
@@ -354,48 +359,132 @@ test('a malformed log closes with --review-override in block mode, and the note 
   assert.ok(!result.warnings.some((warning) => warning.startsWith('Review check failed')));
 });
 
-test('the cap: a pass past it fails without an owner line and passes with one', async (t) => {
-  const rounds = [
-    '- pass 1 | 2026-10-23 09:00 PDT | Codex (GPT-6) | diff | findings',
-    '  - R1.1 | P2 | open | the check skips project-manager lanes with a pass',
-    '- response 1 | 2026-10-23 09:10 PDT | Claude Opus 5.5',
-    '  - R1.1 | P2 | accepted | the role check now looks for a pass line',
-    '- pass 2 | 2026-10-23 09:20 PDT | Codex (GPT-6) | response 1 | findings',
-    '  - R1.1 | P2 | reopened | a malformed project-manager log still skips',
-    '- response 2 | 2026-10-23 09:30 PDT | Claude Opus 5.5',
-    '  - R1.1 | P2 | accepted | it now reads the raw pass lines',
-    '- pass 3 | 2026-10-23 09:40 PDT | Codex (GPT-6) | response 2 | findings',
-    '  - R1.1 | P2 | reopened | no test covers it',
-    '- response 3 | 2026-10-23 09:50 PDT | Claude Opus 5.5',
-    '  - R1.1 | P2 | accepted | added the test',
-  ];
-  const pass4 = [
-    '- pass 4 | 2026-10-23 10:10 PDT | Codex (GPT-6) | response 3 | no findings',
-    '  - R1.1 | P2 | confirmed | the test covers it',
-  ];
-  const ownerLine = '- owner | 2026-10-23 10:00 PDT | Jack (owner) | another round | one more pass to confirm the test';
+const CAP_ROUNDS = [
+  '- pass 1 | 2026-10-23 09:00 PDT | Codex (GPT-6) | diff | findings',
+  '  - R1.1 | P2 | open | the check skips project-manager lanes with a pass',
+  '- response 1 | 2026-10-23 09:10 PDT | Claude Opus 5.5',
+  '  - R1.1 | P2 | accepted | the role check now looks for a pass line',
+  '- pass 2 | 2026-10-23 09:20 PDT | Codex (GPT-6) | response 1 | findings',
+  '  - R1.1 | P2 | reopened | a malformed project-manager log still skips',
+  '- response 2 | 2026-10-23 09:30 PDT | Claude Opus 5.5',
+  '  - R1.1 | P2 | accepted | it now reads the raw pass lines',
+  '- pass 3 | 2026-10-23 09:40 PDT | Codex (GPT-6) | response 2 | findings',
+  '  - R1.1 | P2 | reopened | no test covers it',
+  '- response 3 | 2026-10-23 09:50 PDT | Claude Opus 5.5',
+  '  - R1.1 | P2 | accepted | added the test',
+];
 
-  const root = await createRoot(t);
-  const atCapPath = await openLane(root, 'at-cap');
-  await writeReviewLog(atCapPath, rounds);
-  const atCap = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: 'at-cap' });
+const CAP_PASS_4 = [
+  '- pass 4 | 2026-10-23 10:10 PDT | Codex (GPT-6) | response 3 | no findings',
+  '  - R1.1 | P2 | confirmed | the test covers it',
+];
+
+const ANOTHER_ROUND = '- owner | 2026-10-23 10:00 PDT | Jack (owner) | another round | one more pass to confirm the test';
+
+const STOP_AND_REPORT = (passes, id, lane) => new RegExp(
+  `^the lane has run ${passes} passes against a cap of 3: stop and report the open findings, and say the next pass runs past the cap; the owner starts a reviewer \\(\`review handoff ${lane}\`\\), defers ${id.replace('.', '\\.')}, or leaves the lane open$`,
+);
+
+// D-403: a pass past the cap needs no owner line; the cap stays the builder's
+// stop-and-report point, and the Passes line counts the passes past it.
+test('the cap: at it the next step is to stop and report; a pass past it needs no owner line, in block mode too', async (t) => {
+  const root = await createRoot(t, { review: ['check: block'] });
+
+  const atCap = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: await writeLaneLog(root, 'at-cap', CAP_ROUNDS) });
   assert.equal(atCap.ok, false);
-  assert.match(atCap.failures[0].message, /R1\.1 \(P2\) is open, waiting for the reviewer's verdict/);
-  assert.match(atCap.failures[0].nextStep, /the lane has used its 3 passes \(cap 3\): stop and report; the owner chooses another round, defer R1\.1, or leave open/);
+  assert.deepEqual(atCap.failures.map((failure) => failure.kind), ['open-finding']);
+  assert.match(atCap.failures[0].message, /^R1\.1 \(P2\) is open, waiting for the reviewer's verdict$/);
+  assert.match(atCap.failures[0].nextStep, STOP_AND_REPORT(3, 'R1.1', 'at-cap'));
+  await assert.rejects(() => close(root, 'at-cap'), /close-session refused/);
 
-  const withoutPath = await openLane(root, 'past-cap');
-  await writeReviewLog(withoutPath, [...rounds, ...pass4]);
-  const without = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: 'past-cap' });
-  assert.equal(without.ok, false);
-  assert.deepEqual(without.failures.map((failure) => failure.kind), ['cap']);
-  assert.match(without.failures[0].message, /^pass 4 runs past the cap of 3 with 0 owner "another round" lines before it; it needs 1$/);
+  // Below the cap the builder still asks the owner for the next pass.
+  const below = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: await writeLaneLog(root, 'below-cap', CAP_ROUNDS.slice(0, 4)) });
+  assert.match(below.failures[0].nextStep, /^ask the owner for the reviewer's next pass \(`review handoff below-cap`\)$/);
 
-  const withPath = await openLane(root, 'owner-round');
-  await writeReviewLog(withPath, [...rounds, ownerLine, ...pass4]);
-  const withOwner = await close(root, 'owner-round');
+  // Pass 4 with no owner line before it: review-check passes and the lane closes.
+  const past = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: await writeLaneLog(root, 'past-cap', [...CAP_ROUNDS, ...CAP_PASS_4]) });
+  assert.equal(past.ok, true);
+  assert.equal(past.status, 'passed');
+  assert.deepEqual(past.failures, []);
+  assert.equal(past.passesLine, '4 against a cap of 3, 1 past it; reviewers: Codex (GPT-6)');
+
+  const io = captureIo();
+  assert.equal(await runCli(['review-check', '--root', root.rootDir, '--session', 'past-cap', '--json'], io.io, { cwd: root.tempDir }), 0);
+  const payload = JSON.parse(io.stdout());
+  assert.equal(payload.result, 'passed');
+  assert.equal(payload.passes, 4);
+  assert.equal(payload.passes_past_cap, 1);
+  assert.equal(payload.another_rounds, 0);
+
+  const closed = await close(root, 'past-cap');
+  assert.equal(closed.review.checkLine, 'passed');
+  const section = reviewSection(await readFile(closed.sessionFilePath, 'utf8'));
+  assert.match(section, /^- Check: passed\n- Passes: 4 against a cap of 3, 1 past it; reviewers: Codex \(GPT-6\)\n- R1\.1 \(P2\) the check skips project-manager lanes with a pass — accepted: added the test — confirmed: the test covers it$/);
+
+  // Past the cap, every round still ends with the builder's report.
+  const pastAgain = await checkProjectSessionReview({
+    cwd: root.tempDir,
+    rootDir: root.rootDir,
+    sessionId: await writeLaneLog(root, 'past-cap-again', [
+      ...CAP_ROUNDS,
+      '- pass 4 | 2026-10-23 10:10 PDT | Codex (GPT-6) | response 3 | findings',
+      '  - R1.1 | P2 | reopened | the test never runs the block mode',
+      '- response 4 | 2026-10-23 10:20 PDT | Claude Opus 5.5',
+      '  - R1.1 | P2 | accepted | the test now runs it',
+    ]),
+  });
+  assert.equal(pastAgain.ok, false);
+  assert.deepEqual(pastAgain.failures.map((failure) => failure.kind), ['open-finding']);
+  assert.match(pastAgain.failures[0].nextStep, STOP_AND_REPORT(4, 'R1.1', 'past-cap-again'));
+});
+
+test('an older log with another-round lines still passes and reads the same in the note; the line buys no pass', async (t) => {
+  const root = await createRoot(t, { review: ['check: block'] });
+
+  const io = captureIo();
+  const lane = await writeLaneLog(root, 'owner-round', [...CAP_ROUNDS, ANOTHER_ROUND, ...CAP_PASS_4]);
+  assert.equal(await runCli(['review-check', '--root', root.rootDir, '--session', lane, '--json'], io.io, { cwd: root.tempDir }), 0);
+  const payload = JSON.parse(io.stdout());
+  assert.equal(payload.passes_past_cap, 1);
+  assert.equal(payload.another_rounds, 1);
+  assert.deepEqual(payload.owner_lines, [{ time: '2026-10-23 10:00 PDT', owner: 'Jack (owner)', choice: 'another round', reason: 'one more pass to confirm the test' }]);
+
+  const withOwner = await close(root, lane);
   const section = reviewSection(await readFile(withOwner.sessionFilePath, 'utf8'));
-  assert.match(section, /^- Check: passed\n- Passes: 4 against a cap of 3, plus 1 more round the owner chose; reviewers: Codex \(GPT-6\)\n/);
+  assert.match(section, /^- Check: passed\n- Passes: 4 against a cap of 3, 1 past it; reviewers: Codex \(GPT-6\)\n/);
   assert.match(section, /\n- Owner, Jack \(owner\), 2026-10-23 10:00 PDT: another round — one more pass to confirm the test$/);
+
+  // The same log without the owner line reads the same, apart from that line.
+  const plain = await close(root, await writeLaneLog(root, 'no-owner-round', [...CAP_ROUNDS, ...CAP_PASS_4]));
+  const plainSection = reviewSection(await readFile(plain.sessionFilePath, 'utf8'));
+  assert.equal(section, `${plainSection}\n- Owner, Jack (owner), 2026-10-23 10:00 PDT: another round — one more pass to confirm the test`);
+
+  // An another-round line at the cap doesn't move the stop-and-report point.
+  const atCap = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: await writeLaneLog(root, 'owner-round-at-cap', [...CAP_ROUNDS, ANOTHER_ROUND]) });
+  assert.equal(atCap.ok, false);
+  assert.match(atCap.failures[0].nextStep, STOP_AND_REPORT(3, 'R1.1', 'owner-round-at-cap'));
+});
+
+test('at the cap, an owner defer line passes the check and leave open keeps the lane failing', async (t) => {
+  const root = await createRoot(t, { review: ['check: block'] });
+
+  const deferLane = await writeLaneLog(root, 'cap-defer', [...CAP_ROUNDS, '- owner | 2026-10-23 10:00 PDT | Jack (owner) | defer R1.1 | ship it; the next lane adds the test']);
+  const deferred = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: deferLane });
+  assert.equal(deferred.ok, true);
+  assert.equal(deferred.parsed.findings[0].deferredByOwner, true);
+  const closed = await close(root, deferLane);
+  const note = await readFile(closed.sessionFilePath, 'utf8');
+  assert.match(reviewSection(note), /^- Check: passed\n- Passes: 3 against a cap of 3; reviewers: Codex \(GPT-6\)\n[\s\S]*\n- Owner, Jack \(owner\), 2026-10-23 10:00 PDT: defer R1\.1 — ship it; the next lane adds the test$/);
+  assert.match(note, /\n2\. Deferred review finding R1\.1 \(P2\): the check skips project-manager lanes with a pass — deferred by the owner: ship it; the next lane adds the test\n$/);
+
+  const leaveLane = await writeLaneLog(root, 'cap-leave-open', [...CAP_ROUNDS, '- owner | 2026-10-23 10:00 PDT | Jack (owner) | leave open | I will decide after the release']);
+  const leftOpen = await checkProjectSessionReview({ cwd: root.tempDir, rootDir: root.rootDir, sessionId: leaveLane });
+  assert.equal(leftOpen.ok, false);
+  assert.match(leftOpen.failures[0].nextStep, STOP_AND_REPORT(3, 'R1.1', 'cap-leave-open'));
+  const io = captureIo();
+  assert.equal(await runCli(['review-check', '--root', root.rootDir, '--session', leaveLane], io.io, { cwd: root.tempDir }), 1);
+  assert.match(io.stdout(), /\nOwner, Jack \(owner\), 2026-10-23 10:00 PDT: leave open — I will decide after the release\n/);
+  await assert.rejects(() => close(root, leaveLane), /close-session refused/);
 });
 
 test('an owner deferral stops failing the check until the reviewer reopens the finding', async (t) => {
@@ -453,10 +542,24 @@ test('each check value: warn closes with warnings, block refuses, off skips the 
   assert.ok(invalid.warnings.some((warning) => /unknown key "colour"/.test(warning)));
   assert.match(reviewSection(await readFile(invalid.sessionFilePath, 'utf8')), /^- Check: failed \(warn\): the review log has no pass line/);
 
+  // A pass past the cap fails nothing in warn mode (D-403).
   const capRoot = await createRoot(t, { review: ['round_cap: 1'] });
   await writeReviewLog(await openLane(capRoot, 'cap-one'), [...CLEAN_PASS, '- pass 2 | 2026-10-23 09:40 PDT | Codex (GPT-6) | again | no findings']);
   const capOne = await close(capRoot, 'cap-one');
-  assert.match(reviewSection(await readFile(capOne.sessionFilePath, 'utf8')), /^- Check: failed \(warn\): pass 2 runs past the cap of 1 with 0 owner "another round" lines before it; it needs 1\n- Passes: 2 against a cap of 1;/);
+  assert.ok(!capOne.warnings.some((warning) => warning.startsWith('Review check failed')));
+  assert.match(reviewSection(await readFile(capOne.sessionFilePath, 'utf8')), /^- Check: passed\n- Passes: 2 against a cap of 1, 1 past it; reviewers: Codex \(GPT-6\)$/);
+
+  // At the cap, warn closes and records the open finding; its next step is the builder's report.
+  const warnRoot = await createRoot(t);
+  await writeReviewLog(await openLane(warnRoot, 'warn-at-cap'), CAP_ROUNDS);
+  const warnAtCap = await close(warnRoot, 'warn-at-cap');
+  assert.ok(warnAtCap.warnings.some((warning) => /^Review check failed \(warn\): R1\.1 \(P2\) is open, waiting for the reviewer's verdict — next: the lane has run 3 passes against a cap of 3: stop and report/.test(warning)));
+  assert.match(reviewSection(await readFile(warnAtCap.sessionFilePath, 'utf8')), /^- Check: failed \(warn\): R1\.1 \(P2\) is open, waiting for the reviewer's verdict\n- Passes: 3 against a cap of 3; reviewers: Codex \(GPT-6\)\n/);
+
+  // Off skips the check; the Passes line still counts the passes past the cap.
+  await writeReviewLog(await openLane(offRoot, 'off-past-cap'), [...CAP_ROUNDS, ...CAP_PASS_4]);
+  const offPast = await close(offRoot, 'off-past-cap', { title: 'Off Past Cap' });
+  assert.match(reviewSection(await readFile(offPast.sessionFilePath, 'utf8')), /^- Check: off\n- Passes: 4 against a cap of 3, 1 past it; reviewers: Codex \(GPT-6\)\n/);
 });
 
 test('a project-manager lane needs no pass until its log has one (D-392)', async (t) => {
@@ -512,7 +615,7 @@ test('init and refresh-workflow write no review: block; refresh keeps one the ow
   assert.doesNotMatch(await readFile(projectPath, 'utf8'), /\n\s+review:/);
   const context = await readFile(path.join(root.rootDir, 'context.md'), 'utf8');
   assert.match(context, /- review check: `metadata\.workflow\.review\.check` is `warn` \(the default\); on a failed check, `warn` closes and records the failures in the note, `block` refuses to close and writes nothing, and `off` skips the check/);
-  assert.match(context, /- review round cap: `metadata\.workflow\.review\.round_cap` is 3 \(the default\); a pass beyond it needs an owner `another round` line before it/);
+  assert.match(context, /- review round cap: `metadata\.workflow\.review\.round_cap` is 3 \(the default\); at it, the builder stops and reports the open findings, and a pass past it is the owner's to start, with no owner line/);
 
   const io = captureIo();
   assert.equal(await runCli(['refresh-workflow', '--root', root.rootDir, '--apply'], io.io, { cwd: root.tempDir }), 0);
@@ -525,10 +628,10 @@ test('init and refresh-workflow write no review: block; refresh keeps one the ow
   assert.equal(await readFile(projectPath, 'utf8'), before);
   const customContext = await readFile(path.join(root.rootDir, 'context.md'), 'utf8');
   assert.match(customContext, /- review check: `metadata\.workflow\.review\.check` is `block`; on a failed check/);
-  assert.match(customContext, /- review round cap: `metadata\.workflow\.review\.round_cap` is 5; a pass beyond it/);
+  assert.match(customContext, /- review round cap: `metadata\.workflow\.review\.round_cap` is 5; at it, the builder stops and reports/);
   // The generated guide names the setting rather than a number, so a non-default cap never contradicts it.
   const customGuide = await readFile(path.join(root.rootDir, 'workflows/project-manager.md'), 'utf8');
-  assert.match(customGuide, /- \*\*A cap on rounds,\*\* where a round is one reviewer pass and the builder's response\. The cap is `metadata\.workflow\.review\.round_cap`, 3 by default; `\.compass\/context\.md` › Workflow defaults gives this project's value\. If findings are still open after the last round the cap allows/);
+  assert.match(customGuide, /- \*\*A cap on rounds,\*\* where a round is one reviewer pass and the builder's response\. The cap is `metadata\.workflow\.review\.round_cap`, 3 by default; `\.compass\/context\.md` › Workflow defaults gives this project's value\. If findings are still open once the lane has run as many rounds as the cap/);
   assert.doesNotMatch(customGuide, /cap of 3|after the third/);
 
   const metadata = buildWorkflowMetadata({ workflow: { review: { check: 'block', round_cap: 5 }, reviewer_handback: 'handoff-file' } });
@@ -564,4 +667,25 @@ test('context.md, the managed block, and workflows/project-manager.md carry the 
   assert.match(guide, /## Checking a close report\n[\s\S]*?Read the note's `## Review` section against the review rule\.[\s\S]*?The builder's own account doesn't establish who started a reviewer\.\n\n## When to move on/);
   assert.match(guide, /`vibecompass review-check --root \.compass --session <lane-id>` runs the same check on an open lane/);
   assert.match(guide, /- \*\*Send consequential recommendations through a reviewed lane\*\* before the owner decides \(a plan, a reorder, a protocol change\): one that meets the review rule, with passes by reviewers the owner started\./);
+});
+
+test('context.md and workflows/project-manager.md say a pass past the cap needs no owner line and the cap is the builder\'s stop-and-report point (D-403)', async (t) => {
+  const root = await createRoot(t);
+  const context = await readFile(path.join(root.rootDir, 'context.md'), 'utf8');
+  const guide = await readFile(path.join(root.rootDir, 'workflows/project-manager.md'), 'utf8');
+  const managed = await readFile(path.join(root.tempDir, 'CLAUDE.md'), 'utf8');
+
+  // Builder workflow: owner lines for defer and leave open, and the stop at the cap.
+  assert.match(context, /when the owner defers a finding or leaves the lane open, write an owner line with the owner's choice and the reason in the owner's words\n/);
+  assert.match(context, /\n- at the round cap \(Workflow defaults\), when a finding still waits for the reviewer, stop and report: list the open findings and say that the next pass runs past the cap\. Never ask for that pass or start a reviewer yourself\. The owner chooses: another round, by starting a reviewer, which needs no owner line; a deferral; or leaving the lane open\. The same holds after each pass past the cap\n/);
+  // Review log format: the owner line's choices.
+  assert.match(context, /`<choice>` is `defer <id>\[, <id>…\]` or `leave open`\. `another round` is still accepted but never needed: a pass past the cap needs no owner line, because the owner starting its reviewer is that choice\.\n/);
+  // The check.
+  assert.match(context, /or when a finding is open and not deferred by the owner\. A pass past the round cap fails nothing\. Once the lane has run as many passes as the cap, the next step for a finding waiting for the reviewer is to stop and report/);
+  // The generated guide's review rule.
+  assert.match(guide, /it never asks for that pass or starts a reviewer\. The project manager escalates to the owner, who chooses: another round, by starting a reviewer, which needs no owner line; a scoped deferral, recorded as an owner `defer` line whose reason the session note carries; or leaving the lane open\. The same holds after each pass past the cap\. A cap never marks a finding resolved\./);
+
+  for (const [name, text] of [['context.md', context], ['workflows/project-manager.md', guide], ['the managed block', managed]]) {
+    assert.doesNotMatch(text, /minus the cap owner|needs one more owner `another round` line|needs an owner `another round` line|the owner chooses at the cap/, `${name} still asks for an owner line before a pass past the cap`);
+  }
 });

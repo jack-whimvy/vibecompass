@@ -315,9 +315,11 @@ and a worked example:
 ```
 
 `close-session` checks the record before it writes anything: at least one pass,
-no malformed line, no open finding the owner hasn't deferred, and no pass past
-the cap without an owner `another round` line. `project.yaml` ›
-`metadata.workflow.review` sets what a failure does and the cap:
+no malformed line, and no open finding the owner hasn't deferred. At the round
+cap the builder stops and reports the open findings; a pass past the cap needs
+no owner line, because the owner starting its reviewer is that choice.
+`project.yaml` › `metadata.workflow.review` sets what a failure does and the
+cap:
 
 ```yaml
 metadata:

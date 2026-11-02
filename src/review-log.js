@@ -183,7 +183,6 @@ export function parseReviewLog(lines) {
           return fail(line, `passes are numbered 1, 2, 3… in order; this one should be pass ${passCount + 1}`);
         }
         passCount = record.number;
-        record.anotherRoundsBefore = anotherRounds;
       } else if (record.kind === 'response') {
         if (record.number > passCount) {
           return fail(line, `response ${record.number} comes before pass ${record.number}`);
@@ -194,6 +193,8 @@ export function parseReviewLog(lines) {
             return fail(line, `it defers ${id}, which no pass has opened`);
           }
         }
+        // D-403 item 3: still a valid choice, so older logs parse; the check
+        // counts it for nothing, and review-check --json reports the count.
         if (record.choice === 'another round') {
           anotherRounds += 1;
         }
@@ -311,7 +312,9 @@ export function parseReviewLog(lines) {
 
 /**
  * D-394 item 6, with D-392's coverage: every builder lane, and a
- * project-manager lane once its log has a pass line.
+ * project-manager lane once its log has a pass line. D-403 item 1 dropped the
+ * failure for a pass past the cap without owner `another round` lines: the
+ * owner starting the reviewer is that choice (D-398).
  */
 export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role = 'builder', laneId = null } = {}) {
   const laneRef = laneId ?? '<lane-id>';
@@ -339,7 +342,7 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
     });
   }
 
-  const allowedPasses = roundCap + parsed.anotherRounds;
+  const atCap = parsed.passCount >= roundCap;
   for (const finding of parsed.findings) {
     if (finding.resolved || finding.deferredByOwner) {
       continue;
@@ -352,25 +355,18 @@ export function checkReviewRecord(parsed, { roundCap = DEFAULT_ROUND_CAP, role =
       message: `${finding.id} (${finding.severity}) is open, waiting for the ${waitingOnBuilder ? "builder's response" : "reviewer's verdict"}`,
       nextStep: waitingOnBuilder
         ? 'answer it with a response line (`address review`)'
-        : parsed.passCount >= allowedPasses
-          ? `the lane has used its ${allowedPasses} passes (cap ${roundCap}): stop and report; the owner chooses another round, defer ${finding.id}, or leave open` // D-394 item 8
+        : atCap
+          ? `the lane has run ${parsed.passCount} pass${parsed.passCount === 1 ? '' : 'es'} against a cap of ${roundCap}: stop and report the open findings, and say the next pass runs past the cap; the owner starts a reviewer (\`review handoff ${laneRef}\`), defers ${finding.id}, or leaves the lane open` // D-394 item 8, D-403 item 2
           : `ask the owner for the reviewer's next pass (\`review handoff ${laneRef}\`)`,
     });
   }
 
-  for (const pass of parsed.passes) {
-    const needed = pass.number - roundCap;
-    if (needed > 0 && pass.anotherRoundsBefore < needed) {
-      failures.push({
-        kind: 'cap',
-        lineNumber: pass.line.lineNumber,
-        message: `pass ${pass.number} runs past the cap of ${roundCap} with ${pass.anotherRoundsBefore} owner "another round" line${pass.anotherRoundsBefore === 1 ? '' : 's'} before it; it needs ${needed}`,
-        nextStep: 'escalate to the owner, whose choice goes in an owner line; only the owner continues a lane past the cap', // D-394 item 8
-      });
-    }
-  }
-
   return { status: failures.length > 0 ? 'failed' : 'passed', failures };
+}
+
+/** D-403 item 4: how many passes ran past the cap. */
+export function countPassesPastCap(parsed, roundCap) {
+  return parsed.ok ? Math.max(0, parsed.passCount - roundCap) : null;
 }
 
 export function formatReviewFailure(failure) {
@@ -496,9 +492,9 @@ function renderPassesLine(parsed, roundCap) {
     return 'none parseable';
   }
 
-  const extra = parsed.anotherRounds > 0
-    ? `, plus ${parsed.anotherRounds} more round${parsed.anotherRounds === 1 ? '' : 's'} the owner chose`
-    : '';
+  // D-403 item 4: the passes past the cap, not the owner's `another round` lines.
+  const pastCap = countPassesPastCap(parsed, roundCap);
+  const extra = pastCap > 0 ? `, ${pastCap} past it` : '';
   const reviewers = parsed.reviewers.length > 0 ? `; reviewers: ${parsed.reviewers.join(', ')}` : '';
   return `${parsed.passCount} against a cap of ${roundCap}${extra}${reviewers}`;
 }

@@ -5,6 +5,29 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
+## Unreleased
+
+- Review check: a pass past the round cap no longer needs an owner
+  `another round` line before it. A pass counts only when a reviewer the owner
+  started runs it, so starting that reviewer is already the owner's choice of
+  another round. The check drops that failure in every mode, and no setting
+  changes: `round_cap` keeps its meaning and range. The cap stays the builder's
+  stop-and-report point: once a lane has run `round_cap` passes, the next step
+  for a finding waiting for the reviewer is to stop, list the open findings, and
+  say that the next pass runs past the cap, and the owner starts a reviewer,
+  defers the finding, or leaves the lane open. Owner lines stay for `defer` and
+  `leave open`; `another round` is still accepted and listed in the note, so
+  older logs still pass, but nothing requires it and the check counts it for
+  nothing. The note's `Passes:` line, and `review-check`'s, now says how many
+  passes ran past the cap (`4 against a cap of 3, 1 past it; reviewers: …`)
+  instead of counting the owner's `another round` lines, and
+  `review-check --json` adds `passes_past_cap` beside `another_rounds`. A
+  failure's `kind` is no longer `cap`. `context.md`'s Builder workflow, Review
+  log format, review check paragraph, and Workflow defaults, and
+  `workflows/project-manager.md` › The review rule, say this after the root's
+  next `refresh-workflow --apply`; until then they still ask for the line,
+  which nothing needs.
+
 ## 0.18.0 - 2026-10-31
 
 A session-protocol release: a project manager role, a review record that
