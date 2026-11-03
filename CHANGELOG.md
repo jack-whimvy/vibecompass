@@ -5,7 +5,21 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
-## Unreleased
+## 0.18.1 - 2026-11-02
+
+A review-check release: a pass past the round cap no longer needs an owner
+line before it.
+
+Upgrading: the review check that `close-session` and `review-check` run, the
+note's `Passes:` line, and `review-check --json` work the new way as soon as
+you upgrade, in every review mode, with no setting to change. Help, command
+options, and the text of the managed agent blocks don't change. `context.md`'s
+Builder workflow, Review log format, review check paragraph, and Workflow
+defaults, and `workflows/project-manager.md` › The review rule, change only at
+the root's next `refresh-workflow --apply`. Until then they still ask for an
+owner `another round` line before a pass past the cap, which the check accepts
+and no longer needs. That refresh also moves the `npx` fallback in
+`workflows/docs-review.md` to 0.18.1.
 
 - Review check: a pass past the round cap no longer needs an owner
   `another round` line before it. A pass counts only when a reviewer the owner
@@ -22,11 +36,7 @@ package's installed text, command output, and help do.
   passes ran past the cap (`4 against a cap of 3, 1 past it; reviewers: …`)
   instead of counting the owner's `another round` lines, and
   `review-check --json` adds `passes_past_cap` beside `another_rounds`. A
-  failure's `kind` is no longer `cap`. `context.md`'s Builder workflow, Review
-  log format, review check paragraph, and Workflow defaults, and
-  `workflows/project-manager.md` › The review rule, say this after the root's
-  next `refresh-workflow --apply`; until then they still ask for the line,
-  which nothing needs.
+  failure's `kind` is no longer `cap`.
 
 ## 0.18.0 - 2026-10-31
 

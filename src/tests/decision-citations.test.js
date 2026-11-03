@@ -316,7 +316,7 @@ test('string literals in the shipped source name no package decision number', as
 // - "## Review Record" D-394; "an experiment you turn on" D-368; "### Where the
 //   token lives" D-355; "the same advisory detector" D-292; "to offer
 //   `get_brief`" D-386.
-// CHANGELOG.md, ## Unreleased (the entries 0.18.0 releases):
+// CHANGELOG.md, ## 0.18.0 (its entries, written under ## Unreleased):
 // - "Project manager role" D-392, D-393; the managed blocks' "at its next
 //   `refresh-workflow --apply`" D-257.
 // - "Review record and check" D-394.
