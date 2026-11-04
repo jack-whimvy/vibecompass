@@ -5,17 +5,34 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
-## Unreleased
+## 0.18.2 - 2026-11-04
+
+A secret-check release: `push` checks project memory for common key formats
+before it uploads it, and by default refuses to upload on a match.
+
+Upgrading: the check runs in `push` (and so in `promote-hosted`) and in
+`close-session` as soon as you upgrade, with no setting to change, and by
+default a match stops the push before anything is sent. Before your first push
+after upgrading, run `vibecompass secret-check` over the root, then remove each
+real key (and rotate it) or allow each match that is not a secret with
+`--allow`; until then the push stops and lists the matches. Help gains
+`secret-check`, its options, and a line under `push`. The text of the managed
+agent blocks doesn't change. `context.md`'s Workflow defaults (the secret
+check's setting) and its close-out push bullet (what a refusal means, and the
+allow command) change only at the root's next `refresh-workflow --apply`,
+which also moves the `npx` fallback in `workflows/docs-review.md` to 0.18.2.
 
 - Secret check before push: `push` checks every canonical document it is
   about to upload (`project.yaml`, architecture docs, decisions, and finalized
   session notes) for common key formats: private keys, provider tokens with a
   known prefix, JSON Web Tokens, passwords in URLs, and values assigned to a
   secret-named key. By default a match stops the push before anything is sent
-  and prints each match's path, line, and rule, never the matched text.
-  `project.yaml` `metadata.workflow.secret_check` sets `block` (the default),
-  `warn` (report and upload), or `off`. `promote-hosted` starts with a push, so
-  it is checked the same way.
+  and prints each match's path, line, and rule, never the matched text. No
+  message from the check repeats the setting's value, text from the allow
+  file, or an argument it refuses. `project.yaml`
+  `metadata.workflow.secret_check` sets `block` (the default), `warn` (report
+  and upload), or `off`. `promote-hosted` starts with a push, so it is checked
+  and reported the same way, and a refusal stops it before the mode changes.
 - `vibecompass secret-check` runs the same check over a whole root on demand
   (`--json` for every match with its column, fingerprint, and whether a record
   allows it) and exits 1 on a match no record allows. `--allow <path>:<line>
