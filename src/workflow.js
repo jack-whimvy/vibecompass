@@ -1,4 +1,5 @@
 import { resolveReviewSettings } from './review-log.js';
+import { resolveSecretCheckSettings } from './secret-check.js';
 import { resolveSyncBinding } from './sync-binding.js';
 
 export const DEFAULT_REVIEWER_HANDBACK = 'handoff-file';
@@ -20,6 +21,8 @@ export function resolveWorkflowSettings(projectConfigOrMetadata) {
     reviewerHandback: normalizeReviewerHandback(workflow.reviewer_handback),
     // D-394 item 7: read here, never written by init or refresh-workflow.
     review: resolveReviewSettings(workflow.review),
+    // D-406 item 4: read here, never written by init or refresh-workflow.
+    secretCheck: resolveSecretCheckSettings(workflow.secret_check),
     closeSession: {
       refreshArchitectureDocs: closeSession.refresh_architecture_docs !== false,
       refreshDecisionFiles: closeSession.refresh_decision_files !== false,

@@ -1,3 +1,4 @@
+import { checkProjectMemorySecrets, renderSecretCheckSummary, renderSecretMatchLines } from './secret-check.js';
 import { randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -749,6 +750,10 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
 
   await writeFile(normalized.claudePath, updatedClaude, 'utf8');
   const manifestRefresh = await refreshStateManifestSafely(normalized.rootDir);
+  // D-406 item 3: after the note is written, the whole root is checked and
+  // each match no record allows is a warning. It never refuses the close or
+  // changes what close wrote; off skips it.
+  const secretCheck = await runCloseSecretCheckSafely(normalized.rootDir, workflowSettings.secretCheck);
   const agentFileSync = await syncAgentInstructionFilesSafely({
     rootDir: normalized.rootDir,
     toolingRootDir: normalized.toolingRootDir,
@@ -776,6 +781,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       deferredFindingSteps,
     },
     docsUpdatePlan: docsUpdate.plan,
+    secretCheck: secretCheck.summary,
     workflowGuidance: buildCloseSessionGuidance(workflowSettings, {
       projectConfig,
       rootFlag: buildRootFlagForGuidance(normalized),
@@ -790,6 +796,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
         ? review.failures.map((failure) => `Review check failed (warn): ${formatReviewFailure(failure)}`) // D-394
         : []),
       ...markerCleanupWarnings,
+      ...secretCheck.warnings,
       // A:192 (D-281): the pre-close staleness set computed by docs-update is
       // re-emitted at close as warnings, so the closer sees it even when the
       // embedded plan scrolls past.
@@ -3114,4 +3121,40 @@ async function fileExists(filePath) {
 
 function toPosix(value) {
   return value.split(path.sep).join('/');
+}
+
+async function runCloseSecretCheckSafely(rootDir, settings) {
+  const settingWarnings = settings?.warnings ?? [];
+  if (settings?.mode === 'off') {
+    return { summary: { ran: false, mode: 'off' }, warnings: settingWarnings };
+  }
+  try {
+    const result = await checkProjectMemorySecrets({ rootDir });
+    return {
+      summary: {
+        ran: true,
+        mode: settings?.mode ?? 'block',
+        ok: result.ok,
+        line: renderSecretCheckSummary(result),
+        unallowed: result.unallowed.map(({ path: matchPath, line, rule }) => ({ path: matchPath, line, rule })),
+      },
+      warnings: [
+        ...settingWarnings,
+        ...result.warnings,
+        ...renderSecretMatchLines(result.unallowed).map(
+          (line) => `Secret check: ${line}; ${settings?.mode === 'warn'
+            ? 'push will upload it and report it, because metadata.workflow.secret_check is warn'
+            : 'push will refuse until it is removed or allowed'} (vibecompass secret-check lists every match).`, // D-406
+        ),
+      ],
+    };
+  } catch (error) {
+    return {
+      summary: { ran: false, mode: settings?.mode ?? 'block', error: true },
+      warnings: [
+        ...settingWarnings,
+        `Secret check could not run at close: ${error instanceof Error ? error.message : String(error)} Run vibecompass secret-check before pushing.`, // D-406
+      ],
+    };
+  }
 }

@@ -206,6 +206,11 @@ eval "$(npx -y @vibecompass/vibecompass@latest lane-env)"
 # Agent instruction files
 npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 
+# Secret check: the check push runs before it uploads, over the whole root;
+# prints path, line, and rule, never the matched text; exits 1 on a match no
+# record allows (see Hosted Sync › Secret check before push)
+npx -y @vibecompass/vibecompass@latest secret-check --root .compass
+
 # Decision log maintenance: append-decision allocates the D-number at write
 # time and refreshes the grouped decisions/INDEX.md when it can label the
 # group from the lane context (structure-preserving — hand-authored
@@ -418,6 +423,55 @@ refresh them through the hosted dashboard/proposal flow.
 hosted dashboard could not build from your files, such as a file whose decision
 links could not be read. The push itself succeeded; the note names the file so
 you can check it.
+
+### Secret check before push
+
+Before `push` uploads anything, it checks every canonical document it is about
+to send (`project.yaml`, architecture docs, decisions, and finalized session
+notes) for common key formats: private keys, provider tokens with a known
+prefix (GitHub, GitLab, Slack, Stripe, Supabase, npm, AWS, Google, and `sk-`
+model-provider keys), JSON Web Tokens, passwords in URLs, and values assigned
+to a key whose name ends in a word such as `secret`, `token`, `password`, or
+`api_key`. By default a match stops the push: nothing is uploaded, and the push
+prints each match's path, line, and rule, never the matched text:
+
+```text
+Error: Secret check: 1 possible secret in 1 document, so nothing was pushed.
+- sessions/2026-11-03-2-deploy.md:14 token-github
+Next: remove each value from its document (rotate a real key: it may also be in the root's Git history), or, if a match is not a secret, allow it with: vibecompass secret-check --allow <path>:<line> --reason "<why>". ...
+```
+
+A real key belongs out of project memory: remove it from the document and
+rotate it. When a match is not a secret, such as a sample key in a doc or an
+example password in a local database URL, record it as allowed:
+
+```bash
+npx -y @vibecompass/vibecompass@latest secret-check --root .compass
+npx -y @vibecompass/vibecompass@latest secret-check --root .compass --allow architecture/overview/setup.md:42 --reason "example local database URL"
+```
+
+The record goes in `secret-check-allow.yaml` at the root of the memory root:
+the path, the rule, and a fingerprint (a hash of the match, never the match),
+with your reason. Commit it with the root. It covers that match in that
+document, wherever the line moves; an edited match or a moved document needs a
+new record. When a line holds two matches, `--allow` lists each one's column
+and fingerprint, and `--fingerprint` picks one. Allow only text that is not a
+secret: a hash of a short value can be guessed back.
+
+`project.yaml` `metadata.workflow.secret_check` sets what push does on a match:
+`block` (the default) refuses, `warn` reports the matches and uploads anyway,
+and `off` skips the check. `promote-hosted` starts with a push, so it is
+checked the same way. `close-session` runs the check over the whole root after
+it writes the note and only warns, so you can fix a pasted key before you
+commit or push. `secret-check --json` prints every match with its column,
+fingerprint, and whether a record allows it.
+
+The check is best effort: it recognizes formats and can't prove a document
+holds no secret. It reads only what push sends, not lane scratch (`wip.md`,
+`handoff.md`, `brief.md`), the READMEs, `context.md`, or files outside the
+root, and not your Git history, where a removed key stays in the commits that
+held it. Text you pull from the hosted project is checked at your next push;
+it was already stored there.
 
 ### Where the token lives
 

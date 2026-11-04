@@ -1,6 +1,7 @@
 import { access, mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { DEFAULT_REVIEW_CHECK, DEFAULT_ROUND_CAP } from './review-log.js';
+import { DEFAULT_SECRET_CHECK } from './secret-check.js';
 import { resolveWorkflowSettings } from './workflow.js';
 import { getGeneratedWorkflowFiles, renderPromptCommandLines } from './workflows/registry.js';
 import { renderManagedBlock } from './generators/agent-files/markers.js';
@@ -406,6 +407,7 @@ At session close:
 - close-session deletes the closed lane directory under \`${rootRelativePath}/sessions/active/<lane-id>/\` and cleans up provisioned worktrees, the lane marker, the container, and the lane temp dir when they are safely removable; leftover pieces come with printed guidance
 - refresh any affected architecture/decision docs by folding changes into their current-state contract prose — do not append session chronology; distill anything still pending from lane scratch into the session note's next steps and, when durable, into the docs
 - for local-primary roots with hosted sync configured, run \`vibecompass push --root ${rootRelativePath}\` after canonical docs/session files are finalized when the hosted dashboard should reflect the session; pass \`--sync-target <name>\` when using a non-default or named target
+- push first runs the secret check (Workflow defaults): it prints each match's path, line, and rule, never the text. Remove a real key from its document and rotate it; for a match that is not a secret, record it with \`vibecompass secret-check --allow <path>:<line> --reason "<why>"\`, which keeps a hash of the match in \`${rootRelativePath}/secret-check-allow.yaml\` (commit it with the root). \`vibecompass secret-check\` runs the same check on demand
 - for hosted-only projects, there is no local authoritative push; confirm hosted dashboard/proposal/Understanding state was updated or record the refresh/apply work as deferred
 
 ## Reviewer workflow
@@ -752,6 +754,7 @@ function renderWorkflowDefaults(workflow) {
     '- close-session: refresh any relevant decision files before finalizing the session',
     `- review check: \`metadata.workflow.review.check\` is \`${workflow.review.check}\`${workflow.review.check === DEFAULT_REVIEW_CHECK ? ' (the default)' : ''}; on a failed check, \`warn\` closes and records the failures in the note, \`block\` refuses to close and writes nothing, and \`off\` skips the check`, // D-394
     `- review round cap: \`metadata.workflow.review.round_cap\` is ${workflow.review.roundCap}${workflow.review.roundCap === DEFAULT_ROUND_CAP ? ' (the default)' : ''}; at it, the builder stops and reports the open findings, and a pass past it is the owner's to start, with no owner line`, // D-394, D-403
+    `- secret check: \`metadata.workflow.secret_check\` is \`${workflow.secretCheck.mode}\`${workflow.secretCheck.mode === DEFAULT_SECRET_CHECK ? ' (the default)' : ''}; before \`push\` uploads anything it checks every canonical document for common key formats, and on a match no allow record covers, \`block\` refuses to upload, \`warn\` reports and uploads, and \`off\` skips the check; close-session runs it after writing the note and only warns`, // D-406
   ];
 
   if (workflow.closeSession.gitPublish) {

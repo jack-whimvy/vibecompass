@@ -5,6 +5,12 @@ import { writeStateManifest } from './manifest.js';
 import { withMemoryRootLock } from './serialization.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import {
+  evaluateSecretMatches,
+  readSecretAllowList,
+  resolveSecretCheckSettings,
+  SecretCheckRefusal,
+} from './secret-check.js';
+import {
   credentialStoreOptionsFrom,
   formatMissingCredentialError,
   resolveSyncCredential,
@@ -25,6 +31,9 @@ export async function pushProjectMemory(options = {}, environment = {}) {
   });
   const manifest = manifestResult.manifest;
   const documents = await readPushDocuments(context.rootDir, manifest.documents);
+  // D-406 item 3: the check reads exactly the text this push would upload,
+  // before anything is sent. On block, a match no record allows refuses here.
+  const secretCheck = await runPushSecretCheck(context, documents);
   const cursor = readSyncCursor(manifest.sync, context.binding);
   const baseRemoteRevisionId = normalizeUuid(cursor.last_successful_remote_revision);
   const body = {
@@ -57,8 +66,48 @@ export async function pushProjectMemory(options = {}, environment = {}) {
     appliedProposalIds: response.applied_proposal_ids ?? [],
     staleProposalIds: response.stale_proposal_ids ?? [],
     warnings: readProjectionWarnings(response),
+    secretCheck,
     message: `Pushed ${documents.length} canonical document${documents.length === 1 ? '' : 's'} to hosted project memory.`,
   };
+}
+
+/**
+ * D-406 items 3 and 4: `metadata.workflow.secret_check` is block (the
+ * default), warn, or off. Block throws SecretCheckRefusal on a match no
+ * allow record covers, or on an allow list it can't read; warn returns the
+ * result for push to print and pushes anyway; off skips the check. The
+ * result holds paths, lines, rules, and fingerprints, never matched text.
+ */
+async function runPushSecretCheck(context, documents) {
+  const workflow = context.project?.metadata?.workflow;
+  const settings = resolveSecretCheckSettings(
+    workflow && typeof workflow === 'object' && !Array.isArray(workflow) ? workflow.secret_check : undefined,
+  );
+  if (settings.mode === 'off') {
+    return { mode: 'off', ran: false, warnings: settings.warnings };
+  }
+
+  let allowList;
+  try {
+    allowList = await readSecretAllowList(context.rootDir);
+  } catch (error) {
+    if (settings.mode === 'block') {
+      throw new Error(`Secret check: ${error instanceof Error ? error.message : String(error)} Nothing was pushed.`); // D-406
+    }
+    allowList = { records: [], warnings: [`Secret check (warn): ${error instanceof Error ? error.message : String(error)} Every match is listed.`] };
+  }
+
+  const result = {
+    mode: settings.mode,
+    ...evaluateSecretMatches(
+      documents.map((document) => ({ path: document.path, text: document.raw_text })),
+      allowList.records,
+    ),
+  };
+  if (!result.ok && settings.mode === 'block') {
+    throw new SecretCheckRefusal(result, [...settings.warnings, ...allowList.warnings]);
+  }
+  return { ...result, ran: true, warnings: [...settings.warnings, ...allowList.warnings] };
 }
 
 /**

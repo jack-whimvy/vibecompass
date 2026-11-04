@@ -5,6 +5,31 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
+## Unreleased
+
+- Secret check before push: `push` checks every canonical document it is
+  about to upload (`project.yaml`, architecture docs, decisions, and finalized
+  session notes) for common key formats: private keys, provider tokens with a
+  known prefix, JSON Web Tokens, passwords in URLs, and values assigned to a
+  secret-named key. By default a match stops the push before anything is sent
+  and prints each match's path, line, and rule, never the matched text.
+  `project.yaml` `metadata.workflow.secret_check` sets `block` (the default),
+  `warn` (report and upload), or `off`. `promote-hosted` starts with a push, so
+  it is checked the same way.
+- `vibecompass secret-check` runs the same check over a whole root on demand
+  (`--json` for every match with its column, fingerprint, and whether a record
+  allows it) and exits 1 on a match no record allows. `--allow <path>:<line>
+  --reason "<why>"` records a match that is not a secret in
+  `secret-check-allow.yaml` at the root: the path, the rule, and a hash of the
+  match, never the match. A line with two or more matches needs
+  `--fingerprint` to pick one.
+- `close-session` runs the check over the whole root after it writes the note
+  and prints each match no record allows as a warning. It never refuses a
+  close.
+- The check is best effort: it recognizes formats and can't prove a document
+  holds no secret. It reads only what push sends, not lane scratch, the
+  READMEs, `context.md`, or Git history.
+
 ## 0.18.1 - 2026-11-02
 
 A review-check release: a pass past the round cap no longer needs an owner

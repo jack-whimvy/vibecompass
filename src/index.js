@@ -26,6 +26,16 @@ export {
   pushProjectMemory,
 } from './sync.js';
 export {
+  allowSecretMatch,
+  checkProjectMemorySecrets,
+  DEFAULT_SECRET_CHECK,
+  findSecretMatches,
+  SECRET_CHECK_ALLOW_FILE,
+  SECRET_CHECK_MODES,
+  SECRET_RULE_NAMES,
+  SecretCheckRefusal,
+} from './secret-check.js';
+export {
   ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES,
   detectChangelogShapedLines,
   scanProjectMemory,

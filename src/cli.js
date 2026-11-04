@@ -11,6 +11,16 @@ import { renderBrief } from './brief-render.js';
 import { resolveConnectHostedCliOptions, resolveInitCliOptions } from './setup.js';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  allowSecretMatch,
+  checkProjectMemorySecrets,
+  renderSecretCheckSummary,
+  renderSecretMatchLines,
+  resolveSecretCheckSettings,
+  SECRET_CHECK_ALLOW_FILE,
+  SECRET_CHECK_NEXT_STEP,
+  toPublicSecretCheckResult,
+} from './secret-check.js';
 import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { countPassesPastCap } from './review-log.js';
@@ -202,6 +212,42 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     writeWarnings(io, result.warnings);
     return 0;
+  }
+
+  if (parsed.command === 'secret-check') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const cwd = runtime.cwd ? path.resolve(runtime.cwd) : process.cwd();
+    // D-280 marker-aware root: an explicit --root wins, then the nearest
+    // worktree lane marker, else .compass. The check needs no lane.
+    const markerContext = await resolveLaneMarkerContext({ cwd, explicitRootDir: parsed.options.rootDir ?? null });
+    const rootDir = markerContext.rootDir;
+    writeWarnings(io, markerContext.warnings);
+    if (parsed.options.allow) {
+      const result = await allowSecretMatch({
+        rootDir,
+        target: parsed.options.allow,
+        reason: parsed.options.reason,
+        fingerprint: parsed.options.fingerprint,
+      });
+      const { record } = result;
+      io.stdout.write(result.status === 'already-allowed'
+        ? `Already allowed: ${record.path}:${record.line} ${record.rule} ${record.fingerprint} (${result.filePath})\n`
+        : `Allowed ${record.path}:${record.line} ${record.rule} ${record.fingerprint} in ${result.filePath}\n`); // D-406
+      if (result.status === 'allowed') {
+        io.stdout.write(`Commit ${SECRET_CHECK_ALLOW_FILE} with the root. The record holds a hash of the match, never the match.\n`);
+      }
+      return 0;
+    }
+    const projectConfig = await readProjectConfigForSecretCheck(rootDir);
+    const settings = resolveSecretCheckSettings(projectConfig?.metadata?.workflow?.secret_check);
+    const result = await checkProjectMemorySecrets({ rootDir });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify(toPublicSecretCheckResult({ ...result, mode: settings.mode }), null, 2)}\n`);
+    } else {
+      io.stdout.write(renderSecretCheckText(result, settings.mode));
+    }
+    writeWarnings(io, [...settings.warnings, ...result.warnings]);
+    return result.ok ? 0 : 1;
   }
 
   if (parsed.command === 'review-check') {
@@ -436,6 +482,9 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Review check: ${result.review.checkLine}\n`); // D-394
+    if (result.secretCheck) {
+      io.stdout.write(`Secret check: ${result.secretCheck.ran ? result.secretCheck.line : result.secretCheck.error ? 'could not run (see the warning)' : 'off (metadata.workflow.secret_check)'}\n`); // D-406
+    }
     if (result.planTasks.length > 0) {
       // D-395: the note records the links; ticking stays with the plan's
       // author, once the work is merged and verified.
@@ -647,6 +696,7 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       env: runtime.env,
       runtime,
     });
+    writePushSecretCheck(io, result.secretCheck);
     io.stdout.write(`Push: ${result.status}\n`);
     io.stdout.write(`Remote revision: ${result.remoteRevisionId}\n`);
     io.stdout.write(`Run: ${result.runId}\n`);
@@ -995,6 +1045,10 @@ export function parseCliArgs(argv) {
 
     if (command === 'review-check') {
       return parseReviewCheckArgs(rest);
+    }
+
+    if (command === 'secret-check') {
+      return parseSecretCheckArgs(rest);
     }
 
     if (command === 'append-decision') {
@@ -1359,6 +1413,99 @@ function parseLaneEnvArgs(argv) {
     command: 'lane-env',
     options: parsed,
   };
+}
+
+function parseSecretCheckArgs(argv) {
+  const parsed = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}" for secret-check.`);
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--')) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--allow':
+        parsed.allow = value;
+        break;
+      case '--reason':
+        parsed.reason = value;
+        break;
+      case '--fingerprint':
+        parsed.fingerprint = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}" for secret-check.`);
+    }
+  }
+  if ((parsed.reason !== undefined || parsed.fingerprint !== undefined) && !parsed.allow) {
+    throw new Error('--reason and --fingerprint go with --allow <path>:<line>.');
+  }
+  if (parsed.allow && parsed.json) {
+    throw new Error('--json reports the check; it does not go with --allow.');
+  }
+  return { command: 'secret-check', options: parsed };
+}
+
+async function readProjectConfigForSecretCheck(rootDir) {
+  try {
+    return parseSimpleYaml(await readFile(path.join(rootDir, 'project.yaml'), 'utf8'), { sourceName: 'project.yaml' });
+  } catch {
+    return null;
+  }
+}
+
+/** `vibecompass secret-check` text output: paths, lines, and rules, never matched text (D-406 item 6). */
+function renderSecretCheckText(result, mode) {
+  const lines = [`Secret check: ${renderSecretCheckSummary(result)}`];
+  for (const line of renderSecretMatchLines(result.unallowed)) {
+    lines.push(`- ${line}`);
+  }
+  const ruleCounts = Object.entries(result.counts)
+    .map(([rule, count]) => `${rule} ${count.matches}${count.allowed > 0 ? ` (${count.allowed} allowed)` : ''}`);
+  if (ruleCounts.length > 0) {
+    lines.push(`By rule: ${ruleCounts.join(', ')}`);
+  }
+  if (result.unusedAllows.length > 0) {
+    lines.push(`${result.unusedAllows.length} record${result.unusedAllows.length === 1 ? '' : 's'} in ${SECRET_CHECK_ALLOW_FILE} match${result.unusedAllows.length === 1 ? 'es' : ''} nothing now (an edited or moved match needs a new record; these can be removed):`);
+    for (const record of result.unusedAllows) {
+      lines.push(`- ${record.path} ${record.rule} ${record.fingerprint}`);
+    }
+  }
+  lines.push(`Push setting: metadata.workflow.secret_check is ${mode}${mode === 'block' ? ' (the default when unset): push refuses on a match no record allows' : mode === 'warn' ? ': push reports a match and uploads anyway' : ': push skips the check'}.`);
+  if (!result.ok) {
+    lines.push(`Next: ${SECRET_CHECK_NEXT_STEP}.`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/** The push's secret-check lines (D-406 item 4); a block refusal never reaches here. */
+function writePushSecretCheck(io, secretCheck) {
+  if (!secretCheck) return;
+  writeWarnings(io, secretCheck.warnings ?? []);
+  if (!secretCheck.ran) {
+    io.stdout.write('Secret check: off (metadata.workflow.secret_check)\n');
+    return;
+  }
+  if (secretCheck.ok) {
+    io.stdout.write(`Secret check: ${renderSecretCheckSummary(secretCheck)}\n`);
+    return;
+  }
+  io.stdout.write(`Secret check (warn): ${renderSecretCheckSummary(secretCheck)}; pushed anyway because metadata.workflow.secret_check is warn.\n`);
+  for (const line of renderSecretMatchLines(secretCheck.unallowed)) {
+    io.stdout.write(`- ${line}\n`);
+  }
+  io.stdout.write(`Next: ${SECRET_CHECK_NEXT_STEP}.\n`);
 }
 
 function parseReviewCheckArgs(argv) {
@@ -3364,6 +3511,9 @@ function usageText() {
     '  vibecompass next-decision-id [options]',
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
+    '                                        Checks every canonical document for common key formats first; refuses to upload on a match by default', // D-406
+    '  vibecompass secret-check [--json] [--allow <path>:<line> [--fingerprint <fp>] --reason <text>] [options]',
+    '                                        Read-only: the check push runs, over the whole root; exits 1 on a match no record allows. --allow records a match that is not a secret', // D-406
     '  vibecompass bootstrap --bundle <file> [--root <dir>]',
     '  vibecompass sync-adopt [--accept-divergence] [options]',
     '  vibecompass promote-hosted [--resume|--abort] [options]',
@@ -3559,6 +3709,15 @@ function usageText() {
     '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
     '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
     '',
+    'Secret-check options:', // D-406
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --json                               Print every match (path, line, column, rule, fingerprint, allowed), counts per rule, and unused records as JSON',
+    '  --allow <path>:<line>                Record the match on that line as not a secret, in secret-check-allow.yaml at the root; a record holds the path, rule, and a hash of the match, never the match',
+    '  --fingerprint <fp>                   With --allow: choose one match when the line has several (the refusal lists each one\'s column, rule, and fingerprint)',
+    '  --reason <text>                      Required with --allow: one line saying why the match is not a secret',
+    '                                        The rules are common key formats: private keys, provider tokens, URL passwords, and values after secret-named keys. Output names the path, line, and rule, never the matched text',
+    '                                        project.yaml metadata.workflow.secret_check sets what push does on a match: block (the default) refuses, warn uploads anyway, off skips; close-session warns',
+    '',
     'Decision-log options (append-decision / next-decision-id):',
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --target <domain.md>                 Decision domain file under decisions/ (e.g. cross-cutting.md); never INDEX.md',
@@ -3581,7 +3740,7 @@ function usageText() {
     '  --dry-run                            Show planned writes without changing files',
     '',
     'Sync transport options:',
-    '  push --root <path>                   Push canonical local project memory to hosted',
+    '  push --root <path>                   Push canonical local project memory to hosted, after the secret check (see Secret-check options)',
     '  --sync-target <name>                 Use a named sync target for this command (push, pull-preview, pull-export, docs-review)',
     '  pull-preview --root <path>           Preview hosted proposals and remote state',
     '  pull-preview --no-pending-proposals  Exclude pending proposals from preview',
