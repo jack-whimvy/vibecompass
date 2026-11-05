@@ -72,13 +72,17 @@ async function promoteHostedLocked(options, environment, rootDir) {
 
   const resuming = options.resume === true || Boolean(server.pending_mode_transition) || localMode === 'hosted-only';
   let completeness = null;
+  let secretCheck = null;
 
   if (localMode === 'local-primary') {
     // Phase 1: fresh verified baseline. Idempotent push makes retries safe.
+    // The push runs the secret check (D-406 item 3): a refusal throws here,
+    // before begin; on warn its result is carried out for the CLI to print.
     const pushResult = await pushProjectMemory(
       { rootDir, syncTarget: options.syncTarget ?? null },
       environment,
     );
+    secretCheck = pushResult.secretCheck ?? null;
     notes.push(`Baseline push: ${pushResult.status} (${pushResult.remoteRevisionId}).`);
 
     const manifest = JSON.parse(await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'));
@@ -117,6 +121,7 @@ async function promoteHostedLocked(options, environment, rootDir) {
     status: resuming && localMode !== 'local-primary' ? 'resumed-and-promoted' : 'promoted',
     rootDir,
     completeness,
+    secretCheck,
     warnings: notes,
     message: 'Promotion complete: the hosted app is now this project\'s source of truth (both mode records agree).',
   };

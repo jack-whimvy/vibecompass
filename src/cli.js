@@ -723,6 +723,8 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       env: runtime.env,
       runtime,
     });
+    // promote-hosted's baseline push ran the secret check; print it as push does.
+    writePushSecretCheck(io, result.secretCheck);
     io.stdout.write(`Mode transition: ${result.status}\n`);
     if (result.completeness) {
       io.stdout.write(`Carries over: ${result.completeness.carries_over}\n`);
@@ -1415,6 +1417,9 @@ function parseLaneEnvArgs(argv) {
   };
 }
 
+const SECRET_CHECK_VALUE_FLAGS = ['--root', '--allow', '--reason', '--fingerprint'];
+const SECRET_CHECK_FLAG_LIST = '--root, --json, --allow, --reason, and --fingerprint';
+
 function parseSecretCheckArgs(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -1423,8 +1428,13 @@ function parseSecretCheckArgs(argv) {
       parsed.json = true;
       continue;
     }
+    // A stray or unknown argument is not repeated: it is the caller's text,
+    // which can be a pasted key (D-406 item 6).
     if (!token.startsWith('--')) {
-      throw new Error(`Unexpected argument "${token}" for secret-check.`);
+      throw new Error(`secret-check takes no other argument; its flags are ${SECRET_CHECK_FLAG_LIST}.`);
+    }
+    if (!SECRET_CHECK_VALUE_FLAGS.includes(token)) {
+      throw new Error(`secret-check has no such flag; its flags are ${SECRET_CHECK_FLAG_LIST}.`);
     }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith('--')) {
@@ -1445,7 +1455,7 @@ function parseSecretCheckArgs(argv) {
         parsed.fingerprint = value;
         break;
       default:
-        throw new Error(`Unknown flag "${token}" for secret-check.`);
+        throw new Error(`secret-check has no such flag; its flags are ${SECRET_CHECK_FLAG_LIST}.`);
     }
   }
   if ((parsed.reason !== undefined || parsed.fingerprint !== undefined) && !parsed.allow) {

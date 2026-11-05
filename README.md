@@ -461,10 +461,13 @@ secret: a hash of a short value can be guessed back.
 `project.yaml` `metadata.workflow.secret_check` sets what push does on a match:
 `block` (the default) refuses, `warn` reports the matches and uploads anyway,
 and `off` skips the check. `promote-hosted` starts with a push, so it is
-checked the same way. `close-session` runs the check over the whole root after
-it writes the note and only warns, so you can fix a pasted key before you
-commit or push. `secret-check --json` prints every match with its column,
-fingerprint, and whether a record allows it.
+checked and reported the same way, and a refusal stops it before the mode
+changes. `close-session` runs the check over the whole root after it writes the
+note and only warns, so you can fix a pasted key before you commit or push.
+`secret-check --json` prints every match with its column, fingerprint, and
+whether a record allows it. No message from the check repeats a matched value,
+the setting's value, text from `secret-check-allow.yaml`, or an argument it
+refuses: it names the setting, the record by number, or the line instead.
 
 The check is best effort: it recognizes formats and can't prove a document
 holds no secret. It reads only what push sends, not lane scratch (`wip.md`,

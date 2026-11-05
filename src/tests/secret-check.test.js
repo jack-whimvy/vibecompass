@@ -406,7 +406,7 @@ test('the allow list fails closed on a malformed record and warns on an unknown 
   const valid = { path: DOC, rule: 'token-npm', fingerprint: 'sha256:0123456789abcdef', reason: 'sample' };
   assert.equal(parseSecretAllowList(record(valid)).records.length, 1);
   assert.throws(() => parseSecretAllowList(record({ ...valid, fingerprint: 'sha256:0123' })), /malformed fingerprint/);
-  assert.throws(() => parseSecretAllowList(record({ ...valid, rule: 'actions-secret-reference' })), /unknown rule/);
+  assert.throws(() => parseSecretAllowList(record({ ...valid, rule: 'actions-secret-reference' })), /allow record 1 names a rule the check doesn't have/);
   assert.throws(() => parseSecretAllowList(record({ path: DOC, rule: 'token-npm', fingerprint: valid.fingerprint })), /needs a non-empty reason/);
   assert.throws(() => parseSecretAllowList('allow: nope\n'), /allow must be a list/);
   assert.deepEqual(parseSecretAllowList(`${record({ ...valid, note: 'x' })}extra: 1\n`).warnings.length, 2);
@@ -419,7 +419,9 @@ test('the setting: block by default, warn and off as set, anything else warns an
   assert.deepEqual(resolveSecretCheckSettings('off'), { mode: 'off', warnings: [] });
   const invalid = resolveSecretCheckSettings('refuse');
   assert.equal(invalid.mode, 'block');
-  assert.match(invalid.warnings[0], /metadata\.workflow\.secret_check is "refuse", not block, warn, or off; using block\./);
+  assert.equal(invalid.warnings[0], 'project.yaml metadata.workflow.secret_check is set to other text, not block, warn, or off (lowercase); using block.');
+  assert.match(resolveSecretCheckSettings(['block']).warnings[0], /is set to a list,/);
+  assert.match(resolveSecretCheckSettings(3).warnings[0], /is set to a number,/);
 });
 
 test('push on block: a match no record allows refuses before anything is sent, and the message holds no matched text', async () => {
@@ -467,7 +469,7 @@ test('a refused push shows the warning for an invalid setting, which falls back 
     const calls = [];
     await assert.rejects(
       pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)),
-      /nothing was pushed\.[\s\S]*metadata\.workflow\.secret_check is "warning", not block, warn, or off; using block\./,
+      /nothing was pushed\.[\s\S]*metadata\.workflow\.secret_check is set to other text, not block, warn, or off \(lowercase\); using block\./,
     );
     assert.equal(calls.length, 0);
   } finally {
@@ -532,12 +534,12 @@ test('push on block refuses on an allow list it cannot read; warn pushes and say
       await writeFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), 'allow:\n  - path: "x.md"\n    rule: nope\n    fingerprint: "sha256:0123456789abcdef"\n    reason: "r"\n', 'utf8');
       const calls = [];
       if (refuses) {
-        await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)), /Secret check: .*unknown rule "nope".* Nothing was pushed\./);
+        await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)), /Secret check: .*allow record 1 names a rule the check doesn't have.* Nothing was pushed\./);
         assert.equal(calls.length, 0);
       } else {
         const result = await pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls));
         assert.equal(calls.length, 1);
-        assert.match(result.secretCheck.warnings.join('\n'), /Secret check \(warn\): .*unknown rule "nope"/);
+        assert.match(result.secretCheck.warnings.join('\n'), /Secret check \(warn\): .*allow record 1 names a rule the check doesn't have/);
       }
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -615,6 +617,188 @@ test('close-session checks the whole root after writing the note and only warns;
           : 'push will refuse until it is removed or allowed'));
         assertNoValue(JSON.stringify({ summary: result.secretCheck, warnings: result.warnings }), [key]);
       }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('R2.1: no diagnostic repeats a value: the setting, the allow list, --allow, --fingerprint, and stray arguments', async () => {
+  const key = keys.githubInstallation[0];
+  const noValue = (text) => assertNoValue(text, [key]);
+  const rejectsWithout = async (promise, pattern) => assert.rejects(promise, (error) => {
+    assert.match(error.message, pattern);
+    noValue(error.message);
+    return true;
+  });
+  const throwsWithout = (fn, pattern) => assert.throws(fn, (error) => {
+    assert.match(error.message, pattern);
+    noValue(error.message);
+    return true;
+  });
+
+  // The setting: described, never repeated.
+  const setting = resolveSecretCheckSettings(key);
+  assert.equal(setting.mode, 'block');
+  assert.match(setting.warnings[0], /is set to other text, not block, warn, or off/);
+  noValue(setting.warnings.join('\n'));
+
+  // The allow list: unknown keys, an unknown rule, a parse error that names a
+  // key, and a record whose path or reason a rule matches.
+  const valid = { path: DOC, rule: 'token-npm', fingerprint: 'sha256:0123456789abcdef', reason: 'sample' };
+  const record = (fields) => `allow:\n  - ${Object.entries(fields).map(([field, value]) => `${field}: "${value}"`).join('\n    ')}\n`;
+  const extraKeys = parseSecretAllowList(`${record({ ...valid, [key]: 'x' })}${key}: 1\n`);
+  assert.deepEqual(extraKeys.warnings, [
+    'secret-check-allow.yaml has 1 top-level key other than allow, ignored.',
+    'secret-check-allow.yaml: allow record 1 has 1 key other than path, rule, fingerprint, and reason, ignored.',
+  ]);
+  throwsWithout(() => parseSecretAllowList(record({ ...valid, rule: key })), /^secret-check-allow\.yaml: allow record 1 names a rule the check doesn't have; the rules are /);
+  throwsWithout(
+    () => parseSecretAllowList(`${record(valid)}    ${key}: "a"\n    ${key}: "b"\n`),
+    /^secret-check-allow\.yaml could not be parsed at line 7; it holds an allow: list of records\./,
+  );
+  throwsWithout(() => parseSecretAllowList(record({ ...valid, path: `notes/${key}.md` })), /allow record 1's path matches a secret-check rule itself/);
+  throwsWithout(() => parseSecretAllowList(record({ ...valid, reason: `pasted ${key}` })), /allow record 1's reason matches a secret-check rule itself/);
+
+  const { tempDir, rootDir } = await createRoot({ secretCheck: key });
+  try {
+    // project.yaml holds the key in the setting: push refuses on it, and
+    // neither the refusal nor its setting warning repeats it.
+    const calls = [];
+    await rejectsWithout(
+      pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)),
+      /^Secret check: 1 possible secret in 1 document, so nothing was pushed\.\n- project\.yaml:\d+ token-github\n[\s\S]*is set to other text, not block, warn, or off/,
+    );
+    assert.equal(calls.length, 0);
+
+    // secret-check's text, JSON, and warnings.
+    const stdout = [];
+    const stderr = [];
+    assert.equal(await runCli(['secret-check', '--root', '.compass'], createIo(stdout, stderr), { cwd: tempDir }), 1);
+    assert.match(stderr.join(''), /Warning: project\.yaml metadata\.workflow\.secret_check is set to other text/);
+    noValue(stdout.join('') + stderr.join(''));
+    const json = [];
+    await runCli(['secret-check', '--root', '.compass', '--json'], createIo(json, []), { cwd: tempDir });
+    noValue(json.join(''));
+
+    // A malformed allow list under push, which refuses, and at close, which warns.
+    await writeFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), `${record(valid)}    ${key}: "a"\n    ${key}: "b"\n`, 'utf8');
+    await rejectsWithout(pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)), /^Secret check: secret-check-allow\.yaml could not be parsed at line 7; .* Nothing was pushed\.$/);
+    await writeFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), record({ ...valid, rule: key }), 'utf8');
+    await rejectsWithout(pushProjectMemory({ rootDir: '.compass' }, pushEnvironment(tempDir, calls)), /allow record 1 names a rule the check doesn't have/);
+    await startProjectSession({ cwd: tempDir, rootDir, sessionId: 'bad-list', workingOn: 'Close over a bad allow list.', date: '2026-11-04' });
+    const closed = await closeProjectSession({
+      cwd: tempDir,
+      rootDir,
+      sessionId: 'bad-list',
+      title: 'Bad list',
+      completed: ['Nothing.'],
+      documentMaintenance: { architectureDocs: 'not-needed', decisionLog: 'not-needed', sessionMaintenance: 'updated' },
+      nextSteps: ['Fix the list.'],
+      reviewOverride: 'test: no review in this fixture',
+    });
+    assert.ok(closed.warnings.some((warning) => /^Secret check could not run at close: .*allow record 1 names a rule the check doesn't have/.test(warning)));
+    assert.ok(closed.warnings.some((warning) => /secret_check is set to other text/.test(warning)));
+    noValue(JSON.stringify({ summary: closed.secretCheck, warnings: closed.warnings }));
+    await rm(path.join(rootDir, SECRET_CHECK_ALLOW_FILE));
+
+    // --allow: a path that names no document, a malformed fingerprint, and a
+    // stray or unknown argument are refused without being repeated.
+    const line = await appendToDoc(rootDir, join('pass', 'word: hashed', '12'));
+    await rejectsWithout(allowSecretMatch({ rootDir, target: `notes/${key}.md:1`, reason: 'x' }), /^The --allow path is not a canonical document in this root;/);
+    await rejectsWithout(allowSecretMatch({ rootDir, target: `${DOC}:${line}`, reason: 'x', fingerprint: key }), /^--fingerprint takes sha256: and 16 lowercase hex digits/);
+    await rejectsWithout(allowSecretMatch({ rootDir, target: `${DOC}:${line}`, reason: 'x', fingerprint: '' }), /^--fingerprint takes/);
+    await rejectsWithout(
+      runCli(['secret-check', '--root', '.compass', '--allow', `${DOC}:${line}`, '--fingerprint', key, '--reason', 'x'], createIo([], []), { cwd: tempDir }),
+      /^--fingerprint takes/,
+    );
+    await rejectsWithout(runCli(['secret-check', key], createIo([], []), { cwd: tempDir }), /^secret-check takes no other argument; its flags are /);
+    await rejectsWithout(runCli(['secret-check', `--${key}`, 'x'], createIo([], []), { cwd: tempDir }), /^secret-check has no such flag; its flags are /);
+    await assert.rejects(readFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), 'utf8'), { code: 'ENOENT' }, 'nothing was recorded');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+function promotionFetch(calls) {
+  const json = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
+  let mode = 'local-primary';
+  return async (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ url, body });
+    if (url.includes('/status')) {
+      return json({ mode, current_remote_revision_id: null, current_manifest_hash: null, pending_mode_transition: null });
+    }
+    if (url.includes('/push')) {
+      return json({ status: 'completed', run_id: 'run-1', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f', applied_proposal_ids: [], stale_proposal_ids: [] });
+    }
+    if (url.includes('/mode-transition')) {
+      if (body.action === 'begin') return json({ phase: 'pending', target_mode: body.target_mode, completeness: null });
+      if (body.action === 'confirm') {
+        mode = body.target_mode;
+        return json({ phase: 'confirmed', mode });
+      }
+      return json({ phase: 'aborted' });
+    }
+    throw new Error(`Unexpected URL in mock: ${url}`);
+  };
+}
+
+test('R2.2: promote-hosted prints its baseline push\'s secret check on warn, and on block refuses before the transition begins', async () => {
+  const key = keys.npm[0];
+  const env = { SECRET_CHECK_TEST_TOKEN: join('test-', 'credential') };
+  const transitionCalls = (calls) => calls.filter((call) => call.url.includes('/mode-transition'));
+  {
+    // warn, with a match: promoted, and the match is listed as push lists it.
+    const { tempDir, rootDir } = await createRoot({ secretCheck: 'warn' });
+    try {
+      const line = await appendToDoc(rootDir, `token note ${key}`);
+      const calls = [];
+      const stdout = [];
+      const stderr = [];
+      assert.equal(await runCli(['promote-hosted'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: promotionFetch(calls) }), 0);
+      const output = stdout.join('');
+      assert.match(output, /^Secret check \(warn\): 1 possible secret in 1 document; pushed anyway because metadata\.workflow\.secret_check is warn\.\n/);
+      assert.ok(output.includes(`- ${DOC}:${line} token-npm\n`));
+      assert.match(output, /Mode transition: promoted\n/);
+      assert.deepEqual(transitionCalls(calls).map((call) => call.body.action), ['begin', 'confirm']);
+      assertNoValue(output + stderr.join(''), [key]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+  {
+    // warn, with an allow list it cannot read: the warning is printed.
+    const { tempDir, rootDir } = await createRoot({ secretCheck: 'warn' });
+    try {
+      await writeFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), 'allow:\n  - path: "x.md"\n    rule: nope\n    fingerprint: "sha256:0123456789abcdef"\n    reason: "r"\n', 'utf8');
+      const calls = [];
+      const stdout = [];
+      const stderr = [];
+      assert.equal(await runCli(['promote-hosted'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: promotionFetch(calls) }), 0);
+      assert.match(stderr.join(''), /Warning: Secret check \(warn\): secret-check-allow\.yaml: allow record 1 names a rule the check doesn't have; .* Every match is listed\./);
+      assert.match(stdout.join(''), /^Secret check: passed \(\d+ documents; no match\)\nMode transition: promoted\n/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+  {
+    // block (the default): refused before begin; nothing pushed, mode unchanged.
+    const { tempDir, rootDir } = await createRoot();
+    try {
+      await appendToDoc(rootDir, `token note ${key}`);
+      const calls = [];
+      await assert.rejects(
+        runCli(['promote-hosted'], createIo([], []), { cwd: tempDir, env, fetch: promotionFetch(calls) }),
+        (error) => {
+          assert.match(error.message, /nothing was pushed/);
+          assertNoValue(error.message, [key]);
+          return true;
+        },
+      );
+      assert.equal(calls.filter((call) => call.url.includes('/push')).length, 0);
+      assert.equal(transitionCalls(calls).length, 0);
+      assert.match(await readFile(path.join(rootDir, 'project.yaml'), 'utf8'), /^mode: local-primary$/m);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

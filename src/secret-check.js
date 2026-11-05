@@ -194,10 +194,20 @@ export function resolveSecretCheckSettings(rawValue) {
   if (SECRET_CHECK_MODES.includes(value)) {
     return { mode: value, warnings };
   }
+  // D-406 item 6: the warning describes the value and never repeats it, since
+  // a key pasted into the setting would be printed with it.
   warnings.push(
-    `project.yaml metadata.workflow.secret_check is ${JSON.stringify(rawValue)}, not block, warn, or off; using ${DEFAULT_SECRET_CHECK}.`, // D-406
+    `project.yaml metadata.workflow.secret_check is set to ${describeSettingValue(value)}, not block, warn, or off (lowercase); using ${DEFAULT_SECRET_CHECK}.`,
   );
   return { mode: DEFAULT_SECRET_CHECK, warnings };
+}
+
+function describeSettingValue(value) {
+  if (typeof value === 'string') return value === '' ? 'empty text' : 'other text';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'object') return 'a mapping';
+  if (typeof value === 'boolean') return 'true or false';
+  return `a ${typeof value}`;
 }
 
 /**
@@ -224,17 +234,23 @@ export function parseSecretAllowList(source, filePath = SECRET_CHECK_ALLOW_FILE)
   const label = path.basename(filePath);
   const warnings = [];
   let data;
+  // D-406 item 6: every message below names a record by its number, a field
+  // by its name, and a parse error by its line, and never repeats text from
+  // the file, which a pasted key could be part of. So the parser's own message
+  // (which can name a key) is not passed through.
   try {
     data = source.trim() === '' ? {} : parseSimpleYaml(source, { sourceName: label });
   } catch (error) {
-    throw new Error(`${label} could not be parsed: ${error instanceof Error ? error.message : String(error)}. Fix it, or remove it to list every match again.`);
+    const lineNumber = parseErrorLine(error, label);
+    throw new Error(`${label} could not be parsed${lineNumber ? ` at line ${lineNumber}` : ''}; it holds an allow: list of records. Fix it, or remove it to list every match again.`);
   }
   if (data === null || data === undefined) data = {};
   if (!isPlainObject(data)) {
     throw new Error(`${label} must be a mapping with an allow: list.`);
   }
-  for (const key of Object.keys(data)) {
-    if (key !== 'allow') warnings.push(`${label} has an unknown key "${key}", which is ignored.`);
+  const extraTopLevel = Object.keys(data).filter((key) => key !== 'allow').length;
+  if (extraTopLevel > 0) {
+    warnings.push(`${label} has ${countOf(extraTopLevel, 'top-level key')} other than allow, ignored.`);
   }
   const rawRecords = data.allow ?? [];
   if (!Array.isArray(rawRecords)) {
@@ -243,8 +259,9 @@ export function parseSecretAllowList(source, filePath = SECRET_CHECK_ALLOW_FILE)
   const records = rawRecords.map((record, index) => {
     const where = `${label}: allow record ${index + 1}`;
     if (!isPlainObject(record)) throw new Error(`${where} is not a mapping.`);
-    for (const key of Object.keys(record)) {
-      if (!ALLOW_RECORD_KEYS.includes(key)) warnings.push(`${where} has an unknown key "${key}", which is ignored.`);
+    const extraKeys = Object.keys(record).filter((key) => !ALLOW_RECORD_KEYS.includes(key)).length;
+    if (extraKeys > 0) {
+      warnings.push(`${where} has ${countOf(extraKeys, 'key')} other than path, rule, fingerprint, and reason, ignored.`);
     }
     for (const key of ALLOW_RECORD_KEYS) {
       if (typeof record[key] !== 'string' || record[key].trim() === '') {
@@ -252,14 +269,34 @@ export function parseSecretAllowList(source, filePath = SECRET_CHECK_ALLOW_FILE)
       }
     }
     if (!SECRET_RULE_NAMES.includes(record.rule)) {
-      throw new Error(`${where} names an unknown rule "${record.rule}"; the rules are ${SECRET_RULE_NAMES.join(', ')}.`);
+      throw new Error(`${where} names a rule the check doesn't have; the rules are ${SECRET_RULE_NAMES.join(', ')}.`);
     }
     if (!FINGERPRINT_PATTERN.test(record.fingerprint)) {
       throw new Error(`${where} has a malformed fingerprint; it is sha256: and 16 lowercase hex digits.`);
     }
+    // The path is printed when no match uses the record, and the reason is
+    // checked before --allow writes it (D-406 item 5); a record holding text a
+    // rule matches fails the list closed, as a malformed one does.
+    for (const key of ['path', 'reason']) {
+      if (textHasSecretMatch(record[key])) {
+        throw new Error(`${where}'s ${key} matches a secret-check rule itself; remove that text from ${label} (and rotate it if it is a real key).`);
+      }
+    }
     return { path: record.path, rule: record.rule, fingerprint: record.fingerprint, reason: record.reason };
   });
   return { records, warnings };
+}
+
+/** The line number from a parser error that starts `<label>:<line> `, or null. */
+function parseErrorLine(error, label) {
+  const message = error instanceof Error ? error.message : '';
+  if (!message.startsWith(`${label}:`)) return null;
+  const match = /^(\d+) /.exec(message.slice(label.length + 1));
+  return match ? Number(match[1]) : null;
+}
+
+function countOf(count, noun) {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
 /**
@@ -349,13 +386,16 @@ export async function allowSecretMatch(options = {}) {
   const rootDir = path.resolve(options.rootDir ?? '.compass');
   const target = parseAllowTarget(options.target);
   const reason = normalizeReason(options.reason);
+  const fingerprint = normalizeFingerprint(options.fingerprint);
   return withMemoryRootLock(rootDir, 'secret-check-allow', async () => {
     await assertProjectRoot(rootDir);
     const allowList = await readSecretAllowList(rootDir);
     const documents = await readCanonicalDocumentsForSecretCheck(rootDir);
     const document = documents.find((entry) => entry.path === target.path);
     if (!document) {
-      throw new Error(`${target.path} is not a canonical document in this root; pass the path secret-check prints, relative to the root.`);
+      // Not repeated: a path that names no canonical document is only the
+      // caller's text (D-406 item 6).
+      throw new Error('The --allow path is not a canonical document in this root; pass the path secret-check prints, relative to the root. Nothing was recorded.');
     }
     const onLine = findSecretMatches(document.text, document.path).filter((match) => match.line === target.line);
     const distinct = [...new Map(onLine.map((match) => [`${match.rule}\u0000${match.fingerprint}`, match])).values()];
@@ -363,10 +403,10 @@ export async function allowSecretMatch(options = {}) {
       throw new Error(`secret-check found no match on ${target.path}:${target.line}; nothing was recorded.`);
     }
     let selected;
-    if (options.fingerprint) {
-      selected = distinct.filter((match) => match.fingerprint === options.fingerprint);
+    if (fingerprint) {
+      selected = distinct.filter((match) => match.fingerprint === fingerprint);
       if (selected.length === 0) {
-        throw new Error(`No match on ${target.path}:${target.line} has fingerprint ${options.fingerprint}; nothing was recorded.\n${renderLineMatches(distinct)}`);
+        throw new Error(`No match on ${target.path}:${target.line} has fingerprint ${fingerprint}; nothing was recorded.\n${renderLineMatches(distinct)}`);
       }
     } else if (distinct.length > 1) {
       throw new Error(
@@ -441,6 +481,16 @@ function parseAllowTarget(value) {
     throw new Error('--allow expects <path>:<line>, the path and line secret-check prints.');
   }
   return { path: targetPath, line: Number(lineText) };
+}
+
+/** A `--fingerprint` is checked for its shape before it is ever printed back. */
+function normalizeFingerprint(value) {
+  if (value === undefined || value === null) return null;
+  const fingerprint = typeof value === 'string' ? value.trim() : '';
+  if (!FINGERPRINT_PATTERN.test(fingerprint)) {
+    throw new Error('--fingerprint takes sha256: and 16 lowercase hex digits, as secret-check prints it. Nothing was recorded.');
+  }
+  return fingerprint;
 }
 
 function normalizeReason(value) {
