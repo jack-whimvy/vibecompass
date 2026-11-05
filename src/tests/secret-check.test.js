@@ -16,6 +16,7 @@ import {
   SECRET_CHECK_ALLOW_FILE,
   SECRET_RULE_NAMES,
 } from '../secret-check.js';
+import { promoteHosted } from '../mode-transition.js';
 import { closeProjectSession, startProjectSession } from '../session.js';
 import { pushProjectMemory } from '../sync.js';
 
@@ -720,8 +721,9 @@ test('R2.1: no diagnostic repeats a value: the setting, the allow list, --allow,
   }
 });
 
-function promotionFetch(calls) {
+function promotionFetch(calls, failAction = null) {
   const json = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
+  const unavailable = () => ({ ok: false, status: 503, json: async () => ({}), text: async () => 'unavailable' });
   let mode = 'local-primary';
   return async (url, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : null;
@@ -733,6 +735,7 @@ function promotionFetch(calls) {
       return json({ status: 'completed', run_id: 'run-1', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f', applied_proposal_ids: [], stale_proposal_ids: [] });
     }
     if (url.includes('/mode-transition')) {
+      if (body.action === failAction) return unavailable();
       if (body.action === 'begin') return json({ phase: 'pending', target_mode: body.target_mode, completeness: null });
       if (body.action === 'confirm') {
         mode = body.target_mode;
@@ -744,7 +747,7 @@ function promotionFetch(calls) {
   };
 }
 
-test('R2.2: promote-hosted prints its baseline push\'s secret check on warn, and on block refuses before the transition begins', async () => {
+test('R2.2: promote-hosted prints its baseline push\'s secret check on warn, even when a later phase fails, and on block refuses before the transition begins', async () => {
   const key = keys.npm[0];
   const env = { SECRET_CHECK_TEST_TOKEN: join('test-', 'credential') };
   const transitionCalls = (calls) => calls.filter((call) => call.url.includes('/mode-transition'));
@@ -778,6 +781,61 @@ test('R2.2: promote-hosted prints its baseline push\'s secret check on warn, and
       assert.equal(await runCli(['promote-hosted'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: promotionFetch(calls) }), 0);
       assert.match(stderr.join(''), /Warning: Secret check \(warn\): secret-check-allow\.yaml: allow record 1 names a rule the check doesn't have; .* Every match is listed\./);
       assert.match(stdout.join(''), /^Secret check: passed \(\d+ documents; no match\)\nMode transition: promoted\n/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+  {
+    // warn, with a match, then begin fails after the upload: the report was
+    // printed when the upload finished, and the error carries it too.
+    const { tempDir, rootDir } = await createRoot({ secretCheck: 'warn' });
+    try {
+      const line = await appendToDoc(rootDir, `token note ${key}`);
+      const calls = [];
+      const stdout = [];
+      const stderr = [];
+      await assert.rejects(
+        runCli(['promote-hosted'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: promotionFetch(calls, 'begin') }),
+        /Hosted mode-transition failed with 503/,
+      );
+      assert.equal(calls.filter((call) => call.url.includes('/push')).length, 1, 'the baseline was uploaded');
+      const output = stdout.join('');
+      assert.match(output, /^Secret check \(warn\): 1 possible secret in 1 document; pushed anyway because metadata\.workflow\.secret_check is warn\.\n/);
+      assert.ok(output.includes(`- ${DOC}:${line} token-npm\n`));
+      assert.ok(!output.includes('Mode transition:'));
+      assertNoValue(output + stderr.join(''), [key]);
+
+      // A library caller gets the same report on the error.
+      const again = [];
+      await assert.rejects(
+        promoteHosted({ rootDir: '.compass' }, { cwd: tempDir, env, runtime: { fetch: promotionFetch(again, 'begin') } }),
+        (error) => {
+          assert.equal(error.secretCheck.ok, false);
+          assert.deepEqual(error.secretCheck.unallowed.map((match) => `${match.path}:${match.line} ${match.rule}`), [`${DOC}:${line} token-npm`]);
+          assertNoValue(JSON.stringify(error.secretCheck), [key]);
+          return true;
+        },
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+  {
+    // warn, with an allow list it cannot read, then confirm fails after the
+    // local writes: the warning was printed when the upload finished.
+    const { tempDir, rootDir } = await createRoot({ secretCheck: 'warn' });
+    try {
+      await writeFile(path.join(rootDir, SECRET_CHECK_ALLOW_FILE), 'allow:\n  - path: "x.md"\n    rule: nope\n    fingerprint: "sha256:0123456789abcdef"\n    reason: "r"\n', 'utf8');
+      const calls = [];
+      const stdout = [];
+      const stderr = [];
+      await assert.rejects(
+        runCli(['promote-hosted'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: promotionFetch(calls, 'confirm') }),
+        /Hosted mode-transition failed with 503/,
+      );
+      assert.deepEqual(transitionCalls(calls).map((call) => call.body.action), ['begin', 'confirm']);
+      assert.match(stderr.join(''), /Warning: Secret check \(warn\): secret-check-allow\.yaml: allow record 1 names a rule the check doesn't have; .* Every match is listed\./);
+      assert.match(stdout.join(''), /^Secret check: passed \(\d+ documents; no match\)\n/);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

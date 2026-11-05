@@ -23,12 +23,22 @@ const PROMOTED_MARKER = ['state', 'promoted-root.json'];
 export async function promoteHosted(options = {}, environment = {}) {
   const cwd = environment.cwd ? path.resolve(environment.cwd) : process.cwd();
   const rootDir = path.resolve(cwd, options.rootDir ?? '.compass');
-  return withMemoryRootLock(rootDir, 'promote-hosted', () =>
-    promoteHostedLocked(options, environment, rootDir),
-  );
+  const baseline = { secretCheck: null };
+  try {
+    return await withMemoryRootLock(rootDir, 'promote-hosted', () =>
+      promoteHostedLocked(options, environment, rootDir, baseline),
+    );
+  } catch (error) {
+    // A failure after the baseline upload keeps that push's secret-check
+    // report (D-406 item 4): the documents were already sent.
+    if (baseline.secretCheck && error && typeof error === 'object' && error.secretCheck === undefined) {
+      error.secretCheck = baseline.secretCheck;
+    }
+    throw error;
+  }
 }
 
-async function promoteHostedLocked(options, environment, rootDir) {
+async function promoteHostedLocked(options, environment, rootDir, baseline) {
   const context = await loadModeAgnosticSyncContext(rootDir, options, environment);
   const server = await getJson(context, 'status');
   const localMode = context.project.mode;
@@ -77,12 +87,18 @@ async function promoteHostedLocked(options, environment, rootDir) {
   if (localMode === 'local-primary') {
     // Phase 1: fresh verified baseline. Idempotent push makes retries safe.
     // The push runs the secret check (D-406 item 3): a refusal throws here,
-    // before begin; on warn its result is carried out for the CLI to print.
+    // before begin. Once the upload is done its report is handed out at once
+    // (environment.onBaselineSecretCheck), so a later phase's failure can't
+    // hide what was uploaded; it also rides on the result and on any error.
     const pushResult = await pushProjectMemory(
       { rootDir, syncTarget: options.syncTarget ?? null },
       environment,
     );
     secretCheck = pushResult.secretCheck ?? null;
+    baseline.secretCheck = secretCheck;
+    if (secretCheck && typeof environment.onBaselineSecretCheck === 'function') {
+      environment.onBaselineSecretCheck(secretCheck);
+    }
     notes.push(`Baseline push: ${pushResult.status} (${pushResult.remoteRevisionId}).`);
 
     const manifest = JSON.parse(await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'));

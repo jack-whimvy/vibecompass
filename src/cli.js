@@ -722,9 +722,10 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       cwd: runtime.cwd,
       env: runtime.env,
       runtime,
+      // promote-hosted's baseline push ran the secret check: print it as push
+      // does, as soon as the upload is done, so a later failure can't hide it.
+      onBaselineSecretCheck: (secretCheck) => writePushSecretCheck(io, secretCheck),
     });
-    // promote-hosted's baseline push ran the secret check; print it as push does.
-    writePushSecretCheck(io, result.secretCheck);
     io.stdout.write(`Mode transition: ${result.status}\n`);
     if (result.completeness) {
       io.stdout.write(`Carries over: ${result.completeness.carries_over}\n`);
