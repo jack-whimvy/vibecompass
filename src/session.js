@@ -106,8 +106,9 @@ async function refreshBindingUpstreamsBeforeLock(normalized, options) {
       repoIds: normalizeStringArray(options?.repos),
       projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
       branch,
-      // Test seam; production uses the default limit.
+      // Test seams; production uses the default limit and the real platform.
       timeoutMs: options?.upstreamFetchTimeoutMs,
+      platform: options?.upstreamFetchPlatform,
     });
   } catch {
     return {};

@@ -3647,7 +3647,7 @@ function usageText() {
     '                                        A ticked task warns and is kept. Stored as plan_tasks in session.yaml; the plan joins architecture_docs; close-session lists the links in the note',
     '  --decision-domain-file <domain.md>   Repeatable decision domain file the lane expects to edit (alias: --decision-domain)',
     '  --branch <name>                      Opt-in git binding: create or reuse this branch in every bound --repo; requires at least one --repo', // D-281
-    '                                       A new branch starts at the checkout\'s HEAD, or at its upstream when HEAD is behind it (fetched first, no prompts, 15-second limit; offline it compares with the upstream as last fetched); an existing branch is used as it is', // D-411
+    '                                       A new branch starts at the checkout\'s HEAD, or at its upstream when HEAD is behind it (fetched first, no prompts, 15-second limit; offline, and always on Windows, it compares with the upstream as last fetched); an existing branch is used as it is', // D-411, D-413
     '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> and write the lane marker into the container', // D-279
     '  --date <YYYY-MM-DD>                  Optional explicit session date',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',

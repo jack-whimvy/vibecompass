@@ -28,6 +28,9 @@ export const WORKTREE_REMOVE_AT_CLOSE_EXEC_OPTIONS = Object.freeze({ maxBuffer: 
 // a slow remote can't make another lane's command time out waiting for it.
 export const UPSTREAM_FETCH_TIMEOUT_MS = 15000;
 const FETCH_STDERR_MAX_BYTES = 8192;
+// How long start-session waits for git's error output to close once git has
+// exited (D-413 item 3).
+const EXIT_GRACE_MS = 1000;
 
 /**
  * Repo working copies live as siblings of the memory root: the workspace is
@@ -214,14 +217,17 @@ export async function readBranchUpstream(repoDir) {
 }
 
 /**
- * D-411 item 1: fetch one upstream ref into its remote-tracking ref and
- * nothing else. The empty --refmap stops the remote's configured fetch
- * mappings from updating any other ref (a local branch included); the other
- * options stop pruning, tags, submodules, remote HEAD updates, and automatic
- * maintenance. Writes: fetched objects, that one tracking ref (and its reflog
- * where reflogs are on), and FETCH_HEAD. Never throws: returns `fetched`,
- * `skipped` (nothing to fetch, or not a ref under refs/remotes/), or `failed`
- * with git's first line of error.
+ * D-411 item 1, as amended by D-413: fetch one upstream ref into its
+ * remote-tracking ref and nothing else. The empty --refmap stops the remote's
+ * configured fetch mappings from updating any other ref (a local branch
+ * included); the other options stop pruning, tags, submodules, remote HEAD
+ * updates, automatic maintenance, and a configured commit-graph write. A
+ * symbolic tracking ref is never a destination, since git would write through
+ * it to its target. Writes: fetched objects, that one tracking ref (and its
+ * reflog where reflogs are on), and FETCH_HEAD. Never throws: returns
+ * `fetched`; `skipped` (nothing to fetch, or not a ref under refs/remotes/);
+ * `symbolic` with the ref it points at; `not-on-windows`; or `failed` with
+ * git's first line of error.
  */
 export async function fetchBranchUpstream(repoDir, upstream, options = {}) {
   if (!upstream || upstream.local) {
@@ -229,6 +235,16 @@ export async function fetchBranchUpstream(repoDir, upstream, options = {}) {
   }
   if (!upstream.trackingRef.startsWith('refs/remotes/') || !upstream.mergeRef.startsWith('refs/')) {
     return { status: 'skipped' };
+  }
+  // D-413 item 4: no process group on Windows to stop git's descendants at the
+  // limit, so start-session compares with the upstream as last fetched there.
+  if ((options.platform ?? process.platform) === 'win32') {
+    return { status: 'not-on-windows' };
+  }
+  // D-413 item 2: git follows a symbolic destination to its target.
+  const symbolicTarget = await readSymbolicRefTarget(repoDir, upstream.trackingRef);
+  if (symbolicTarget) {
+    return { status: 'symbolic', target: symbolicTarget };
   }
 
   const timeoutMs = options.timeoutMs ?? UPSTREAM_FETCH_TIMEOUT_MS;
@@ -242,7 +258,7 @@ export async function fetchBranchUpstream(repoDir, upstream, options = {}) {
     '-c', `remote.${upstream.remote}.followRemoteHEAD=never`,
     ...sshOverride,
     'fetch', '--quiet', '--refmap=', '--no-prune', '--no-prune-tags', '--no-tags',
-    '--no-recurse-submodules', '--no-auto-gc',
+    '--no-recurse-submodules', '--no-auto-gc', '--no-write-commit-graph',
     upstream.remote,
     `+${upstream.mergeRef}:${upstream.trackingRef}`,
   ], { timeoutMs });
@@ -279,7 +295,7 @@ export async function refreshUpstreamsForBinding(options) {
       if (!upstream) {
         return null;
       }
-      return [repoId, await fetchBranchUpstream(sourceDir, upstream, { timeoutMs: options.timeoutMs })];
+      return [repoId, await fetchBranchUpstream(sourceDir, upstream, { timeoutMs: options.timeoutMs, platform: options.platform })];
     } catch (error) {
       return [repoId, { status: 'failed', reason: error instanceof Error ? error.message : String(error) }];
     }
@@ -307,11 +323,12 @@ export async function chooseLaneStartPoint(options) {
   const localName = `local ${upstream.branch}`;
   const atHead = `the lane branch starts at ${localName} (${headRevision.slice(0, 12)})`;
   const upstreamTip = await resolveCommitRevision(sourceDir, upstream.trackingRef);
-  if (fetchOutcome?.status === 'failed') {
+  const notFetched = describeNotFetched(fetchOutcome, upstream, upstreamName);
+  if (notFetched) {
     warnings.push(
       upstreamTip
-        ? `Repo "${repoId}": could not reach ${upstream.remote} to update ${upstreamName} (${fetchOutcome.reason}); comparing with ${upstreamName} as last fetched.`
-        : `Repo "${repoId}": could not reach ${upstream.remote} to update ${upstreamName} (${fetchOutcome.reason}), and there is no copy of ${upstreamName} to compare, so ${atHead}.`,
+        ? `Repo "${repoId}": ${notFetched.reason}; ${notFetched.comparing}.`
+        : `Repo "${repoId}": ${notFetched.reason}, and there is no copy of ${upstreamName} to compare, so ${atHead}.`,
     );
   }
   if (!upstreamTip || upstreamTip === headRevision) {
@@ -345,6 +362,45 @@ export async function chooseLaneStartPoint(options) {
 
   warnings.push(`Repo "${repoId}": could not compare ${localName} with ${upstreamName}; ${atHead}.`);
   return { startPoint: headRevision, warnings };
+}
+
+// Why the upstream wasn't fetched, when that changes what the comparison means.
+function describeNotFetched(fetchOutcome, upstream, upstreamName) {
+  switch (fetchOutcome?.status) {
+    case 'failed':
+      return {
+        reason: `could not reach ${upstream.remote} to update ${upstreamName} (${fetchOutcome.reason})`,
+        comparing: `comparing with ${upstreamName} as last fetched`,
+      };
+    case 'symbolic':
+      // D-413 item 2
+      return {
+        reason: `${upstreamName} is a symbolic ref to ${fetchOutcome.target}, so start-session didn't fetch into it`,
+        comparing: `comparing with ${upstreamName} as it stands`,
+      };
+    case 'not-on-windows':
+      // D-413 item 4
+      return {
+        reason: `start-session doesn't fetch on Windows (run \`git fetch\` first to start the lane from the remote's latest)`,
+        comparing: `comparing with ${upstreamName} as last fetched`,
+      };
+    default:
+      return null;
+  }
+}
+
+async function readSymbolicRefTarget(repoDir, ref) {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'symbolic-ref', '--quiet', ref],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    const target = stdout.trim();
+    return target === '' ? null : target;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -458,6 +514,16 @@ function runNonInteractiveGit(args, options) {
         stderr += chunk.slice(0, FETCH_STDERR_MAX_BYTES - stderr.length);
       }
     });
+    let graceTimer = null;
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      resolve(result);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       try {
@@ -469,17 +535,30 @@ function runNonInteractiveGit(args, options) {
       } catch {
         // Already gone.
       }
+      // Never wait past a short grace after the kill, even if no exit comes.
+      graceTimer = setTimeout(() => {
+        child.stderr.destroy();
+        finish({ ok: false, code: null, signal: 'SIGKILL', timedOut, stderr });
+      }, EXIT_GRACE_MS);
     }, options.timeoutMs);
-    const finish = (result) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
     child.on('error', (error) => {
       finish({ ok: false, code: null, signal: null, timedOut, stderr: stderr || (error instanceof Error ? error.message : String(error)) });
+    });
+    // D-413 item 3: once git has exited, go on. After a kill, at once; after a
+    // normal exit, as soon as its error output closes, or after a short grace
+    // when a process that left the group still holds that output open.
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      if (timedOut) {
+        child.stderr.destroy();
+        finish({ ok: false, code, signal, timedOut, stderr });
+        return;
+      }
+      graceTimer = setTimeout(() => {
+        child.stderr.destroy();
+        finish({ ok: code === 0, code, signal, timedOut, stderr });
+      }, EXIT_GRACE_MS);
     });
     child.on('close', (code, signal) => {
       finish({ ok: code === 0 && !timedOut, code, signal, timedOut, stderr });

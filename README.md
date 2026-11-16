@@ -175,8 +175,9 @@ npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow
 # repo. A new branch starts at the checkout's HEAD, or at its upstream when
 # HEAD is behind it: start-session fetches that one upstream first (no other
 # ref, no prompts, a 15-second limit) and says where the branch started and
-# why; offline it compares with the upstream as last fetched. An existing
-# branch is used as it is. --worktree provisions per-repo worktrees under
+# why; offline it compares with the upstream as last fetched. On Windows it
+# doesn't fetch: run git fetch first to start from the remote's latest. An
+# existing branch is used as it is. --worktree provisions per-repo worktrees under
 # <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
 # container, so commands run from inside a worktree need no --root/--session.
 # At close, close-session removes the recorded worktrees when they are clean

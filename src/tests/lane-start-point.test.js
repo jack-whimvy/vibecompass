@@ -485,3 +485,148 @@ test('the fetch environment turns off Git prompts, every askpass program, and Gi
   assert.equal(env.SSH_ASKPASS_REQUIRE, 'never');
   assert.equal(env.GCM_INTERACTIVE, 'never');
 });
+
+// D-413: the fetch keeps D-411's write budget against a symbolic tracking ref
+// and a configured commit-graph write, goes on once git exits, and doesn't run
+// on Windows.
+
+for (const target of ['refs/heads/shadow', 'refs/tags/v1']) {
+  test(`a tracking ref that is a symbolic ref to ${target} is never fetched into, and its target doesn't move`, async (t) => {
+    if (!hasGit()) {
+      t.skip('git is required.');
+      return;
+    }
+    const { tempDir, seed, appDir, base } = await createWorkspace('vibecompass-start-symref-');
+    try {
+      if (target.startsWith('refs/heads/')) {
+        git(appDir, ['branch', 'shadow']);
+      } else {
+        git(appDir, ['tag', 'v1']);
+      }
+      git(appDir, ['symbolic-ref', 'refs/remotes/origin/main', target]);
+      await pushFromSeed(seed, 'remote-only');
+
+      const result = await startLane(tempDir);
+
+      assert.equal(git(appDir, ['rev-parse', target]), base, `${target} did not move`);
+      assert.equal(git(appDir, ['symbolic-ref', 'refs/remotes/origin/main']), target, 'the symbolic ref is left as it was');
+      assert.equal(git(appDir, ['rev-parse', 'refs/heads/lane-a']), base);
+      assert.deepEqual(startPointWarnings(result), [
+        `Repo "app": origin/main is a symbolic ref to ${target}, so start-session didn't fetch into it; comparing with origin/main as it stands.`,
+      ]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a configured commit-graph write is switched off for the fetch', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+  const { tempDir, seed, appDir } = await createWorkspace('vibecompass-start-graph-');
+  try {
+    git(appDir, ['config', 'fetch.writeCommitGraph', 'true']);
+    const remoteTip = await pushFromSeed(seed, 'remote-only');
+
+    await startLane(tempDir);
+
+    assert.equal(git(appDir, ['rev-parse', 'origin/main']), remoteTip, 'the fetch ran');
+    const info = path.join(appDir, '.git', 'objects', 'info');
+    assert.equal(existsSync(path.join(info, 'commit-graph')), false);
+    assert.equal(existsSync(path.join(info, 'commit-graphs')), false);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('on Windows start-session fetches nothing, compares with the upstream as last fetched, and says how to start from the latest', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+  const { tempDir, seed, appDir, base } = await createWorkspace('vibecompass-start-windows-');
+  try {
+    const fetchedTip = await pushFromSeed(seed, 'fetched-earlier');
+    git(appDir, ['fetch', '-q']);
+    await pushFromSeed(seed, 'never-fetched');
+
+    const result = await startLane(tempDir, { upstreamFetchPlatform: 'win32' });
+
+    assert.equal(git(appDir, ['rev-parse', 'origin/main']), fetchedTip, 'nothing was fetched');
+    assert.equal(git(appDir, ['rev-parse', 'refs/heads/lane-a']), fetchedTip, 'the last-fetched tip');
+    assert.equal(git(appDir, ['rev-parse', 'refs/heads/main']), base);
+    assert.deepEqual(startPointWarnings(result), [
+      'Repo "app": start-session doesn\'t fetch on Windows (run `git fetch` first to start the lane from the remote\'s latest); comparing with origin/main as last fetched.',
+      `Repo "app": local main is 1 commit behind origin/main, so the lane branch starts at origin/main (${fetchedTip.slice(0, 12)}). Local main was left unchanged.`,
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+function hasPerl() {
+  return spawnSync('perl', ['-e', '1']).status === 0;
+}
+
+// A stand-in SSH that first starts a process in its own session (outside the
+// fetch's process group) holding only git's error output open for 20 seconds
+// (its input and output go to /dev/null, so git still sees SSH end), then
+// either hangs or refuses.
+async function writeEscapingSsh(tempDir, then) {
+  const pidFile = path.join(tempDir, 'escaped-pids.txt');
+  const script = path.join(tempDir, 'escaping-ssh.sh');
+  await writeFile(script, [
+    '#!/bin/sh',
+    `perl -e 'use POSIX (); POSIX::setsid(); open(my $f, ">>", "${pidFile}"); print $f "$$\\n"; close $f; sleep 20' </dev/null >/dev/null &`,
+    then,
+    '',
+  ].join('\n'), 'utf8');
+  await chmod(script, 0o755);
+  return { script, pidFile };
+}
+
+async function killRecordedPids(pidFile) {
+  const pids = await readFile(pidFile, 'utf8').then((text) => text.split('\n').filter(Boolean).map(Number), () => []);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+  return pids;
+}
+
+for (const [label, then, timeoutMs, expected] of [
+  ['hangs past the limit', 'exec sleep 30', 1000, /no answer within 1 second/],
+  ['refuses at once', 'echo "Host key verification failed." >&2\nexit 255', 15000, /Host key verification failed/],
+]) {
+  test(`a fetch whose SSH ${label} goes on once git exits, though a process outside its group holds git's error output`, async (t) => {
+    if (!hasGit() || !hasPerl() || process.platform === 'win32') {
+      t.skip('git, perl, and a POSIX shell are required.');
+      return;
+    }
+    const { tempDir, appDir, base } = await createWorkspace('vibecompass-start-escape-');
+    const { script, pidFile } = await writeEscapingSsh(tempDir, then);
+    try {
+      git(appDir, ['remote', 'set-url', 'origin', 'ssh://git@example.invalid/app.git']);
+
+      const started = Date.now();
+      const result = await withIsolatedGitEnv(tempDir, { GIT_SSH_COMMAND: script, GIT_SSH_VARIANT: 'ssh' }, () =>
+        startLane(tempDir, { upstreamFetchTimeoutMs: timeoutMs }));
+      const elapsed = Date.now() - started;
+
+      const escaped = await readFile(pidFile, 'utf8').then((text) => text.split('\n').filter(Boolean), () => []);
+      assert.ok(escaped.length > 0, 'the escaping process started');
+      assert.ok(elapsed < 6000, `start-session took ${elapsed} ms while the escaped process held git's error output`);
+      assert.equal(git(appDir, ['rev-parse', 'refs/heads/lane-a']), base);
+      assert.equal(startPointWarnings(result).length, 1);
+      assert.match(startPointWarnings(result)[0], expected);
+    } finally {
+      await killRecordedPids(pidFile);
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+}
