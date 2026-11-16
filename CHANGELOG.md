@@ -5,7 +5,7 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
-## Unreleased
+## 0.18.3 - 2026-11-16
 
 A lane-lifecycle release: a lane's new branch starts from an up-to-date base,
 a long session title no longer stops `close-session`, and lifecycle commands
