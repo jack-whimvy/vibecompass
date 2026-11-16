@@ -30,11 +30,13 @@ version. Notes already written keep their names.
   it. Before it takes the project-memory lock it fetches the checked-out
   branch's upstream into that one remote-tracking ref and nothing else: no
   other configured mapping, no pruning, no tags, no submodules, no automatic
-  maintenance, and no commit-graph write. A tracking ref that is a symbolic
-  ref is never fetched into, since git would write through it to another
-  ref; start-session says so and compares with it as it stands. The fetch can't prompt: no terminal, Git's prompts
-  and every askpass program off, SSH in batch mode unless you set your own SSH
-  command, and Git Credential Manager told not to interact. Stored credentials
+  maintenance, no commit-graph write, and no download from a saved bundle
+  URI (your bundle settings stay as they are). A tracking ref that is a
+  symbolic ref is never fetched into, since git would write through it to
+  another ref; start-session says so and compares with it as it stands. The
+  fetch can't prompt: no terminal, Git's prompts and every askpass program
+  off, SSH in batch mode unless you set your own SSH command, and Git
+  Credential Manager told not to interact. Stored credentials
   still work. It stops after 15 seconds, and start-session goes on as soon
   as git has exited. On Windows, where the package can't stop git's own
   child processes at the limit, it doesn't fetch: it compares with the

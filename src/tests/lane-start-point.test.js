@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { initializeProjectMemory } from '../init.js';
 import { planDocsUpdate } from '../docs-update.js';
-import { buildNonInteractiveGitEnv } from '../git-binding.js';
+import { buildNonInteractiveGitEnv, fetchBranchUpstream, readBranchUpstream } from '../git-binding.js';
 import { startProjectSession } from '../session.js';
 
 // Where start-session cuts a new lane branch: the checkout's HEAD, or its
@@ -536,6 +537,100 @@ test('a configured commit-graph write is switched off for the fetch', async (t) 
     const info = path.join(appDir, '.git', 'objects', 'info');
     assert.equal(existsSync(path.join(info, 'commit-graph')), false);
     assert.equal(existsSync(path.join(info, 'commit-graphs')), false);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// Every file in a git directory but its objects, keyed by path, with a hash
+// of its bytes.
+async function snapshotGitDirectory(gitDir, relativeDir = '', files = new Map()) {
+  for (const entry of await readdir(path.join(gitDir, relativeDir), { withFileTypes: true })) {
+    const relative = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      await snapshotGitDirectory(gitDir, relative, files);
+    } else if (entry.isFile() && !/^objects\/([0-9a-f]{2}\/|pack\/.+\.(pack|idx|rev|promisor)$)/.test(relative)) {
+      files.set(relative, createHash('sha256').update(await readFile(path.join(gitDir, relative))).digest('hex'));
+    }
+  }
+  return files;
+}
+
+function changedPaths(before, after) {
+  const paths = new Set([...before.keys(), ...after.keys()]);
+  return [...paths].filter((key) => before.get(key) !== after.get(key)).sort();
+}
+
+test('a saved bundle URI is switched off for the fetch, and with every write-capable fetch setting on, the git directory changes only within the budget', async (t) => {
+  if (!hasGit()) {
+    t.skip('git is required.');
+    return;
+  }
+  const { tempDir, seed, appDir } = await createWorkspace('vibecompass-start-bundle-');
+  try {
+    // Pruning bait: a branch and a tag the checkout has, then deleted on the remote.
+    git(seed, ['push', '-q', 'origin', 'main:refs/heads/other']);
+    git(seed, ['tag', 'v1']);
+    git(seed, ['push', '-q', 'origin', 'v1']);
+    git(appDir, ['fetch', '-q', '--tags']);
+    git(seed, ['push', '-q', 'origin', ':refs/heads/other', ':refs/tags/v1']);
+    // A bundle list with the creationToken heuristic, as `git clone
+    // --bundle-uri` saves it; its bundle carries a branch the remote doesn't have.
+    git(seed, ['branch', 'side']);
+    const remoteTip = await commit(seed, 'remote-only');
+    const bundle = path.join(tempDir, 'full.bundle');
+    git(seed, ['bundle', 'create', '-q', bundle, 'main', 'side']);
+    const list = path.join(tempDir, 'bundle-list');
+    await writeFile(list, [
+      '[bundle]', '\tversion = 1', '\tmode = all', '\theuristic = creationToken',
+      '[bundle "full"]', `\turi = file://${bundle}`, '\tcreationToken = 1', '',
+    ].join('\n'), 'utf8');
+    git(seed, ['push', '-q', 'origin', 'main']);
+    git(seed, ['tag', 'v2']);
+    git(seed, ['push', '-q', 'origin', 'v2']);
+    for (const [key, value] of [
+      ['fetch.bundleURI', `file://${list}`],
+      ['fetch.writeCommitGraph', 'true'],
+      ['fetch.prune', 'true'],
+      ['fetch.pruneTags', 'true'],
+      ['remote.origin.prune', 'true'],
+      ['remote.origin.pruneTags', 'true'],
+      ['remote.origin.tagOpt', '--tags'],
+      ['submodule.recurse', 'true'],
+      ['fetch.recurseSubmodules', 'true'],
+      ['gc.auto', '1'],
+      ['gc.autoPackLimit', '1'],
+      ['gc.autoDetach', 'false'],
+      ['maintenance.auto', 'true'],
+      ['fetch.unpackLimit', '1'],
+      ['core.logAllRefUpdates', 'always'],
+      ['remote.origin.followRemoteHEAD', 'create'],
+    ]) {
+      git(appDir, ['config', key, value]);
+    }
+    git(appDir, ['config', '--add', 'remote.origin.fetch', '+refs/heads/main:refs/heads/shadow']);
+    git(appDir, ['symbolic-ref', '--delete', 'refs/remotes/origin/HEAD']);
+    // One pack now and the fetch's own makes two, past gc.autoPackLimit, so
+    // automatic maintenance would repack and pack refs if it ran.
+    git(appDir, ['repack', '-q', '-d']);
+
+    const gitDir = path.join(appDir, '.git');
+    const configBefore = await readFile(path.join(gitDir, 'config'));
+    const before = await snapshotGitDirectory(gitDir);
+    const result = await withIsolatedGitEnv(tempDir, {}, async () => (
+      fetchBranchUpstream(appDir, await readBranchUpstream(appDir))
+    ));
+    const after = await snapshotGitDirectory(gitDir);
+
+    assert.deepEqual(result, { status: 'fetched' });
+    assert.equal(git(appDir, ['rev-parse', 'origin/main']), remoteTip, 'the tracking ref moved');
+    assert.equal(git(appDir, ['for-each-ref', 'refs/bundles/']), '', 'no bundle refs');
+    assert.deepEqual(await readFile(path.join(gitDir, 'config')), configBefore, '.git/config is byte-identical');
+    const changed = changedPaths(before, after);
+    assert.ok(changed.includes('logs/refs/remotes/origin/main') && changed.includes('FETCH_HEAD'), `the snapshot sees the budget's writes: ${changed.join(', ')}`);
+    const outside = changed
+      .filter((file) => !['refs/remotes/origin/main', 'logs/refs/remotes/origin/main', 'FETCH_HEAD'].includes(file));
+    assert.deepEqual(outside, [], 'nothing outside the budget changed in the git directory');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

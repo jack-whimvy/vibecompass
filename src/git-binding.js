@@ -217,14 +217,18 @@ export async function readBranchUpstream(repoDir) {
 }
 
 /**
- * D-411 item 1, as amended by D-413: fetch one upstream ref into its
- * remote-tracking ref and nothing else. The empty --refmap stops the remote's
- * configured fetch mappings from updating any other ref (a local branch
- * included); the other options stop pruning, tags, submodules, remote HEAD
- * updates, automatic maintenance, and a configured commit-graph write. A
- * symbolic tracking ref is never a destination, since git would write through
- * it to its target. Writes: fetched objects, that one tracking ref (and its
- * reflog where reflogs are on), and FETCH_HEAD. Never throws: returns
+ * D-411 item 1, as amended by D-413 and D-414: fetch one upstream ref into
+ * its remote-tracking ref and nothing else. The empty --refmap stops the
+ * remote's configured fetch mappings from updating any other ref (a local
+ * branch included); the other options stop pruning, tags, submodules, remote
+ * HEAD updates, automatic maintenance, a configured commit-graph write, and a
+ * configured bundle URI's downloads (bundle refs, temporary files, and a
+ * creation-token line in .git/config). A symbolic tracking ref is never a
+ * destination, since git would write through it to its target. Writes, in
+ * the repository: fetched objects, that one tracking ref (and its reflog
+ * where reflogs are on), and FETCH_HEAD. Outside it, what the user set git up
+ * to do on every fetch (credential helpers, hooks, a cookie file) happens on
+ * this one too (D-414 item 2). Never throws: returns
  * `fetched`; `skipped` (nothing to fetch, or not a ref under refs/remotes/);
  * `symbolic` with the ref it points at; `not-on-windows`; or `failed` with
  * git's first line of error.
@@ -256,6 +260,9 @@ export async function fetchBranchUpstream(repoDir, upstream, options = {}) {
   const result = await runNonInteractiveGit([
     '-C', repoDir,
     '-c', `remote.${upstream.remote}.followRemoteHEAD=never`,
+    // D-414 item 1: empty turns bundle downloads off for this command only;
+    // the user's saved bundle settings stay as they are.
+    '-c', 'fetch.bundleURI=',
     ...sshOverride,
     'fetch', '--quiet', '--refmap=', '--no-prune', '--no-prune-tags', '--no-tags',
     '--no-recurse-submodules', '--no-auto-gc', '--no-write-commit-graph',
