@@ -561,7 +561,10 @@ function changedPaths(before, after) {
   return [...paths].filter((key) => before.get(key) !== after.get(key)).sort();
 }
 
-test('a saved bundle URI is switched off for the fetch, and with every write-capable fetch setting on, the git directory changes only within the budget', async (t) => {
+// The budget is what git itself writes; no program or output of the user's
+// (a hook, trace output) is configured here, so a snapshot of the whole git
+// directory can check it.
+test('a saved bundle URI is switched off for the fetch, and with git\'s own write-capable fetch settings on, git writes nothing in the git directory beyond the budget', async (t) => {
   if (!hasGit()) {
     t.skip('git is required.');
     return;
@@ -630,7 +633,7 @@ test('a saved bundle URI is switched off for the fetch, and with every write-cap
     assert.ok(changed.includes('logs/refs/remotes/origin/main') && changed.includes('FETCH_HEAD'), `the snapshot sees the budget's writes: ${changed.join(', ')}`);
     const outside = changed
       .filter((file) => !['refs/remotes/origin/main', 'logs/refs/remotes/origin/main', 'FETCH_HEAD'].includes(file));
-    assert.deepEqual(outside, [], 'nothing outside the budget changed in the git directory');
+    assert.deepEqual(outside, [], 'git wrote nothing in the git directory beyond the budget');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

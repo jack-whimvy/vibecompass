@@ -224,11 +224,13 @@ export async function readBranchUpstream(repoDir) {
  * HEAD updates, automatic maintenance, a configured commit-graph write, and a
  * configured bundle URI's downloads (bundle refs, temporary files, and a
  * creation-token line in .git/config). A symbolic tracking ref is never a
- * destination, since git would write through it to its target. Writes, in
- * the repository: fetched objects, that one tracking ref (and its reflog
- * where reflogs are on), and FETCH_HEAD. Outside it, what the user set git up
- * to do on every fetch (credential helpers, hooks, a cookie file) happens on
- * this one too (D-414 item 2). Never throws: returns
+ * destination, since git would write through it to its target. What git
+ * itself writes for this fetch, whatever settings are on: fetched objects,
+ * that one tracking ref (and its reflog where reflogs are on), and FETCH_HEAD.
+ * The programs and outputs the user configured for git (credential helpers,
+ * an SSH command, hooks, trace output, a cookie file) run and write as on any
+ * fetch, wherever they write, .git included; they are outside that budget
+ * (D-415). Never throws: returns
  * `fetched`; `skipped` (nothing to fetch, or not a ref under refs/remotes/);
  * `symbolic` with the ref it points at; `not-on-windows`; or `failed` with
  * git's first line of error.
