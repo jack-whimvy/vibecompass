@@ -5,6 +5,58 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
+## Unreleased
+
+A lane-lifecycle release: a lane's new branch starts from an up-to-date base,
+a long session title no longer stops `close-session`, and lifecycle commands
+no longer rewrite the agent files' instructions.
+
+Upgrading: the start point, the note names, and the agent-file behavior apply
+as soon as you upgrade, with no setting to change. The managed agent blocks'
+instructions now change only at `refresh-workflow --apply` or `sync-agents`.
+Before this release, `start-session`, `continue-session`, `switch-session`, and
+`close-session` re-rendered the whole block, as 0.18.0's entry says; now they
+write only its project facts and say when its instructions differ from the
+running package's. To take a release's instructions, run `refresh-workflow
+--dry-run`, then `--apply`. An install upgrading from before 0.18.0 keeps
+instructions whose decision numbers name decisions in the VibeCompass project's
+own log, not yours, until that refresh. `context.md`'s git-binding and
+finalized-note lines change at the root's next `refresh-workflow --apply`,
+which also moves the `npx` fallback in `workflows/docs-review.md` to this
+version. Notes already written keep their names.
+
+- Where a new lane branch starts: `start-session --branch` creates a new
+  branch at the checkout's `HEAD`, or at its upstream when `HEAD` is behind
+  it. Before it takes the project-memory lock it fetches the checked-out
+  branch's upstream into that one remote-tracking ref and nothing else: no
+  other configured mapping, no pruning, no tags, no submodules, and no
+  automatic maintenance. The fetch can't prompt: no terminal, Git's prompts
+  and every askpass program off, SSH in batch mode unless you set your own SSH
+  command, and Git Credential Manager told not to interact. Stored credentials
+  still work. It stops after 15 seconds. Then it compares: behind, the branch
+  starts at the upstream and local `main` (or whatever branch is checked out)
+  is left alone; ahead or diverged, the branch starts at `HEAD`; each case
+  prints what it did and why. Offline, it compares with the upstream as last
+  fetched and says the remote couldn't be reached; start-session never fails
+  for the network. An existing branch is used as it is, and nothing is
+  fetched for it. A lane without `--branch` fetches nothing.
+  `base_revisions` records the start point, and the staleness warnings no
+  longer count a checkout that is simply behind the lane's base.
+- Long session titles: `close-session` used to fail with `ENAMETOOLONG`,
+  writing nothing, when a title made the note's file name longer than 255
+  bytes (a title of about 240 letters, digits, and hyphens). The note's file name now
+  keeps at most 80 characters of the title, cut at a word break, and the
+  note's heading keeps the whole title; `close-session` says when it
+  shortened the name. Each name stays distinct through its date and session
+  number.
+- Agent files: `start-session`, `continue-session`, `switch-session`, and
+  `close-session` write only an existing managed block's project facts (the
+  memory root's path wherever the block names it, the project name in its
+  heading, and the Project Snapshot: latest session, latest decision, repos,
+  mode) and create an enabled agent file that is missing. A moved root or a
+  renamed project still updates at the next lifecycle command. The rest of
+  the block changes only at `refresh-workflow --apply` or `sync-agents`.
+
 ## 0.18.2 - 2026-11-04
 
 A secret-check release: `push` checks project memory for common key formats

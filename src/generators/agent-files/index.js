@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parseSimpleYaml } from '../../simple-yaml.js';
 import { loadProjectReadModel } from '../../read-model.js';
 import { applyManagedBlock } from './markers.js';
+import { applyBoundValues } from './bound-values.js';
 import { buildAgentContext } from './template.js';
 import { claudeMdFormat } from './claude-md.js';
 import { agentsMdFormat } from './agents-md.js';
@@ -38,6 +39,10 @@ async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
   const dryRun = Boolean(options.dryRun);
   const adoptExisting = Boolean(options.adoptExisting);
   const existingOnly = Boolean(options.existingOnly);
+  // D-411 item 3: lifecycle commands pass `bound-values`, which writes an
+  // existing block's bound values and nothing else; a missing file is still
+  // created whole. Every other caller writes the whole block.
+  const boundValuesOnly = options.mode === 'bound-values';
 
   const projectConfig = await readProjectConfig(rootDir);
   const selection = resolveEnabledFormats(projectConfig, requestedFormat);
@@ -83,9 +88,11 @@ async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
     }
 
     const generatedContent = format.render(context);
-    const applied = applyManagedBlock(existingContent, generatedContent, {
-      adoptExisting,
-    });
+    const applied = boundValuesOnly && existingContent !== null
+      ? applyBoundValues(existingContent, generatedContent, { projectName: context.projectName })
+      : applyManagedBlock(existingContent, generatedContent, {
+          adoptExisting,
+        });
     const changed = applied.warning === null && applied.content !== existingContent;
     const conflicts = applied.status === 'adopt'
       ? scanPotentialWorkflowConflicts(existingContent)
@@ -111,6 +118,9 @@ async function syncAgentInstructionFilesLocked(options, cwd, rootDir) {
       warning: applied.warning,
       changed,
       conflicts,
+      // D-411 item 3: false when, after its bound values, an existing block
+      // still differs from this package's whole block; null when not checked.
+      instructionsCurrent: applied.instructionsCurrent ?? null,
     });
   }
 

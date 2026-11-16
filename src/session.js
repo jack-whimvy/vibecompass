@@ -20,6 +20,7 @@ import {
   normalizeBranchName,
   preflightGitBinding,
   provisionGitBinding,
+  refreshUpstreamsForBinding,
   removeLaneWorktreesAtClose,
   rollbackGitBinding,
 } from './git-binding.js';
@@ -77,8 +78,40 @@ const DOCUMENT_MAINTENANCE_FIELDS = [
 ];
 export async function startProjectSession(options) {
   const { normalized, markerContext } = await resolveSessionCommandContext(options);
+  const upstreamFetches = await refreshBindingUpstreamsBeforeLock(normalized, options);
   return withMemoryRootLock(normalized.rootDir, 'start-session', () =>
-    startProjectSessionLocked(normalized, options, markerContext));
+    startProjectSessionLocked(normalized, options, markerContext, upstreamFetches));
+}
+
+/**
+ * D-411 item 1: with --branch, fetch each bound repo's upstream before the
+ * memory-root lock, so a slow remote never holds the lock. Best effort and
+ * never throws: anything start-session would refuse anyway (a bad branch
+ * name, an existing lane, an unreadable project.yaml) fetches nothing, and
+ * the locked preflight reports it as before.
+ */
+async function refreshBindingUpstreamsBeforeLock(normalized, options) {
+  if (!options?.branch) {
+    return {};
+  }
+  try {
+    const laneId = normalizeOptionalString(options?.sessionId);
+    if (laneId && (await fileExists(path.join(normalized.activeSessionsDir, laneId)))) {
+      return {};
+    }
+    const branch = await normalizeBranchName(options.branch);
+    const projectConfig = await readProjectConfig(normalized.projectFilePath);
+    return await refreshUpstreamsForBinding({
+      workspaceDir: path.dirname(normalized.rootDir),
+      repoIds: normalizeStringArray(options?.repos),
+      projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
+      branch,
+      // Test seam; production uses the default limit.
+      timeoutMs: options?.upstreamFetchTimeoutMs,
+    });
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -154,7 +187,7 @@ export async function inferToolingRootForMemoryRoot(rootDir) {
   return path.dirname(rootDir);
 }
 
-async function startProjectSessionLocked(normalized, options, markerContext) {
+async function startProjectSessionLocked(normalized, options, markerContext, upstreamFetches = {}) {
   await assertLaneMarkerSnapshotCurrent(markerContext);
   const workingOn = requireNonEmptyString(options?.workingOn, 'start-session requires a non-empty workingOn value.');
   const role = normalizeStartSessionRole(options?.role);
@@ -252,6 +285,7 @@ async function startProjectSessionLocked(normalized, options, markerContext) {
       projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
       existingLanes,
       containerDir,
+      upstreamFetches,
     });
     gitBinding = {
       branch,
@@ -580,7 +614,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     throw new Error('session close could not determine what the session worked on. Pass workedOn explicitly.');
   }
 
-  const sessionSlug = slugifyTitle(title);
+  const { slug: sessionSlug, shortened: sessionSlugShortened } = buildSessionNoteSlug(title);
   if (!sessionSlug) {
     throw new Error('session close title must contain at least one letter or number.');
   }
@@ -767,6 +801,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     sessionId,
     sessionFilePath,
     sessionRelativePath,
+    sessionFileNameShortened: sessionSlugShortened,
     sessionDate: activeSession.sessionDate,
     sessionNumber: activeSession.sessionNumber,
     documentMaintenance,
@@ -1927,9 +1962,13 @@ async function planDocsUpdateSafely(options) {
   }
 }
 
+// D-411 item 3: the lifecycle commands' only path to the agent files. It
+// writes each existing block's bound values (root path, project name, Project
+// Snapshot) and creates a missing enabled file; the instructions change only
+// at `refresh-workflow --apply` or `sync-agents`.
 async function syncAgentInstructionFilesSafely(options) {
   try {
-    return await syncAgentInstructionFiles(options);
+    return await syncAgentInstructionFiles({ ...options, mode: 'bound-values' });
   } catch (error) {
     return {
       rootDir: options.rootDir,
@@ -2730,6 +2769,28 @@ function slugifyTitle(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+// D-411 item 2: the note's file name holds at most this many slug characters;
+// the note's heading keeps the whole title.
+export const SESSION_NOTE_SLUG_MAX_LENGTH = 80;
+
+/**
+ * D-411 item 2: a slug over the cap is cut at the last hyphen at or before
+ * character 80, or at character 80 when no hyphen comes earlier, and a
+ * trailing hyphen is dropped. Names stay distinct through their
+ * `<date>-<n>-` prefix, which is unique in a root, so no hash is added.
+ */
+export function buildSessionNoteSlug(title) {
+  const full = slugifyTitle(title);
+  if (full.length <= SESSION_NOTE_SLUG_MAX_LENGTH) {
+    return { slug: full, shortened: false };
+  }
+
+  const head = full.slice(0, SESSION_NOTE_SLUG_MAX_LENGTH);
+  const lastHyphen = head.lastIndexOf('-');
+  const cut = lastHyphen > 0 ? head.slice(0, lastHyphen) : head;
+  return { slug: cut.replace(/-+$/g, ''), shortened: true };
 }
 
 /**

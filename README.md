@@ -105,7 +105,8 @@ Generate evidence-backed architecture docs:
 npx -y @vibecompass/vibecompass@latest docs-review --root .compass --guided
 ```
 
-Close the session:
+Close the session. The note's file name keeps at most 80 characters of the
+title, and its heading keeps the whole title:
 
 ```bash
 npx -y @vibecompass/vibecompass@latest close-session \
@@ -171,7 +172,11 @@ npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest brief --root .compass --session auth-flow --check   # current or stale, and why
 
 # Optional git binding for a lane: create/reuse a branch in each bound
-# repo; --worktree provisions per-repo worktrees under
+# repo. A new branch starts at the checkout's HEAD, or at its upstream when
+# HEAD is behind it: start-session fetches that one upstream first (no other
+# ref, no prompts, a 15-second limit) and says where the branch started and
+# why; offline it compares with the upstream as last fetched. An existing
+# branch is used as it is. --worktree provisions per-repo worktrees under
 # <workspace>/worktrees/<lane-id>/<repo-id> with the lane marker in the
 # container, so commands run from inside a worktree need no --root/--session.
 # At close, close-session removes the recorded worktrees when they are clean
@@ -203,7 +208,13 @@ npx -y @vibecompass/vibecompass@latest start-session \
 # the lane temp dir (guarded; the port record vanishes with the lane).
 eval "$(npx -y @vibecompass/vibecompass@latest lane-env)"
 
-# Agent instruction files
+# Agent instruction files: sync-agents and refresh-workflow --apply write
+# each file's whole managed block. start-session, continue-session,
+# switch-session, and close-session write only its project facts (the memory
+# root's path, the project name, and the Project Snapshot: latest session,
+# latest decision, repos) and create a missing file, so a package upgrade
+# changes the block's instructions only when you refresh. They say when an
+# existing block's instructions differ from the running package's.
 npx -y @vibecompass/vibecompass@latest sync-agents --root .compass
 
 # Secret check: the check push runs before it uploads, over the whole root;

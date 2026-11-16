@@ -480,6 +480,10 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     });
     io.stdout.write(`Closed session ${result.sessionDate}-${result.sessionNumber}\n`);
     io.stdout.write(`Wrote ${result.sessionFilePath}\n`);
+    if (result.sessionFileNameShortened) {
+      // D-411 item 2
+      io.stdout.write('The title was shortened to 80 characters in the note\'s file name; the note\'s heading keeps the whole title.\n');
+    }
     io.stdout.write(`Updated ${result.claudePath}\n`);
     io.stdout.write(`Review check: ${result.review.checkLine}\n`); // D-394
     if (result.secretCheck) {
@@ -3305,6 +3309,10 @@ function writeAgentFileSyncResult(io, result) {
     const suffix = item.warning ? ` — ${item.warning}` : '';
     const stream = item.warning ? io.stderr : io.stdout;
     stream.write(`- ${item.relativePath}: ${item.status}${suffix}\n`);
+    if (item.instructionsCurrent === false) {
+      // D-411 item 3
+      io.stdout.write('  its managed instructions differ from this package\'s; they change only through `vibecompass refresh-workflow` (run --dry-run first, then --apply) or `vibecompass sync-agents`.\n');
+    }
     if (item.conflicts?.length > 0) {
       const lineNumbers = item.conflicts.map((conflict) => conflict.line).join(', ');
       io.stderr.write(`  possible workflow overlap on lines ${lineNumbers}; review existing instructions if behavior conflicts.\n`);
@@ -3639,6 +3647,7 @@ function usageText() {
     '                                        A ticked task warns and is kept. Stored as plan_tasks in session.yaml; the plan joins architecture_docs; close-session lists the links in the note',
     '  --decision-domain-file <domain.md>   Repeatable decision domain file the lane expects to edit (alias: --decision-domain)',
     '  --branch <name>                      Opt-in git binding: create or reuse this branch in every bound --repo; requires at least one --repo', // D-281
+    '                                       A new branch starts at the checkout\'s HEAD, or at its upstream when HEAD is behind it (fetched first, no prompts, 15-second limit; offline it compares with the upstream as last fetched); an existing branch is used as it is', // D-411
     '  --worktree                           With --branch: provision per-repo worktrees under <workspace>/worktrees/<lane-id>/<repo-id> and write the lane marker into the container', // D-279
     '  --date <YYYY-MM-DD>                  Optional explicit session date',
     '  --last-thing-completed <text>        Optional override for the CLAUDE.md current-session block',
@@ -3649,7 +3658,7 @@ function usageText() {
     'Close-session options (also accepted by end-session):',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '  --tooling-root <path>                Tooling root that contains CLAUDE.md. Defaults to cwd; follows the memory root placement when a marker supplies the root or cwd has no CLAUDE.md under an explicit --root',
-    '  --title <text>                       Required display title for the finalized session note',
+    '  --title <text>                       Required display title for the finalized session note; the note\'s file name keeps at most 80 characters of it, and its heading keeps all of it', // D-411
     '  --worked-on <text>                   Optional override for "What we worked on"',
     '  --session <lane-id>                  Active session lane to close. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --completed <text>                   Repeatable completed item',
@@ -3749,6 +3758,7 @@ function usageText() {
     '  --format <name>                      Optional format: claude_md, agents_md, cursor_rules, copilot_instructions',
     '  --adopt-existing                     Append managed blocks to existing unmarked files',
     '  --dry-run                            Show planned writes without changing files',
+    '                                       sync-agents and refresh-workflow --apply write each whole managed block; start-session, continue-session, switch-session, and close-session write only its project facts (the memory root\'s path, the project name, the Project Snapshot) and create a missing file', // D-411
     '',
     'Sync transport options:',
     '  push --root <path>                   Push canonical local project memory to hosted, after the secret check (see Secret-check options)',

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { realpath, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -22,6 +22,12 @@ const GIT_OUTPUT_MAX_BUFFER = 1024 * 1024;
 // the next close saw as modified. A filesystem that stalls makes close wait
 // until git finishes or the user interrupts it.
 export const WORKTREE_REMOVE_AT_CLOSE_EXEC_OPTIONS = Object.freeze({ maxBuffer: GIT_OUTPUT_MAX_BUFFER });
+
+// D-411 item 1: start-session fetches a bound repo's upstream before it takes
+// the memory-root lock, and stops the fetch after this long. Outside the lock,
+// a slow remote can't make another lane's command time out waiting for it.
+export const UPSTREAM_FETCH_TIMEOUT_MS = 15000;
+const FETCH_STDERR_MAX_BYTES = 8192;
 
 /**
  * Repo working copies live as siblings of the memory root: the workspace is
@@ -160,6 +166,366 @@ export async function normalizeBranchName(branch) {
 }
 
 /**
+ * D-411 item 1: the checked-out branch's upstream as git records it, or null
+ * when HEAD is detached or the branch has no upstream (a repo with no remote
+ * included). `trackingRef` is where the upstream's tip is kept locally:
+ * `refs/remotes/<remote>/<branch>` for a remote, `refs/heads/<branch>` for an
+ * upstream on a local branch (remote `.`).
+ */
+export async function readBranchUpstream(repoDir) {
+  let headRef;
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'symbolic-ref', '--quiet', 'HEAD'],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    headRef = stdout.trim();
+  } catch {
+    return null;
+  }
+  if (!headRef.startsWith('refs/heads/')) {
+    return null;
+  }
+
+  const branch = headRef.slice('refs/heads/'.length);
+  const remote = await readGitConfigValue(repoDir, `branch.${branch}.remote`);
+  const mergeRef = await readGitConfigValue(repoDir, `branch.${branch}.merge`);
+  if (!remote || !mergeRef) {
+    return null;
+  }
+
+  let trackingRef = '';
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'for-each-ref', '--format=%(upstream)', headRef],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    trackingRef = stdout.trim().split('\n')[0] ?? '';
+  } catch {
+    return null;
+  }
+  if (!trackingRef) {
+    return null;
+  }
+
+  return { branch, remote, mergeRef, trackingRef, local: remote === '.' };
+}
+
+/**
+ * D-411 item 1: fetch one upstream ref into its remote-tracking ref and
+ * nothing else. The empty --refmap stops the remote's configured fetch
+ * mappings from updating any other ref (a local branch included); the other
+ * options stop pruning, tags, submodules, remote HEAD updates, and automatic
+ * maintenance. Writes: fetched objects, that one tracking ref (and its reflog
+ * where reflogs are on), and FETCH_HEAD. Never throws: returns `fetched`,
+ * `skipped` (nothing to fetch, or not a ref under refs/remotes/), or `failed`
+ * with git's first line of error.
+ */
+export async function fetchBranchUpstream(repoDir, upstream, options = {}) {
+  if (!upstream || upstream.local) {
+    return { status: 'skipped' };
+  }
+  if (!upstream.trackingRef.startsWith('refs/remotes/') || !upstream.mergeRef.startsWith('refs/')) {
+    return { status: 'skipped' };
+  }
+
+  const timeoutMs = options.timeoutMs ?? UPSTREAM_FETCH_TIMEOUT_MS;
+  const sshOverride = await hasCustomSshCommand(repoDir)
+    ? []
+    // No SSH command of the user's own: authentication and host-key questions
+    // fail at once instead of asking.
+    : ['-c', 'core.sshCommand=ssh -o BatchMode=yes'];
+  const result = await runNonInteractiveGit([
+    '-C', repoDir,
+    '-c', `remote.${upstream.remote}.followRemoteHEAD=never`,
+    ...sshOverride,
+    'fetch', '--quiet', '--refmap=', '--no-prune', '--no-prune-tags', '--no-tags',
+    '--no-recurse-submodules', '--no-auto-gc',
+    upstream.remote,
+    `+${upstream.mergeRef}:${upstream.trackingRef}`,
+  ], { timeoutMs });
+
+  if (result.ok) {
+    return { status: 'fetched' };
+  }
+  return {
+    status: 'failed',
+    reason: result.timedOut
+      ? `no answer within ${describeSeconds(timeoutMs)}`
+      : firstErrorLine(result.stderr) ?? `git exited with ${result.code ?? result.signal}`,
+  };
+}
+
+/**
+ * D-411 item 1, before the memory-root lock: fetch each bound repo's upstream
+ * that a new branch could start from. A repo whose branch already exists
+ * (reuse mode) fetches nothing. Never throws; a repo that isn't a git
+ * repository root, or has no upstream, is left out.
+ */
+export async function refreshUpstreamsForBinding(options) {
+  const entries = await Promise.all((options.repoIds ?? []).map(async (repoId) => {
+    try {
+      const sourceDir = resolveRepoSourceDir(options.workspaceDir, repoId, options.projectRepos);
+      const toplevel = await readGitToplevel(sourceDir);
+      if (!toplevel || !(await isSameDirectoryReal(toplevel, sourceDir))) {
+        return null;
+      }
+      if (options.branch && (await readBranchTip(sourceDir, options.branch))) {
+        return [repoId, { status: 'skipped' }];
+      }
+      const upstream = await readBranchUpstream(sourceDir);
+      if (!upstream) {
+        return null;
+      }
+      return [repoId, await fetchBranchUpstream(sourceDir, upstream, { timeoutMs: options.timeoutMs })];
+    } catch (error) {
+      return [repoId, { status: 'failed', reason: error instanceof Error ? error.message : String(error) }];
+    }
+  }));
+
+  return Object.fromEntries(entries.filter(Boolean));
+}
+
+/**
+ * D-411 item 1, inside the lock: where a new lane branch starts, from what
+ * git holds now. HEAD when it is detached, has no upstream, or equals the
+ * upstream's tip; the upstream's tip when HEAD is strictly behind it; HEAD,
+ * with a message, when HEAD is ahead or the two have diverged. A failed fetch
+ * compares with the upstream as last fetched and says so.
+ */
+export async function chooseLaneStartPoint(options) {
+  const { repoId, sourceDir, headRevision, fetchOutcome } = options;
+  const upstream = await readBranchUpstream(sourceDir);
+  if (!upstream) {
+    return { startPoint: headRevision, warnings: [] };
+  }
+
+  const warnings = [];
+  const upstreamName = displayRefName(upstream.trackingRef);
+  const localName = `local ${upstream.branch}`;
+  const atHead = `the lane branch starts at ${localName} (${headRevision.slice(0, 12)})`;
+  const upstreamTip = await resolveCommitRevision(sourceDir, upstream.trackingRef);
+  if (fetchOutcome?.status === 'failed') {
+    warnings.push(
+      upstreamTip
+        ? `Repo "${repoId}": could not reach ${upstream.remote} to update ${upstreamName} (${fetchOutcome.reason}); comparing with ${upstreamName} as last fetched.`
+        : `Repo "${repoId}": could not reach ${upstream.remote} to update ${upstreamName} (${fetchOutcome.reason}), and there is no copy of ${upstreamName} to compare, so ${atHead}.`,
+    );
+  }
+  if (!upstreamTip || upstreamTip === headRevision) {
+    return { startPoint: headRevision, warnings };
+  }
+
+  const headIsBehind = await isAncestorRevision(sourceDir, headRevision, upstreamTip);
+  const headIsAhead = headIsBehind ? false : await isAncestorRevision(sourceDir, upstreamTip, headRevision);
+  if (headIsBehind === true) {
+    const behind = await countCommits(sourceDir, headRevision, upstreamTip);
+    warnings.push(
+      `Repo "${repoId}": ${localName} is ${describeCommitCount(behind)} behind ${upstreamName}, so the lane branch starts at ${upstreamName} (${upstreamTip.slice(0, 12)}). ${capitalize(localName)} was left unchanged.`,
+    );
+    return { startPoint: upstreamTip, warnings };
+  }
+  if (headIsAhead === true) {
+    const ahead = await countCommits(sourceDir, upstreamTip, headRevision);
+    warnings.push(
+      `Repo "${repoId}": ${localName} is ${describeCommitCount(ahead)} ahead of ${upstreamName}; ${atHead} and includes ${ahead === 1 ? 'it' : 'them'}.`,
+    );
+    return { startPoint: headRevision, warnings };
+  }
+  if (headIsBehind === false && headIsAhead === false) {
+    const onlyLocal = await countCommits(sourceDir, upstreamTip, headRevision);
+    const onlyUpstream = await countCommits(sourceDir, headRevision, upstreamTip);
+    warnings.push(
+      `Repo "${repoId}": ${localName} and ${upstreamName} have diverged (${describeCommitCount(onlyLocal)} only on ${localName}, ${describeCommitCount(onlyUpstream)} only on ${upstreamName}); ${atHead}. If the lane should include ${upstreamName}'s commits, reconcile ${upstream.branch} and fast-forward the lane branch before any edit.`,
+    );
+    return { startPoint: headRevision, warnings };
+  }
+
+  warnings.push(`Repo "${repoId}": could not compare ${localName} with ${upstreamName}; ${atHead}.`);
+  return { startPoint: headRevision, warnings };
+}
+
+/**
+ * Whether `ancestor` is an ancestor of (or equal to) `descendant` in the repo:
+ * true, false, or null when git can't tell (an unknown revision).
+ */
+export async function isAncestorRevision(repoDir, ancestor, descendant) {
+  try {
+    await execFileAsync(
+      'git',
+      ['-C', repoDir, 'merge-base', '--is-ancestor', ancestor, descendant],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    return true;
+  } catch (error) {
+    return error && typeof error === 'object' && error.code === 1 ? false : null;
+  }
+}
+
+async function resolveCommitRevision(repoDir, ref) {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    const revision = stdout.trim();
+    return revision === '' ? null : revision;
+  } catch {
+    return null;
+  }
+}
+
+async function countCommits(repoDir, from, to) {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'rev-list', '--count', `${from}..${to}`],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    const count = Number.parseInt(stdout.trim(), 10);
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readGitConfigValue(repoDir, key) {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', repoDir, 'config', '--get', key],
+      { timeout: QUICK_GIT_TIMEOUT_MS, maxBuffer: GIT_OUTPUT_MAX_BUFFER },
+    );
+    const value = stdout.trim();
+    return value === '' ? null : value;
+  } catch {
+    return null;
+  }
+}
+
+async function hasCustomSshCommand(repoDir) {
+  if (normalizeEnvValue(process.env.GIT_SSH_COMMAND) || normalizeEnvValue(process.env.GIT_SSH)) {
+    return true;
+  }
+  return (await readGitConfigValue(repoDir, 'core.sshCommand')) !== null;
+}
+
+/**
+ * D-411 item 1: the fetch can't ask anything. It runs with no input and, off
+ * Windows, in its own session (setsid), so it has no controlling terminal; Git's
+ * terminal prompts are off; empty GIT_ASKPASS and SSH_ASKPASS turn off every
+ * askpass program, core.askPass included; OpenSSH is told never to use one;
+ * and Git Credential Manager is told not to interact. Credential helpers still
+ * run, since stored credentials are what reach a private remote. On timeout the
+ * whole process group is killed.
+ */
+export function buildNonInteractiveGitEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '',
+    SSH_ASKPASS: '',
+    SSH_ASKPASS_REQUIRE: 'never',
+    GCM_INTERACTIVE: 'never',
+  };
+}
+
+function runNonInteractiveGit(args, options) {
+  return new Promise((resolve) => {
+    const ownSession = process.platform !== 'win32';
+    let child;
+    try {
+      child = spawn('git', args, {
+        detached: ownSession,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: buildNonInteractiveGitEnv(),
+        windowsHide: true,
+      });
+    } catch (error) {
+      resolve({ ok: false, code: null, signal: null, timedOut: false, stderr: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < FETCH_STDERR_MAX_BYTES) {
+        stderr += chunk.slice(0, FETCH_STDERR_MAX_BYTES - stderr.length);
+      }
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        if (ownSession) {
+          process.kill(-child.pid, 'SIGKILL');
+        } else {
+          child.kill('SIGKILL');
+        }
+      } catch {
+        // Already gone.
+      }
+    }, options.timeoutMs);
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    child.on('error', (error) => {
+      finish({ ok: false, code: null, signal: null, timedOut, stderr: stderr || (error instanceof Error ? error.message : String(error)) });
+    });
+    child.on('close', (code, signal) => {
+      finish({ ok: code === 0 && !timedOut, code, signal, timedOut, stderr });
+    });
+  });
+}
+
+function firstErrorLine(stderr) {
+  const line = (stderr ?? '').split(/\r?\n/).map((entry) => entry.trim()).find((entry) => entry !== '');
+  if (!line) {
+    return null;
+  }
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+function displayRefName(ref) {
+  if (ref.startsWith('refs/remotes/')) {
+    return ref.slice('refs/remotes/'.length);
+  }
+  if (ref.startsWith('refs/heads/')) {
+    return ref.slice('refs/heads/'.length);
+  }
+  return ref;
+}
+
+function describeCommitCount(count) {
+  if (count === null || count === undefined) {
+    return 'some commits';
+  }
+  return `${count} commit${count === 1 ? '' : 's'}`;
+}
+
+function describeSeconds(milliseconds) {
+  const seconds = Math.max(1, Math.round(milliseconds / 1000));
+  return `${seconds} second${seconds === 1 ? '' : 's'}`;
+}
+
+function capitalize(value) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function normalizeEnvValue(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
+/**
  * D-281/D-266/D-279 git-readiness preflight. Runs before any filesystem write
  * so a refused binding leaves nothing behind. Returns per-repo plans (mode,
  * source dir, base revision, worktree target) plus non-fatal warnings.
@@ -265,14 +631,28 @@ export async function preflightGitBinding(options) {
       warnings.push(`Branch "${options.branch}" already exists in repo "${repoId}"; reusing it (base ${branchTip.slice(0, 12)}).`);
     }
 
+    // D-411 item 1: a created branch starts at HEAD, or at the upstream's tip
+    // when HEAD is strictly behind it; reuse mode never moves the branch.
+    let startPoint = head.revision;
+    if (mode === 'create') {
+      const choice = await chooseLaneStartPoint({
+        repoId,
+        sourceDir,
+        headRevision: head.revision,
+        fetchOutcome: options.upstreamFetches?.[repoId] ?? null,
+      });
+      startPoint = choice.startPoint;
+      warnings.push(...choice.warnings);
+    }
+
     repoPlans.push({
       repoId,
       sourceDir,
       mode,
       // Reuse mode bases the lane on what actually gets checked out — the
-      // existing branch tip — not the source HEAD.
-      baseRevision: branchTip ?? head.revision,
-      startPoint: head.revision,
+      // existing branch tip — and create mode on the start point.
+      baseRevision: branchTip ?? startPoint,
+      startPoint,
       worktreePath: options.worktree ? path.join(options.containerDir, repoId) : null,
     });
   }

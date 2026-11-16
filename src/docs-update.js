@@ -3,7 +3,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parseFrontmatter } from './frontmatter.js';
-import { readCurrentRepoHead, resolveRepoSourceDir } from './git-binding.js';
+import { isAncestorRevision, readCurrentRepoHead, resolveRepoSourceDir } from './git-binding.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { ARCHITECTURE_DOC_SOFT_SIZE_LIMIT_BYTES, scanProjectMemory } from './project-memory.js';
 import { parseSimpleYaml } from './simple-yaml.js';
@@ -359,7 +359,10 @@ async function buildPreCloseStaleness(options) {
       );
       continue;
     }
-    if (head !== baseRevision) {
+    // D-411 item 1: a lane may start at its checkout's upstream, ahead of a
+    // checkout that hasn't pulled yet. A checkout whose head is an ancestor of
+    // the lane's base is behind the lane, so nothing landed the lane lacks.
+    if (head !== baseRevision && (await isAncestorRevision(sourceDir, head, baseRevision)) !== true) {
       staleBaseRevisions.push({ repoId, baseRevision, headRevision: head });
       entries.push(
         `Base revision for repo "${repoId}" is stale: lane base ${baseRevision.slice(0, 12)}, current source head ${head.slice(0, 12)} — review what landed since lane start.`,
