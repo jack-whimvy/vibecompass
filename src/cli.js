@@ -22,6 +22,7 @@ import {
   toPublicSecretCheckResult,
 } from './secret-check.js';
 import { shortRound, writeReadyMark } from './relay-mark.js';
+import { defaultConfirm, refuseInsideRelayTurn, runReviewRelay } from './review-relay.js';
 import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, resolveActiveLaneContext, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { countPassesPastCap } from './review-log.js';
@@ -55,6 +56,9 @@ import {
 } from './sync.js';
 
 export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
+  // D-419 item 8: inside a relayed builder turn, close, the relay, and the
+  // hosted commands refuse here, at the entry point, however they were spelled.
+  refuseInsideRelayTurn(argv[0], runtime.env ?? process.env);
   const parsed = parseCliArgs(argv);
 
   if (parsed.command === 'help') {
@@ -265,6 +269,24 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     writeWarnings(io, result.warnings);
     return result.ok ? 0 : 1;
+  }
+
+  if (parsed.command === 'review-relay') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await runReviewRelay({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    }, {
+      io,
+      env: runtime.env ?? process.env,
+      confirm: runtime.confirm ?? defaultConfirm(io),
+      platform: runtime.platform,
+      table: runtime.relayProcessTable,
+      supportedReviewerVersions: runtime.supportedReviewerVersions,
+      userInfo: runtime.userInfo,
+      signals: runtime.signals,
+    });
+    return result.exitCode;
   }
 
   if (parsed.command === 'ready-for-review') {
@@ -1111,6 +1133,10 @@ export function parseCliArgs(argv) {
       return parseReadyForReviewArgs(rest);
     }
 
+    if (command === 'review-relay') {
+      return parseReviewRelayArgs(rest);
+    }
+
     if (command === 'secret-check') {
       return parseSecretCheckArgs(rest);
     }
@@ -1699,6 +1725,73 @@ function renderReviewCheckJson(result) {
       : null,
     failures: result.failures.map((failure) => ({ kind: failure.kind, message: failure.message, next_step: failure.nextStep })),
     warnings: result.warnings,
+  };
+}
+
+const REVIEW_RELAY_BOOLEAN_FLAGS = {
+  '--recover': 'recover',
+  '--past-cap': 'pastCap',
+  '--one-pass': 'onePass',
+  '--conversation-closed': 'conversationClosed',
+  '--confirm-each-round': 'confirmEachRound',
+  '--fresh-reviewer': 'freshReviewer',
+};
+
+function parseReviewRelayArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (Object.hasOwn(REVIEW_RELAY_BOOLEAN_FLAGS, token)) {
+      parsed[REVIEW_RELAY_BOOLEAN_FLAGS[token]] = true;
+      continue;
+    }
+
+    if (token.startsWith('--dangerously') || token === '--allow-dangerously-skip-permissions') {
+      throw new Error(`${token} is refused: the review relay never passes a bypass flag.`); // D-419 item 8
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--reviewer':
+        parsed.reviewer = value;
+        break;
+      case '--reviewer-model':
+        parsed.reviewerModel = value;
+        break;
+      case '--builder-mode':
+        parsed.builderMode = value;
+        break;
+      case '--reviewer-timeout':
+        parsed.reviewerTimeout = value;
+        break;
+      case '--builder-timeout':
+        parsed.builderTimeout = value;
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'review-relay',
+    options: parsed,
   };
 }
 
@@ -3717,6 +3810,8 @@ function usageText() {
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
     '  vibecompass review-check [--session <lane-id>] [--json] [options]',
     '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails', // D-394
+    '  vibecompass review-relay --session <lane-id> [--recover] [--past-cap] [--one-pass] [--conversation-closed] [--confirm-each-round] [options]',
+    '                                        Owner: relay review rounds for one lane, a read-only reviewer\'s pass and the builder\'s answer; macOS only', // D-419
     '  vibecompass ready-for-review [--session <lane-id>] [--path <repo-id>:<path>|<root-path>...] [--json] [options]',
     '                                        Builder: mark the round ready for review (fingerprints the handoff, the record, and the work)', // D-419
     '  vibecompass review-settings [--round-cap <n>] [--json] [options]',
@@ -3926,6 +4021,25 @@ function usageText() {
     '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
     '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
+    '',
+    'Review-relay options (the owner runs it; it never closes, pushes, merges, publishes, or releases):', // D-419
+    '  --session <lane-id>                  Required every time, even with one active lane: the builder lane to relay',
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --reviewer <codex|claude>            The reviewer tool (default codex); it runs read-only, only on a version listed as supported, and writes no file',
+    '  --reviewer-model <model>             The reviewer\'s model; required for Codex',
+    '  --fresh-reviewer                     Start a new reviewer thread instead of resuming the lane\'s',
+    '  --one-pass                           Run one pass and stop, even when the mark names a Claude Code conversation (keep its window open)',
+    '  --conversation-closed                Confirm, for the loop, that the builder\'s conversation is closed and was started in this folder',
+    '  --confirm-each-round                 In the loop, wait for Enter after each pass\'s findings before the builder\'s turn',
+    '  --builder-mode <default|acceptEdits|auto>',
+    '                                        The builder turn\'s permission mode (default: default); bypass modes are refused',
+    '  --past-cap                           Once the lane has reached the cap: one pass past it (and in the loop the builder\'s answer), recorded with an owner line',
+    '  --reviewer-timeout <minutes>         End a reviewer turn after this long (default 45)',
+    '  --builder-timeout <minutes>          End a builder turn after this long (default 60)',
+    '  --recover                            Start no agent: finish a recorded write and report an interrupted turn, then exit',
+    '                                        The run is the owner\'s go for passes up to the cap, counting those in the log. With a mark that names a closed Claude Code',
+    '                                        conversation it loops (a pass, then the builder\'s fixed address-review turn) until a clean pass or the cap; otherwise one pass.',
+    '                                        Each stop prints the reason, the open findings, the choices, and in the loop `claude --resume <id>`. macOS only for now',
     '',
     'Ready-for-review options:', // D-419
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',

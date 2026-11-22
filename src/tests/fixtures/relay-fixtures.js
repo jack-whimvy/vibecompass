@@ -10,6 +10,8 @@ import { startProjectSession } from '../../session.js';
 // a code repository side by side, lanes with and without a worktree, and the
 // lane files the relay reads.
 
+const ARCH_FRONTMATTER = (component) => `---\ndomain: Platform\nfeature: Relay\ncomponent: ${component}\nstatus: In progress\nrepos:\n  - app\n---\n\n`;
+
 export function git(cwd, args, env = {}) {
   const result = spawnSync('git', args, { cwd, env: { ...process.env, ...env } });
   assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
@@ -61,8 +63,8 @@ export async function createWorkspace(t, { docsGit = true, review = null, prefix
     bootstrap: { workflow: true, claude: true },
   });
   await mkdir(path.join(rootDir, 'architecture', 'platform'), { recursive: true });
-  await writeFile(path.join(rootDir, 'architecture', 'platform', 'relay.md'), '# Relay\n\nThe contract.\n', 'utf8');
-  await writeFile(path.join(rootDir, 'architecture', 'platform', 'other.md'), '# Other\n\nUnrelated.\n', 'utf8');
+  await writeFile(path.join(rootDir, 'architecture', 'platform', 'relay.md'), `${ARCH_FRONTMATTER('Relay')}## Description\nThe contract.\n`, 'utf8');
+  await writeFile(path.join(rootDir, 'architecture', 'platform', 'other.md'), `${ARCH_FRONTMATTER('Other')}## Description\nUnrelated.\n`, 'utf8');
   if (review) {
     const projectPath = path.join(rootDir, 'project.yaml');
     const source = await readFile(projectPath, 'utf8');
@@ -140,3 +142,41 @@ export const ANSWER_ONE = [
 ];
 
 export const CLEAN = ['- pass 1 | 2026-11-21 10:00 PST | Codex (GPT-6) | the diff | no findings'];
+
+const STANDIN = new URL('./relay-standin.js', import.meta.url).pathname;
+export const CLI_PATH = new URL('../../cli.js', import.meta.url).pathname;
+
+/**
+ * Installs the scripted stand-ins as `codex` and `claude` on a PATH of their
+ * own, with the scenario in `dir`. Returns the env for the relay and helpers.
+ */
+export async function installStandins(t, ws, lane, scenario) {
+  const { chmod } = await import('node:fs/promises');
+  const dir = path.join(ws.tempDir, 'standin');
+  const binDir = path.join(dir, 'bin');
+  await mkdir(binDir, { recursive: true });
+  for (const tool of ['codex', 'claude']) {
+    const script = path.join(binDir, tool);
+    await writeFile(script, `#!/bin/sh\nexec "${process.execPath}" "${STANDIN}" ${tool} "$@"\n`, 'utf8');
+    await chmod(script, 0o755);
+  }
+  const full = { cliPath: CLI_PATH, rootDir: ws.rootDir, laneDir: lane.laneDir, laneId: lane.laneId, ...scenario };
+  await writeFile(path.join(dir, 'scenario.json'), JSON.stringify(full, null, 2), 'utf8');
+  const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, RELAY_STANDIN_DIR: dir };
+  delete env.VIBECOMPASS_RELAY_TURN;
+  delete env.CLAUDE_CODE_SESSION_ID;
+  return {
+    dir,
+    env,
+    async setScenario(next) {
+      await writeFile(path.join(dir, 'scenario.json'), JSON.stringify({ cliPath: CLI_PATH, rootDir: ws.rootDir, laneDir: lane.laneDir, laneId: lane.laneId, ...next }, null, 2), 'utf8');
+    },
+    async calls() {
+      try {
+        return (await readFile(path.join(dir, 'calls.jsonl'), 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    },
+  };
+}
