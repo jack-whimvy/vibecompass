@@ -5,6 +5,64 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
+## Unreleased
+
+### The review relay, the ready-for-review mark, and the review cap at setup
+
+- `vibecompass review-relay --session <lane-id>`: an optional command the
+  owner runs for one builder lane, on macOS. It starts a read-only reviewer
+  (Codex by default, or Claude Code with `--reviewer claude`) on the owner's own
+  sign-in, checks its answer (exactly one verdict for each finding waiting for
+  the reviewer), and writes it as the lane's pass in the reviewer's two
+  sections. When the lane's mark names a Claude Code conversation that the
+  owner has closed, the relay then sends that conversation a fixed
+  `address review` turn and repeats until a clean pass or the cap; otherwise,
+  or with `--one-pass`, it runs one pass and stops. Each stop prints the
+  reason, the open findings, the choices, and in the loop `claude --resume <id>`.
+  Flags: `--recover`, `--past-cap`, `--one-pass`, `--conversation-closed`,
+  `--confirm-each-round`, `--reviewer`, `--reviewer-model`, `--fresh-reviewer`,
+  `--builder-mode`, `--reviewer-timeout`, and `--builder-timeout`. It never
+  closes, pushes, merges, publishes, releases, or retries, and it reads no
+  command, path, mode, or model from a committed file.
+- A reviewer runs only on an exact tool version listed as supported for its
+  platform, each listed once its read-only checks held on that version; an
+  unlisted version stops before launch and names the choices.
+- Inside a relayed builder turn, `close-session`, `end-session`,
+  `review-relay`, `push`, `promote-hosted`, `demote-hosted`, `connect-hosted`,
+  and `sync-adopt` refuse, pushes are rewritten to fail, and `gh` has no
+  sign-in.
+- A relayed write has two recoverable halves, `wip.md` then `handoff.md`, each
+  written only over what it expects to replace; `review-relay --recover`
+  finishes an interrupted one as complete, superseded, or discarded, and sends
+  no signal to a process it finds from an earlier run. One relay runs per lane
+  and per conversation. `close-session` refuses while a relay runs on the lane
+  or left a write or a turn unfinished.
+- `vibecompass ready-for-review --session <lane-id> [--path <path>…]`: the
+  builder marks a round ready. The mark holds SHA-256 fingerprints of
+  `handoff.md` › `## Builder → Reviewer`, `wip.md` › `## Review log`, and the
+  work (the lane's worktrees and each named path), and the builder's Claude
+  Code conversation when it runs inside one. It is refused while a finding
+  waits for the builder's response. It works on every platform; in a lane
+  reviewed by hand it changes only the lane's stage.
+- Lane inventories (`list-sessions`, and the inventories `continue-session`
+  and `start-session` print) show a `stage:` line for a lane with a mark or
+  relay state: building, ready for review, reviewing, builder answering,
+  waiting for the owner with the reason, or review clean. `--json` adds `stage`
+  and `stageReason` to every lane, null for a lane with neither.
+- The review cap at setup: `init --review-round-cap <n>` and guided setup's
+  question write `metadata.workflow.review.round_cap` (1 to 10; Enter keeps the
+  default, 3, and writes nothing). `vibecompass review-settings` prints the
+  check and the cap in effect, and `--round-cap <n>` writes the cap, keeping
+  every other key. `refresh-workflow` still writes no `review:` block.
+- The role text: the builder's mark, the relay in the builder workflow, a
+  relayed reviewer, a relayed pass in the Review log format, and the project
+  manager's check of relayed passes.
+
+Upgrading: nothing changes for a project that never runs `ready-for-review` or
+`review-relay`, apart from the `stage` and `stageReason` keys, null, in
+`list-sessions --json`. The role text changes at the root's next
+`refresh-workflow --apply`.
+
 ## 0.18.3 - 2026-11-16
 
 A lane-lifecycle release: a lane's new branch starts from an up-to-date base,

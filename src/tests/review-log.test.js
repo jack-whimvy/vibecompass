@@ -663,8 +663,8 @@ test('context.md, the managed block, and workflows/project-manager.md carry the 
   assert.match(managed, /- A review pass counts only when a reviewer the owner started runs it, pointed at the lane with `review handoff <lane-id>`\. An agent the builder launched or directed \(a subagent, a second model, a review tool\) does the builder's own checks: record them in `wip\.md` › `## Log`, never as pass lines\./);
 
   // The generic project manager guide: The review rule, Checking a close report, Operating rules.
-  assert.match(guide, /- \*\*At least one recorded reviewer pass,\*\* even when it finds nothing, by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>`\. An agent the builder launched or directed/);
-  assert.match(guide, /## Checking a close report\n[\s\S]*?Read the note's `## Review` section against the review rule\.[\s\S]*?The builder's own account doesn't establish who started a reviewer\.\n\n## When to move on/);
+  assert.match(guide, /- \*\*At least one recorded reviewer pass,\*\* even when it finds nothing, by a reviewer the owner started and pointed at the lane with `review handoff <lane-id>`, or by the reviewer the owner's `vibecompass review-relay --root [^`]+ --session <lane-id>` run started, whose checked answer the relay writes\. An agent the builder launched or directed/);
+  assert.match(guide, /## Checking a close report\n[\s\S]*?Read the note's `## Review` section against the review rule\.[\s\S]*?The builder's own account doesn't establish who started a reviewer\.\n\nA relayed pass names its reviewer `… via the relay`[\s\S]*?such a pass goes to the owner\.\n\n## When to move on/);
   assert.match(guide, /`vibecompass review-check --root \.compass --session <lane-id>` runs the same check on an open lane/);
   assert.match(guide, /- \*\*Send consequential recommendations through a reviewed lane\*\* before the owner decides \(a plan, a reorder, a protocol change\): one that meets the review rule, with passes by reviewers the owner started\./);
 });

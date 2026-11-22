@@ -315,7 +315,7 @@ test('the project manager guide names the memory root in every command, `--root 
       .filter((command) => command !== 'vibecompass refresh-workflow --apply');
     assert.deepEqual(
       commands.map((command) => command.split(' ')[1]),
-      ['list-sessions', 'start-session', 'start-session', 'review-check', 'list-sessions', 'list-sessions', 'connect-hosted', 'push'],
+      ['list-sessions', 'start-session', 'start-session', 'review-relay', 'review-check', 'list-sessions', 'list-sessions', 'connect-hosted', 'push'],
     );
     for (const command of commands) {
       assert.ok(command.includes(` --root ${rootRelativePath} `) || command.endsWith(` --root ${rootRelativePath}`), `${command} names --root ${rootRelativePath}`);

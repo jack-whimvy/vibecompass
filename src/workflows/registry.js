@@ -165,7 +165,7 @@ If the user explicitly wants to rerun docs-review for a focused architecture-doc
 // - The review rule: who counts as a reviewer D-398; the record lines D-394;
 //   stopping at the cap, with no owner line before a pass past it, D-403.
 // - Checking a close report: the note's Plan tasks D-395; the note's Review
-//   D-394, D-398.
+//   D-394, D-398; relayed passes D-419 items 13 and 14.
 // - Plan format: D-393; naming a task outside its plan D-395.
 // - Operating rules: reviewed recommendations D-398.
 function renderProjectManagerWorkflow(options = {}) {
@@ -229,7 +229,7 @@ The project manager writes each build lane's prompt, and the owner gives it to a
 ## The review rule
 
 A build lane closes only after:
-- **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
+- **At least one recorded reviewer pass,** even when it finds nothing, by a reviewer the owner started and pointed at the lane with \`review handoff <lane-id>\`, or by the reviewer the owner's \`vibecompass review-relay${rootFlag} --session <lane-id>\` run started, whose checked answer the relay writes. An agent the builder launched or directed (a subagent, a second model it prompts, a review tool it runs on its own work) does the builder's own checks, recorded in the lane's \`## Log\`, never as pass lines. A pass writes only the lane's \`wip.md\` › \`## Review log\` and \`handoff.md\` › \`## Reviewer → Builder\`.
 - **Findings drive more passes.** After \`address review\`, the reviewer's next pass checks each response. The loop ends at a pass that leaves no finding open: each one fixed and confirmed, rejected with evidence the reviewer accepts, or deferred with a scoped reason.
 - **A cap on rounds,** where a round is one reviewer pass and the builder's response. The cap is \`metadata.workflow.review.round_cap\`, 3 by default; \`${contextPath}\` › Workflow defaults gives this project's value. If findings are still open once the lane has run as many rounds as the cap, the builder stops, reports them, and says that the next pass runs past the cap; it never asks for that pass or starts a reviewer. The project manager escalates to the owner, who chooses: another round, by starting a reviewer, which needs no owner line; a scoped deferral, recorded as an owner \`defer\` line whose reason the session note carries; or leaving the lane open. The same holds after each pass past the cap. A cap never marks a finding resolved.
 
@@ -242,6 +242,8 @@ Check each claim against its primary source before accepting it: \`vibecompass l
 The note's \`## Plan tasks\` section lists the tasks the lane linked with \`--plan-task\`; compare it with the prompt and the session map row. Close ticks nothing, so check that each linked task is ticked only once its work is merged and verified, and annotated otherwise.
 
 Read the note's \`## Review\` section against the review rule. Its \`Check:\` line says whether the record passed, failed, or was overridden, and why. Compare each reviewer on its \`Passes:\` line with the reviewer the build prompt named and any reviewer the owner has named to you since. A pass by the builder's own tool and model, or by a reviewer nobody named, counts when the prompt or the owner's word says the owner started that reviewer. It goes to the owner when nothing does, or when the record shows the builder launched or directed the run, whatever the pass line names. The builder's own account doesn't establish who started a reviewer.
+
+A relayed pass names its reviewer \`… via the relay\` and its scope \`relay write <write id>, round <12 hex>; …\`, and each relayed pass past the cap has an \`another round\` owner line with the same write id. The record shows that a pass in the relay's form was written, not who ran the command. Count relayed passes when the build prompt or the owner's word says the owner ran the review relay on that lane; take them to the owner when nothing does or the record conflicts. A model marked \`requested\` is only the relay's request: when the prompt or the owner requires a particular reviewer model, such a pass goes to the owner.
 
 ## When to move on
 

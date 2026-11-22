@@ -136,6 +136,9 @@ npx -y @vibecompass/vibecompass@latest start-session --root .compass --id auth-f
 npx -y @vibecompass/vibecompass@latest switch-session auth-flow --root .compass
 npx -y @vibecompass/vibecompass@latest docs-update --root .compass --session auth-flow
 npx -y @vibecompass/vibecompass@latest review-check --root .compass --session auth-flow   # parse and check the lane's review log without closing; --json; exits 1 on a failed check
+npx -y @vibecompass/vibecompass@latest review-settings --root .compass --round-cap 5   # the review cap, 1 to 10; without --round-cap it prints the settings
+npx -y @vibecompass/vibecompass@latest ready-for-review --root .compass --session auth-flow   # the builder marks a round ready for review
+npx -y @vibecompass/vibecompass@latest review-relay --root .compass --session auth-flow --reviewer-model <model>   # the owner relays review rounds (macOS)
 npx -y @vibecompass/vibecompass@latest close-session --root .compass --session auth-flow --title "Auth Flow" --completed "Built auth" --architecture-docs updated --decision-log not-needed --session-maintenance updated --next-step "Review"
 
 # Resuming: an active lane is an open session, not a crash. continue-session
@@ -346,6 +349,13 @@ metadata:
       round_cap: 3    # 1 to 10, default 3
 ```
 
+Choose the cap at setup with `init --review-round-cap <n>` (guided setup asks;
+pressing Enter keeps the default and writes nothing), or later with
+`vibecompass review-settings --round-cap <n>`, which writes the key and keeps
+every other one. `vibecompass review-settings` on its own prints the check and
+the cap in effect. The check uses a new cap at once; `context.md` shows it after
+the next `refresh-workflow --apply`.
+
 The finalized note gets a `## Review` section with the check line, the passes
 and reviewers, one line per finding, and the owner's choices, and each deferred
 finding joins its next steps; `close-session --review-note "<text>"`
@@ -353,6 +363,57 @@ finding joins its next steps; `close-session --review-note "<text>"`
 runs the same check on an open lane. Only the owner closes past a failed check:
 `close-session --review-override "<the owner's reason>"`, which the note
 records.
+
+## Review Relay (optional, macOS)
+
+The review relay replaces your copying between a builder terminal and a
+reviewer terminal, not your decisions. You run it for one lane:
+
+```bash
+# The builder marks a round ready (it fingerprints the handoff, the review log, and the work):
+vibecompass ready-for-review --session auth-flow
+# You relay the review:
+vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <model>
+```
+
+- **The mark.** `ready-for-review` writes `sessions/active/<lane-id>/ready.json`
+  with SHA-256 fingerprints of `handoff.md` › `## Builder → Reviewer`, of
+  `wip.md` › `## Review log`, and of the work: each lane worktree's `HEAD`,
+  staged and working diffs, and untracked files, plus each `--path` you name
+  (`<repo-id>:<path>` or a path in the memory root) for shared files outside the
+  worktrees. It is refused while a finding waits for the builder's response.
+  When it runs inside Claude Code, it records that conversation.
+- **The reviewer** is Codex (the default) or Claude Code, started read-only on
+  your own sign-in: it answers in a fixed JSON form and writes no file. The
+  relay checks the answer (exactly one verdict for each finding waiting for the
+  reviewer) and writes it as the pass, in the reviewer's two sections only. A
+  reviewer runs only on an exact version listed as supported for your platform,
+  each listed once its read-only checks held; an unlisted version stops before
+  launch, and you review by hand as before. For programmatic Codex use, OpenAI
+  recommends signing in with an API key.
+- **Two modes.** When the mark names a Claude Code conversation and you have
+  closed it, the relay loops: a pass, then a fixed `address review` turn in that
+  conversation, until a clean pass or the cap. It asks you to confirm that the
+  conversation is closed and was started in the folder it prints
+  (`--conversation-closed` confirms both). Otherwise, or with `--one-pass`, it
+  runs one pass and stops; you type `address review` in the builder's window.
+  `--confirm-each-round` waits for your Enter after each pass.
+- **Stops.** Every stop prints the reason, the open findings, your choices, and
+  in the loop `claude --resume <id>`, which continues from the relayed turns. At
+  the cap, `--past-cap` runs one more pass, recorded with an owner line. A
+  failure, an invalid answer, a change to the work during the review, a refused
+  builder action, or a timeout (45 minutes for a reviewer turn, 60 for a builder
+  turn) stops it with no retry.
+- **Limits.** The relay never closes, pushes, merges, publishes, or releases.
+  In its builder turns, pushes are rewritten to fail, `gh` has no sign-in, and
+  `close-session`, `review-relay`, and the hosted commands refuse. It reads no
+  command, path, mode, or model from a committed file, and passes no bypass
+  mode. `close-session` refuses while a relay runs or left a write unfinished;
+  `review-relay --session <lane-id> --recover` finishes it. The mark and the
+  relay's state live in the lane folder and go at close.
+- **Platforms.** macOS only until a Linux run is recorded; `ready-for-review`
+  and the lane's stage (`list-sessions`) work everywhere. An install that never
+  runs the relay sees no change.
 
 ## Session Brief (opt-in)
 
