@@ -98,6 +98,10 @@ function formatScalar(value) {
 
 function requiresQuotes(value) {
   return (
+    // A string the reader would take for null, a boolean, or a number keeps
+    // its type only when quoted.
+    ['null', '~', 'true', 'false'].includes(value) ||
+    /^-?\d+$/.test(value) ||
     /^\s|\s$/.test(value) ||
     /^[-?:,[\]{}#&*!|>'"%@`]/.test(value) ||
     value.includes(': ') ||

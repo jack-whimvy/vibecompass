@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -30,6 +30,7 @@ import {
 } from '../relay-state.js';
 import { extractReviewLogLines, parseReviewLog } from '../review-log.js';
 import { closeProjectSession, listProjectSessions } from '../session.js';
+import { withMemoryRootLock } from '../serialization.js';
 import {
   ANSWER_BOTH,
   OPEN_TWO,
@@ -108,6 +109,16 @@ test('a verdict missing, doubled, or on a finding not waiting for the reviewer i
   // Findings still waiting for the builder take no verdict.
   const open = parse(`## Review log\n${OPEN_TWO.join('\n')}\n`);
   assert.match(validateReviewerAnswer({ ...base, verdicts: [verdict('R1.1')] }, open).problem, /R1\.1 isn't waiting for the reviewer/);
+});
+
+test('nested answer objects with fields the schema forbids are refused', () => {
+  const waiting = parse(`## Review log\n${ANSWER_BOTH.join('\n')}\n`);
+  const verdict = (id) => ({ id, status: 'confirmed', severity: 'P2', reason: 'checked', evidence: [] });
+  const finding = { severity: 'P2', finding: 'a thing', evidence: ['x'] };
+  const base = { read: 'responses', summary: 's' };
+  assert.equal(validateReviewerAnswer({ ...base, verdicts: [verdict('R1.1'), verdict('R1.2')], findings: [finding] }, waiting).ok, true);
+  assert.match(validateReviewerAnswer({ ...base, verdicts: [verdict('R1.1'), verdict('R1.2')], findings: [{ ...finding, title: 'T' }] }, waiting).problem, /new finding 1 has fields the schema doesn't allow: title/);
+  assert.match(validateReviewerAnswer({ ...base, verdicts: [verdict('R1.1'), { ...verdict('R1.2'), note: 'n' }], findings: [] }, waiting).problem, /verdict 2 has fields the schema doesn't allow: note/);
 });
 
 test('an answer that fails the schema is refused with the reason', () => {
@@ -265,6 +276,38 @@ test("a recovery whose round's work changed records the write discarded", async 
   assert.doesNotMatch(await readFile(lane.handoffPath, 'utf8'), /Relay write/);
 });
 
+test('a recovery whose named directory lost its last file records the write discarded', async (t) => {
+  const ws = await createWorkspace(t, { docsGit: false });
+  const lane = await openLane(ws, 'emptied-dir');
+  await mkdir(path.join(ws.rootDir, 'architecture/solo'), { recursive: true });
+  await writeFile(path.join(ws.rootDir, 'architecture/solo/only.md'), '# Only\n', 'utf8');
+  lane.paths = ['architecture/solo'];
+  const write = await prepareOn(ws, lane, CLEAN_ANSWER);
+  // The directory stays; its one file goes.
+  await rm(path.join(ws.rootDir, 'architecture/solo/only.md'));
+  const recheck = makeRecheck({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: {}, paths: lane.paths, projectRepos: [{ id: 'app' }] });
+  const result = await settleRelayWrite({ rootDir: ws.rootDir, laneDir: lane.laneDir, write, recheck });
+  assert.equal(result.write.state, 'discarded');
+  assert.equal(parse(await readFile(lane.wipPath, 'utf8')).passCount, 0);
+  // Settling the ended write again replays nothing and doesn't throw.
+  assert.deepEqual((await settleRelayWrite({ rootDir: ws.rootDir, laneDir: lane.laneDir, write: result.write, recheck })).wrote, []);
+});
+
+test('a reviewer summary with a heading or a fence stays inside its section, and the next pass replaces all of it', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'summary-heading', { worktree: true });
+  const first = await prepareOn(ws, lane, { ...CLEAN_ANSWER, summary: '## Remaining work\nStill to check.\n```\nan unclosed fence\n# Top heading' });
+  await settleRelayWrite({ rootDir: ws.rootDir, laneDir: lane.laneDir, write: first });
+  const afterFirst = await readFile(lane.handoffPath, 'utf8');
+  const body = readSectionBody(afterFirst, REVIEWER_TO_BUILDER_HEADING);
+  for (const text of ['\\## Remaining work', 'Still to check.', '\\```', 'an unclosed fence', '\\# Top heading', '### Recommended next step']) assert.ok(body.includes(text), text);
+  const second = await prepareOn(ws, lane, { ...CLEAN_ANSWER, summary: 'Pass two.' }, { passNumber: 2 });
+  await settleRelayWrite({ rootDir: ws.rootDir, laneDir: lane.laneDir, write: second });
+  const afterSecond = await readFile(lane.handoffPath, 'utf8');
+  for (const text of ['Remaining work', 'Still to check.', 'an unclosed fence', 'Top heading', `Relay write ${first.id}`]) assert.ok(!afterSecond.includes(text), `pass 1's ${text} is gone`);
+  assert.match(readSectionBody(afterSecond, REVIEWER_TO_BUILDER_HEADING), new RegExp(`^Relay write ${second.id}: pass 2`));
+});
+
 test('a write over a changed review log is discarded and writes nothing', async (t) => {
   const ws = await createWorkspace(t);
   const lane = await openLane(ws, 'changed-log', { worktree: true });
@@ -330,6 +373,108 @@ test('one relay per lane: a live holder refuses, a dead holder is taken over', a
 function userInfoAt(home) {
   return { homedir: home };
 }
+
+// Two contenders that have both read a dead holder's lock: each waits at the
+// takeover step until the other arrives or a short time passes, so without
+// serialization both would rename and create.
+function takeoverRendezvous(count = 2, waitMs = 300) {
+  let arrived = 0;
+  let releaseAll;
+  const all = new Promise((resolve) => { releaseAll = resolve; });
+  return async () => {
+    arrived += 1;
+    if (arrived >= count) releaseAll();
+    await Promise.race([all, new Promise((resolve) => setTimeout(resolve, waitMs))]);
+  };
+}
+
+async function settled(promises) {
+  const results = await Promise.allSettled(promises);
+  return { won: results.filter((item) => item.status === 'fulfilled').map((item) => item.value), lost: results.filter((item) => item.status === 'rejected').map((item) => item.reason) };
+}
+
+test('two relays taking over one dead lane lock at once: exactly one holds it', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'lane-race');
+  const table = fakeTable();
+  const dead = await acquireLaneLock({ laneDir: lane.laneDir, laneId: lane.laneId, runId: 'run-dead', token: 'td', table });
+  await writeFile(dead.filePath, JSON.stringify({ ...dead.record, pid: 999999, process_started_at: null }), 'utf8');
+  const meet = takeoverRendezvous();
+  const { won, lost } = await settled(['ta', 'tb'].map((token) => acquireLaneLock({ laneDir: lane.laneDir, laneId: lane.laneId, runId: `run-${token}`, token, table, beforeTakeOver: meet })));
+  assert.equal(won.length, 1, 'one contender holds the lane');
+  assert.equal(lost.length, 1);
+  assert.match(lost[0].message, /Another relay is running on lane lane-race/);
+  assert.equal(JSON.parse(await readFile(dead.filePath, 'utf8')).token, won[0].record.token, 'the lock on disk is the winner\'s');
+  await releaseLaneLock(won[0]);
+});
+
+test('two relays in different memory roots taking over one dead conversation lock at once: exactly one holds it', async (t) => {
+  const wsA = await createWorkspace(t);
+  const wsB = await createWorkspace(t);
+  const holder = await openLane(wsA, 'conv-holder');
+  const laneA = await openLane(wsA, 'conv-race-a');
+  const laneB = await openLane(wsB, 'conv-race-b');
+  const home = path.join(wsA.tempDir, 'home');
+  const table = fakeTable();
+  const conversationId = '22222222-3333-4444-8555-666666666666';
+  const dead = await acquireConversationLock({ conversationId, rootDir: wsA.rootDir, laneId: holder.laneId, runId: 'run-dead', token: 'td', table, userInfo: userInfoAt(home) });
+  await writeFile(dead.filePath, JSON.stringify({ ...dead.record, pid: 999999, process_started_at: null }), 'utf8');
+  await rm(holder.laneDir, { recursive: true, force: true });
+  const meet = takeoverRendezvous();
+  const { won, lost } = await settled([
+    acquireConversationLock({ conversationId, rootDir: wsA.rootDir, laneId: laneA.laneId, runId: 'run-a', token: 'ta', table, userInfo: userInfoAt(home), beforeTakeOver: meet }),
+    acquireConversationLock({ conversationId, rootDir: wsB.rootDir, laneId: laneB.laneId, runId: 'run-b', token: 'tb', table, userInfo: userInfoAt(home), beforeTakeOver: meet }),
+  ]);
+  assert.equal(won.length, 1, 'one contender holds the conversation');
+  assert.match(lost[0].message, /is in use by another relay/);
+  assert.equal(JSON.parse(await readFile(dead.filePath, 'utf8')).token, won[0].record.token);
+  await releaseConversationLock(won[0]);
+  await assert.rejects(readFile(path.join(home, '.config', 'vibecompass', 'relay-locks', '.takeover', 'owner.json'), 'utf8'), /ENOENT/, 'the mutex is gone after the takeover');
+});
+
+test('a takeover mutex left by a dead process is kept, and the message names it', async (t) => {
+  const ws = await createWorkspace(t);
+  const holder = await openLane(ws, 'mutex-holder');
+  const other = await openLane(ws, 'mutex-other');
+  const home = path.join(ws.tempDir, 'home');
+  const table = fakeTable();
+  const conversationId = '33333333-4444-4555-8666-777777777777';
+  const dead = await acquireConversationLock({ conversationId, rootDir: ws.rootDir, laneId: holder.laneId, runId: 'run-dead', token: 'td', table, userInfo: userInfoAt(home) });
+  await writeFile(dead.filePath, JSON.stringify({ ...dead.record, pid: 999999, process_started_at: null }), 'utf8');
+  await rm(holder.laneDir, { recursive: true, force: true });
+  const mutex = path.join(home, '.config', 'vibecompass', 'relay-locks', '.takeover');
+  await mkdir(mutex, { recursive: true });
+  await writeFile(path.join(mutex, 'owner.json'), JSON.stringify({ pid: 999999, process_started_at: null }), 'utf8');
+  await assert.rejects(
+    acquireConversationLock({ conversationId, rootDir: ws.rootDir, laneId: other.laneId, runId: 'run-2', token: 't2', table, userInfo: userInfoAt(home) }),
+    /An earlier takeover of a conversation lock didn't finish \(.*\.takeover\)\. If no review relay is running, remove that folder and run again\./,
+  );
+  assert.equal(JSON.parse(await readFile(dead.filePath, 'utf8')).token, 'td', 'the dead holder\'s lock is untouched');
+});
+
+test('a relay waits for a close holding the memory-root lock, and is refused once the lane is gone', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'close-race');
+  const table = fakeTable();
+  let entered;
+  const inside = new Promise((resolve) => { entered = resolve; });
+  let finishClose;
+  const closeMayFinish = new Promise((resolve) => { finishClose = resolve; });
+  const closing = withMemoryRootLock(ws.rootDir, 'close-session', async () => {
+    entered();
+    await closeMayFinish;
+    await rm(lane.laneDir, { recursive: true, force: true });
+  });
+  await inside;
+  let admitted = false;
+  const admission = acquireLaneLock({ laneDir: lane.laneDir, laneId: lane.laneId, runId: 'run-late', token: 'tl', table }).then((lock) => { admitted = true; return lock; });
+  admission.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(admitted, false, 'admission waits while close holds the memory-root lock');
+  finishClose();
+  await closing;
+  await assert.rejects(admission, /Lane close-race is no longer open \(sessions\/active\/close-race\/session\.yaml is gone\)/);
+});
 
 test('two lanes, each with its own TMPDIR, naming one conversation get one lock', async (t) => {
   const ws = await createWorkspace(t);
@@ -429,9 +574,29 @@ test('close-session removes a conversation lock that names the closing lane', as
   const table = fakeTable();
   const lock = await acquireConversationLock({ conversationId: 'conv-close', rootDir: ws.rootDir, laneId: lane.laneId, runId: 'run-x', token: 'tx', table, userInfo: userInfoAt(home) });
   await writeFile(lock.filePath, JSON.stringify({ ...lock.record, pid: 999999, process_started_at: null }), 'utf8');
-  await saveRelayState(lane.laneDir, { ...emptyRelayState(lane.laneId), run: { id: 'run-x' }, conversation_lock: { path: lock.filePath } });
-  await closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane.laneId, ...CLOSE });
+  await saveRelayState(lane.laneDir, { ...emptyRelayState(lane.laneId), run: { id: 'run-x' }, builder: { conversation_id: 'conv-close', mode: 'default' }, conversation_lock: { path: lock.filePath } });
+  await closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane.laneId, ...CLOSE, relayUserInfo: userInfoAt(home) });
   await assert.rejects(readFile(lock.filePath, 'utf8'), /ENOENT/);
+});
+
+test('close-session never removes a file the relay state points at outside the user\'s lock folder', async (t) => {
+  const ws = await createWorkspace(t, { review: ['check: off'] });
+  const lane = await openLane(ws, 'close-bounded');
+  const home = path.join(ws.tempDir, 'home');
+  // An unrelated JSON file whose fields would match the lane, named by a damaged state.
+  const unrelated = path.join(ws.tempDir, 'unrelated.json');
+  await writeFile(unrelated, JSON.stringify({ conversation_id: 'conv-bounded', root: ws.rootDir, lane: lane.laneId, run_id: 'run-y', pid: 999999 }), 'utf8');
+  await saveRelayState(lane.laneDir, { ...emptyRelayState(lane.laneId), run: { id: 'run-y' }, builder: { conversation_id: 'conv-bounded', mode: 'default' }, conversation_lock: { path: unrelated } });
+  await closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane.laneId, ...CLOSE, relayUserInfo: userInfoAt(home) });
+  assert.ok(JSON.parse(await readFile(unrelated, 'utf8')).lane, 'the unrelated file is kept');
+  // A lock in the user's folder whose record names another conversation is kept too.
+  const lane2 = await openLane(ws, 'close-bounded-2');
+  const table = fakeTable();
+  const otherLock = await acquireConversationLock({ conversationId: 'conv-real', rootDir: ws.rootDir, laneId: lane2.laneId, runId: 'run-z', token: 'tz', table, userInfo: userInfoAt(home) });
+  await writeFile(otherLock.filePath, JSON.stringify({ ...otherLock.record, conversation_id: 'conv-other', pid: 999999, process_started_at: null }), 'utf8');
+  await saveRelayState(lane2.laneDir, { ...emptyRelayState(lane2.laneId), run: { id: 'run-z' }, builder: { conversation_id: 'conv-real', mode: 'default' }, conversation_lock: { path: otherLock.filePath } });
+  await closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane2.laneId, ...CLOSE, relayUserInfo: userInfoAt(home) });
+  assert.equal(JSON.parse(await readFile(otherLock.filePath, 'utf8')).conversation_id, 'conv-other');
 });
 
 test('the stage reads the relay: reviewing, builder answering, and waiting for the owner', async (t) => {

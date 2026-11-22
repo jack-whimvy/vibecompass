@@ -65,6 +65,10 @@ export const REVIEWER_ANSWER_SCHEMA = Object.freeze({
   },
 });
 
+// Each nested object's keys, from the schema, so the check and the schema agree.
+const VERDICT_KEYS = Object.keys(REVIEWER_ANSWER_SCHEMA.properties.verdicts.items.properties);
+const FINDING_KEYS = Object.keys(REVIEWER_ANSWER_SCHEMA.properties.findings.items.properties);
+
 export function newWriteId() {
   return randomBytes(6).toString('hex');
 }
@@ -82,6 +86,16 @@ export function sanitizeLines(text, { lastField = true } = {}) {
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F\u0080-\u009F\u2028\u2029]/g, '');
   const lines = cleaned.split('\n').map((line) => line.trim()).filter((line) => line !== '');
   return lastField ? lines : lines.map((line) => line.replaceAll(' | ', ' / ').replace(/\|$/, '').replace(/^\|/, ''));
+}
+
+/**
+ * A line of reviewer text written at the start of a line in a lane file: one
+ * that would read as a heading or a fence delimiter gets a backslash, so it
+ * stays text inside the reviewer's section and the section's end stays where
+ * the relay put it (D-419 item 6).
+ */
+export function asDataLine(line) {
+  return /^(#|`{3,}|~{3,})/.test(line) ? `\\${line}` : line;
 }
 
 function oneLine(text, options) {
@@ -117,6 +131,8 @@ export function validateReviewerAnswer(answer, parsed) {
   const verdicts = [];
   for (const [index, verdict] of answer.verdicts.entries()) {
     if (!verdict || typeof verdict !== 'object' || Array.isArray(verdict)) return fail(`verdict ${index + 1} is not an object`);
+    const extraVerdictKeys = Object.keys(verdict).filter((key) => !VERDICT_KEYS.includes(key));
+    if (extraVerdictKeys.length > 0) return fail(`verdict ${index + 1} has fields the schema doesn't allow: ${extraVerdictKeys.join(', ')}`);
     const { id, status, severity, reason, evidence } = verdict;
     if (!isString(id) || !/^R[1-9]\d*\.[1-9]\d*$/.test(id)) return fail(`verdict ${index + 1} has no finding id`);
     if (!VERDICTS.includes(status)) return fail(`the verdict on ${id} is "${status}", not confirmed, reopened, or withdrawn`);
@@ -134,6 +150,8 @@ export function validateReviewerAnswer(answer, parsed) {
   const findings = [];
   for (const [index, finding] of answer.findings.entries()) {
     if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return fail(`new finding ${index + 1} is not an object`);
+    const extraFindingKeys = Object.keys(finding).filter((key) => !FINDING_KEYS.includes(key));
+    if (extraFindingKeys.length > 0) return fail(`new finding ${index + 1} has fields the schema doesn't allow: ${extraFindingKeys.join(', ')}`);
     if (!SEVERITIES.includes(finding.severity)) return fail(`new finding ${index + 1} has severity "${finding.severity}", not P1, P2, or P3`);
     if (!isString(finding.finding) || oneLine(finding.finding) === '') return fail(`new finding ${index + 1} states nothing`);
     if (!Array.isArray(finding.evidence) || !finding.evidence.every(isString)) return fail(`new finding ${index + 1} has evidence that isn't a list of text`);
@@ -201,7 +219,7 @@ export function buildHandoffSummaryLines({ answer, passNumber, reviewerLabel, wr
     '',
     '### Findings summary',
   ];
-  const summary = sanitizeLines(clip(answer.summary));
+  const summary = sanitizeLines(clip(answer.summary)).map(asDataLine);
   lines.push(...(summary.length > 0 ? summary : ['(no summary given)']));
   for (const verdict of answer.verdicts) lines.push(`- ${verdict.id} (${verdict.severity}) ${verdict.status}: ${oneLine(clip(verdict.reason))}`);
   for (const [index, finding] of answer.findings.entries()) lines.push(`- ${newIds[index]} (${finding.severity}) open: ${oneLine(clip(finding.finding))}`);

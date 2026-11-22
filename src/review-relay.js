@@ -306,7 +306,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
   const turnDir = path.join(laneDir, RELAY_TURN_DIR);
   const active = { group: null, interrupted: false };
 
-  const laneLock = await acquireLaneLock({ laneDir, laneId, runId, token, table });
+  const laneLock = await acquireLaneLock({ laneDir, laneId, runId, token, table, rootDir });
   if (laneLock.tookOver) {
     out(`Took over lane ${laneId}'s relay lock from run ${laneLock.tookOver.run_id}, whose process is gone.`);
   }

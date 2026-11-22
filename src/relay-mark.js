@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, readFile, readdir, readlink, rename, writeFile } from 'node:fs/promises';
+import { lstat, readFile, readdir, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   BUILDER_TO_REVIEWER_HEADING,
@@ -199,7 +199,7 @@ function isLaneOwnFile(absolute, laneDir) {
  * recorded worktree (its HEAD, a hash of the staged diff, a hash of the
  * working diff, and each untracked, not-ignored file) and each named path.
  */
-export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env }) {
+export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env, marking = false }) {
   const entries = [];
   const covers = { worktrees: [], paths: [] };
   const notes = [];
@@ -253,7 +253,15 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
     }
     const listing = await listDirectoryFiles(resolved.absolute, { rootDir, laneDir, env });
     if (listing.files.length === 0) {
-      throw new Error(`ready-for-review --path ${resolved.spec} covers no files${listing.ignored > 0 ? ` (${listing.ignored} ignored left out)` : ''}; name the files instead.`); // D-419 item 4
+      // Marking refuses a directory with nothing to cover. Comparing against a
+      // mark, a directory that lost its last file is changed work, never an
+      // error that would stop recovery from recording an end state.
+      if (marking) {
+        throw new Error(`ready-for-review --path ${resolved.spec} covers no files${listing.ignored > 0 ? ` (${listing.ignored} ignored left out)` : ''}; name the files instead.`); // D-419 item 4
+      }
+      entries.push(`path\t${resolved.spec}\tempty directory`);
+      covers.paths.push({ spec: resolved.spec, kind: 'directory', covered: 0, ignored: listing.ignored, git: listing.git });
+      continue;
     }
     for (const file of listing.files) {
       const relative = toPosix(path.relative(resolved.absolute, file));
@@ -279,13 +287,21 @@ async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
   let files;
   let ignored = 0;
   if (top) {
-    const relative = toPosix(path.relative(top, dir)) || '.';
+    // Git names its top level by the physical path; the named directory may
+    // be reached through a symlink. Both are resolved before the relative
+    // path is taken, and git's listing is mapped back under the path as
+    // named, so the exclusions below compare like with like.
+    const physicalTop = await realpath(top);
+    const physicalDir = await realpath(dir);
+    const relative = toPosix(path.relative(physicalTop, physicalDir)) || '.';
     const listed = await gitText(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', relative], top, env);
     if (!listed.ok) {
       throw new Error(`git ls-files failed for ${dir}: ${listed.stderr}`);
     }
-    files = [...new Set(splitNul(listed.stdout))].map((item) => path.join(top, item));
-    const ignoredListing = await gitText(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z', '--', relative], top, env);
+    files = [...new Set(splitNul(listed.stdout))].map((item) => path.join(dir, path.relative(physicalDir, path.join(physicalTop, item))));
+    // Every ignored file is counted: without --directory, git lists the files
+    // inside a wholly ignored directory instead of one entry for it.
+    const ignoredListing = await gitText(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', relative], top, env);
     ignored = ignoredListing.ok ? splitNul(ignoredListing.stdout).length : 0;
   } else {
     files = await walkFiles(dir);
@@ -325,9 +341,9 @@ export async function fingerprintLaneFiles(laneDir) {
 }
 
 /** All three fingerprints and the round id, as of now. */
-export async function computeCurrentFingerprints({ rootDir, laneDir, worktrees, paths, projectRepos, env }) {
+export async function computeCurrentFingerprints({ rootDir, laneDir, worktrees, paths, projectRepos, env, marking = false }) {
   const files = await fingerprintLaneFiles(laneDir);
-  const work = await fingerprintWork({ rootDir, laneDir, worktrees, paths, projectRepos, env });
+  const work = await fingerprintWork({ rootDir, laneDir, worktrees, paths, projectRepos, env, marking });
   const fingerprints = { handoff: files.handoff, record: files.record, work: work.fingerprint };
   return { fingerprints, roundId: computeRoundId(fingerprints), work, wipContent: files.wipContent, handoffContent: files.handoffContent };
 }
@@ -400,7 +416,13 @@ export async function writeReadyMark({ rootDir, laneId, laneDir, worktrees = {},
   if (Object.keys(worktrees).length === 0 && paths.length === 0) {
     throw new Error('ready-for-review is refused: this lane has no worktree, so name the work under review with --path <repo-id>:<path> or a path relative to the memory root.'); // D-419 item 4
   }
-  const current = await computeCurrentFingerprints({ rootDir, laneDir, worktrees, paths, projectRepos, env });
+  const current = await computeCurrentFingerprints({ rootDir, laneDir, worktrees, paths, projectRepos, env, marking: true });
+  // The work must cover something: a worktree, or a named path that isn't the
+  // lane's own file (a named missing file counts, for a deletion).
+  const covered = current.work.covers.worktrees.length + current.work.covers.paths.filter((item) => item.kind !== 'lane file').length;
+  if (covered === 0) {
+    throw new Error(`ready-for-review is refused: the paths named cover no work (${current.work.covers.paths.map((item) => item.spec).join(', ')} ${current.work.covers.paths.length === 1 ? 'is the lane\'s own file' : 'are the lane\'s own files'}, never part of the work). Name the work under review with --path <repo-id>:<path> or a path relative to the memory root.`); // D-419 item 4
+  }
   const { builder, warning } = readBuilderConversation(env);
   const mark = {
     format: MARK_FORMAT,

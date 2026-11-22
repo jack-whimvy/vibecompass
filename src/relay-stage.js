@@ -64,9 +64,6 @@ export async function computeLaneStage({ rootDir, laneDir, wipContent, worktrees
   }
 
   const parsed = wipContent ? parseReviewLog(extractReviewLogLines(wipContent).lines) : null;
-  if (isReviewClean(parsed)) {
-    return { stage: 'review clean', reason: null };
-  }
 
   let mark = null;
   try {
@@ -80,6 +77,8 @@ export async function computeLaneStage({ rootDir, laneDir, wipContent, worktrees
     return { stage: 'waiting for the owner', reason: relay.lastStop.reason };
   }
 
+  // A current mark with no pass on its round is ready for review, even after
+  // an earlier round's clean pass: that pass reviewed the work before it.
   if (mark) {
     try {
       const comparison = await compareMark(mark, { rootDir, laneDir, worktrees, projectRepos, env });
@@ -89,6 +88,9 @@ export async function computeLaneStage({ rootDir, laneDir, wipContent, worktrees
     } catch {
       // A mark that can't be compared isn't current.
     }
+  }
+  if (isReviewClean(parsed)) {
+    return { stage: 'review clean', reason: null };
   }
   return { stage: 'building', reason: null };
 }

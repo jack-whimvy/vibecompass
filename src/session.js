@@ -759,7 +759,7 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
 
     // D-278: a conversation lock that names this lane goes with it.
     if (relayState) {
-      await removeConversationLockForLane({ state: relayState, rootDir: normalized.rootDir, laneId: sessionId }).catch(() => null);
+      await removeConversationLockForLane({ state: relayState, rootDir: normalized.rootDir, laneId: sessionId, userInfo: options?.relayUserInfo }).catch(() => null);
     }
     await rm(lanePaths.laneDir, { recursive: true, force: true });
     activeSessionIndex = await removeActiveSessionFromIndex(normalized, sessionId);

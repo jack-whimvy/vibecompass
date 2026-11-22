@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { RELAY_LOCK_FILE, RELAY_STATE_FILE, isConversationId, writeFileAtomic } from './relay-mark.js';
+import { withMemoryRootLock } from './serialization.js';
 
 // D-419 item 10: the relay's state, its two locks, and what a restarted relay
 // or close-session can tell about a turn that was running when a relay died.
@@ -205,8 +206,11 @@ async function readLockRecord(filePath) {
 }
 
 /**
- * Takes over a dead holder's lock: the old file is renamed aside (only one
- * taker's rename succeeds), then the new lock is created exclusively.
+ * Takes over a dead holder's lock: the old file is renamed aside, then the
+ * new lock is created exclusively. Callers serialize takeovers (the
+ * memory-root lock for a lane, the takeover mutex for a conversation) and
+ * read the dead holder's record inside that serialization, so a second taker
+ * reads the first one's live lock instead of renaming it away.
  */
 async function takeOver(filePath, record) {
   const aside = `${filePath}.stale-${randomUUID()}`;
@@ -220,30 +224,89 @@ async function takeOver(filePath, record) {
 
 /**
  * The lane lock, `sessions/active/<lane-id>/relay.lock`: one relay per lane.
- * A dead holder's lock is taken over with a message; a live one refuses.
+ * It is taken under the memory-root lock, which close-session holds from its
+ * relay check through the lane's removal, so a relay is admitted only to a
+ * lane that is still open and close never removes a lane a relay was just
+ * admitted to. The same lock serializes two relays taking over one dead
+ * holder's lock: the second reads the first's live lock and refuses. A dead
+ * holder's lock is taken over with a message; a live one refuses.
+ * `beforeTakeOver` is a test hook.
  */
-export async function acquireLaneLock({ laneDir, laneId, runId, token, table }) {
+export async function acquireLaneLock({ laneDir, laneId, runId, token, table, rootDir = path.resolve(laneDir, '..', '..', '..'), beforeTakeOver = null }) {
   const filePath = path.join(laneDir, RELAY_LOCK_FILE);
   const record = { lane: laneId, run_id: runId, token, pid: process.pid, process_started_at: await processStartTime(table, process.pid).catch(() => null), at: new Date().toISOString() };
+  return withMemoryRootLock(rootDir, 'review-relay', async () => {
+    if (!(await laneStillOpen(laneDir))) {
+      throw new Error(`Lane ${laneId} is no longer open (sessions/active/${laneId}/session.yaml is gone); the relay runs only on an open lane.`); // D-419 item 10
+    }
+    try {
+      await createExclusive(filePath, record);
+      return { filePath, record, tookOver: null };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    const existing = await readLockRecord(filePath);
+    if (existing.missing) {
+      await createExclusive(filePath, record);
+      return { filePath, record, tookOver: null };
+    }
+    if (existing.unreadable) {
+      throw new Error(`${filePath} exists but can't be read, so another relay may hold lane ${laneId}. If no relay is running, move it aside and run again.`);
+    }
+    if (await lockHolderAlive(table, existing.record)) {
+      throw new Error(`Another relay is running on lane ${laneId} (process ${existing.record.pid}, run ${existing.record.run_id}). One relay runs per lane.`); // D-419 item 10
+    }
+    if (beforeTakeOver) await beforeTakeOver();
+    await takeOver(filePath, record);
+    return { filePath, record, tookOver: existing.record };
+  });
+}
+
+async function laneStillOpen(laneDir) {
   try {
-    await createExclusive(filePath, record);
-    return { filePath, record, tookOver: null };
+    await stat(path.join(laneDir, 'session.yaml'));
+    return true;
   } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
   }
-  const existing = await readLockRecord(filePath);
-  if (existing.missing) {
-    await createExclusive(filePath, record);
-    return { filePath, record, tookOver: null };
+}
+
+const TAKEOVER_MUTEX = '.takeover';
+const TAKEOVER_WAIT_MS = 2_000;
+
+/**
+ * The conversation locks' takeover mutex, a folder in the per-user lock
+ * folder, so takeovers of one conversation's lock are serialized across
+ * memory roots. It is held only while a dead holder's record is read again
+ * and replaced. A mutex left by a process that died inside that step is never
+ * reclaimed automatically: the message names it, and the owner removes it.
+ */
+async function withTakeoverMutex(dir, table, fn, { waitMs = TAKEOVER_WAIT_MS } = {}) {
+  const mutexPath = path.join(dir, TAKEOVER_MUTEX);
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      await mkdir(mutexPath);
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    if (Date.now() >= deadline) {
+      const owner = await readLockRecord(path.join(mutexPath, 'owner.json'));
+      const alive = owner.record ? await lockHolderAlive(table, owner.record) : false;
+      throw new Error(alive
+        ? `Another relay is taking over a conversation lock (${mutexPath}); run again in a moment.`
+        : `An earlier takeover of a conversation lock didn't finish (${mutexPath}). If no review relay is running, remove that folder and run again.`); // D-419 item 10
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  if (existing.unreadable) {
-    throw new Error(`${filePath} exists but can't be read, so another relay may hold lane ${laneId}. If no relay is running, move it aside and run again.`);
+  try {
+    await writeFile(path.join(mutexPath, 'owner.json'), `${JSON.stringify({ pid: process.pid, process_started_at: await processStartTime(table, process.pid).catch(() => null), at: new Date().toISOString() })}\n`, 'utf8');
+    return await fn();
+  } finally {
+    await rm(mutexPath, { recursive: true, force: true });
   }
-  if (await lockHolderAlive(table, existing.record)) {
-    throw new Error(`Another relay is running on lane ${laneId} (process ${existing.record.pid}, run ${existing.record.run_id}). One relay runs per lane.`); // D-419 item 10
-  }
-  await takeOver(filePath, record);
-  return { filePath, record, tookOver: existing.record };
 }
 
 export async function releaseLaneLock(lock) {
@@ -298,7 +361,7 @@ async function deadConversationLockReleasable(record) {
   return { ok: true, reason: `run ${record.run_id} on lane ${record.lane} has ended` };
 }
 
-export async function acquireConversationLock({ conversationId, rootDir, laneId, runId, token, table, userInfo }) {
+export async function acquireConversationLock({ conversationId, rootDir, laneId, runId, token, table, userInfo, beforeTakeOver = null }) {
   const filePath = conversationLockPath(conversationId, userInfo);
   await mkdir(path.dirname(filePath), { recursive: true });
   const record = {
@@ -317,25 +380,30 @@ export async function acquireConversationLock({ conversationId, rootDir, laneId,
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
   }
-  const existing = await readLockRecord(filePath);
-  if (existing.missing) {
-    await createExclusive(filePath, record);
-    return { filePath, record, tookOver: null };
-  }
-  if (existing.unreadable) {
-    throw new Error(`Conversation ${conversationId} is locked by a record that can't be read (${filePath}); the lock is kept. If no relay uses the conversation, move it aside and run again.`); // D-419 item 10
-  }
-  const held = existing.record;
-  if (await lockHolderAlive(table, held)) {
-    throw new Error(`Conversation ${conversationId} is in use by another relay: lane ${held.lane} in ${held.root}, run ${held.run_id}. One relay runs per conversation.`); // D-419 item 10
-  }
-  // The same run's own lock (a restart) is ours to reuse once its turn is settled.
-  const releasable = await deadConversationLockReleasable(held);
-  if (!releasable.ok) {
-    throw new Error(`Conversation ${conversationId} is still reserved: ${releasable.reason}.`);
-  }
-  await takeOver(filePath, record);
-  return { filePath, record, tookOver: { ...held, reason: releasable.reason } };
+  // Every reading of an existing holder, and any takeover, happens under the
+  // takeover mutex (D-419 item 10).
+  return withTakeoverMutex(path.dirname(filePath), table, async () => {
+    const existing = await readLockRecord(filePath);
+    if (existing.missing) {
+      await createExclusive(filePath, record);
+      return { filePath, record, tookOver: null };
+    }
+    if (existing.unreadable) {
+      throw new Error(`Conversation ${conversationId} is locked by a record that can't be read (${filePath}); the lock is kept. If no relay uses the conversation, move it aside and run again.`); // D-419 item 10
+    }
+    const held = existing.record;
+    if (await lockHolderAlive(table, held)) {
+      throw new Error(`Conversation ${conversationId} is in use by another relay: lane ${held.lane} in ${held.root}, run ${held.run_id}. One relay runs per conversation.`); // D-419 item 10
+    }
+    // The same run's own lock (a restart) is ours to reuse once its turn is settled.
+    const releasable = await deadConversationLockReleasable(held);
+    if (!releasable.ok) {
+      throw new Error(`Conversation ${conversationId} is still reserved: ${releasable.reason}.`);
+    }
+    if (beforeTakeOver) await beforeTakeOver();
+    await takeOver(filePath, record);
+    return { filePath, record, tookOver: { ...held, reason: releasable.reason } };
+  });
 }
 
 export async function releaseConversationLock(lock) {
@@ -349,14 +417,24 @@ export async function releaseConversationLock(lock) {
 /**
  * At close: a conversation lock whose record names this root and lane goes
  * with the lane (D-278). Close refuses earlier while a live relay holds it.
+ * The file is found from the conversation id the relay recorded, in the OS
+ * user's lock folder, never from a stored path: a recorded path anywhere
+ * else is left alone, and so is a lock whose record names another
+ * conversation, lane, or root.
  */
-export async function removeConversationLockForLane({ state, rootDir, laneId }) {
-  const recorded = state?.conversation_lock?.path;
-  if (!recorded) return null;
-  const existing = await readLockRecord(recorded);
-  if (existing.record && existing.record.lane === laneId && path.resolve(existing.record.root ?? '') === path.resolve(rootDir)) {
-    await rm(recorded, { force: true });
-    return recorded;
+export async function removeConversationLockForLane({ state, rootDir, laneId, userInfo }) {
+  const conversationId = state?.builder?.conversation_id;
+  if (!state?.conversation_lock || !isConversationId(conversationId)) return null;
+  const expected = conversationLockPath(conversationId, userInfo);
+  const recorded = state.conversation_lock.path;
+  if (typeof recorded !== 'string' || path.resolve(recorded) !== path.resolve(expected)) return null;
+  const existing = await readLockRecord(expected);
+  if (existing.record
+    && existing.record.conversation_id === conversationId
+    && existing.record.lane === laneId
+    && path.resolve(existing.record.root ?? '') === path.resolve(rootDir)) {
+    await rm(expected, { force: true });
+    return expected;
   }
   return null;
 }

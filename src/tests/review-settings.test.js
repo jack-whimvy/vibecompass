@@ -6,6 +6,7 @@ import test from 'node:test';
 import { runCli } from '../cli.js';
 import { initializeProjectMemory } from '../init.js';
 import { parseSimpleYaml } from '../simple-yaml.js';
+import { serializeProjectConfig } from '../project-yaml.js';
 import { REVIEW_ROUND_CAP_PROMPT } from '../setup.js';
 import { parseRoundCapValue } from '../review-settings.js';
 import { resolveWorkflowSettings } from '../workflow.js';
@@ -228,6 +229,33 @@ test('review-settings --round-cap writes the key and keeps every other key', asy
   const again = captureIo();
   assert.equal(await runCli(['review-settings', '--root', '.compass', '--round-cap', '6'], again.io, { cwd: tempDir }), 0);
   assert.match(again.stdout(), /already 6 .*nothing written/);
+});
+
+test('review-settings keeps a quoted value that reads like a number, a boolean, or null', async (t) => {
+  const { tempDir, rootDir } = await initRoot(t);
+  const projectPath = path.join(rootDir, 'project.yaml');
+  const source = await readFile(projectPath, 'utf8');
+  await writeFile(projectPath, source.replace(/^name: .*$/m, 'name: "2026"\nlabel: "true"'), 'utf8');
+  const before = (await readProject(rootDir)).config;
+  assert.equal(before.name, '2026');
+  assert.equal(before.label, 'true');
+  const capture = captureIo();
+  assert.equal(await runCli(['review-settings', '--root', '.compass', '--round-cap', '4'], capture.io, { cwd: tempDir }), 0, capture.stderr());
+  const after = (await readProject(rootDir));
+  assert.equal(after.config.name, '2026');
+  assert.equal(after.config.label, 'true');
+  assert.match(after.source, /^name: "2026"$/m);
+  assert.match(after.source, /^label: "true"$/m);
+  const expected = structuredClone(before);
+  expected.metadata.workflow.review = { round_cap: 4 };
+  assert.deepEqual(after.config, expected);
+});
+
+test('the project.yaml writer quotes a string the reader would take for another type', () => {
+  const config = { a: '2026', b: 'true', c: 'null', d: '~', e: '-12', f: 'false', g: 7, h: true, i: null, j: 'plain' };
+  const written = serializeProjectConfig(config);
+  assert.equal(written, 'a: "2026"\nb: "true"\nc: "null"\nd: "~"\ne: "-12"\nf: "false"\ng: 7\nh: true\ni: null\nj: plain\n');
+  assert.deepEqual(parseSimpleYaml(written), config);
 });
 
 test('review-settings refuses each kind of invalid value and writes nothing', async (t) => {

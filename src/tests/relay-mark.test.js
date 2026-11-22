@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, rm, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { runCli } from '../cli.js';
@@ -305,6 +305,59 @@ test('a hand-run pass after the mark moves the stage back to building', async (t
   await rm(path.join(lane.laneDir, 'ready.json'));
   const after = await listProjectSessions({ cwd: ws.tempDir, rootDir: ws.rootDir });
   assert.equal(after.inventory.lanes.find((item) => item.id === 'hand-run').stage, null);
+});
+
+test('a lane without a worktree that names only its own files covers no work and writes no mark', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'scratch-only');
+  await assert.rejects(
+    mark(ws, lane, { paths: [`sessions/active/${lane.laneId}/wip.md`] }),
+    /ready-for-review is refused: the paths named cover no work \(sessions\/active\/scratch-only\/wip\.md is the lane's own file, never part of the work\)/,
+  );
+  assert.equal(await readReadyMark(lane.laneDir), null);
+  // A named missing file is coverage: a deletion.
+  const deletion = await mark(ws, lane, { paths: [`sessions/active/${lane.laneId}/wip.md`, 'architecture/gone.md'] });
+  assert.equal(deletion.code, 0);
+  assert.deepEqual(deletion.mark.paths, ['architecture/gone.md']);
+});
+
+test('a named directory in a git checkout reached through a symlink is listed under the path as named', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'symlinked-root');
+  const link = path.join(ws.tempDir, 'docs-link');
+  await symlink(ws.rootDir, link);
+  const work = await fingerprintWork({ rootDir: link, laneDir: path.join(link, 'sessions', 'active', lane.laneId), paths: ['architecture/platform'] });
+  const covered = work.covers.paths[0];
+  assert.equal(covered.kind, 'directory');
+  assert.ok(covered.covered >= 1);
+  for (const entry of work.entries) assert.doesNotMatch(entry, /\t\.\.\//, 'no entry reaches outside the directory');
+  // The same work through the real path fingerprints the same.
+  const direct = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['architecture/platform'] });
+  assert.equal(work.fingerprint, direct.fingerprint);
+});
+
+test('every file in a wholly ignored directory counts as left out', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'ignored-dir');
+  await writeFile(path.join(ws.rootDir, '.gitignore'), `${await readFile(path.join(ws.rootDir, '.gitignore'), 'utf8')}architecture/platform/build/\n`, 'utf8');
+  await mkdir(path.join(ws.rootDir, 'architecture/platform/build/deep'), { recursive: true });
+  for (const name of ['a.txt', 'b.txt', 'deep/c.txt']) await writeFile(path.join(ws.rootDir, 'architecture/platform/build', name), 'x\n', 'utf8');
+  const work = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['architecture/platform'] });
+  assert.equal(work.covers.paths[0].ignored, 3);
+});
+
+test('a new mark after a clean pass is ready for review, not review clean', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'clean-then-mark', { worktree: true });
+  const first = await mark(ws, lane);
+  const short = first.mark.round_id.slice(0, 12);
+  await writeReviewLog(lane, [`- pass 1 | 2026-11-22 10:00 -08:00 | Codex 0.171.0 (gpt-6.2-astra requested) via the relay | relay write abcdef012345, round ${short}; the diff | no findings`]);
+  const stageOf = async () => (await listProjectSessions({ cwd: ws.tempDir, rootDir: ws.rootDir })).inventory.lanes.find((item) => item.id === lane.laneId).stage;
+  assert.equal(await stageOf(), 'review clean');
+  // The builder changes the work and marks a new round.
+  await writeFile(path.join(lane.worktreeDir, 'src/index.js'), 'export const answer = 44;\n', 'utf8');
+  await mark(ws, lane);
+  assert.equal(await stageOf(), 'ready for review');
 });
 
 test('writeReadyMark refuses work that names nothing', async (t) => {
