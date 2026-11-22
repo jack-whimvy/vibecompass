@@ -26,6 +26,7 @@ import {
 } from '../src/relay-adapters.js';
 import { REVIEWER_ANSWER_SCHEMA } from '../src/relay-record.js';
 import {
+  classifyAppsCheck,
   classifyFixtureCheck,
   classifyWriteCheck,
   readClaudeWriteEvidence,
@@ -109,6 +110,19 @@ function appsEvidence(rolloutText, stderr) {
   return { appTools, mcpConnections };
 }
 
+// The account's apps tool cache in a Codex home. The check deletes it before
+// each run, so a run that fetches the account's app tools writes it again.
+const APPS_CACHE_DIRS = ['codex_apps_tools', 'codex_apps_server_info'];
+function appsCacheFiles(home) {
+  return APPS_CACHE_DIRS.flatMap((dir) => {
+    const full = path.join(home, 'cache', dir);
+    return existsSync(full) ? readdirSync(full).map((file) => path.join(full, file)) : [];
+  });
+}
+function clearAppsCache(home) {
+  for (const file of appsCacheFiles(home)) rmSync(file, { force: true });
+}
+
 /** Process rows as the report keeps them: pid, start time, and which fixture. */
 function describeRows(rows, tokens) {
   return (rows ?? []).map((row) => ({ pid: row.pid, started: row.startedAt, fixture: tokens.find((value) => row.command.includes(value)) ?? 'another' }));
@@ -184,13 +198,15 @@ async function checkCodex(options) {
 
   const run = async (name, args, input) => {
     for (const file of readdirSync(markers)) rmSync(path.join(markers, file));
+    clearAppsCache(home);
     const result = await runWatchedTurn({ command, args: [...prefix, ...args], cwd: project, env, input, token: watchToken, timeoutMs: 600_000 });
+    const appsCacheWritten = appsCacheFiles(home).length > 0;
     save(base, `${name}.stdout.jsonl`, result.stdout);
     save(base, `${name}.stderr.txt`, result.stderr);
     const seenTokens = allTokens.filter((value) => result.rows.some((row) => row.command.includes(value)));
     const markersWritten = readdirSync(markers);
-    report.runs[name] = { args: [...prefix, ...args], exit: result.code, started_at: result.startedAt, seenTokens, markersWritten, fixtures_seen: describeRows(result.rows, allTokens), earlier_fixtures_ignored: describeRows(result.ignored, allTokens), fixtures_left_before: describeRows(result.leftBefore, allTokens) };
-    return { ...result, seenTokens, markersWritten };
+    report.runs[name] = { args: [...prefix, ...args], exit: result.code, started_at: result.startedAt, seenTokens, markersWritten, fixtures_seen: describeRows(result.rows, allTokens), earlier_fixtures_ignored: describeRows(result.ignored, allTokens), fixtures_left_before: describeRows(result.leftBefore, allTokens), apps_cache_written: appsCacheWritten };
+    return { ...result, seenTokens, markersWritten, appsCacheWritten };
   };
 
   // 1. stdin closes empty: no model turn.
@@ -233,28 +249,20 @@ async function checkCodex(options) {
     checks.push({ check: `write and wider sandbox (${mode})`, ...check, sandbox_policies: evidence.sandboxPolicies });
   }
   // The account's apps and remote plugins (connected tools that come with the
-  // sign-in, not a config file): the control's thread lists their tools, or
-  // its stderr shows an MCP connection; the reviewer's thread and stderr must
-  // show neither.
+  // sign-in, not a config file): the control's thread lists their tools, its
+  // stderr shows an MCP connection, or it writes the apps tool cache again;
+  // the reviewer's thread, stderr, and the cache must show none of these.
   const controlThread = readCodexEvents(control.stdout).threadId;
   const controlRollout = controlThread ? rolloutFor(home, controlThread) : null;
-  const controlApps = appsEvidence(controlRollout ? readFileSync(controlRollout, 'utf8') : '', control.stderr);
+  const controlApps = { ...appsEvidence(controlRollout ? readFileSync(controlRollout, 'utf8') : '', control.stderr), cacheWritten: control.appsCacheWritten };
   const reviewerRollout = threadId ? rolloutFor(home, threadId) : null;
   const reviewerRolloutText = reviewerRollout ? readFileSync(reviewerRollout, 'utf8') : '';
   report.apps = { control: controlApps };
   for (const [mode, restricted] of [['fresh', fresh], ['resumed', resumed]]) {
     if (!restricted) continue;
-    const seen = appsEvidence(reviewerRolloutText, restricted.stderr);
+    const seen = { ...appsEvidence(reviewerRolloutText, restricted.stderr), cacheWritten: restricted.appsCacheWritten };
     report.apps[mode] = seen;
-    const shown = controlApps.appTools.length > 0 || controlApps.mcpConnections > 0;
-    checks.push({
-      check: `account apps and plugins (${mode})`,
-      ...(!shown
-        ? { verdict: 'inconclusive', reason: 'the control showed no app tools and no MCP connection, so they aren\'t known to load' }
-        : seen.appTools.length > 0 || seen.mcpConnections > 0
-          ? { verdict: 'loaded', reason: `the reviewer's thread or stderr shows ${seen.appTools.length} app tools and ${seen.mcpConnections} MCP connection lines` }
-          : { verdict: 'held', reason: `the control showed ${controlApps.appTools.length} app tools and ${controlApps.mcpConnections} MCP connection lines; the reviewer's thread and stderr show none` }),
-    });
+    checks.push({ check: `account apps and plugins (${mode})`, ...classifyAppsCheck({ control: controlApps, restricted: seen }) });
   }
   report.thread_id_present = Boolean(threadId);
   report.checks = checks;
@@ -444,20 +452,27 @@ async function checkClaudeBuilder(options) {
   await run('start', ['-p', '--session-id', conversation, '--output-format', 'stream-json', '--verbose'], 'Reply with the single word ready.', project, env);
   const turnEnv = builderTurnEnv(env, { ghConfigDir: path.join(base, 'gh-empty'), relayToken: `check-${randomUUID()}` });
   mkdirSync(path.join(base, 'gh-empty'), { recursive: true });
-  // The empty-stdin exit with the builder's own launch: no model turn, and
-  // nothing added to the conversation's transcript.
-  const transcriptLines = () => {
+  // The empty-stdin exit with the builder's own launch: no model turn, and no
+  // message added to the conversation's transcript. The record types it adds
+  // are kept (2.1.318 adds bookkeeping records such as `mode` and `cost-state`).
+  const transcriptTypes = () => {
     const root = path.join(configDir ?? path.join(process.env.HOME ?? '', '.claude'), 'projects');
     if (!existsSync(root)) return null;
     for (const dir of readdirSync(root)) {
       const file = path.join(root, dir, `${conversation}.jsonl`);
-      if (existsSync(file)) return readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+      if (existsSync(file)) {
+        return readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => {
+          try { return String(JSON.parse(line).type ?? 'unknown'); } catch { return 'unreadable'; }
+        });
+      }
     }
     return null;
   };
-  const linesBefore = transcriptLines();
+  const typesBefore = transcriptTypes();
   const empty = await run('empty-stdin', claudeBuilderLaunch({ conversationId: conversation, mode: 'default' }).args, '', project, turnEnv);
-  report.runs['empty-stdin'].transcript_lines = { before: linesBefore, after: transcriptLines() };
+  const typesAfter = transcriptTypes();
+  const added = typesBefore && typesAfter ? typesAfter.slice(typesBefore.length) : null;
+  report.runs['empty-stdin'].transcript_lines = { before: typesBefore?.length ?? null, after: typesAfter?.length ?? null, added, messages_added: added ? added.filter((type) => type === 'user' || type === 'assistant').length : null };
   // The push rewrite on its own, with no model: the two spellings a deny list
   // doesn't match, run directly in the turn's environment.
   report.push_rewrite = ['git -C . push origin main', 'sh -c \'git push origin main\''].map((command) => {
@@ -521,7 +536,7 @@ function printReport(report, base) {
   if (report.verdict) process.stdout.write(`Verdict: ${report.verdict}\n`);
   for (const check of report.checks ?? []) process.stdout.write(`- ${check.check}: ${check.verdict} — ${check.reason}\n`);
   for (const [name, run] of Object.entries(report.runs)) {
-    process.stdout.write(`Run ${name}: exit ${run.exit}${run.seenTokens ? `; fixtures seen: ${run.seenTokens.length}` : ''}${run.earlier_fixtures_ignored?.length ? `; earlier runs' fixtures ignored: ${run.earlier_fixtures_ignored.length}` : ''}${run.markersWritten ? `; markers: ${run.markersWritten.join(', ') || 'none'}` : ''}${run.first_non_hook_event ? `; first non-hook event: ${run.first_non_hook_event}` : ''}${run.init?.cwd ? `; init cwd: ${run.init.cwd}` : ''}${run.init && 'same_session' in run.init ? `; same conversation: ${run.init.same_session ? 'yes' : 'no'}` : ''}${run.permission_denials?.length ? `; denials: ${run.permission_denials.map((item) => item.command ?? item.tool).join(' | ')}` : ''}${run.relay_turn_check ? `; the relay's turn check: ${run.relay_turn_check}` : ''}${run.transcript_lines ? `; transcript lines ${run.transcript_lines.before} -> ${run.transcript_lines.after}` : ''}${'remote_refs' in run ? `; remote refs: ${run.remote_refs || 'none'}` : ''}\n`);
+    process.stdout.write(`Run ${name}: exit ${run.exit}${run.seenTokens ? `; fixtures seen: ${run.seenTokens.length}` : ''}${run.earlier_fixtures_ignored?.length ? `; earlier runs' fixtures ignored: ${run.earlier_fixtures_ignored.length}` : ''}${run.markersWritten ? `; markers: ${run.markersWritten.join(', ') || 'none'}` : ''}${'apps_cache_written' in run ? `; apps cache written: ${run.apps_cache_written ? 'yes' : 'no'}` : ''}${run.first_non_hook_event ? `; first non-hook event: ${run.first_non_hook_event}` : ''}${run.init?.cwd ? `; init cwd: ${run.init.cwd}` : ''}${run.init && 'same_session' in run.init ? `; same conversation: ${run.init.same_session ? 'yes' : 'no'}` : ''}${run.permission_denials?.length ? `; denials: ${run.permission_denials.map((item) => item.command ?? item.tool).join(' | ')}` : ''}${run.relay_turn_check ? `; the relay's turn check: ${run.relay_turn_check}` : ''}${run.transcript_lines ? `; transcript lines ${run.transcript_lines.before} -> ${run.transcript_lines.after}${run.transcript_lines.added ? ` (added: ${run.transcript_lines.added.join(', ') || 'nothing'}; messages added: ${run.transcript_lines.messages_added})` : ''}` : ''}${'remote_refs' in run ? `; remote refs: ${run.remote_refs || 'none'}` : ''}\n`);
   }
   for (const item of report.push_rewrite ?? []) process.stdout.write(`Push rewrite, no model: ${item.command} -> exit ${item.exit}: ${item.stderr_first_line}; remote refs: ${item.remote_refs || 'none'}\n`);
   if (report.empty_stdin) process.stdout.write(`Empty stdin: exit ${report.empty_stdin.exit}; model turn: ${report.empty_stdin.model_turn ? 'yes' : 'no'}\n`);

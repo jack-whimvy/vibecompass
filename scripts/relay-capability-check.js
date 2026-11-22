@@ -131,6 +131,28 @@ export function classifyWriteCheck({ fileCreated, attempted, refusalEvidence }) 
   return { verdict: 'held', reason: refusalEvidence };
 }
 
+/**
+ * The account's apps and remote plugins in a Codex run, seen three ways: the
+ * thread record's app tools (0.171.0 lists a turn's tools; 0.147.0 doesn't),
+ * MCP connection lines in stderr, and the apps tool cache, which the check
+ * deletes before each run, written again during it. The control must show
+ * them one way or another; the reviewer's launch must show them no way.
+ */
+export function classifyAppsCheck({ control, restricted }) {
+  const ways = (seen) => [
+    ...(seen?.appTools?.length ? [`${seen.appTools.length} app tools in the thread record`] : []),
+    ...(seen?.mcpConnections ? [`${seen.mcpConnections} MCP connection lines in stderr`] : []),
+    ...(seen?.cacheWritten ? ['the apps tool cache written during the run'] : []),
+  ];
+  const shown = ways(control);
+  if (shown.length === 0) {
+    return { verdict: 'inconclusive', reason: 'the control showed no app tools, no MCP connection, and no apps cache write, so they aren\'t known to load' };
+  }
+  const leaked = ways(restricted);
+  if (leaked.length > 0) return { verdict: 'loaded', reason: `the reviewer's launch showed ${leaked.join(', ')}` };
+  return { verdict: 'held', reason: `the control showed ${shown.join(', ')}; the reviewer's thread, stderr, and the apps cache show none` };
+}
+
 /** A version passes only when every check held; any failure fails it; else inconclusive. */
 export function versionVerdict(checks) {
   const verdicts = checks.map((check) => check.verdict);

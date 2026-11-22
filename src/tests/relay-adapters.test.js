@@ -27,6 +27,7 @@ import {
   validateBuilderMode,
 } from '../relay-adapters.js';
 import {
+  classifyAppsCheck,
   classifyFixtureCheck,
   classifyWriteCheck,
   readClaudeWriteEvidence,
@@ -232,6 +233,22 @@ test('the check harness: a fixture absent for the whole restricted turn, with th
   const check = classifyFixtureCheck({ control, restricted });
   assert.equal(check.verdict, 'held');
   assert.equal(versionVerdict([check, { verdict: 'held' }]), 'pass');
+});
+
+test('the apps check: the control shows the account\'s apps one way or another, the reviewer\'s launch no way', () => {
+  const none = { appTools: [], mcpConnections: 0, cacheWritten: false };
+  // 0.147.0's thread record lists no tools: the cache write alone shows the control loaded them.
+  const cacheOnly = classifyAppsCheck({ control: { ...none, cacheWritten: true }, restricted: none });
+  assert.equal(cacheOnly.verdict, 'held');
+  assert.match(cacheOnly.reason, /the apps tool cache written during the run/);
+  assert.equal(classifyAppsCheck({ control: { ...none, appTools: ['mcp__codex_apps__x'] }, restricted: none }).verdict, 'held');
+  assert.equal(classifyAppsCheck({ control: none, restricted: none }).verdict, 'inconclusive');
+  // Any one way under the reviewer's launch counts as loaded.
+  for (const leak of [{ cacheWritten: true }, { appTools: ['mcp__codex_apps__x'] }, { mcpConnections: 1 }]) {
+    const check = classifyAppsCheck({ control: { ...none, cacheWritten: true }, restricted: { ...none, ...leak } });
+    assert.equal(check.verdict, 'loaded');
+    assert.equal(versionVerdict([{ verdict: 'held' }, check]), 'fail');
+  }
 });
 
 test('write checks need the tool\'s record of a refused attempt', () => {
