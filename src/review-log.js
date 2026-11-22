@@ -8,8 +8,8 @@ import { stepFence } from './markdown-sections.js';
 export const REVIEW_CHECK_MODES = ['warn', 'block', 'off'];
 export const DEFAULT_REVIEW_CHECK = 'warn';
 export const DEFAULT_ROUND_CAP = 3;
-const MIN_ROUND_CAP = 1;
-const MAX_ROUND_CAP = 10;
+export const MIN_ROUND_CAP = 1;
+export const MAX_ROUND_CAP = 10;
 const REVIEW_SETTING_KEYS = ['check', 'round_cap'];
 
 const REVIEW_LOG_HEADING = '## review log';

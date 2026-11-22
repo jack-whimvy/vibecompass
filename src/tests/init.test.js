@@ -11,6 +11,7 @@ import { buildDocsReviewAnchorContext } from '../docs-review.js';
 import { sha256Text } from '../hash.js';
 import { fileURLToPath } from 'node:url';
 import { parseCliArgs, runCli, isDirectExecution } from '../cli.js';
+import { REVIEW_ROUND_CAP_PROMPT } from '../setup.js';
 import { getGeneratedWorkflowFiles } from '../workflows/registry.js';
 
 const docsReviewFixtureDir = fileURLToPath(new URL('fixtures/docs-review-output/', import.meta.url));
@@ -3874,6 +3875,11 @@ test('runCli supports guided init with placement recommendation and first-sessio
             return laneIdAnswers.shift();
           }
 
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -3956,6 +3962,11 @@ test('runCli guided init defaults project mode to local-primary', async () => {
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4418,6 +4429,11 @@ test('runCli guided init can adopt existing unmarked agent files after confirmat
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4490,6 +4506,11 @@ test('runCli guided init infers the current single Git repo', async (t) => {
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4561,6 +4582,11 @@ test('runCli guided init infers a single child Git repo from a parent workspace'
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4636,6 +4662,11 @@ test('runCli guided init infers multiple child Git repos from a parent workspace
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4707,6 +4738,11 @@ test('runCli guided init ignores non-git children when inferring a parent worksp
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4780,6 +4816,11 @@ test('runCli guided init falls back to repo prompts when detected child repos ar
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }
@@ -4848,6 +4889,11 @@ test('runCli guided init defaults a single primary repo to the matching child di
         cwd: tempDir,
         async prompt(spec) {
           prompts.push(spec.message);
+          // D-420: guided setup asks for the review cap; Enter accepts the default.
+          if (spec.message === REVIEW_ROUND_CAP_PROMPT) {
+            return '';
+          }
+
           if (!answers.has(spec.message)) {
             throw new Error(`Unexpected guided prompt: ${spec.message}`);
           }

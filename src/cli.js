@@ -24,6 +24,7 @@ import {
 import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { countPassesPastCap } from './review-log.js';
+import { parseRoundCapValue, runReviewSettings } from './review-settings.js';
 import { checkGroupedDecisionIndex, refreshGroupedDecisionIndex, resolveDefaultIndexGroupLabel } from './decision-index.js';
 import { resolveLaneMarkerContext, resolveLaneSelection } from './lane-marker.js';
 import { syncAgentInstructionFiles } from './generators/agent-files/index.js';
@@ -263,6 +264,29 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     writeWarnings(io, result.warnings);
     return result.ok ? 0 : 1;
+  }
+
+  if (parsed.command === 'review-settings') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const result = await runReviewSettings({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({
+        root_dir: result.rootDir,
+        project_file: result.projectFilePath,
+        check: result.check,
+        round_cap: result.roundCap,
+        round_cap_source: result.roundCapSource,
+        changed: result.changed,
+        warnings: result.warnings,
+      }, null, 2)}\n`);
+    } else {
+      io.stdout.write(renderReviewSettingsText(result, parsed.options.roundCap !== undefined));
+    }
+    writeWarnings(io, result.warnings);
+    return 0;
   }
 
   if (parsed.command === 'connect-hosted') {
@@ -1054,6 +1078,10 @@ export function parseCliArgs(argv) {
       return parseReviewCheckArgs(rest);
     }
 
+    if (command === 'review-settings') {
+      return parseReviewSettingsArgs(rest);
+    }
+
     if (command === 'secret-check') {
       return parseSecretCheckArgs(rest);
     }
@@ -1227,6 +1255,10 @@ export function parseCliArgs(argv) {
       case '--close-session-git-remote':
         parsed.closeSessionGitRemote = value;
         break;
+      case '--review-round-cap':
+        // D-420 item 3: refused before anything is written.
+        parsed.reviewRoundCap = parseRoundCapValue(value, '--review-round-cap');
+        break;
       default:
         throw new Error(`Unknown flag "${token}".`);
     }
@@ -1264,6 +1296,7 @@ export function parseCliArgs(argv) {
       sessionId: parsed.sessionId,
       closeSessionGitPublish: parsed.closeSessionGitPublish,
       closeSessionGitRemote: parsed.closeSessionGitRemote,
+      ...(parsed.reviewRoundCap !== undefined ? { reviewRoundCap: parsed.reviewRoundCap } : {}),
       adoptExistingAgentFiles: parsed.adoptExistingAgentFiles,
       ...(parsed.withWorkflow || parsed.withClaude || parsed.withAgents
         ? {
@@ -1638,6 +1671,63 @@ function renderReviewCheckJson(result) {
     failures: result.failures.map((failure) => ({ kind: failure.kind, message: failure.message, next_step: failure.nextStep })),
     warnings: result.warnings,
   };
+}
+
+function parseReviewSettingsArgs(argv) {
+  const parsed = {};
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--round-cap':
+        // D-420 item 3: refused before anything is written.
+        parsed.roundCap = parseRoundCapValue(value, '--round-cap');
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'review-settings',
+    options: parsed,
+  };
+}
+
+// D-420 item 2: the effective settings, and on a write what changed and when
+// it takes effect.
+function renderReviewSettingsText(result, wrote) {
+  const lines = [];
+  if (wrote) {
+    lines.push(result.changed
+      ? `Set metadata.workflow.review.round_cap to ${result.roundCap} in ${result.projectFilePath} (was ${result.previousRoundCap}).`
+      : `metadata.workflow.review.round_cap is already ${result.roundCap} in ${result.projectFilePath}; nothing written.`);
+  }
+  lines.push(`Review check: ${result.check}`);
+  lines.push(`Review round cap: ${result.roundCap}${result.roundCapSource === 'project.yaml' ? '' : ` (${result.roundCapSource})`}`);
+  if (wrote) {
+    lines.push('The review check uses the new cap at once. context.md\'s Workflow defaults line shows it after the next `vibecompass refresh-workflow --apply`. A review relay already running keeps the cap it started with as its ceiling and stops at the lower of the two.'); // D-420 item 2, D-223
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 function parseConnectHostedArgs(argv) {
@@ -3525,6 +3615,8 @@ function usageText() {
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
     '  vibecompass review-check [--session <lane-id>] [--json] [options]',
     '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails', // D-394
+    '  vibecompass review-settings [--round-cap <n>] [--json] [options]',
+    '                                        Show the review check and round cap; --round-cap sets the cap (1-10) in project.yaml', // D-420
     '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [--group <label>] [options]',
     '  vibecompass refresh-decision-index [--check] [--session <lane-id>] [--group <label>] [options]',
     '  vibecompass next-decision-id [options]',
@@ -3565,6 +3657,7 @@ function usageText() {
     '  --session-id <lane-id>                Required with --start-session; names the first builder lane',
     '  --close-session-git-publish          Include a Git publish step in the stored close-session workflow',
     '  --close-session-git-remote <name>    Default Git remote name for that close-session publish step',
+    '  --review-round-cap <n>               Review passes before the builder stops and asks the owner, 1-10 (default 3); writes metadata.workflow.review.round_cap', // D-420
     '  --force                              Overwrite an existing project.yaml',
     '  --replace-active-lanes               Allow --force to replace a root that has active session lanes',
     '',
@@ -3728,6 +3821,12 @@ function usageText() {
     '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
     '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
+    '',
+    'Review-settings options:', // D-420
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --round-cap <n>                      Set metadata.workflow.review.round_cap, a whole number from 1 to 10, under the memory-root lock; every other key is kept',
+    '                                        Without it the command writes nothing. The check uses a new cap at once; context.md shows it after the next refresh-workflow --apply',
+    '  --json                               Print check, round_cap, where the cap came from, and any warning as JSON',
     '',
     'Secret-check options:', // D-406
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',

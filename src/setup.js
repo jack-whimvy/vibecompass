@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { access, readFile, readdir, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_ROUND_CAP, MAX_ROUND_CAP, MIN_ROUND_CAP, parseRoundCapValue } from './review-settings.js';
 import { createInterface } from 'node:readline/promises';
 import { promisify } from 'node:util';
 import { getSupportedAgentFilePaths } from './generators/agent-files/index.js';
@@ -88,6 +89,7 @@ export async function resolveInitCliOptions(options, environment = {}) {
       metadata: resolved.metadata,
       closeSessionGitPublish: resolved.closeSessionGitPublish,
       closeSessionGitRemote: resolved.closeSessionGitRemote,
+      reviewRoundCap: resolved.reviewRoundCap ?? undefined,
       placementPattern: resolved.placementPattern,
     },
     placementPattern: resolved.placementPattern ?? null,
@@ -641,6 +643,10 @@ async function completeGuidedInitOptions(options, environment) {
     );
   }
 
+  if (resolved.reviewRoundCap === undefined) {
+    resolved.reviewRoundCap = await askReviewRoundCap(prompter);
+  }
+
   return {
     options: resolved,
     summary: {
@@ -1139,6 +1145,30 @@ async function askChoice(prompter, message, choices, options = {}) {
     }
 
     prompter.write('Please choose one of the listed options.\n');
+  }
+}
+
+// D-420 item 1: guided setup asks for the review cap, 1 to 10. An answer
+// writes metadata.workflow.review.round_cap; accepting the default (Enter)
+// writes nothing, and a missing key still means the default.
+export const REVIEW_ROUND_CAP_PROMPT = `How many review passes run before the builder stops and asks the owner? (${MIN_ROUND_CAP} to ${MAX_ROUND_CAP})`;
+
+async function askReviewRoundCap(prompter) {
+  while (true) {
+    const raw = await prompter.ask({
+      type: 'input',
+      message: REVIEW_ROUND_CAP_PROMPT,
+      defaultValue: String(DEFAULT_ROUND_CAP),
+    });
+    const trimmed = String(raw ?? '').trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      return parseRoundCapValue(trimmed, 'The review cap');
+    } catch (error) {
+      prompter.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    }
   }
 }
 

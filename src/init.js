@@ -6,6 +6,7 @@ import { withMemoryRootLock } from './serialization.js';
 import { scaffoldInitFiles } from './scaffold.js';
 import { applyPlacementDefaults } from './setup.js';
 import { buildWorkflowMetadata } from './workflow.js';
+import { parseRoundCapValue, withRoundCap } from './review-settings.js';
 import { parseSimpleYaml } from './simple-yaml.js';
 import {
   assertValidSyncTargetName,
@@ -338,6 +339,11 @@ function normalizeInitOptions(options) {
       gitRemote: preparedOptions.closeSessionGitRemote,
     })),
   };
+  // D-420 item 1: a cap chosen at setup is written; none chosen writes no
+  // review: block, as before.
+  if (preparedOptions.reviewRoundCap !== undefined && preparedOptions.reviewRoundCap !== null) {
+    projectConfig.metadata = withRoundCap({ metadata: projectConfig.metadata }, parseRoundCapValue(preparedOptions.reviewRoundCap, '--review-round-cap')).metadata;
+  }
 
   const bootstrapOptions = normalizeBootstrapOptions(preparedOptions.bootstrap, {
     rootDir,
