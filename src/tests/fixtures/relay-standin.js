@@ -10,6 +10,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import path from 'node:path';
 
 const [tool, ...args] = process.argv.slice(2);
+const BUILT_IN_PLUGINS = ['cc-plugin-agents-md', 'cc-plugin-telemetry', 'cc-plugin-privacy', 'cc-plugin-plugin-authoring'].map((name) => ({ name, path: 'builtin', source: `${name}@builtin` }));
 const dir = process.env.RELAY_STANDIN_DIR;
 const scenario = JSON.parse(readFileSync(path.join(dir, 'scenario.json'), 'utf8'));
 const spec = scenario[tool] ?? {};
@@ -160,9 +161,11 @@ async function claude() {
       cwd: process.cwd(),
       permissionMode: turn.initMode ?? mode,
       model: turn.model ?? 'claude-opus-5-5',
-      tools: turn.tools ?? (reviewer ? ['Read', 'Glob', 'Grep', 'Bash'] : ['Bash', 'Edit', 'Read']),
+      // A reviewer's init as Claude Code 2.1.318 lists it under the relay's
+      // launch: the reading set, the answer's tool, and the built-in plugins.
+      tools: turn.tools ?? (reviewer ? ['Bash', 'Glob', 'Grep', 'Read', 'StructuredOutput'] : ['Bash', 'Edit', 'Read']),
       mcp_servers: turn.mcpServers ?? [],
-      plugins: turn.plugins ?? [],
+      plugins: turn.plugins ?? (reviewer ? BUILT_IN_PLUGINS : []),
     });
   }
   if (turn.hookAfterInit) emit({ type: 'system', subtype: 'hook_response', hook_name: 'PreToolUse' });

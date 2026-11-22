@@ -14,8 +14,10 @@ import { spawn } from 'node:child_process';
  * An adapter with no listed version is not enabled.
  */
 export const SUPPORTED_REVIEWER_VERSIONS = Object.freeze({
-  codex: Object.freeze({ darwin: Object.freeze([]) }),
-  claude: Object.freeze({ darwin: Object.freeze([]) }),
+  // Codex 0.171.0 and Claude Code 2.1.318 on macOS: session 63's checks,
+  // 2026-11-22 (Claude Code's built-in plugins allowed by D-421).
+  codex: Object.freeze({ darwin: Object.freeze(['0.171.0']) }),
+  claude: Object.freeze({ darwin: Object.freeze(['2.1.318']) }),
 });
 
 // The builder: Claude Code from the oldest checked version on; newer runs, and
@@ -380,6 +382,11 @@ export function checkBuilderInit(stream, { conversationId, mode }) {
  * hook event, or an init listing an MCP server, a plugin, or a tool outside
  * the reading set, discards the turn.
  */
+/** A plugin entry in Claude Code's init that ships inside Claude Code: path `builtin` and a source ending in `@builtin`. */
+export function isBuiltInClaudePlugin(plugin) {
+  return Boolean(plugin) && typeof plugin === 'object' && plugin.path === 'builtin' && typeof plugin.source === 'string' && plugin.source.endsWith('@builtin');
+}
+
 export function checkClaudeReviewerStream(stream) {
   if (stream.hookEvents.length > 0) {
     return `the reviewer's stream shows a hook event (${stream.hookEvents[0].subtype}${stream.hookEvents[0].hook_name ? ` ${stream.hookEvents[0].hook_name}` : ''}); a hook ran, so the turn is discarded`;
@@ -391,9 +398,13 @@ export function checkClaudeReviewerStream(stream) {
   if (servers.length > 0) {
     return `the reviewer's init lists an MCP server (${servers.map((server) => server?.name ?? String(server)).join(', ')})`;
   }
+  // Plugins built into Claude Code ship with the exact version checked, not
+  // from any configuration, so they don't end the turn (D-421); any other
+  // plugin does.
   const plugins = Array.isArray(stream.init.plugins) ? stream.init.plugins : [];
-  if (plugins.length > 0) {
-    return `the reviewer's init lists a plugin (${plugins.map((plugin) => plugin?.name ?? String(plugin)).join(', ')})`;
+  const loaded = plugins.filter((plugin) => !isBuiltInClaudePlugin(plugin));
+  if (loaded.length > 0) {
+    return `the reviewer's init lists a plugin (${loaded.map((plugin) => plugin?.name ?? String(plugin)).join(', ')})`;
   }
   const tools = Array.isArray(stream.init.tools) ? stream.init.tools : [];
   const outside = tools.filter((tool) => !CLAUDE_REVIEWER_TOOLS.includes(tool) && !CLAUDE_REVIEWER_ANSWER_TOOLS.includes(tool));

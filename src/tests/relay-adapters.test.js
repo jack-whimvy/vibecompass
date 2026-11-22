@@ -73,6 +73,8 @@ test('the package lists only versions whose capability checks held', () => {
     }
   }
   assert.ok(Object.isFrozen(SUPPORTED_REVIEWER_VERSIONS));
+  // Exactly the versions the real-tool checks passed on, and no other platform.
+  assert.deepEqual(JSON.parse(JSON.stringify(SUPPORTED_REVIEWER_VERSIONS)), { codex: { darwin: ['0.171.0'] }, claude: { darwin: ['2.1.318'] } });
 });
 
 test('the builder gate: the minimum, and newer versions run with a note', () => {
@@ -169,6 +171,19 @@ test('streams: Codex thread ids and failures; Claude Code init, hooks, and resul
   assert.equal(checkClaudeReviewerStream(readClaudeStream(withAnswerTool)), null);
   const withPlugin = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [], plugins: [{ name: 'p', path: '/x', source: 'p@market' }] });
   assert.match(checkClaudeReviewerStream(readClaudeStream(withPlugin)), /lists a plugin \(p\)/);
+  // The four plugins built into Claude Code 2.1.318, as its init listed them in the real checks, don't end the turn.
+  const builtIn = ['cc-plugin-agents-md', 'cc-plugin-telemetry', 'cc-plugin-privacy', 'cc-plugin-plugin-authoring'].map((name) => ({ name, path: 'builtin', source: `${name}@builtin` }));
+  const withBuiltIn = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Bash', 'Glob', 'Grep', 'Read', 'StructuredOutput'], mcp_servers: [], plugins: builtIn });
+  assert.equal(checkClaudeReviewerStream(readClaudeStream(withBuiltIn)), null);
+  // Only one of the two marks, or another plugin beside the built-in ones, still ends it.
+  for (const [plugin, name] of [[{ name: 'a', path: 'builtin', source: 'a@market' }, 'a'], [{ name: 'b', path: '/plugins/b', source: 'b@builtin' }, 'b'], [{ name: 'c', path: 'builtin' }, 'c'], ['d', 'd']]) {
+    const mixed = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [], plugins: [...builtIn, plugin] });
+    const reason = checkClaudeReviewerStream(readClaudeStream(mixed));
+    assert.match(reason, new RegExp(`lists a plugin \\(${name}\\)$`));
+  }
+  // A hook event or an MCP server still ends a turn whose plugins are all built in.
+  const builtInWithMcp = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [{ name: 'x' }], plugins: builtIn });
+  assert.match(checkClaudeReviewerStream(readClaudeStream(builtInWithMcp)), /MCP server \(x\)/);
 });
 
 test('the fixed text carries only the lane id, the pass number, paths, and the round id', () => {

@@ -280,9 +280,9 @@ test('reviewer versions: only exact listed versions reach the launch', async (t)
   assert.equal(packaged.code, 1);
 });
 
-test('a Claude Code reviewer: a clean pass names the reported model; a hook event or an MCP server discards the turn', async (t) => {
+test('a Claude Code reviewer: a pass whose init lists the built-in plugins counts; a hook event, an MCP server, or another plugin discards the turn', async (t) => {
   const s = await setup(t);
-  await s.standin.setScenario({ claude: { version: '2.1.318', reviewTurns: [{ answer: ONE_FINDING, newSessionId: 'rev-conv-1', model: 'claude-opus-5-5' }, { answer: CLEAN_ANSWER, hookAfterInit: true }, { answer: CLEAN_ANSWER, mcpServers: [{ name: 'evil', status: 'connected' }] }] } });
+  await s.standin.setScenario({ claude: { version: '2.1.318', reviewTurns: [{ answer: ONE_FINDING, newSessionId: 'rev-conv-1', model: 'claude-opus-5-5' }, { answer: CLEAN_ANSWER, hookAfterInit: true }, { answer: CLEAN_ANSWER, mcpServers: [{ name: 'evil', status: 'connected' }] }, { answer: CLEAN_ANSWER, plugins: [{ name: 'market-plugin', path: '/plugins/market-plugin', source: 'market-plugin@market' }] }] } });
   await s.mark(null);
   const first = await s.relay(['--reviewer', 'claude']);
   assert.equal(first.code, 0, first.out);
@@ -305,6 +305,9 @@ test('a Claude Code reviewer: a clean pass names the reported model; a hook even
   assert.equal(reviews[1].args[reviews[1].args.indexOf('--resume') + 1], 'rev-conv-1');
   const mcp = await s.relay(['--reviewer', 'claude']);
   assert.match(mcp.out, /the reviewer's init lists an MCP server \(evil\)/);
+  const plugin = await s.relay(['--reviewer', 'claude']);
+  assert.equal(plugin.code, 1);
+  assert.match(plugin.out, /the reviewer's init lists a plugin \(market-plugin\)/);
   assert.equal(parse(await s.wip()).passCount, 1);
 });
 

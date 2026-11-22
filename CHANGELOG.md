@@ -26,7 +26,9 @@ package's installed text, command output, and help do.
   command, path, mode, or model from a committed file.
 - A reviewer runs only on an exact tool version listed as supported for its
   platform, each listed once its read-only checks held on that version; an
-  unlisted version stops before launch and names the choices.
+  unlisted version stops before launch and names the choices. Listed on macOS:
+  Codex 0.171.0 and Claude Code 2.1.318. The builder needs Claude Code 2.1.318
+  or later.
 - Inside a relayed builder turn, `close-session`, `end-session`,
   `review-relay`, `push`, `promote-hosted`, `demote-hosted`, `connect-hosted`,
   and `sync-adopt` refuse, pushes are rewritten to fail, and `gh` has no

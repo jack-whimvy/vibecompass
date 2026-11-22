@@ -388,8 +388,9 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   relay checks the answer (exactly one verdict for each finding waiting for the
   reviewer) and writes it as the pass, in the reviewer's two sections only. A
   reviewer runs only on an exact version listed as supported for your platform,
-  each listed once its read-only checks held; an unlisted version stops before
-  launch, and you review by hand as before. For programmatic Codex use, OpenAI
+  each listed once its read-only checks held (on macOS: Codex 0.171.0 and
+  Claude Code 2.1.318); an unlisted version stops before launch, and you review
+  by hand as before. The builder needs Claude Code 2.1.318 or later. For programmatic Codex use, OpenAI
   recommends signing in with an API key.
 - **Two modes.** When the mark names a Claude Code conversation and you have
   closed it, the relay loops: a pass, then a fixed `address review` turn in that
