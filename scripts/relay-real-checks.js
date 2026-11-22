@@ -9,6 +9,7 @@
 //   node scripts/relay-real-checks.js codex --base <dir> --label <version> --home <CODEX_HOME> --model <model> [--codex "<command words>"]
 //   node scripts/relay-real-checks.js claude-reviewer --base <dir> --config-dir <CLAUDE_CONFIG_DIR>
 //   node scripts/relay-real-checks.js claude-builder --base <dir> [--config-dir <CLAUDE_CONFIG_DIR>]
+//   node scripts/relay-real-checks.js e2e-prepare --base <dir> [--codex-bin <path to codex or its codex.js>]
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -513,7 +514,18 @@ function prepareEndToEnd(options) {
   node(['init', '--root', '.compass', '--name', 'Relay End To End', '--mode', 'local-only', '--repo', 'app=https://example.invalid/relay-e2e-app.git', '--with-workflow', '--with-claude', '--review-round-cap', '3']);
   // The builder may edit and run the package's commands without prompts.
   mkdirSync(path.join(base, '.claude'), { recursive: true });
-  writeFileSync(path.join(base, '.claude', 'settings.json'), `${JSON.stringify({ permissions: { allow: ['Edit', 'Write', `Bash(node ${cli}:*)`, 'Bash(git diff:*)', 'Bash(git status:*)'] } }, null, 2)}\n`);
+  writeFileSync(path.join(base, '.claude', 'settings.json'), `${JSON.stringify({ permissions: { allow: ['Edit', 'Write', 'Bash(vibecompass:*)', `Bash(node ${cli}:*)`, 'Bash(git diff:*)', 'Bash(git status:*)'] } }, null, 2)}\n`);
+  // Commands on PATH for the run's terminals only: `vibecompass` is this
+  // branch's CLI (the builder's fixed text names it), and `codex` the exact
+  // version given with --codex-bin. Nothing installed is changed.
+  const bin = path.join(base, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const shim = (name, target) => {
+    const line = target.endsWith('.js') ? `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(target)} "$@"` : `exec ${JSON.stringify(target)} "$@"`;
+    writeFileSync(path.join(bin, name), `#!/bin/sh\n${line}\n`, { mode: 0o755 });
+  };
+  shim('vibecompass', cli);
+  if (options['codex-bin']) shim('codex', path.resolve(options['codex-bin']));
   node(['start-session', '--root', '.compass', '--id', 'e2e-lane', '--working-on', 'Relay end-to-end run: sum()', '--repo', 'app', '--branch', 'e2e-sum', '--worktree', '--no-brief']);
   const worktree = path.join(base, 'worktrees', 'e2e-lane', 'app');
   // The seeded change: sum() subtracts.
