@@ -89,7 +89,7 @@ test('builder modes: default, acceptEdits, auto; bypass modes refused', () => {
 
 test('the Codex launches: read-only fresh, resume without a sandbox flag', () => {
   const fresh = codexReviewerLaunch({ model: 'gpt-x', schemaPath: '/s.json', outputPath: '/o.json', gitRepository: false });
-  assert.deepEqual(fresh.args, ['exec', '-s', 'read-only', '--ignore-user-config', '--ignore-rules', '-m', 'gpt-x', '--output-schema', '/s.json', '-o', '/o.json', '--json', '--skip-git-repo-check']);
+  assert.deepEqual(fresh.args, ['exec', '-s', 'read-only', '--ignore-user-config', '--ignore-rules', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins', '--disable', 'browser_use', '--disable', 'in_app_browser', '--disable', 'computer_use', '-m', 'gpt-x', '--output-schema', '/s.json', '-o', '/o.json', '--json', '--skip-git-repo-check']);
   const resumed = codexReviewerLaunch({ model: 'gpt-x', schemaPath: '/s.json', outputPath: '/o.json', threadId: 't-1' });
   assert.deepEqual(resumed.args.slice(0, 3), ['exec', 'resume', 't-1']);
   assert.ok(!resumed.args.includes('-s'));

@@ -175,8 +175,17 @@ export function validateBuilderMode(mode) {
 // ---------------------------------------------------------------------------
 // Launches. The fixed text always goes on stdin.
 
+// Codex features a reviewer turn turns off: hooks (the user's hooks.json
+// still loads under --ignore-user-config), apps and plugins (connected tools,
+// with plugin-bundled MCP servers), and the browser and computer-use tools.
+export const CODEX_REVIEWER_DISABLED_FEATURES = Object.freeze(['hooks', 'apps', 'plugins', 'browser_use', 'in_app_browser', 'computer_use']);
+
 export function codexReviewerLaunch({ model, schemaPath, outputPath, threadId = null, gitRepository = true, extraConfig = [] }) {
-  const common = ['--ignore-user-config', '--ignore-rules', '-m', model, '--output-schema', schemaPath, '-o', outputPath, '--json'];
+  const common = [
+    '--ignore-user-config', '--ignore-rules',
+    ...CODEX_REVIEWER_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
+    '-m', model, '--output-schema', schemaPath, '-o', outputPath, '--json',
+  ];
   const config = extraConfig.flatMap((item) => ['-c', item]);
   const skip = gitRepository ? [] : ['--skip-git-repo-check'];
   // A resumed thread keeps the read-only policy it started with; resume takes no -s.

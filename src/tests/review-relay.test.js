@@ -95,7 +95,9 @@ test('one pass: the relay writes the reviewer\'s answer as the pass and stops cl
   assert.match(parsed.passes[0].scope, /^relay write [0-9a-f]{12}, round [0-9a-f]{12}; the diff and the handoff$/);
   assert.match(readSectionBody(await s.handoff(), REVIEWER_TO_BUILDER_HEADING), /^Relay write [0-9a-f]{12}: pass 1 by Codex 0\.171\.0/);
   const [call] = (await s.standin.calls()).filter((item) => item.kind === 'review');
-  assert.deepEqual(call.args.slice(0, 9), ['exec', '-s', 'read-only', '--ignore-user-config', '--ignore-rules', '-m', 'gpt-test', '--output-schema', path.join(s.lane.laneDir, 'relay-turns', 'answer-schema.json')]);
+  assert.deepEqual(call.args.slice(0, 5), ['exec', '-s', 'read-only', '--ignore-user-config', '--ignore-rules']);
+  assert.deepEqual(call.args.slice(call.args.indexOf('-m'), call.args.indexOf('-m') + 4), ['-m', 'gpt-test', '--output-schema', path.join(s.lane.laneDir, 'relay-turns', 'answer-schema.json')]);
+  assert.ok(call.args.join(' ').includes('--disable hooks --disable apps --disable plugins'));
   assert.ok(call.args.includes('--json') && call.args.includes('-o'));
   assert.ok(call.args.includes('--skip-git-repo-check'), 'the workspace folder (the tooling root) is not a git repository');
   assert.match(call.prompt, /^review handoff relay-lane\n/);
@@ -644,4 +646,24 @@ test('the relay names its lane every time, runs only on builder lanes, refuses b
   await writeFile(sessionYaml, (await readFile(sessionYaml, 'utf8')).replace(/^role: .*$/m, 'role: project-manager'), 'utf8');
   await assert.rejects(runCli(['review-relay', '--root', s.ws.rootDir, '--session', pm.laneId, ...codexArgs], captureIo().io, { cwd: s.ws.tempDir, env: s.standin.env, platform: 'darwin', supportedReviewerVersions: SUPPORTED, signals: new EventEmitter() }), /is a project-manager lane; the review relay runs on builder lanes/);
   assert.equal(await readReadyMark(pm.laneDir), null);
+});
+
+test('the role text carries the mark, the relay, a relayed pass, and the project manager\'s check, with no decision number', async (t) => {
+  const ws = await createWorkspace(t);
+  const context = await readFile(path.join(ws.rootDir, 'context.md'), 'utf8');
+  assert.match(context, /- when a round's work is ready for review, run `vibecompass ready-for-review --session <lane-id>`: after you update `handoff\.md` › `## Builder → Reviewer`, and from the second round on after your response line\./);
+  assert.match(context, /- the owner may relay a round with `vibecompass review-relay --session <lane-id>` instead of starting a reviewer by hand/);
+  assert.match(context, /In a relayed turn never close the lane, push code or project memory, merge, publish, release, start a reviewer, run the relay, or write a pass line or the reviewer's section/);
+  assert.match(context, /- when the owner's `vibecompass review-relay` starts you, you run read-only: do the same review, write no file, and return the pass in the JSON form the relay asks for/);
+  assert.match(context, /- \*\*A relayed pass\*\* is written by the review relay from its reviewer's checked answer: `<reviewer>` names the tool, its version, and the model, then `via the relay`/);
+  assert.match(context, /`- owner \| <time> \| the owner \| another round \| the owner ran the relay for one pass past the cap \(relay write <write id>\)`/);
+  assert.match(context, /or the reviewer the owner's `vibecompass review-relay` run started for that lane\./);
+  assert.match(context, /A pass `… via the relay` counts when the prompt or the owner's word says the owner ran the relay on that lane/);
+  assert.match(context, /`vibecompass review-settings --round-cap <n>` changes it/);
+  assert.match(context, /ready\.json`, `relay\.json`, `relay\.lock` — the lane's ready-for-review mark and the review relay's state and lock/);
+  const guide = await readFile(path.join(ws.rootDir, 'workflows', 'project-manager.md'), 'utf8');
+  assert.match(guide, /Count relayed passes when the build prompt or the owner's word says the owner ran the review relay on that lane; take them to the owner when nothing does or the record conflicts\./);
+  for (const text of [context, guide]) {
+    assert.doesNotMatch(text, /\bD-\d{3}\b/, 'installed text names no decision number');
+  }
 });
