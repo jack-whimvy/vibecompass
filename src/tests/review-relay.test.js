@@ -288,7 +288,9 @@ test('a Claude Code reviewer: a clean pass names the reported model; a hook even
   assert.equal(first.code, 0, first.out);
   assert.equal(parse(await s.wip()).passes[0].reviewer, 'Claude Code 2.1.318 (claude-opus-5-5) via the relay');
   const [call] = (await s.standin.calls()).filter((item) => item.kind === 'review');
-  for (const flag of ['-p', '--safe-mode', '--strict-mcp-config', '--include-hook-events', '--json-schema']) assert.ok(call.args.includes(flag), flag);
+  for (const flag of ['-p', '--safe-mode', '--restricted', '--strict-mcp-config', '--include-hook-events', '--json-schema']) assert.ok(call.args.includes(flag), flag);
+  // The memory root and the lane's worktrees sit inside the tooling root, so no folder is added.
+  assert.ok(!call.args.includes('--add-dir'));
   assert.equal(call.args[call.args.indexOf('--tools') + 1], 'Read,Glob,Grep,Bash');
   assert.equal(call.args[call.args.indexOf('--permission-mode') + 1], 'default');
   assert.ok(call.args.includes('mcp__*') && call.args.includes('Edit') && call.args.includes('Write'));

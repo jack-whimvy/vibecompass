@@ -691,7 +691,14 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
   if (ctx.reviewerTool === 'codex') {
     launch = codexReviewerLaunch({ model: ctx.options.reviewerModel, schemaPath, outputPath: answerPath, threadId, gitRepository: await isGitRepository(ctx.toolingRoot) });
   } else {
-    launch = claudeReviewerLaunch({ model: ctx.options.reviewerModel ?? null, schemaJson: JSON.stringify(REVIEWER_ANSWER_SCHEMA), conversationId: threadId });
+    // The reviewer reads from the tooling root; the memory root and any covered
+    // repository outside it are added, since the launch confines file reads.
+    const inside = (dir) => {
+      const relative = path.relative(ctx.toolingRoot, dir);
+      return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    };
+    const addDirs = [...new Set([path.resolve(rootDir), ...(await coveredRepositories(ctx, mark))])].filter((dir) => !inside(dir)).sort();
+    launch = claudeReviewerLaunch({ model: ctx.options.reviewerModel ?? null, schemaJson: JSON.stringify(REVIEWER_ANSWER_SCHEMA), conversationId: threadId, addDirs });
   }
   const prompt = reviewerPrompt({ laneId, passNumber, rootDir, roundId: mark.round_id });
   out(`Pass ${passNumber}: ${TOOL_NAMES[ctx.reviewerTool]} ${version.version} reviewing round ${shortRound(mark.round_id)}${threadId ? ` (resuming ${threadId})` : ''}…`);

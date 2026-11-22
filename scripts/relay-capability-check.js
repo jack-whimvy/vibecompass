@@ -16,18 +16,24 @@ import { createProcessTable } from '../src/relay-state.js';
  * Watches the process table for a command line containing `token` until
  * stopped. Resolves `{ seen, rows }` on `stop()`.
  */
-export function watchProcesses({ table = createProcessTable(), token, intervalMs = 100 }) {
+export function watchProcesses({ table = createProcessTable(), token, intervalMs = 100, startedAfter = null }) {
   let seen = false;
   const rows = [];
+  const ignored = [];
   let running = true;
   const loop = (async () => {
     while (running) {
       try {
         for (const row of await table.list()) {
-          if (row.command.includes(token) && !rows.some((item) => item.pid === row.pid)) {
-            seen = true;
-            rows.push(row);
+          if (!row.command.includes(token) || rows.some((item) => item.pid === row.pid) || ignored.some((item) => item.pid === row.pid)) continue;
+          // A process that started before this turn (a fixture an earlier run
+          // left running) isn't this turn's; `ps` gives start times to the second.
+          if (startedAfter !== null && startedBefore(row.startedAt, startedAfter)) {
+            ignored.push(row);
+            continue;
           }
+          seen = true;
+          rows.push(row);
         }
       } catch {
         // An unreadable table this round; the next one is read again.
@@ -39,7 +45,7 @@ export function watchProcesses({ table = createProcessTable(), token, intervalMs
     async stop() {
       running = false;
       await loop;
-      return { seen, rows };
+      return { seen, rows, ignored };
     },
   };
 }
@@ -49,8 +55,34 @@ export function watchProcesses({ table = createProcessTable(), token, intervalMs
  * The watch keeps going until the turn's process group is empty, so a fixture
  * the tool started and left running is still seen.
  */
+/** True when a `ps` start time is before `when` (a Date), to the second. */
+export function startedBefore(startedAt, when) {
+  const started = Date.parse(startedAt);
+  if (Number.isNaN(started)) return false;
+  return started < Math.floor(when.getTime() / 1000) * 1000;
+}
+
+/** Waits until no process with `token` in its command line is left, up to `timeoutMs`. */
+export async function waitForNoFixture({ table = createProcessTable(), token, timeoutMs = 45_000, intervalMs = 250 }) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let left = [];
+    try {
+      left = (await table.list()).filter((row) => row.command.includes(token));
+    } catch {
+      left = [];
+    }
+    if (left.length === 0) return { waited: true, left: [] };
+    if (Date.now() >= deadline) return { waited: false, left };
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 export async function runWatchedTurn({ command, args, cwd, env, input = '', timeoutMs = 300_000, table = createProcessTable(), token, markerPath }) {
-  const watcher = watchProcesses({ table, token });
+  // An earlier run's fixture still running would look like this turn's.
+  const before = await waitForNoFixture({ table, token });
+  const startedAt = new Date();
+  const watcher = watchProcesses({ table, token, startedAfter: startedAt });
   const child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const closed = once(child, 'close').catch(() => [null, null]);
   let stdout = '';
@@ -69,7 +101,7 @@ export async function runWatchedTurn({ command, args, cwd, env, input = '', time
   // Keep watching briefly: a fixture started late in the turn still shows.
   await new Promise((resolve) => setTimeout(resolve, 500));
   const watched = await watcher.stop();
-  return { code, stdout, stderr, seen: watched.seen, rows: watched.rows, marker: markerPath ? existsSync(markerPath) : false };
+  return { code, stdout, stderr, seen: watched.seen, rows: watched.rows, ignored: watched.ignored, leftBefore: before.left, startedAt: startedAt.toISOString(), marker: markerPath ? existsSync(markerPath) : false };
 }
 
 /**
@@ -127,24 +159,45 @@ export function readCodexRollout(text, commandFragment) {
   return { attempted, refused, sandboxPolicies: [...sandbox] };
 }
 
-/** Claude Code's stream: a write tool attempt and its refusal. */
+/**
+ * Claude Code's stream: a tool call whose input names `pathFragment`, and the
+ * refusal of that same call (a `permission_denied` event or a
+ * `permission_denials` entry with its tool_use_id, or an error result for it
+ * saying it was denied or needs approval).
+ */
 export function readClaudeWriteEvidence(streamText, { toolNames = ['Write', 'Edit', 'Bash'], pathFragment }) {
   const lines = String(streamText ?? '').split('\n').filter(Boolean);
+  const ids = new Set();
   let attempted = false;
   let refusal = null;
+  const events = [];
   for (const line of lines) {
-    let event;
-    try { event = JSON.parse(line); } catch { continue; }
-    const serialized = JSON.stringify(event);
+    try { events.push(JSON.parse(line)); } catch { /* not JSON */ }
+  }
+  for (const event of events) {
     if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
       for (const part of event.message.content) {
-        if (part?.type === 'tool_use' && toolNames.includes(part.name) && JSON.stringify(part.input ?? {}).includes(pathFragment)) attempted = true;
+        if (part?.type === 'tool_use' && toolNames.includes(part.name) && JSON.stringify(part.input ?? {}).includes(pathFragment)) {
+          attempted = true;
+          if (part.id) ids.add(part.id);
+        }
       }
     }
-    if (event.type === 'result' && Array.isArray(event.permission_denials) && event.permission_denials.length > 0) {
-      refusal = `permission_denials: ${event.permission_denials.map((item) => item.tool_name).join(', ')}`;
+  }
+  for (const event of events) {
+    if (refusal) break;
+    if (event.type === 'system' && event.subtype === 'permission_denied' && ids.has(event.tool_use_id)) {
+      refusal = `a permission_denied event for that call (${String(event.message ?? '').slice(0, 160)})`;
+    } else if (event.type === 'result' && Array.isArray(event.permission_denials)) {
+      const entry = event.permission_denials.find((item) => ids.has(item.tool_use_id));
+      if (entry) refusal = `a permission_denials entry for that call (${entry.tool_name})`;
+    } else if (event.type === 'user' && Array.isArray(event.message?.content)) {
+      for (const part of event.message.content) {
+        if (part?.type === 'tool_result' && ids.has(part.tool_use_id) && part.is_error && /denied|needs approval|not allowed/i.test(JSON.stringify(part.content ?? ''))) {
+          refusal = `an error result for that call (${JSON.stringify(part.content).slice(0, 160)})`;
+        }
+      }
     }
-    if (!refusal && /permission_denied/.test(serialized)) refusal = 'a permission_denied event';
   }
   return { attempted, refusal };
 }

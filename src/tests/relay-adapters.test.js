@@ -5,6 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   BUILDER_DENY_LIST,
+  CLAUDE_REVIEWER_ALLOWED_COMMANDS,
+  CLAUDE_REVIEWER_DENIED,
   SUPPORTED_REVIEWER_VERSIONS,
   builderPrompt,
   builderTurnEnv,
@@ -21,6 +23,7 @@ import {
   readClaudeStream,
   readCodexEvents,
   reviewerPrompt,
+  reviewerTurnEnv,
   validateBuilderMode,
 } from '../relay-adapters.js';
 import {
@@ -29,7 +32,10 @@ import {
   readClaudeWriteEvidence,
   readCodexRollout,
   runWatchedTurn,
+  startedBefore,
   versionVerdict,
+  waitForNoFixture,
+  watchProcesses,
 } from '../../scripts/relay-capability-check.js';
 
 // D-419 items 5, 7, 8, and 12: the adapters' version gates, launches, turn
@@ -101,10 +107,18 @@ test('the Codex launches: read-only fresh, resume without a sandbox flag', () =>
 test('the Claude Code launches: the reviewer\'s reading set, and the builder\'s resume with the deny list', () => {
   const reviewer = claudeReviewerLaunch({ schemaJson: '{}' });
   assert.equal(reviewer.args[0], '-p');
-  for (const flag of ['--safe-mode', '--strict-mcp-config', '--include-hook-events', '--verbose']) assert.ok(reviewer.args.includes(flag));
+  for (const flag of ['--safe-mode', '--restricted', '--strict-mcp-config', '--include-hook-events', '--verbose']) assert.ok(reviewer.args.includes(flag), flag);
   assert.equal(reviewer.args[reviewer.args.indexOf('--permission-mode') + 1], 'default');
   assert.ok(!reviewer.args.includes('--resume'));
+  assert.ok(!reviewer.args.includes('--add-dir'));
   assert.equal(claudeReviewerLaunch({ schemaJson: '{}', conversationId: 'c-1' }).args[2], 'c-1');
+  const withDirs = claudeReviewerLaunch({ schemaJson: '{}', addDirs: ['/memory', '/repo'] }).args;
+  assert.deepEqual(withDirs.filter((arg, index) => withDirs[index - 1] === '--add-dir'), ['/memory', '/repo']);
+  // No command that runs another command or writes a file through an option.
+  assert.ok(!CLAUDE_REVIEWER_ALLOWED_COMMANDS.some((rule) => /git grep/.test(rule)));
+  assert.ok(CLAUDE_REVIEWER_DENIED.includes('Bash(*--output*)'));
+  assert.equal(reviewerTurnEnv({ VIBECOMPASS_RELAY_TURN: 'x' }).GIT_OPTIONAL_LOCKS, '0');
+  assert.equal(reviewerTurnEnv({ VIBECOMPASS_RELAY_TURN: 'x' }).VIBECOMPASS_RELAY_TURN, undefined);
   const builder = claudeBuilderLaunch({ conversationId: 'conv', mode: 'auto' });
   assert.deepEqual(builder.args.slice(0, 5), ['-p', '--resume', 'conv', '--permission-mode', 'auto']);
   assert.deepEqual(builder.args.slice(builder.args.indexOf('--disallowedTools') + 1), [...BUILDER_DENY_LIST]);
@@ -149,6 +163,11 @@ test('streams: Codex thread ids and failures; Claude Code init, hooks, and resul
   assert.match(checkClaudeReviewerStream(readClaudeStream(withMcp)), /lists an MCP server \(x\)/);
   const withTool = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read', 'Write'], mcp_servers: [], plugins: [] });
   assert.match(checkClaudeReviewerStream(readClaudeStream(withTool)), /tools outside the reading set \(Write\)/);
+  // The answer schema adds StructuredOutput, which the reading set allows.
+  const withAnswerTool = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Bash', 'Glob', 'Grep', 'Read', 'StructuredOutput'], mcp_servers: [], plugins: [] });
+  assert.equal(checkClaudeReviewerStream(readClaudeStream(withAnswerTool)), null);
+  const withPlugin = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [], plugins: [{ name: 'p', path: '/x', source: 'p@market' }] });
+  assert.match(checkClaudeReviewerStream(readClaudeStream(withPlugin)), /lists a plugin \(p\)/);
 });
 
 test('the fixed text carries only the lane id, the pass number, paths, and the round id', () => {
@@ -230,8 +249,40 @@ test('write checks need the tool\'s record of a refused attempt', () => {
   assert.match(evidence.refused, /Operation not permitted/);
   assert.deepEqual(evidence.sandboxPolicies, ['{"type":"read-only"}']);
   const stream = [
-    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: '/x/probe.txt' } }] } }),
-    JSON.stringify({ type: 'result', permission_denials: [{ tool_name: 'Write' }] }),
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Write', input: { file_path: '/x/probe.txt' } }] } }),
+    JSON.stringify({ type: 'result', permission_denials: [{ tool_name: 'Write', tool_use_id: 'tu-1' }] }),
   ].join('\n');
-  assert.deepEqual(readClaudeWriteEvidence(stream, { pathFragment: 'probe.txt' }), { attempted: true, refusal: 'permission_denials: Write' });
+  assert.deepEqual(readClaudeWriteEvidence(stream, { pathFragment: 'probe.txt' }), { attempted: true, refusal: 'a permission_denials entry for that call (Write)' });
+  // A refusal of another call isn't evidence for this one.
+  const other = [
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Bash', input: { command: 'touch probe.txt' } }, { type: 'tool_use', id: 'tu-2', name: 'Bash', input: { command: 'rm -rf x' } }] } }),
+    JSON.stringify({ type: 'system', subtype: 'permission_denied', tool_use_id: 'tu-2', message: 'denied' }),
+    JSON.stringify({ type: 'result', permission_denials: [{ tool_name: 'Bash', tool_use_id: 'tu-2' }] }),
+  ].join('\n');
+  assert.deepEqual(readClaudeWriteEvidence(other, { toolNames: ['Bash'], pathFragment: 'probe.txt' }), { attempted: true, refusal: null });
+  const event = [
+    JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu-3', name: 'Bash', input: { command: 'touch probe.txt' } }] } }),
+    JSON.stringify({ type: 'system', subtype: 'permission_denied', tool_use_id: 'tu-3', message: 'Permission to use Bash with command touch probe.txt has been denied.' }),
+  ].join('\n');
+  assert.match(readClaudeWriteEvidence(event, { toolNames: ['Bash'], pathFragment: 'probe.txt' }).refusal, /^a permission_denied event for that call/);
+});
+
+test('the check harness ignores a fixture an earlier run left running, and waits for it to end first', async () => {
+  assert.equal(startedBefore('Sat Nov 21 23:44:23 2026', new Date(Date.parse('Sat Nov 21 23:44:24 2026') + 500)), true);
+  assert.equal(startedBefore('Sat Nov 21 23:44:24 2026', new Date(Date.parse('Sat Nov 21 23:44:24 2026') + 500)), false, 'the same second counts as this turn');
+  const startedAfter = new Date(Date.parse('Sat Nov 21 23:44:30 2026'));
+  const rows = [
+    { pid: 10, pgid: 10, startedAt: 'Sat Nov 21 23:44:05 2026', command: 'node fixture.js m tok-left' },
+    { pid: 11, pgid: 11, startedAt: 'Sat Nov 21 23:44:31 2026', command: 'node fixture.js m tok-new' },
+  ];
+  const watcher = watchProcesses({ table: { list: async () => rows }, token: 'tok-', intervalMs: 5, startedAfter });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const watched = await watcher.stop();
+  assert.deepEqual(watched.rows.map((row) => row.pid), [11]);
+  assert.deepEqual(watched.ignored.map((row) => row.pid), [10]);
+  let reads = 0;
+  const draining = { list: async () => (reads++ < 2 ? [rows[0]] : []) };
+  assert.deepEqual(await waitForNoFixture({ table: draining, token: 'tok-', intervalMs: 5 }), { waited: true, left: [] });
+  const stuck = await waitForNoFixture({ table: { list: async () => [rows[0]] }, token: 'tok-', intervalMs: 5, timeoutMs: 20 });
+  assert.equal(stuck.waited, false);
 });

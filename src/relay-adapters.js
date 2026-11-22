@@ -40,11 +40,16 @@ export const CLAUDE_REVIEWER_ALLOWED_COMMANDS = [
   'Bash(git ls-files:*)',
   'Bash(git rev-parse:*)',
   'Bash(git blame:*)',
-  'Bash(git grep:*)',
   'Bash(vibecompass review-check:*)',
   'Bash(vibecompass list-sessions:*)',
 ];
-export const CLAUDE_REVIEWER_DENIED = ['mcp__*', 'Edit', 'Write', 'NotebookEdit'];
+// `git grep` is left out because its `-O` option runs a command, and any
+// command with `--output` is refused because `git diff`, `git log`, and
+// `git show` write a file with it (the Grep tool searches instead).
+export const CLAUDE_REVIEWER_DENIED = ['mcp__*', 'Edit', 'Write', 'NotebookEdit', 'Bash(*--output*)'];
+// Tools a reviewer's init may list besides the reading set: the one the
+// answer schema adds.
+export const CLAUDE_REVIEWER_ANSWER_TOOLS = ['StructuredOutput'];
 
 /**
  * The builder turn's deny list (D-419 item 8): close, push, merge, publish,
@@ -195,12 +200,18 @@ export function codexReviewerLaunch({ model, schemaPath, outputPath, threadId = 
   return { command: 'codex', args };
 }
 
-export function claudeReviewerLaunch({ model = null, schemaJson, conversationId = null }) {
+export function claudeReviewerLaunch({ model = null, schemaJson, conversationId = null, addDirs = [] }) {
+  // --restricted ignores the user, project, and local settings files, so an
+  // allow list in one of them can't let the reviewer write (PM10's checks:
+  // under --safe-mode alone a user's allow of `touch` ran). It also confines
+  // the file tools to the working folder and the --add-dir folders.
   const args = [
     '-p',
     ...(conversationId ? ['--resume', conversationId] : []),
     '--safe-mode',
+    '--restricted',
     '--strict-mcp-config',
+    ...addDirs.flatMap((dir) => ['--add-dir', dir]),
     '--tools', CLAUDE_REVIEWER_TOOLS.join(','),
     '--allowedTools', ...CLAUDE_REVIEWER_ALLOWED_COMMANDS,
     '--disallowedTools', ...CLAUDE_REVIEWER_DENIED,
@@ -257,6 +268,8 @@ export function builderTurnEnv(baseEnv, { ghConfigDir, relayToken }) {
 export function reviewerTurnEnv(baseEnv) {
   const env = { ...baseEnv };
   delete env.VIBECOMPASS_RELAY_TURN;
+  // `git status` refreshes the index unless optional locks are off.
+  env.GIT_OPTIONAL_LOCKS = '0';
   return env;
 }
 
@@ -383,7 +396,7 @@ export function checkClaudeReviewerStream(stream) {
     return `the reviewer's init lists a plugin (${plugins.map((plugin) => plugin?.name ?? String(plugin)).join(', ')})`;
   }
   const tools = Array.isArray(stream.init.tools) ? stream.init.tools : [];
-  const outside = tools.filter((tool) => !CLAUDE_REVIEWER_TOOLS.includes(tool));
+  const outside = tools.filter((tool) => !CLAUDE_REVIEWER_TOOLS.includes(tool) && !CLAUDE_REVIEWER_ANSWER_TOOLS.includes(tool));
   if (outside.length > 0) {
     return `the reviewer's init lists tools outside the reading set (${outside.join(', ')})`;
   }
