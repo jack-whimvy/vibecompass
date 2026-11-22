@@ -1,0 +1,425 @@
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { RELAY_LOCK_FILE, RELAY_STATE_FILE, isConversationId, writeFileAtomic } from './relay-mark.js';
+
+// D-419 item 10: the relay's state, its two locks, and what a restarted relay
+// or close-session can tell about a turn that was running when a relay died.
+// State is recorded before each step it starts (D-281), replaced whole, and
+// lives in the lane folder, so it goes at close (D-278). A restarted relay only
+// inspects processes: it never signals a group recovered from disk.
+
+export const RELAY_STATE_FORMAT = 1;
+export const WRITE_END_STATES = new Set(['complete', 'superseded', 'discarded']);
+
+// ---------------------------------------------------------------------------
+// Processes
+
+function parseProcessTable(text) {
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens.length < 7) continue;
+    const pid = Number(tokens[0]);
+    const pgid = Number(tokens[1]);
+    if (!Number.isInteger(pid) || !Number.isInteger(pgid)) continue;
+    rows.push({ pid, pgid, startedAt: tokens.slice(2, 7).join(' '), command: tokens.slice(7).join(' ') });
+  }
+  return rows;
+}
+
+/**
+ * The operating system's process table, read with `ps`. Injectable so tests
+ * can stand in a table and count signals; the default never signals anything
+ * but the live relay's own groups (`killGroup`).
+ */
+export function createProcessTable({ exec = execFile } = {}) {
+  return {
+    list() {
+      return new Promise((resolve, reject) => {
+        exec('ps', ['-A', '-o', 'pid=,pgid=,lstart=,command='], { maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } }, (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(parseProcessTable(String(stdout)));
+        });
+      });
+    },
+    killGroup(pgid, signal = 'SIGTERM') {
+      try {
+        process.kill(-pgid, signal);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+export async function processStartTime(table, pid) {
+  const rows = await table.list();
+  return rows.find((row) => row.pid === pid)?.startedAt ?? null;
+}
+
+/**
+ * What became of a recorded process group (D-419 item 10):
+ * - `ended`: no process is in the group, or a different process (another
+ *   start time) holds the leader's process id; POSIX doesn't reuse a process
+ *   id while a group with that id has a member;
+ * - `active`: the recorded leader still runs;
+ * - `uncertain`: members remain without the leader, or the table can't be read.
+ */
+export async function inspectProcessGroup(table, { pgid, pid, startedAt }) {
+  let rows;
+  try {
+    rows = await table.list();
+  } catch (error) {
+    return { state: 'uncertain', processes: [], reason: `the process table couldn't be read (${error instanceof Error ? error.message : String(error)})` };
+  }
+  const members = rows.filter((row) => row.pgid === pgid);
+  const leader = rows.find((row) => row.pid === pid);
+  if (leader && startedAt && leader.startedAt !== startedAt) {
+    return { state: 'ended', processes: [], reason: 'another process now holds the leader\'s process id' };
+  }
+  if (members.length === 0) {
+    return { state: 'ended', processes: [], reason: 'no process is left in the group' };
+  }
+  if (leader && leader.pgid === pgid && (!startedAt || leader.startedAt === startedAt)) {
+    return { state: 'active', processes: members, reason: 'the turn\'s process is still running' };
+  }
+  return { state: 'uncertain', processes: members, reason: 'processes remain in the group without its leader, so they can\'t be told from a reused group' };
+}
+
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+/** Whether a lock's recorded process is the one still running. */
+export async function lockHolderAlive(table, record) {
+  if (!record || !isAlive(record.pid)) return false;
+  if (!record.process_started_at) return true;
+  try {
+    return (await processStartTime(table, record.pid)) === record.process_started_at;
+  } catch {
+    return true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// relay.json
+
+export function relayStatePath(laneDir) {
+  return path.join(laneDir, RELAY_STATE_FILE);
+}
+
+export async function readRelayState(laneDir) {
+  let source;
+  try {
+    source = await readFile(relayStatePath(laneDir), 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const state = JSON.parse(source);
+    if (!state || typeof state !== 'object' || state.format !== RELAY_STATE_FORMAT) {
+      throw new Error('not a relay state this package reads');
+    }
+    return state;
+  } catch (error) {
+    const wrapped = new Error(`${relayStatePath(laneDir)} can't be read (${error instanceof Error ? error.message : String(error)}).`);
+    wrapped.unreadable = true;
+    throw wrapped;
+  }
+}
+
+export async function saveRelayState(laneDir, state) {
+  const next = { ...state, format: RELAY_STATE_FORMAT, updated_at: new Date().toISOString() };
+  await writeFileAtomic(relayStatePath(laneDir), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+export function emptyRelayState(laneId) {
+  return {
+    format: RELAY_STATE_FORMAT,
+    lane: laneId,
+    run: null,
+    step: 'idle',
+    round: null,
+    reviewer: null,
+    builder: null,
+    turn: null,
+    answer: null,
+    write: null,
+    writes: [],
+    last_stop: null,
+    conversation_lock: null,
+  };
+}
+
+/** A turn counts as running until its end is recorded. */
+export function turnUnfinished(state) {
+  return Boolean(state?.turn && !state.turn.ended);
+}
+
+export function writeUnfinished(state) {
+  return Boolean(state?.write && !WRITE_END_STATES.has(state.write.state));
+}
+
+// ---------------------------------------------------------------------------
+// Locks
+
+async function createExclusive(filePath, record) {
+  const handle = await open(filePath, 'wx');
+  try {
+    await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readLockRecord(filePath) {
+  let source;
+  try {
+    source = await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { missing: true };
+    return { unreadable: true, error };
+  }
+  try {
+    const record = JSON.parse(source);
+    if (!record || typeof record !== 'object') throw new Error('not an object');
+    return { record };
+  } catch (error) {
+    return { unreadable: true, error };
+  }
+}
+
+/**
+ * Takes over a dead holder's lock: the old file is renamed aside (only one
+ * taker's rename succeeds), then the new lock is created exclusively.
+ */
+async function takeOver(filePath, record) {
+  const aside = `${filePath}.stale-${randomUUID()}`;
+  await rename(filePath, aside);
+  try {
+    await createExclusive(filePath, record);
+  } finally {
+    await rm(aside, { force: true });
+  }
+}
+
+/**
+ * The lane lock, `sessions/active/<lane-id>/relay.lock`: one relay per lane.
+ * A dead holder's lock is taken over with a message; a live one refuses.
+ */
+export async function acquireLaneLock({ laneDir, laneId, runId, token, table }) {
+  const filePath = path.join(laneDir, RELAY_LOCK_FILE);
+  const record = { lane: laneId, run_id: runId, token, pid: process.pid, process_started_at: await processStartTime(table, process.pid).catch(() => null), at: new Date().toISOString() };
+  try {
+    await createExclusive(filePath, record);
+    return { filePath, record, tookOver: null };
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  const existing = await readLockRecord(filePath);
+  if (existing.missing) {
+    await createExclusive(filePath, record);
+    return { filePath, record, tookOver: null };
+  }
+  if (existing.unreadable) {
+    throw new Error(`${filePath} exists but can't be read, so another relay may hold lane ${laneId}. If no relay is running, move it aside and run again.`);
+  }
+  if (await lockHolderAlive(table, existing.record)) {
+    throw new Error(`Another relay is running on lane ${laneId} (process ${existing.record.pid}, run ${existing.record.run_id}). One relay runs per lane.`); // D-419 item 10
+  }
+  await takeOver(filePath, record);
+  return { filePath, record, tookOver: existing.record };
+}
+
+export async function releaseLaneLock(lock) {
+  if (!lock) return;
+  const existing = await readLockRecord(lock.filePath);
+  if (existing.record?.token === lock.record.token) {
+    await rm(lock.filePath, { force: true });
+  }
+}
+
+/**
+ * The per-user conversation lock's folder: `.config/vibecompass/relay-locks/`
+ * under the home folder the user record names, which no environment variable
+ * moves (D-419 item 10).
+ */
+export function conversationLockDir(userInfo = os.userInfo()) {
+  return path.join(userInfo.homedir, '.config', 'vibecompass', 'relay-locks');
+}
+
+export function conversationLockPath(conversationId, userInfo) {
+  if (!isConversationId(conversationId)) {
+    throw new Error(`"${conversationId}" is not a conversation id the relay accepts.`);
+  }
+  return path.join(conversationLockDir(userInfo), `${conversationId}.json`);
+}
+
+/**
+ * Whether a dead run's conversation lock may be taken over: only once that
+ * run's recorded turn is finished, or its lane has closed. A record that can't
+ * be read keeps the lock.
+ */
+async function deadConversationLockReleasable(record) {
+  if (typeof record.root !== 'string' || typeof record.lane !== 'string') {
+    return { ok: false, reason: 'its record names no lane' };
+  }
+  const laneDir = path.join(record.root, 'sessions', 'active', record.lane);
+  try {
+    await stat(laneDir);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, reason: `lane ${record.lane} has closed` };
+    return { ok: false, reason: `lane ${record.lane} can't be read` };
+  }
+  let state;
+  try {
+    state = await readRelayState(laneDir);
+  } catch {
+    return { ok: false, reason: `lane ${record.lane}'s relay state can't be read` };
+  }
+  if (state && state.run?.id === record.run_id && turnUnfinished(state)) {
+    return { ok: false, reason: `run ${record.run_id} on lane ${record.lane} left a turn unfinished; run \`vibecompass review-relay --session ${record.lane} --recover\` there` };
+  }
+  return { ok: true, reason: `run ${record.run_id} on lane ${record.lane} has ended` };
+}
+
+export async function acquireConversationLock({ conversationId, rootDir, laneId, runId, token, table, userInfo }) {
+  const filePath = conversationLockPath(conversationId, userInfo);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const record = {
+    conversation_id: conversationId,
+    root: path.resolve(rootDir),
+    lane: laneId,
+    run_id: runId,
+    token,
+    pid: process.pid,
+    process_started_at: await processStartTime(table, process.pid).catch(() => null),
+    at: new Date().toISOString(),
+  };
+  try {
+    await createExclusive(filePath, record);
+    return { filePath, record, tookOver: null };
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  const existing = await readLockRecord(filePath);
+  if (existing.missing) {
+    await createExclusive(filePath, record);
+    return { filePath, record, tookOver: null };
+  }
+  if (existing.unreadable) {
+    throw new Error(`Conversation ${conversationId} is locked by a record that can't be read (${filePath}); the lock is kept. If no relay uses the conversation, move it aside and run again.`); // D-419 item 10
+  }
+  const held = existing.record;
+  if (await lockHolderAlive(table, held)) {
+    throw new Error(`Conversation ${conversationId} is in use by another relay: lane ${held.lane} in ${held.root}, run ${held.run_id}. One relay runs per conversation.`); // D-419 item 10
+  }
+  // The same run's own lock (a restart) is ours to reuse once its turn is settled.
+  const releasable = await deadConversationLockReleasable(held);
+  if (!releasable.ok) {
+    throw new Error(`Conversation ${conversationId} is still reserved: ${releasable.reason}.`);
+  }
+  await takeOver(filePath, record);
+  return { filePath, record, tookOver: { ...held, reason: releasable.reason } };
+}
+
+export async function releaseConversationLock(lock) {
+  if (!lock) return;
+  const existing = await readLockRecord(lock.filePath);
+  if (existing.record?.token === lock.record.token) {
+    await rm(lock.filePath, { force: true });
+  }
+}
+
+/**
+ * At close: a conversation lock whose record names this root and lane goes
+ * with the lane (D-278). Close refuses earlier while a live relay holds it.
+ */
+export async function removeConversationLockForLane({ state, rootDir, laneId }) {
+  const recorded = state?.conversation_lock?.path;
+  if (!recorded) return null;
+  const existing = await readLockRecord(recorded);
+  if (existing.record && existing.record.lane === laneId && path.resolve(existing.record.root ?? '') === path.resolve(rootDir)) {
+    await rm(recorded, { force: true });
+    return recorded;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// What the stage and close-session read
+
+/**
+ * The relay's state as the stage reads it: whether a relay holds the lane, the
+ * step it is on, anything unfinished, and the last stop.
+ */
+export async function readRelayView(laneDir, { table = createProcessTable() } = {}) {
+  let state;
+  try {
+    state = await readRelayState(laneDir);
+  } catch {
+    return { live: false, step: null, unfinished: 'the relay state can\'t be read', lastStop: null };
+  }
+  const lock = await readLockRecord(path.join(laneDir, RELAY_LOCK_FILE));
+  const live = Boolean(lock.record) && (await lockHolderAlive(table, lock.record));
+  if (!state) {
+    return { live, step: live ? 'starting' : null, unfinished: null, lastStop: null };
+  }
+  let unfinished = null;
+  if (!live && turnUnfinished(state)) {
+    unfinished = 'a relay stopped during a turn; run review-relay --recover';
+  } else if (!live && writeUnfinished(state)) {
+    unfinished = 'a relayed write has no end state; run review-relay --recover';
+  }
+  return { live, step: state.step, unfinished, lastStop: state.last_stop ?? null };
+}
+
+/**
+ * close-session's refusal (D-419 item 10): while a live relay holds the lane,
+ * while an interrupted turn's group is active or uncertain, or while a write
+ * has no end state. Null when the lane has no relay state or nothing is
+ * unfinished, so a lane that never ran the relay closes as before.
+ */
+export async function inspectRelayForClose({ laneDir, laneId, table = createProcessTable() }) {
+  const recover = `vibecompass review-relay --session ${laneId} --recover`;
+  const lock = await readLockRecord(path.join(laneDir, RELAY_LOCK_FILE));
+  if (lock.unreadable) {
+    return `close-session is refused: ${path.join(laneDir, RELAY_LOCK_FILE)} can't be read, so a relay may hold lane ${laneId}. If no relay is running, move it aside and close again.`;
+  }
+  if (lock.record && (await lockHolderAlive(table, lock.record))) {
+    return `close-session is refused: a review relay is running on lane ${laneId} (process ${lock.record.pid}, run ${lock.record.run_id}). Let it stop, or stop it with Ctrl-C, then close.`; // D-419 item 10
+  }
+  let state;
+  try {
+    state = await readRelayState(laneDir);
+  } catch (error) {
+    return `close-session is refused: ${error.message} It records whether a relayed write finished; run \`${recover}\`, or move the file aside to close without it.`;
+  }
+  if (!state) return null;
+  if (turnUnfinished(state) && state.turn.pgid) {
+    const group = await inspectProcessGroup(table, { pgid: state.turn.pgid, pid: state.turn.pid, startedAt: state.turn.process_started_at });
+    if (group.state !== 'ended') {
+      const listed = group.processes.map((row) => `${row.pid} ${row.command}`.trim()).join('; ');
+      return `close-session is refused: the relay's ${state.turn.role} turn on lane ${laneId} is ${group.state === 'active' ? 'still running' : 'uncertain'} (${group.reason}${listed ? `: ${listed}` : ''}). Let it finish or stop those processes, then run \`${recover}\`.`; // D-419 item 10
+    }
+  }
+  if (writeUnfinished(state)) {
+    return `close-session is refused: relay write ${state.write.id} on lane ${laneId} has no end state. Run \`${recover}\` to finish it.`; // D-419 items 6 and 10
+  }
+  return null;
+}

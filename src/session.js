@@ -46,6 +46,7 @@ import {
 } from './lane-marker.js';
 import { PACKAGE_VERSION } from './version.js';
 import { computeLaneStage, laneHasRelayFiles, renderStage } from './relay-stage.js';
+import { inspectRelayForClose, readRelayState, readRelayView, removeConversationLockForLane } from './relay-state.js';
 import { formatPlanTaskRef, resolvePlanTaskRefs, splitPlanTaskRef } from './plan-tasks.js';
 // This lazy-only cycle is intentional: manifest.js reads lane state from this
 // module, and session command handlers rewrite the derived manifest after
@@ -594,6 +595,17 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
     );
   }
 
+  // D-419 item 10: refused while a live relay holds the lane, an interrupted
+  // turn's group is active or uncertain, or a relayed write has no end state.
+  // A lane that never ran the relay has no relay files and closes as before.
+  let relayState = null;
+  if (sessionId) {
+    const relayRefusal = await inspectRelayForClose({ laneDir: lanePaths.laneDir, laneId: sessionId, table: options?.relayProcessTable });
+    if (relayRefusal) {
+      throw new Error(relayRefusal);
+    }
+    relayState = await readRelayState(lanePaths.laneDir).catch(() => null);
+  }
   const wipContent = await readFile(lanePaths.wipFilePath, 'utf8');
   const activeSession = parseActiveSession(wipContent, lanePaths.wipFilePath);
   // D-394 item 6: the review check runs after wip.md is read and before
@@ -745,6 +757,10 @@ async function closeProjectSessionLocked(normalized, options, markerContext) {
       markerCleanupWarnings.push(...runtimeCleanup.warnings);
     }
 
+    // D-278: a conversation lock that names this lane goes with it.
+    if (relayState) {
+      await removeConversationLockForLane({ state: relayState, rootDir: normalized.rootDir, laneId: sessionId }).catch(() => null);
+    }
     await rm(lanePaths.laneDir, { recursive: true, force: true });
     activeSessionIndex = await removeActiveSessionFromIndex(normalized, sessionId);
   } else {
@@ -1122,8 +1138,12 @@ async function computeLaneStages(normalized, lanes, options = {}) {
 }
 
 // The relay's state for the stage; none until a relay has run on the lane.
-async function readRelayViewSafely(_rootDir, _laneId, _laneDir) {
-  return null;
+async function readRelayViewSafely(_rootDir, _laneId, laneDir) {
+  try {
+    return await readRelayView(laneDir);
+  } catch {
+    return null;
+  }
 }
 
 /**
