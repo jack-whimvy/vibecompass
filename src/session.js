@@ -45,6 +45,7 @@ import {
   validateLaneId,
 } from './lane-marker.js';
 import { PACKAGE_VERSION } from './version.js';
+import { computeLaneStage, laneHasRelayFiles, renderStage } from './relay-stage.js';
 import { formatPlanTaskRef, resolvePlanTaskRefs, splitPlanTaskRef } from './plan-tasks.js';
 // This lazy-only cycle is intentional: manifest.js reads lane state from this
 // module, and session command handlers rewrite the derived manifest after
@@ -229,6 +230,7 @@ async function startProjectSessionLocked(normalized, options, markerContext, ups
   const resumeAlternativeWarnings = buildResumeAlternativeWarnings(
     existingLanes,
     resolveValidatedCurrentLane(priorIndex.current, existingLanes),
+    await computeLaneStages(normalized, existingLanes, options),
   );
   const overlapWarnings = buildOverlapWarnings({
     sessionId,
@@ -1074,13 +1076,99 @@ export async function listProjectSessions(options = {}) {
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const index = await readActiveSessionIndex(normalized);
   const lanes = await listActiveSessionLanes(normalized);
+  const stages = await computeLaneStages(normalized, lanes, options);
 
   const current = resolveValidatedCurrentLane(index.current, lanes);
   return {
     rootDir: normalized.rootDir,
     current,
     lanes,
-    inventory: buildLaneInventory(lanes, current),
+    inventory: buildLaneInventory(lanes, current, stages),
+  };
+}
+
+/**
+ * D-419 item 11: each lane's stage, null for a lane with no mark or relay
+ * state, so an install that never marks a lane sees no new line.
+ */
+async function computeLaneStages(normalized, lanes, options = {}) {
+  const stages = new Map();
+  const projectConfig = await readProjectConfig(normalized.projectFilePath);
+  const projectRepos = Array.isArray(projectConfig?.repos) ? projectConfig.repos : [];
+  for (const lane of lanes) {
+    const laneDir = getLanePaths(normalized, lane.id).laneDir;
+    if (!(await laneHasRelayFiles(laneDir))) {
+      stages.set(lane.id, null);
+      continue;
+    }
+    let wipContent = null;
+    try {
+      wipContent = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
+    } catch {
+      wipContent = null;
+    }
+    const relay = await readRelayViewSafely(normalized.rootDir, lane.id, laneDir);
+    stages.set(lane.id, await computeLaneStage({
+      rootDir: normalized.rootDir,
+      laneDir,
+      wipContent,
+      worktrees: lane.worktrees ?? {},
+      projectRepos,
+      env: options.env ?? process.env,
+      relay,
+    }));
+  }
+  return stages;
+}
+
+// The relay's state for the stage; none until a relay has run on the lane.
+async function readRelayViewSafely(_rootDir, _laneId, _laneDir) {
+  return null;
+}
+
+/**
+ * The selected active lane with what the relay commands need: its folder,
+ * metadata, the project config, and the tooling root. `requireExplicit`
+ * refuses an implicit selection (the relay names its lane every time).
+ */
+export async function resolveActiveLaneContext(options = {}, { purpose = 'use', requireExplicit = false } = {}) {
+  const { normalized, markerContext } = await resolveSessionCommandContext(options, { needMarkerForLane: true });
+  await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
+  const lanes = await listActiveSessionLanes(normalized);
+  const explicitId = normalizeOptionalString(options?.sessionId);
+  if (requireExplicit && !explicitId) {
+    throw new Error(`Name the lane to ${purpose} with --session <lane-id>, even when it is the only active lane.`);
+  }
+  const selection = resolveLaneSelection({
+    explicitSessionId: explicitId ? validateLaneId(explicitId) : null,
+    marker: requireExplicit ? null : markerContext.marker,
+    laneIds: lanes.map((lane) => lane.id),
+    rootDir: normalized.rootDir,
+    purpose,
+  });
+  if (!selection.sessionId) {
+    throw new Error(`No active session lane exists to ${purpose}. Run \`vibecompass start-session\` first.`);
+  }
+  const lane = lanes.find((item) => item.id === selection.sessionId);
+  if (!lane) {
+    throw new Error(`No active session lane "${selection.sessionId}" exists under ${normalized.activeSessionsDir}.`);
+  }
+  const lanePaths = getLanePaths(normalized, selection.sessionId);
+  const metadata = await readLaneMetadata(lanePaths.sessionFilePath);
+  const projectConfig = await readProjectConfig(normalized.projectFilePath);
+  return {
+    rootDir: normalized.rootDir,
+    cwd: normalized.cwd,
+    sessionId: selection.sessionId,
+    lane,
+    laneDir: lanePaths.laneDir,
+    wipFilePath: lanePaths.wipFilePath,
+    handoffFilePath: lanePaths.handoffFilePath,
+    metadata,
+    projectConfig,
+    projectRepos: Array.isArray(projectConfig?.repos) ? projectConfig.repos : [],
+    workflowSettings: resolveWorkflowSettings(projectConfig),
+    warnings: [...markerContext.warnings, ...selection.warnings, ...metadata.warnings],
   };
 }
 
@@ -1175,7 +1263,7 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
   await ensureInitializedProjectMemory(normalized.rootDir, { allowMissingProjectFile: true });
   const lanes = await listActiveSessionLanes(normalized);
   const index = await readActiveSessionIndex(normalized);
-  const inventory = buildLaneInventory(lanes, resolveValidatedCurrentLane(index.current, lanes));
+  const inventory = buildLaneInventory(lanes, resolveValidatedCurrentLane(index.current, lanes), await computeLaneStages(normalized, lanes, options));
 
   if (lanes.length === 0) {
     throw new Error(
@@ -1355,7 +1443,8 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
   const latestFinalized = finalizedSessions.length > 0 ? finalizedSessions[finalizedSessions.length - 1] : null;
   // The returned inventory is the post-resume state (what list-sessions shows
   // now), not the pre-mutation snapshot used for the refusal messages.
-  const inventoryAfter = buildLaneInventory(await listActiveSessionLanes(normalized), lane.id);
+  const lanesAfter = await listActiveSessionLanes(normalized);
+  const inventoryAfter = buildLaneInventory(lanesAfter, lane.id, await computeLaneStages(normalized, lanesAfter, options));
 
   return {
     rootDir: normalized.rootDir,
@@ -1421,12 +1510,15 @@ async function continueProjectSessionLocked(normalized, options, markerContext) 
  * the continue-session multi-lane failure, and the start-session resume
  * hint, so every surface an agent might read describes lanes the same way.
  */
-function buildLaneInventory(lanes, current) {
+function buildLaneInventory(lanes, current, stages = new Map()) {
   return {
     current: current ?? null,
     lanes: [...lanes]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((lane) => ({
+        // D-419 item 11: null for a lane with no mark or relay state.
+        stage: stages.get(lane.id)?.stage ?? null,
+        stageReason: stages.get(lane.id)?.reason ?? null,
         id: lane.id,
         role: lane.role ?? DEFAULT_LANE_ROLE,
         workingOn: lane.workingOn ?? null,
@@ -1482,6 +1574,9 @@ export function renderLaneInventoryLines(inventory) {
     if (lane.planTasks?.length > 0) {
       lines.push(`    tasks: ${lane.planTasks.map(formatPlanTaskRef).join(', ')}`);
     }
+    if (lane.stage) {
+      lines.push(`    stage: ${renderStage({ stage: lane.stage, reason: lane.stageReason })}`); // D-419 item 11
+    }
     if (lane.lastLogEntry) {
       lines.push(`    last log: ${lane.lastLogEntry}`);
     }
@@ -1493,13 +1588,13 @@ export function renderLaneInventoryLines(inventory) {
   return lines;
 }
 
-function buildResumeAlternativeWarnings(existingLanes, currentHint = null) {
+function buildResumeAlternativeWarnings(existingLanes, currentHint = null, stages = new Map()) {
   if (existingLanes.length === 0) {
     return [];
   }
 
   const ids = existingLanes.map((lane) => lane.id).sort((left, right) => left.localeCompare(right));
-  const inventoryLines = renderLaneInventoryLines(buildLaneInventory(existingLanes, currentHint)).map((line) => `  ${line}`);
+  const inventoryLines = renderLaneInventoryLines(buildLaneInventory(existingLanes, currentHint, stages)).map((line) => `  ${line}`);
   return [
     [
       `${ids.length} lane${ids.length === 1 ? ' is' : 's are'} already active (${ids.join(', ')}). Opening a second lane is fine for new work; to resume existing work instead, run \`vibecompass continue-session <lane-id>\`.`, // D-353

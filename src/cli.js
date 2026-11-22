@@ -21,7 +21,8 @@ import {
   SECRET_CHECK_NEXT_STEP,
   toPublicSecretCheckResult,
 } from './secret-check.js';
-import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
+import { shortRound, writeReadyMark } from './relay-mark.js';
+import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, resolveActiveLaneContext, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { countPassesPastCap } from './review-log.js';
 import { parseRoundCapValue, runReviewSettings } from './review-settings.js';
@@ -264,6 +265,30 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     writeWarnings(io, result.warnings);
     return result.ok ? 0 : 1;
+  }
+
+  if (parsed.command === 'ready-for-review') {
+    await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
+    const context = await resolveActiveLaneContext({
+      ...parsed.options,
+      ...(runtime.cwd ? { cwd: runtime.cwd } : {}),
+    }, { purpose: 'mark ready for review' });
+    const result = await writeReadyMark({
+      rootDir: context.rootDir,
+      laneId: context.sessionId,
+      laneDir: context.laneDir,
+      worktrees: context.metadata.worktrees ?? {},
+      paths: parsed.options.paths ?? [],
+      projectRepos: context.projectRepos,
+      env: runtime.env ?? process.env,
+    });
+    if (parsed.options.json) {
+      io.stdout.write(`${JSON.stringify({ root_dir: context.rootDir, lane_id: context.sessionId, ready_path: result.readyPath, ...result.mark, notes: result.notes }, null, 2)}\n`);
+    } else {
+      io.stdout.write(renderReadyMarkText(context, result));
+    }
+    writeWarnings(io, [...context.warnings, ...result.warnings]);
+    return 0;
   }
 
   if (parsed.command === 'review-settings') {
@@ -1082,6 +1107,10 @@ export function parseCliArgs(argv) {
       return parseReviewSettingsArgs(rest);
     }
 
+    if (command === 'ready-for-review') {
+      return parseReadyForReviewArgs(rest);
+    }
+
     if (command === 'secret-check') {
       return parseSecretCheckArgs(rest);
     }
@@ -1671,6 +1700,79 @@ function renderReviewCheckJson(result) {
     failures: result.failures.map((failure) => ({ kind: failure.kind, message: failure.message, next_step: failure.nextStep })),
     warnings: result.warnings,
   };
+}
+
+function parseReadyForReviewArgs(argv) {
+  const parsed = { paths: [] };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument "${token}".`);
+    }
+
+    if (token === '--json') {
+      parsed.json = true;
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value === undefined) {
+      throw new Error(`Flag "${token}" requires a value.`);
+    }
+    index += 1;
+
+    switch (token) {
+      case '--root':
+        parsed.rootDir = value;
+        break;
+      case '--session':
+        parsed.sessionId = value;
+        break;
+      case '--path':
+        parsed.paths.push(value);
+        break;
+      default:
+        throw new Error(`Unknown flag "${token}".`);
+    }
+  }
+
+  return {
+    command: 'ready-for-review',
+    options: parsed,
+  };
+}
+
+// D-419 item 4: the mark, its fingerprints, and what the work covered.
+function renderReadyMarkText(context, result) {
+  const { mark } = result;
+  const lines = [
+    `Marked lane ${context.sessionId} ready for review (round ${shortRound(mark.round_id)}).`,
+    `- Handoff: ${mark.fingerprints.handoff.slice(0, 12)} (${mark.covers.handoff})`,
+    `- Record: ${mark.fingerprints.record.slice(0, 12)} (${mark.covers.record})`,
+    `- Work: ${mark.fingerprints.work.slice(0, 12)}`,
+  ];
+  for (const worktree of mark.covers.worktrees) {
+    lines.push(`  - worktree ${worktree.repo} at ${worktree.head.slice(0, 12)}: staged and working changes, ${worktree.untracked} untracked file${worktree.untracked === 1 ? '' : 's'}`);
+  }
+  for (const item of mark.covers.paths) {
+    if (item.kind === 'directory') {
+      lines.push(`  - ${item.spec}/: ${item.covered} file${item.covered === 1 ? '' : 's'} covered${item.git ? `, ${item.ignored} ignored by git left out` : ''}`);
+    } else if (item.kind === 'missing') {
+      lines.push(`  - ${item.spec}: missing (counts as a deletion)`);
+    } else if (item.kind === 'file') {
+      lines.push(`  - ${item.spec}`);
+    }
+  }
+  for (const note of result.notes) {
+    lines.push(`  - note: ${note}`);
+  }
+  lines.push(mark.builder
+    ? `Builder conversation: ${mark.builder.conversation_id} (Claude Code). The relay can loop with it once it is closed.`
+    : 'No builder conversation recorded (CLAUDE_CODE_SESSION_ID is not set): the relay runs one pass.');
+  lines.push(`Wrote ${result.readyPath}`);
+  return `${lines.join('\n')}\n`;
 }
 
 function parseReviewSettingsArgs(argv) {
@@ -3615,6 +3717,8 @@ function usageText() {
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
     '  vibecompass review-check [--session <lane-id>] [--json] [options]',
     '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails', // D-394
+    '  vibecompass ready-for-review [--session <lane-id>] [--path <repo-id>:<path>|<root-path>...] [--json] [options]',
+    '                                        Builder: mark the round ready for review (fingerprints the handoff, the record, and the work)', // D-419
     '  vibecompass review-settings [--round-cap <n>] [--json] [options]',
     '                                        Show the review check and round cap; --round-cap sets the cap (1-10) in project.yaml', // D-420
     '  vibecompass append-decision --target <domain.md> --entry <staged-entry.md> [--group <label>] [options]',
@@ -3799,6 +3903,7 @@ function usageText() {
     '  --root <path>                        Project-memory root. Defaults to .compass',
     '  --session <lane-id>                  Lane ID for switch-session; positional ID is also accepted',
     '  --json                               list-sessions: print the lane inventory as JSON (every lane carries its role and planTasks, a list of { plan, id })', // D-392, D-395
+    '                                        list-sessions shows a stage: line for a lane with a ready-for-review mark or relay state (--json stage and stageReason, null otherwise)', // D-419
     '',
     'Rebuild-active-index options:',
     '  --root <path>                        Project-memory root. Defaults to .compass',
@@ -3821,6 +3926,16 @@ function usageText() {
     '  --session <lane-id>                  Lane to check. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker', // D-277
     '  --json                               Print the parse and check as JSON: findings with their states, owner lines, passes, failures',
     '                                        The check reads wip.md › ## Review log and project.yaml metadata.workflow.review (check warn|block|off, round_cap 1-10); it writes nothing',
+    '',
+    'Ready-for-review options:', // D-419
+    '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
+    '  --session <lane-id>                  Lane to mark. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker',
+    '  --path <repo-id>:<path>|<path>       Repeatable: a file or folder under review outside the lane\'s worktrees, in a project.yaml repository or relative to the memory root',
+    '                                        Writes sessions/active/<lane-id>/ready.json: SHA-256 of handoff.md › ## Builder → Reviewer, of wip.md › ## Review log, and of the work',
+    '                                        (each worktree\'s HEAD, staged and working diffs, and untracked files, plus each --path), the round id they make, and the',
+    '                                        builder\'s Claude Code conversation when CLAUDE_CODE_SESSION_ID is set. Refused while a finding waits for the builder\'s response',
+    '                                        and no owner line defers it, and when the lane has no worktree and no --path. In a hand-run lane it changes only the stage',
+    '  --json                               Print the mark as JSON',
     '',
     'Review-settings options:', // D-420
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
