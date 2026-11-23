@@ -17,6 +17,10 @@ const POLL_INTERVAL_MS = 15_000;
 const POLL_BUDGET_MS = 6 * 60 * 1000;
 const POLL_MAX_REQUESTS = 24;
 const DETAILS_BUDGET_MS = 60_000;
+/** The app's run and revision ids are UUIDs (gen_random_uuid). */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ACKNOWLEDGED_STATUSES = new Set(['completed', 'already_current']);
+const UNKNOWN_NEXT_STEP = 'Run vibecompass status, or push again: a push that already applied answers already current.';
 
 /**
  * A push that ended without applying, or whose outcome is unknown. `outcome`
@@ -59,35 +63,104 @@ function endpoint(context, route) {
   return new URL(`api/sync/projects/${encodeURIComponent(context.projectId)}/${route}`, base).href;
 }
 
-/** Reads a response body under a byte cap; a longer body is an error, never buffered whole. */
-export async function readResponseText(response, cap = RESPONSE_READ_CAP_BYTES) {
+/**
+ * Reads a response body under a byte cap; a longer body is an error, never
+ * buffered whole. With `signal`, the read gives up when it aborts, even if the
+ * body stalls after its headers.
+ */
+export async function readResponseText(response, cap = RESPONSE_READ_CAP_BYTES, { signal = null } = {}) {
+  if (signal?.aborted) throw abortError(signal);
   if (!response.body || typeof response.body.getReader !== 'function') {
-    const text = typeof response.text === 'function' ? await response.text() : '';
+    const text = typeof response.text === 'function' ? await raceAbort(response.text(), signal) : '';
     if (Buffer.byteLength(text, 'utf8') > cap) throw new Error(`The hosted app's answer was larger than ${cap} bytes.`);
     return text;
   }
   const reader = response.body.getReader();
   const chunks = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      await reader.cancel();
-      throw new Error(`The hosted app's answer was larger than ${cap} bytes.`);
+  try {
+    for (;;) {
+      const { done, value } = await raceAbort(reader.read(), signal);
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) throw new Error(`The hosted app's answer was larger than ${cap} bytes.`);
+      chunks.push(value);
     }
-    chunks.push(value);
+  } catch (error) {
+    reader.cancel().catch(() => {});
+    throw error;
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total).toString('utf8');
 }
 
-function parseJson(text) {
+function abortError(signal) {
+  const reason = signal?.reason;
+  return reason instanceof Error ? reason : new Error('The request ran past its time budget.');
+}
+
+/** `promise`, or a rejection as soon as `signal` aborts. */
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** A signal that aborts when `deadline` (epoch ms) passes. */
+function deadlineSignal(deadline) {
+  return AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+}
+
+/** The parsed JSON value, or undefined when `text` isn't JSON. */
+function tryParseJson(text) {
   try {
-    return text ? JSON.parse(text) : {};
+    return text ? JSON.parse(text) : undefined;
   } catch {
-    return {};
+    return undefined;
   }
+}
+
+/** An object to read an error's fields from: the parsed body, or {}. Never used to accept a success. */
+function parseJson(text) {
+  const value = tryParseJson(text);
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+/**
+ * A push acknowledgement the package may record: a known success status, the
+ * run id, and the hosted revision it produced or found, both UUIDs.
+ */
+export function isValidPushAnswer(answer) {
+  return (
+    Boolean(answer) &&
+    typeof answer === 'object' &&
+    !Array.isArray(answer) &&
+    ACKNOWLEDGED_STATUSES.has(answer.status) &&
+    typeof answer.run_id === 'string' &&
+    UUID_PATTERN.test(answer.run_id) &&
+    typeof answer.remote_revision_id === 'string' &&
+    UUID_PATTERN.test(answer.remote_revision_id)
+  );
+}
+
+/** The error for a success status whose answer the package can't record. */
+export function invalidAnswerError(status) {
+  return new PushOutcomeError(
+    `The push's outcome is unknown: the hosted app answered${status ? ` ${status}` : ''} without a valid acknowledgement (a run id, the hosted revision, and a success status). Nothing was recorded locally. ${UNKNOWN_NEXT_STEP}`,
+    { outcome: 'unknown', status, code: 'invalid_answer' },
+  );
 }
 
 /** A fetch on the push path that never follows a redirect, so no body goes to another address. */
@@ -121,7 +194,9 @@ function serverReason(body, text) {
 
 /**
  * The single request for a large body (over 4,000,000 bytes), with redirects
- * refused. Vercel's own 413 becomes the too-large message.
+ * refused. Only a 202 with a valid acknowledgement counts as applied; any
+ * other success status, a malformed 202, or a reply cut off mid-body leaves
+ * the outcome unknown. Vercel's own 413 becomes the too-large message.
  */
 export async function sendLargeSinglePush(context, bodyText, documents) {
   const response = await send(context, endpoint(context, 'push'), {
@@ -129,9 +204,21 @@ export async function sendLargeSinglePush(context, bodyText, documents) {
     headers: authHeaders(context, { 'content-type': 'application/json' }),
     body: bodyText,
   });
-  const text = await readResponseText(response);
+  let text;
+  try {
+    text = await readResponseText(response);
+  } catch {
+    throw new PushOutcomeError(
+      `The push's outcome is unknown: the hosted app's answer (${response.status}) was cut off. Nothing was recorded locally. ${UNKNOWN_NEXT_STEP}`,
+      { outcome: 'unknown', status: response.status, code: 'answer_unreadable' },
+    );
+  }
+  if (response.ok) {
+    const answer = tryParseJson(text);
+    if (response.status === 202 && isValidPushAnswer(answer)) return answer;
+    throw invalidAnswerError(response.status);
+  }
   const body = parseJson(text);
-  if (response.ok) return body;
   if (response.status === 413) {
     const largest = documents.reduce(
       (max, document) => {
@@ -149,8 +236,9 @@ export async function sendLargeSinglePush(context, bodyText, documents) {
       { outcome: 'refused', status: 413, code: 'push_too_large' },
     );
   }
+  if (response.status >= 400 && response.status < 500) throw refusalError(response.status, body, text);
   throw new PushOutcomeError(`Hosted push failed with ${response.status}: ${serverReason(body, text)}`, {
-    outcome: response.status >= 500 ? 'unknown' : 'refused',
+    outcome: 'unknown',
     status: response.status,
     code: body.code ?? null,
   });
@@ -248,6 +336,16 @@ export async function uploadPush(context, bodyText, documentCount) {
   return commitUpload(context, uploadId, packedSha256);
 }
 
+/**
+ * The commit, retried once on a network error, a reply cut off mid-body, or a
+ * 5xx, then polled within the budget while the answer says nothing definitive
+ * (in progress, rate-limited, unsettled, or a 202 that isn't a valid
+ * acknowledgement). Every request and body read is bounded by the budget.
+ *
+ * Once any attempt was ambiguous (it may have reached the app), a refusal
+ * counts only when it is this upload's recorded answer (it names the upload
+ * id): a 401 after a lost reply, say, says nothing about the earlier attempt.
+ */
 async function commitUpload(context, uploadId, packedSha256) {
   const sleep = sleeper(context);
   const url = endpoint(context, `push-uploads/${encodeURIComponent(uploadId)}/commit`);
@@ -256,63 +354,98 @@ async function commitUpload(context, uploadId, packedSha256) {
     headers: authHeaders(context, { 'content-type': 'application/json' }),
     body: JSON.stringify({ packed_sha256: packedSha256 }),
   };
-  const started = Date.now();
+  const deadline = Date.now() + (context.pushBudgets?.commitMs ?? POLL_BUDGET_MS);
   let networkRetries = 0;
   let polls = 0;
+  let ambiguous = false;
   let lastProblem = 'no answer';
-  for (;;) {
+  while (Date.now() < deadline) {
+    const signal = deadlineSignal(deadline);
     let response;
+    let text;
     try {
-      response = await send(context, url, init);
+      response = await send(context, url, { ...init, signal });
+      text = await readResponseText(response, RESPONSE_READ_CAP_BYTES, { signal });
     } catch (error) {
       if (error instanceof PushOutcomeError) throw error;
-      lastProblem = 'a network error';
-      if (networkRetries < 1) {
-        networkRetries += 1;
-        continue;
-      }
-      break;
-    }
-    const text = await readResponseText(response);
-    const body = parseJson(text);
-    if (response.status === 202) return { answer: body };
-    // A definitive refusal: the recorded answer, the first time or replayed.
-    if (response.status >= 400 && response.status < 500 && response.status !== 409 && response.status !== 429) {
-      throw refusalError(response.status, body, text);
-    }
-    if (response.status === 409 && body.code !== 'upload_in_progress') {
-      throw refusalError(response.status, body, text);
-    }
-    if (response.status >= 500 && networkRetries < 1 && body.code !== 'push_outcome_unknown') {
+      ambiguous = true;
+      lastProblem = signal.aborted
+        ? 'no answer within the time budget'
+        : response
+          ? `an answer (${response.status}) cut off mid-body`
+          : 'a network error';
+      if (signal.aborted || networkRetries >= 1) break;
       networkRetries += 1;
-      lastProblem = `status ${response.status}`;
       continue;
     }
-    // In progress, rate-limited, or unsettled: none of these says what an
-    // earlier attempt did. Ask again within the budget.
-    lastProblem = body.code ? `${body.code} (${response.status})` : `status ${response.status}`;
+    if (response.status === 202) {
+      const answer = tryParseJson(text);
+      if (isValidPushAnswer(answer)) return { answer };
+      ambiguous = true;
+      lastProblem = 'a 202 without a valid acknowledgement';
+    } else {
+      const body = parseJson(text);
+      const definitive =
+        (response.status >= 400 && response.status < 500 && response.status !== 409 && response.status !== 429) ||
+        (response.status === 409 && body.code !== 'upload_in_progress');
+      if (definitive) {
+        // The recorded answer, the first time or replayed.
+        if (!ambiguous || body.upload_id === uploadId) throw refusalError(response.status, body, text);
+        throw new PushOutcomeError(
+          `The push's outcome is unknown: an earlier commit attempt got no definitive answer, and the hosted app then answered ${response.status} (${serverReason(body, text)}), which doesn't say what the earlier attempt did. Nothing was recorded locally. ${UNKNOWN_NEXT_STEP}`,
+          { outcome: 'unknown', status: response.status, code: body.code ?? null },
+        );
+      }
+      ambiguous = true;
+      if (response.status >= 500 && networkRetries < 1 && body.code !== 'push_outcome_unknown') {
+        networkRetries += 1;
+        lastProblem = `status ${response.status}`;
+        continue;
+      }
+      // In progress, rate-limited, or unsettled: none of these says what an
+      // earlier attempt did. Ask again within the budget.
+      lastProblem = body.code ? `${body.code} (${response.status})` : `status ${response.status}`;
+    }
     const wait = retryAfterMs(response, POLL_INTERVAL_MS);
-    if (polls >= POLL_MAX_REQUESTS || Date.now() - started + wait > POLL_BUDGET_MS) break;
+    if (polls >= POLL_MAX_REQUESTS || Date.now() + wait >= deadline) break;
     polls += 1;
     await sleep(wait);
   }
   throw new PushOutcomeError(
-    `The push's outcome is unknown (last answer: ${lastProblem}). Run vibecompass status, or push again: a push that already applied answers already current.`,
+    `The push's outcome is unknown (last answer: ${lastProblem}). ${UNKNOWN_NEXT_STEP}`,
     { outcome: 'unknown' },
   );
 }
 
+const MAX_ISSUE_LINES = 20;
+
+/**
+ * A definitive refusal, worded with the receipt's bounded fields: the reason
+ * and code, the path, the hosted head, the run (a needs_rebase audit run), and
+ * up to 20 schema issues, then how many more there were.
+ */
 function refusalError(status, body, text) {
-  const reason = serverReason(body, text);
+  const reason = serverReason(body, text).replace(/\.$/, '');
   const detail = [
-    body.code ? `code ${body.code}` : null,
+    typeof body.code === 'string' ? `code ${body.code}` : typeof body.status === 'string' ? body.status : null,
     typeof body.path === 'string' ? `path ${body.path}` : null,
     typeof body.target_remote_revision_id === 'string' ? `hosted head ${body.target_remote_revision_id}` : null,
+    typeof body.run_id === 'string' ? `run ${body.run_id}` : null,
   ].filter(Boolean).join(', ');
-  const error = new PushOutcomeError(
-    `Push refused (${status}): ${reason}${detail ? ` (${detail})` : ''}. The hosted memory didn't change.`,
-    { outcome: 'refused', status, code: body.code ?? (body.status === 'needs_rebase' ? 'needs_rebase' : null) },
-  );
+  const lines = [`Push refused (${status}): ${reason}${detail ? ` (${detail})` : ''}. The hosted memory didn't change.`];
+  const issues = Array.isArray(body.issues) ? body.issues.filter((issue) => issue && typeof issue === 'object') : [];
+  const shown = issues.slice(0, MAX_ISSUE_LINES);
+  for (const issue of shown) {
+    const where = typeof issue.path === 'string' && issue.path ? `${issue.path}: ` : '';
+    lines.push(`  - ${where}${typeof issue.message === 'string' ? issue.message : 'invalid'}`);
+  }
+  const total = Number.isInteger(body.issues_total) ? body.issues_total : issues.length;
+  if (total > shown.length) lines.push(`  - and ${total - shown.length} more (${total} in all)`);
+  const error = new PushOutcomeError(lines.join('\n'), {
+    outcome: 'refused',
+    status,
+    code: body.code ?? (body.status === 'needs_rebase' ? 'needs_rebase' : null),
+  });
   error.responseBody = body;
   return error;
 }
@@ -320,7 +453,10 @@ function refusalError(status, body, text) {
 /**
  * After a valid 202: fetch what the answer left out (omitted warnings and
  * ids, and the full text of each cut warning) within 60 seconds and the
- * request windows. Never undoes the push; reports what it couldn't fetch.
+ * request windows; every request and body read is bounded by that budget.
+ * Each page and chunk is checked before it's used: a cut warning's full text
+ * replaces its preview only when its chunks account for every byte the app
+ * declared. Never undoes the push; reports what it couldn't fetch.
  */
 export async function completePushDetails(context, answer) {
   const projection = answer.projection ?? {};
@@ -343,17 +479,19 @@ export async function completePushDetails(context, answer) {
     return { warnings, lists, totals, incomplete: null };
   }
 
-  const deadline = Date.now() + DETAILS_BUDGET_MS;
+  const deadline = Date.now() + (context.pushBudgets?.detailsMs ?? DETAILS_BUDGET_MS);
   const sleep = sleeper(context);
   const runId = String(answer.run_id);
   async function getJson(query) {
     for (;;) {
-      if (Date.now() > deadline) throw new Error('details budget spent');
+      if (Date.now() >= deadline) throw new Error('details budget spent');
+      const signal = deadlineSignal(deadline);
       const response = await send(context, `${endpoint(context, `runs/${encodeURIComponent(runId)}/push-details`)}?${query}`, {
         method: 'GET',
         headers: authHeaders(context),
+        signal,
       });
-      const text = await readResponseText(response);
+      const text = await readResponseText(response, RESPONSE_READ_CAP_BYTES, { signal });
       if (response.status === 429) {
         const wait = retryAfterMs(response, 5_000);
         if (Date.now() + wait > deadline) throw new Error('details budget spent');
@@ -361,7 +499,35 @@ export async function completePushDetails(context, answer) {
         continue;
       }
       if (response.status !== 200) throw new Error(`push-details answered ${response.status}`);
-      return parseJson(text);
+      const value = tryParseJson(text);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('push-details answered malformed JSON');
+      return value;
+    }
+  }
+
+  /** The whole message of cut warning `index`, or null when the chunks don't agree. */
+  async function readWholeMessage(index, declaredBytes) {
+    const pieces = [];
+    let messageOffset = 0;
+    let messageBytes = null;
+    for (;;) {
+      const chunk = await getJson(`list=warnings&item=${index}&message_offset=${messageOffset}`);
+      if (
+        chunk.item !== index ||
+        chunk.message_offset !== messageOffset ||
+        typeof chunk.text !== 'string' ||
+        !Number.isInteger(chunk.message_bytes)
+      ) {
+        return null;
+      }
+      if (messageBytes === null) messageBytes = chunk.message_bytes;
+      if (chunk.message_bytes !== messageBytes || (declaredBytes !== null && messageBytes !== declaredBytes)) return null;
+      const end = messageOffset + Buffer.byteLength(chunk.text, 'utf8');
+      if (end > messageBytes) return null;
+      pieces.push(chunk.text);
+      if (chunk.next_message_offset === null) return end === messageBytes ? pieces.join('') : null;
+      if (chunk.next_message_offset !== end || end <= messageOffset || end >= messageBytes) return null;
+      messageOffset = end;
     }
   }
 
@@ -370,32 +536,45 @@ export async function completePushDetails(context, answer) {
       let offset = lists[name].length;
       while (offset < totals[name]) {
         const page = await getJson(`list=${name}&offset=${offset}`);
-        if (!Array.isArray(page.items) || page.items.length === 0) break;
-        lists[name].push(...page.items);
-        offset = page.next_offset ?? totals[name];
+        if (
+          page.offset !== offset ||
+          !Array.isArray(page.items) ||
+          page.items.length === 0 ||
+          !page.items.every((item) => typeof item === 'string')
+        ) {
+          break;
+        }
+        lists[name].push(...page.items.slice(0, totals[name] - offset));
+        offset = lists[name].length;
       }
     }
     let offset = warnings.length;
-    while (offset < totals.warnings) {
+    pages: while (offset < totals.warnings) {
       const page = await getJson(`list=warnings&offset=${offset}`);
-      if (!Array.isArray(page.items) || page.items.length === 0) break;
+      if (page.offset !== offset || !Array.isArray(page.items) || page.items.length === 0) break;
       for (const item of page.items) {
+        // Each item must be the next warning in order.
+        if (
+          !item ||
+          typeof item !== 'object' ||
+          item.index !== warnings.length ||
+          warnings.length >= totals.warnings ||
+          typeof item.message !== 'string'
+        ) {
+          break pages;
+        }
         const { index: _index, ...warning } = item;
         warnings.push(warning);
       }
-      offset = page.next_offset ?? totals.warnings;
+      offset = warnings.length;
     }
     for (let index = 0; index < warnings.length; index += 1) {
-      if (!warnings[index]?.message_truncated) continue;
-      let messageOffset = 0;
-      const pieces = [];
-      while (messageOffset !== null) {
-        const chunk = await getJson(`list=warnings&item=${index}&message_offset=${messageOffset}`);
-        pieces.push(String(chunk.text ?? ''));
-        messageOffset = chunk.next_message_offset ?? null;
-      }
-      const { message_truncated: _cut, message_bytes: _bytes, ...rest } = warnings[index];
-      warnings[index] = { ...rest, message: pieces.join('') };
+      const entry = warnings[index];
+      if (!entry?.message_truncated) continue;
+      const message = await readWholeMessage(index, Number.isInteger(entry.message_bytes) ? entry.message_bytes : null);
+      if (message === null) continue; // keeps the preview and its marks
+      const { message_truncated: _cut, message_bytes: _bytes, ...rest } = entry;
+      warnings[index] = { ...rest, message };
     }
   } catch {
     // Fall through: report what is still missing.

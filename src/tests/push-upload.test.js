@@ -1,10 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import { initializeProjectMemory } from '../init.js';
 import { runCli } from '../cli.js';
@@ -14,6 +16,7 @@ import {
   INLINE_PUSH_MAX_BYTES,
   PushOutcomeError,
   readResponseText,
+  sendLargeSinglePush,
 } from '../push-upload.js';
 
 // The hosted push's large path against a local stand-in of the app: the
@@ -21,6 +24,7 @@ import {
 // older-app fallback, redirects refused, retries, polls, refusals, and the
 // details fetch after a valid 202.
 
+const CLI_PATH = fileURLToPath(new URL('../cli.js', import.meta.url));
 const TOKEN_VAR = 'PUSH_UPLOAD_TEST_TOKEN';
 const TOKEN = ['test', 'upload', 'credential'].join('-');
 
@@ -125,7 +129,7 @@ async function startStandIn(behavior = {}) {
         return send(202, { run_id: randomUUID(), status: 'completed', remote_revision_id: randomUUID(), projection: { counts: {}, warnings: [], warnings_total: 0 }, details_truncated: false });
       }
       match = route.match(/^runs\/([^/]+)\/push-details$/);
-      if (match && request.method === 'GET' && behavior.details) return behavior.details({ send, url, state });
+      if (match && request.method === 'GET' && behavior.details) return behavior.details({ send, url, state, response });
       return send(404, { error: 'not found' });
     } catch (error) {
       send(500, { error: String(error?.message ?? error) });
@@ -136,7 +140,12 @@ async function startStandIn(behavior = {}) {
   return {
     url: `http://127.0.0.1:${port}`,
     state,
-    close: () => new Promise((resolve) => server.close(resolve)),
+    close: () =>
+      new Promise((resolve) => {
+        server.close(resolve);
+        // A stalled answer (the budget tests) must not hold the server open.
+        server.closeAllConnections();
+      }),
   };
 }
 
@@ -283,13 +292,14 @@ test('redirects are refused on begin, parts, commit, the large-document request,
 });
 
 test('a commit retried after a network error succeeds; polls honour in-progress answers', async () => {
+  const runId = randomUUID();
   let commits = 0;
   const standIn = await startStandIn({
     commit: ({ send, response }) => {
       commits += 1;
       if (commits === 1) return response.destroy();
       if (commits <= 3) return send(409, { error: 'in progress', code: 'upload_in_progress' }, { 'retry-after': '1' });
-      return send(202, { run_id: 'run-9', status: 'completed', remote_revision_id: randomUUID(), projection: { warnings: [], warnings_total: 0 } });
+      return send(202, { run_id: runId, status: 'completed', remote_revision_id: randomUUID(), projection: { warnings: [], warnings_total: 0 } });
     },
   });
   try {
@@ -298,7 +308,7 @@ test('a commit retried after a network error succeeds; polls honour in-progress 
     await addDocument(rootDir, 'b', 2_200_000);
     const waits = [];
     const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir, { sleep: async (ms) => waits.push(ms) }));
-    assert.equal(result.runId, 'run-9');
+    assert.equal(result.runId, runId);
     assert.equal(commits, 4);
     assert.deepEqual(waits, [1000, 1000]);
   } finally {
@@ -404,7 +414,7 @@ test('after a valid 202 the package fetches omitted warnings, both lists, and ea
         const offset = Number(url.searchParams.get('message_offset'));
         const bytes = Buffer.from(warnings[item].message, 'utf8');
         const end = Math.min(bytes.length, offset + 1_000_000);
-        return send(200, { item, message_offset: offset, text: bytes.subarray(offset, end).toString('utf8'), next_message_offset: end < bytes.length ? end : null });
+        return send(200, { run_id: runId, item, message_bytes: bytes.length, message_offset: offset, text: bytes.subarray(offset, end).toString('utf8'), next_message_offset: end < bytes.length ? end : null });
       }
       const offset = Number(url.searchParams.get('offset'));
       const source = list === 'warnings' ? warnings : applied;
@@ -462,4 +472,462 @@ test('an answer past the read cap is refused without buffering it whole', async 
   const big = new Response('x'.repeat(2_000));
   await assert.rejects(readResponseText(big, 1_000), /larger than 1000 bytes/);
   assert.equal(await readResponseText(new Response('ok'), 1_000), 'ok');
+});
+
+// Review pass 6: answers validated before the cursor, ambiguous retries,
+// time budgets that bound reads, refusal details, and checked details.
+
+async function readManifestSync(rootDir) {
+  const manifest = JSON.parse(await readFile(path.join(rootDir, 'state', 'manifest.json'), 'utf8'));
+  return manifest.sync ?? null;
+}
+
+function validAnswer(extra = {}) {
+  return { run_id: randomUUID(), status: 'completed', remote_revision_id: randomUUID(), projection: { counts: {}, warnings: [], warnings_total: 0 }, details_truncated: false, ...extra };
+}
+
+/** A root that already pushed once, so a later failure can be checked against its recorded cursor. */
+async function rootWithCursor(standIn) {
+  const { tempDir, rootDir } = await createRoot(standIn.url);
+  await addDocument(rootDir, 'a', 2_200_000);
+  await addDocument(rootDir, 'b', 2_200_000);
+  await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+  const before = await readManifestSync(rootDir);
+  assert.equal(before.last_sync_direction, 'push');
+  await addDocument(rootDir, 'c', 300_000);
+  return { tempDir, rootDir, before };
+}
+
+test('a commit reply cut off mid-body is retried for the same upload, and the replayed receipt is recorded', async () => {
+  const replay = validAnswer();
+  const uploadIds = [];
+  const standIn = await startStandIn({
+    intercept: async ({ route }) => {
+      const match = route.match(/^push-uploads\/([^/]+)\/commit$/);
+      if (match) uploadIds.push(match[1]);
+      return false;
+    },
+    commit: ({ send, response }) => {
+      if (uploadIds.length === 1) {
+        response.writeHead(202, { 'content-type': 'application/json' });
+        response.write(JSON.stringify(replay).slice(0, 40));
+        setTimeout(() => response.destroy(), 20);
+        return;
+      }
+      return send(202, replay);
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+    assert.equal(uploadIds.length, 2);
+    assert.equal(uploadIds[0], uploadIds[1], 'the retry names the same upload');
+    assert.equal(result.runId, replay.run_id);
+    assert.equal((await readManifestSync(rootDir)).last_successful_remote_revision, replay.remote_revision_id);
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('a 202 that never carries a valid acknowledgement is an unknown outcome, and the recorded cursor stays as it was', async () => {
+  for (const malformed of ['not json', '{"status":"completed"}', JSON.stringify({ ...validAnswer(), run_id: 'run-1' })]) {
+    let failing = false;
+    const standIn = await startStandIn({
+      commit: ({ send }) => (failing ? send(202, malformed) : send(202, validAnswer())),
+    });
+    try {
+      const { tempDir, rootDir, before } = await rootWithCursor(standIn);
+      failing = true;
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.equal(error.outcome, 'unknown', malformed);
+        assert.match(error.message, /outcome is unknown/);
+        return true;
+      });
+      assert.deepEqual(await readManifestSync(rootDir), before, 'cursor, manifest hash, and pending previews unchanged');
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+test('an empty or malformed success on a single request (the older-app fallback, and a small push) is unknown and records nothing', async () => {
+  for (const kind of ['fallback-204', 'small-empty-object', 'small-not-json']) {
+    const standIn = await startStandIn({
+      noUploadRoutes: kind === 'fallback-204',
+      intercept: async ({ route, response, send }) => {
+        if (route !== 'push') return false;
+        if (kind === 'fallback-204') {
+          response.writeHead(204);
+          response.end();
+        } else if (kind === 'small-empty-object') send(202, {});
+        else send(200, '<html>ok</html>');
+        return true;
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      if (kind === 'fallback-204') {
+        await addDocument(rootDir, 'a', 2_200_000);
+        await addDocument(rootDir, 'b', 2_200_000);
+      } else await addDocument(rootDir, 'a', 10_000);
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.equal(error.outcome, 'unknown', kind);
+        assert.equal(error.code, 'invalid_answer', kind);
+        return true;
+      });
+      assert.notEqual((await readManifestSync(rootDir))?.last_sync_direction, 'push', kind);
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+test('after a lost commit reply, an answer that isn\'t this upload\'s record (a 401, another upload\'s refusal) is unknown, not refused', async () => {
+  for (const second of ['401', 'other-upload']) {
+    let commits = 0;
+    const standIn = await startStandIn({
+      commit: ({ send, response }) => {
+        commits += 1;
+        if (commits === 1) return response.destroy();
+        if (second === '401') return send(401, { error: 'Invalid sync credential' });
+        return send(409, { error: 'The upload used all of its commit attempts.', code: 'upload_attempts_exhausted', upload_id: randomUUID() });
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      await addDocument(rootDir, 'a', 2_200_000);
+      await addDocument(rootDir, 'b', 2_200_000);
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.equal(error.outcome, 'unknown', second);
+        assert.match(error.message, /doesn't say what the earlier attempt did/);
+        assert.doesNotMatch(error.message, /didn't change/);
+        return true;
+      });
+      assert.equal(commits, 2);
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+test('after a lost commit reply, the upload\'s replayed refusal reports its original outcome and details', async () => {
+  let commits = 0;
+  const auditRun = randomUUID();
+  const head = randomUUID();
+  const standIn = await startStandIn({
+    commit: ({ send, response, upload, state }) => {
+      commits += 1;
+      if (commits === 1) return response.destroy();
+      const uploadId = [...state.uploads.entries()].find(([, value]) => value === upload)[0];
+      return send(409, { error: 'Remote project-memory head has advanced; pull before pushing.', upload_id: uploadId, status: 'needs_rebase', target_remote_revision_id: head, run_id: auditRun });
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+      assert.equal(error.outcome, 'refused');
+      assert.equal(error.code, 'needs_rebase');
+      assert.match(error.message, new RegExp(`hosted head ${head}, run ${auditRun}\\). The hosted memory didn't change`));
+      return true;
+    });
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('a commit answer that sends its headers and then stalls ends as an unknown outcome within the budget', async () => {
+  let commits = 0;
+  const standIn = await startStandIn({
+    commit: ({ send, response }) => {
+      commits += 1;
+      if (commits === 1) return send(409, { error: 'in progress', code: 'upload_in_progress' }, { 'retry-after': '1' });
+      response.writeHead(202, { 'content-type': 'application/json' });
+      response.write('{"run_id":');
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const started = Date.now();
+    await assert.rejects(
+      pushProjectMemory({ rootDir: '.compass' }, environment(tempDir, { pushBudgets: { commitMs: 1_500 } })),
+      (error) => error.outcome === 'unknown' && /time budget/.test(error.message),
+    );
+    assert.ok(Date.now() - started < 6_000, `ended after ${Date.now() - started} ms`);
+    assert.equal(commits, 2);
+    assert.notEqual((await readManifestSync(rootDir))?.last_sync_direction, 'push');
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('a details read that stalls after a valid 202 keeps the push, its run id and cursor, and reports what is missing', async () => {
+  const answer = validAnswer({
+    projection: { counts: {}, warnings: [{ code: 'unknown_status', message: 'short', message_truncated: true, message_bytes: 900 }], warnings_total: 3 },
+    details_truncated: true,
+  });
+  const standIn = await startStandIn({
+    commit: ({ send }) => send(202, answer),
+    details: ({ response }) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.write('{"items":[');
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const started = Date.now();
+    const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir, { pushBudgets: { detailsMs: 1_000 } }));
+    assert.ok(Date.now() - started < 6_000, `ended after ${Date.now() - started} ms`);
+    assert.equal(result.runId, answer.run_id);
+    assert.deepEqual(result.detailsIncomplete, { runId: answer.run_id, warnings: 2, cutWarnings: 1, applied_proposal_ids: 0, stale_proposal_ids: 0 });
+    assert.equal((await readManifestSync(rootDir)).last_successful_remote_revision, answer.remote_revision_id);
+  } finally {
+    await standIn.close();
+  }
+});
+
+/** Runs the real CLI as a child process and returns its exit code and output. */
+function runCliProcess(cwd) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI_PATH, 'push'], {
+      cwd,
+      env: { PATH: process.env.PATH, HOME: cwd, [TOKEN_VAR]: TOKEN },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+test('the CLI prints a refusal\'s recorded details: the needs_rebase run and head, and schema issues, first time and replayed', async () => {
+  const auditRun = randomUUID();
+  const head = randomUUID();
+  const issues = Array.from({ length: 25 }, (_, i) => ({ path: `documents.${i}.raw_text`, message: `Document ${i} is invalid` }));
+  for (const kind of ['needs_rebase', 'issues', 'needs_rebase-replayed']) {
+    let commits = 0;
+    const standIn = await startStandIn({
+      commit: ({ send, response, upload, state }) => {
+        commits += 1;
+        const uploadId = [...state.uploads.entries()].find(([, value]) => value === upload)[0];
+        if (kind === 'needs_rebase-replayed' && commits === 1) return response.destroy();
+        if (kind === 'issues') {
+          return send(422, { error: 'Invalid push request', upload_id: uploadId, issues, issues_total: 40, issues_omitted: 15 });
+        }
+        return send(409, { error: 'Remote project-memory head has advanced; pull before pushing.', upload_id: uploadId, status: 'needs_rebase', target_remote_revision_id: head, run_id: auditRun });
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      await addDocument(rootDir, 'a', 2_200_000);
+      await addDocument(rootDir, 'b', 2_200_000);
+      const { code, stderr } = await runCliProcess(tempDir);
+      assert.equal(code, 1, kind);
+      if (kind === 'issues') {
+        assert.match(stderr, /Error: Push refused \(422\): Invalid push request\. The hosted memory didn't change\./);
+        assert.match(stderr, /\n {2}- documents\.0\.raw_text: Document 0 is invalid\n/);
+        assert.match(stderr, /\n {2}- documents\.19\.raw_text: Document 19 is invalid\n/);
+        assert.doesNotMatch(stderr, /documents\.20\.raw_text/);
+        assert.match(stderr, /\n {2}- and 20 more \(40 in all\)/);
+      } else {
+        assert.match(stderr, new RegExp(`Error: Push refused \\(409\\): Remote project-memory head has advanced; pull before pushing \\(needs_rebase, hosted head ${head}, run ${auditRun}\\)\\. The hosted memory didn't change\\.`), kind);
+      }
+      assert.doesNotMatch(stderr, new RegExp(TOKEN));
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+/** UTF-8 cut points the app uses: chunk k ends at the last character boundary at or before (k + 1) × 999,997 bytes. */
+function appChunk(bytes, offset) {
+  const grid = 999_997;
+  const k = offset === 0 ? 0 : Math.ceil(offset / grid);
+  let end = Math.min(bytes.length, (k + 1) * grid);
+  if (end < bytes.length) while (end > offset && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return end;
+}
+
+/**
+ * A receipt with 1,000 plain warnings and a total of 1,300, so the cut warning
+ * at index 1,150 is first found on a later page. `chunkFault(n, body)` can
+ * change the nth chunk's answer.
+ */
+async function laterPageStandIn({ chunkFault } = {}) {
+  const runId = randomUUID();
+  const long = `status "xy${'€😀a'.repeat(330_000)}"`;
+  const longBytes = Buffer.from(long, 'utf8');
+  const warnings = Array.from({ length: 1_300 }, (_, i) => ({ code: 'unknown_status', message: i === 1_150 ? long : `note ${i}`, path: `a/${i}.md` }));
+  let chunks = 0;
+  const standIn = await startStandIn({
+    commit: ({ send }) =>
+      send(202, validAnswer({
+        run_id: runId,
+        projection: { counts: {}, warnings: warnings.slice(0, 1_000), warnings_total: 1_300 },
+        details_truncated: true,
+      })),
+    details: ({ send, url }) => {
+      if (url.searchParams.has('item')) {
+        const item = Number(url.searchParams.get('item'));
+        const offset = Number(url.searchParams.get('message_offset'));
+        assert.equal(item, 1_150);
+        const end = appChunk(longBytes, offset);
+        chunks += 1;
+        const body = { run_id: runId, item, message_bytes: longBytes.length, message_offset: offset, text: longBytes.subarray(offset, end).toString('utf8'), next_message_offset: end < longBytes.length ? end : null };
+        const faulted = chunkFault?.(chunks, body);
+        if (faulted === 'fail') return send(500, { error: 'down' });
+        return send(200, faulted ?? body);
+      }
+      const offset = Number(url.searchParams.get('offset'));
+      const items = warnings.slice(offset, offset + 100).map((warning, i) => {
+        const index = offset + i;
+        if (index !== 1_150) return { index, ...warning };
+        return { index, code: warning.code, path: warning.path, message: longBytes.subarray(0, 65_536).toString('utf8').replace(/�+$/, ''), message_truncated: true, message_bytes: longBytes.length };
+      });
+      return send(200, { run_id: runId, list: 'warnings', total: 1_300, offset, items, next_offset: offset + items.length < 1_300 ? offset + items.length : null });
+    },
+  });
+  return { standIn, long, longBytes, chunkCount: () => chunks };
+}
+
+test('a cut warning first found on a later page is recovered exactly, across multibyte chunk boundaries', async () => {
+  const { standIn, long, chunkCount } = await laterPageStandIn();
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+    assert.equal(result.warnings.length, 1_300);
+    assert.equal(result.warnings[1_150].message, long);
+    assert.equal(result.warnings[1_150].message_truncated, undefined);
+    assert.equal(result.warnings[1_299].message, 'note 1299');
+    assert.equal(result.detailsIncomplete, null);
+    assert.ok(chunkCount() >= 3);
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('an interrupted or malformed message read keeps the preview and its marks, and reports one incomplete warning', async () => {
+  const faults = {
+    'interrupted': (n) => (n === 2 ? 'fail' : undefined),
+    'empty final chunk': (n, body) => (n === 1 ? { ...body, text: '', next_message_offset: null } : undefined),
+    'offset not advanced by the text': (n, body) => (n === 1 ? { ...body, next_message_offset: body.next_message_offset + 1 } : undefined),
+    'wrong item': (n, body) => (n === 2 ? { ...body, item: 1_149 } : undefined),
+    'message_bytes changed': (n, body) => (n === 2 ? { ...body, message_bytes: body.message_bytes - 1 } : undefined),
+    'wrong echoed offset': (n, body) => (n === 2 ? { ...body, message_offset: 0 } : undefined),
+    'no message_bytes': (n, body) => (n === 1 ? { ...body, message_bytes: undefined } : undefined),
+  };
+  for (const [name, chunkFault] of Object.entries(faults)) {
+    const { standIn, longBytes } = await laterPageStandIn({ chunkFault });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      await addDocument(rootDir, 'a', 2_200_000);
+      await addDocument(rootDir, 'b', 2_200_000);
+      const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+      const entry = result.warnings[1_150];
+      assert.equal(entry.message_truncated, true, name);
+      assert.equal(entry.message_bytes, longBytes.length, name);
+      assert.ok(entry.message.length > 0 && entry.message.length < 70_000, name);
+      assert.equal(result.detailsIncomplete?.cutWarnings, 1, name);
+      assert.equal(result.detailsIncomplete?.warnings, 0, name);
+      assert.equal((await readManifestSync(rootDir)).last_sync_direction, 'push', name);
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+test('a warning page whose items are out of order is not used past the break', async () => {
+  const runId = randomUUID();
+  const warnings = Array.from({ length: 1_200 }, (_, i) => ({ code: 'unknown_status', message: `note ${i}` }));
+  const standIn = await startStandIn({
+    commit: ({ send }) => send(202, validAnswer({ run_id: runId, projection: { counts: {}, warnings: warnings.slice(0, 1_000), warnings_total: 1_200 }, details_truncated: true })),
+    details: ({ send, url }) => {
+      const offset = Number(url.searchParams.get('offset'));
+      const items = warnings.slice(offset, offset + 100).map((warning, i) => ({ index: offset + i + (i === 50 ? 1 : 0), ...warning }));
+      return send(200, { run_id: runId, list: 'warnings', total: 1_200, offset, items, next_offset: offset + 100 < 1_200 ? offset + 100 : null });
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+    assert.equal(result.warnings.length, 1_050);
+    assert.equal(result.detailsIncomplete.warnings, 150);
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('a malformed 202 is asked again for the same upload, and a valid replay is recorded', async () => {
+  const replay = validAnswer();
+  let commits = 0;
+  const standIn = await startStandIn({
+    commit: ({ send }) => {
+      commits += 1;
+      return commits === 1 ? send(202, '{"status":"completed"') : send(202, replay);
+    },
+  });
+  try {
+    const { tempDir, rootDir } = await createRoot(standIn.url);
+    await addDocument(rootDir, 'a', 2_200_000);
+    await addDocument(rootDir, 'b', 2_200_000);
+    const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+    assert.equal(commits, 2);
+    assert.equal(result.runId, replay.run_id);
+  } finally {
+    await standIn.close();
+  }
+});
+
+test('the large single request accepts only a 202 with a valid acknowledgement, and words a refusal with its details', async () => {
+  const context = (status, body) => ({
+    apiUrl: 'http://127.0.0.1:9/',
+    projectId: 'proj-upload',
+    credential: TOKEN,
+    fetch: async () => new Response(body === null ? null : typeof body === 'string' ? body : JSON.stringify(body), { status }),
+  });
+  const documents = [{ path: 'a.md', raw_text: 'x' }];
+  const valid = validAnswer();
+  assert.equal((await sendLargeSinglePush(context(202, valid), '{}', documents)).run_id, valid.run_id);
+  for (const [status, body] of [[204, null], [200, valid], [202, { status: 'completed' }], [202, 'not json']]) {
+    await assert.rejects(
+      sendLargeSinglePush(context(status, body), '{}', documents),
+      (error) => error.outcome === 'unknown' && error.code === 'invalid_answer',
+      `${status} ${JSON.stringify(body)}`,
+    );
+  }
+  const issues = Array.from({ length: 3 }, (_, i) => ({ path: `documents.${i}.kind`, message: `Kind ${i} is invalid` }));
+  await assert.rejects(sendLargeSinglePush(context(422, { error: 'Invalid push request', issues }), '{}', documents), (error) => {
+    assert.equal(error.outcome, 'refused');
+    assert.match(error.message, /^Push refused \(422\): Invalid push request\. The hosted memory didn't change\.\n {2}- documents\.0\.kind: Kind 0 is invalid\n/);
+    assert.match(error.message, /documents\.2\.kind: Kind 2 is invalid$/);
+    return true;
+  });
+});
+
+test('a body read gives up when its signal aborts, even on a stream that never sends another byte', async () => {
+  const stalled = new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"run')); } }));
+  const started = Date.now();
+  // A real request's socket keeps the process alive while it stalls; this
+  // stream holds nothing open, and AbortSignal.timeout's timer is unref'd.
+  const keepAlive = setInterval(() => {}, 1_000);
+  // A backstop, so a read that never gives up fails instead of hanging.
+  setTimeout(() => clearInterval(keepAlive), 5_000).unref();
+  try {
+    await assert.rejects(readResponseText(stalled, 1_000, { signal: AbortSignal.timeout(200) }));
+  } finally {
+    clearInterval(keepAlive);
+  }
+  assert.ok(Date.now() - started < 5_000);
 });

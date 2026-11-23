@@ -129,7 +129,7 @@ function pushEnvironment(tempDir, calls) {
         return {
           ok: true,
           async json() {
-            return { run_id: 'run-1', status: 'completed', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f' };
+            return { run_id: 'aaaaaaaa-0000-4000-8000-000000000012', status: 'completed', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f' };
           },
         };
       },
@@ -732,7 +732,7 @@ function promotionFetch(calls, failAction = null) {
       return json({ mode, current_remote_revision_id: null, current_manifest_hash: null, pending_mode_transition: null });
     }
     if (url.includes('/push')) {
-      return json({ status: 'completed', run_id: 'run-1', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f', applied_proposal_ids: [], stale_proposal_ids: [] });
+      return json({ status: 'completed', run_id: 'aaaaaaaa-0000-4000-8000-000000000012', remote_revision_id: '7d2f4c1e-3b5a-4c6d-8e9f-0a1b2c3d4e5f', applied_proposal_ids: [], stale_proposal_ids: [] });
     }
     if (url.includes('/mode-transition')) {
       if (body.action === failAction) return unavailable();

@@ -41,7 +41,7 @@ function hostedMock(initialMode) {
       if (url.includes('/push')) {
         return json({
           status: 'completed',
-          run_id: 'run-1',
+          run_id: 'aaaaaaaa-0000-4000-8000-000000000011',
           remote_revision_id: HEAD_ID,
           applied_proposal_ids: [],
           stale_proposal_ids: [],

@@ -94,6 +94,12 @@ Upgrading: nothing changes for a project that never runs `ready-for-review` or
   (the hosted memory didn't change), and `The push's outcome is unknown` (run
   `vibecompass status`, or push again). `push` never follows a redirect on a
   request that carries a large body.
+- Every push, small or large, is recorded locally only when the hosted app's
+  answer names the run and the hosted revision. A cut-off or malformed answer
+  leaves the outcome unknown and records nothing.
+- A refused push shows the hosted app's recorded details: the reason, the
+  path, the hosted head and run when you need to pull first, and up to 20
+  schema issues.
 - When a push fails after the secret check, `push` and `promote-hosted` print
   the check's report as they do on success, in `warn` mode too.
 - After a push succeeds, `push` fetches the notes the hosted app left out of

@@ -2217,7 +2217,7 @@ test('runCli sync transport pushes, previews, exports, and applies proposals', a
           status: 202,
           async json() {
             return {
-              run_id: body.base_remote_revision_id ? 'run_push_confirm' : 'run_push_initial',
+              run_id: body.base_remote_revision_id ? 'aaaaaaaa-0000-4000-8000-000000000013' : 'aaaaaaaa-0000-4000-8000-000000000014',
               status: 'completed',
               remote_revision_id: body.base_remote_revision_id
                 ? '33333333-3333-4333-8333-333333333333'

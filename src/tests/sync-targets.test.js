@@ -227,7 +227,7 @@ test('push resolves the default target and honors --sync-target per invocation',
         async json() {
           return {
             status: 'completed',
-            run_id: 'run-test',
+            run_id: 'aaaaaaaa-0000-4000-8000-000000000001',
             remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
             applied_proposal_ids: [],
             stale_proposal_ids: [],
@@ -287,7 +287,7 @@ test('push prints the server projection warnings as Note lines, and nothing when
       // (D-239, D-371). Entries without a message are skipped.
       {
         status: 'completed',
-        run_id: 'run-warned',
+        run_id: 'aaaaaaaa-0000-4000-8000-000000000002',
         remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
         applied_proposal_ids: [],
         stale_proposal_ids: [],
@@ -304,7 +304,7 @@ test('push prints the server projection warnings as Note lines, and nothing when
       // An idempotent no-op push projects nothing and sends an empty list.
       {
         status: 'already_current',
-        run_id: 'run-current',
+        run_id: 'aaaaaaaa-0000-4000-8000-000000000003',
         remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
         applied_proposal_ids: [],
         stale_proposal_ids: [],
@@ -313,7 +313,7 @@ test('push prints the server projection warnings as Note lines, and nothing when
       // A server without a projection block.
       {
         status: 'completed',
-        run_id: 'run-plain',
+        run_id: 'aaaaaaaa-0000-4000-8000-000000000004',
         remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
         applied_proposal_ids: [],
         stale_proposal_ids: [],
@@ -342,13 +342,13 @@ test('push prints the server projection warnings as Note lines, and nothing when
       'Note: slug_collision: Feature slug "auth" is owned by source "scan".',
     ]);
     // The notes follow the run and proposal lines and precede the closing lines.
-    const runIndex = warnedLines.findIndex((line) => line === 'Run: run-warned');
+    const runIndex = warnedLines.findIndex((line) => line === 'Run: aaaaaaaa-0000-4000-8000-000000000002');
     const firstNoteIndex = warnedLines.indexOf(noteLines[0]);
     const recordedIndex = warnedLines.findIndex((line) => line.startsWith('Recorded '));
     assert.ok(runIndex >= 0 && runIndex < firstNoteIndex && firstNoteIndex < recordedIndex);
     assert.doesNotMatch(warnedStderr.join(''), /lineage_extraction_failed|slug_collision/);
 
-    for (const runId of ['run-current', 'run-plain']) {
+    for (const runId of ['aaaaaaaa-0000-4000-8000-000000000003', 'aaaaaaaa-0000-4000-8000-000000000004']) {
       const stdout = [];
       const stderr = [];
       assert.equal(await runCli(['push'], createIo(stdout, stderr), { cwd: tempDir, env, fetch: fetchMock }), 0);
@@ -402,7 +402,7 @@ test('legacy flat sync bindings keep working without named targets', async () =>
           async json() {
             return {
               status: 'completed',
-              run_id: 'run-legacy',
+              run_id: 'aaaaaaaa-0000-4000-8000-000000000005',
               remote_revision_id: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff',
               applied_proposal_ids: [],
               stale_proposal_ids: [],
@@ -436,7 +436,7 @@ test('sync cursors are isolated per target (D-237): a dev push never becomes a p
         async json() {
           return {
             status: 'completed',
-            run_id: 'run-cursor-test',
+            run_id: 'aaaaaaaa-0000-4000-8000-000000000006',
             remote_revision_id: url.includes('proj-dev') ? devRevision : prodRevision,
             applied_proposal_ids: [],
             stale_proposal_ids: [],
@@ -499,7 +499,7 @@ test('switching the default target re-mirrors the flat cursor (D-237)', async ()
       async json() {
         return {
           status: 'completed',
-          run_id: 'run-remirror',
+          run_id: 'aaaaaaaa-0000-4000-8000-000000000007',
           remote_revision_id: devRevision,
           applied_proposal_ids: [],
           stale_proposal_ids: [],
@@ -553,7 +553,7 @@ test('converting a flat binding to its first named target carries the cursor ove
       async json() {
         return {
           status: 'completed',
-          run_id: 'run-migrate',
+          run_id: 'aaaaaaaa-0000-4000-8000-000000000008',
           remote_revision_id: flatRevision,
           applied_proposal_ids: [],
           stale_proposal_ids: [],
@@ -658,7 +658,7 @@ test('rebinding the default target to a new project clears stale cursors (D-237)
       async json() {
         return {
           status: 'completed',
-          run_id: 'run-rebind',
+          run_id: 'aaaaaaaa-0000-4000-8000-000000000010',
           remote_revision_id: devRevision,
           applied_proposal_ids: [],
           stale_proposal_ids: [],
@@ -710,7 +710,7 @@ test('rebinding a target with unchanged values keeps its cursor (D-237)', async 
       async json() {
         return {
           status: 'completed',
-          run_id: 'run-rebind-same',
+          run_id: 'aaaaaaaa-0000-4000-8000-000000000009',
           remote_revision_id: devRevision,
           applied_proposal_ids: [],
           stale_proposal_ids: [],

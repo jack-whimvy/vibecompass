@@ -23,6 +23,8 @@ import {
 import {
   choosePushTransport,
   completePushDetails,
+  invalidAnswerError,
+  isValidPushAnswer,
   LEGACY_SINGLE_MAX_BYTES,
   PushOutcomeError,
   sendLargeSinglePush,
@@ -55,6 +57,10 @@ export async function pushProjectMemory(options = {}, environment = {}) {
   let sent;
   try {
     sent = await sendPush(context, body, documents);
+    // Nothing is recorded without a valid acknowledgement: a success status,
+    // the run id, and the hosted revision. Otherwise the outcome is unknown and
+    // the cursor, manifest hash, and pending previews stay as they were.
+    if (!isValidPushAnswer(sent.answer)) throw invalidAnswerError(null);
   } catch (error) {
     // D-406 item 4: the documents may already have been sent, so every error
     // after the check carries its report, in warn mode too.
@@ -108,7 +114,15 @@ async function sendPush(context, body, documents) {
   const bodyBytes = Buffer.byteLength(bodyText, 'utf8');
   const transport = choosePushTransport(bodyBytes, documents);
   if (transport === 'single') {
-    return { answer: await postJson(context, 'push', body), transport };
+    let answer;
+    try {
+      answer = await postJson(context, 'push', body);
+    } catch (error) {
+      // A success status whose body isn't JSON: the push may have applied.
+      if (error instanceof SyntaxError) throw invalidAnswerError(null);
+      throw error;
+    }
+    return { answer, transport };
   }
   if (transport === 'single-large') {
     return { answer: await sendLargeSinglePush(context, bodyText, documents), transport };
@@ -625,6 +639,10 @@ async function loadSyncContext(options, environment) {
     fetch: fetchImpl,
     // Test seam for the push path's waits; real timers otherwise.
     ...(typeof environment.runtime?.sleep === 'function' ? { sleep: environment.runtime.sleep } : {}),
+    // Test seam for the push path's time budgets (commit polling, details).
+    ...(environment.runtime?.pushBudgets && typeof environment.runtime.pushBudgets === 'object'
+      ? { pushBudgets: environment.runtime.pushBudgets }
+      : {}),
     credential,
     credentialSource: resolution.source,
     apiUrl: binding.apiUrl,

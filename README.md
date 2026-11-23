@@ -528,6 +528,13 @@ it once all the parts have arrived. You don't have to do anything different.
   sent), `Push refused` (the hosted memory didn't change), and `The push's
   outcome is unknown` (run `vibecompass status`, or push again; a push that
   already applied answers `already current`).
+- `push` records a push locally only when the hosted app's answer names the
+  run and the hosted revision. An answer that's cut off or malformed, or one
+  after a lost reply that doesn't say what happened to that upload, leaves the
+  outcome unknown and records nothing.
+- A refused push shows what the hosted app recorded: the reason, the path,
+  the hosted head and the run when you need to pull first, and up to 20 schema
+  issues with a count of the rest.
 - A push never follows a redirect. If your `sync.api_url` redirects, set it to
   the final address.
 - A hosted app that predates large pushes still takes a push of up to 5 MB the
