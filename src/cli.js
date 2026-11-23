@@ -771,11 +771,18 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
 
   if (parsed.command === 'push') {
     await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
-    const result = await pushProjectMemory(parsed.options, {
-      cwd: runtime.cwd,
-      env: runtime.env,
-      runtime,
-    });
+    let result;
+    try {
+      result = await pushProjectMemory(parsed.options, {
+        cwd: runtime.cwd,
+        env: runtime.env,
+        runtime,
+      });
+    } catch (error) {
+      // D-406 item 4: a push that fails after the check still prints its report.
+      if (error?.secretCheck) writePushSecretCheck(io, error.secretCheck, { failed: true });
+      throw error;
+    }
     writePushSecretCheck(io, result.secretCheck);
     io.stdout.write(`Push: ${result.status}\n`);
     io.stdout.write(`Remote revision: ${result.remoteRevisionId}\n`);
@@ -788,7 +795,18 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
     }
     for (const warning of result.warnings) {
       const where = warning.path ? ` (${warning.path})` : '';
-      io.stdout.write(`Note: ${warning.code}${where}: ${warning.message}\n`);
+      const cut = warning.message_truncated ? ' [shortened]' : '';
+      io.stdout.write(`Note: ${warning.code}${where}: ${warning.message}${cut}\n`);
+    }
+    if (result.detailsIncomplete) {
+      const missing = result.detailsIncomplete;
+      const parts = [
+        missing.warnings ? `${missing.warnings} warning${missing.warnings === 1 ? '' : 's'}` : null,
+        missing.cutWarnings ? `the full text of ${missing.cutWarnings} shortened warning${missing.cutWarnings === 1 ? '' : 's'}` : null,
+        missing.applied_proposal_ids ? `${missing.applied_proposal_ids} applied proposal id${missing.applied_proposal_ids === 1 ? '' : 's'}` : null,
+        missing.stale_proposal_ids ? `${missing.stale_proposal_ids} stale proposal id${missing.stale_proposal_ids === 1 ? '' : 's'}` : null,
+      ].filter(Boolean);
+      io.stdout.write(`Details incomplete: couldn't fetch ${parts.join(', ')}; they're stored with run ${missing.runId}. The push itself succeeded.\n`);
     }
     io.stdout.write(`Recorded ${result.manifestPath}\n`);
     io.stdout.write(`${result.message}\n`);
@@ -798,14 +816,25 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
   if (parsed.command === 'promote-hosted' || parsed.command === 'demote-hosted') {
     await writeCompatibilityPreflightWarnings(io, parsed.options, runtime);
     const run = parsed.command === 'promote-hosted' ? promoteHosted : demoteHosted;
-    const result = await run(parsed.options, {
-      cwd: runtime.cwd,
-      env: runtime.env,
-      runtime,
-      // promote-hosted's baseline push ran the secret check: print it as push
-      // does, as soon as the upload is done, so a later failure can't hide it.
-      onBaselineSecretCheck: (secretCheck) => writePushSecretCheck(io, secretCheck),
-    });
+    let secretCheckPrinted = false;
+    let result;
+    try {
+      result = await run(parsed.options, {
+        cwd: runtime.cwd,
+        env: runtime.env,
+        runtime,
+        // promote-hosted's baseline push ran the secret check: print it as push
+        // does, as soon as the upload is done, so a later failure can't hide it.
+        onBaselineSecretCheck: (secretCheck) => {
+          secretCheckPrinted = true;
+          writePushSecretCheck(io, secretCheck);
+        },
+      });
+    } catch (error) {
+      // A baseline push that failed after its check still prints the report.
+      if (!secretCheckPrinted && error?.secretCheck) writePushSecretCheck(io, error.secretCheck, { failed: true });
+      throw error;
+    }
     io.stdout.write(`Mode transition: ${result.status}\n`);
     if (result.completeness) {
       io.stdout.write(`Carries over: ${result.completeness.carries_over}\n`);
@@ -1597,8 +1626,11 @@ function renderSecretCheckText(result, mode) {
   return `${lines.join('\n')}\n`;
 }
 
-/** The push's secret-check lines (D-406 item 4); a block refusal never reaches here. */
-function writePushSecretCheck(io, secretCheck) {
+/**
+ * The push's secret-check lines (D-406 item 4); a block refusal never reaches
+ * here. `failed` words the warn line for a push that then failed.
+ */
+function writePushSecretCheck(io, secretCheck, { failed = false } = {}) {
   if (!secretCheck) return;
   writeWarnings(io, secretCheck.warnings ?? []);
   if (!secretCheck.ran) {
@@ -1609,7 +1641,11 @@ function writePushSecretCheck(io, secretCheck) {
     io.stdout.write(`Secret check: ${renderSecretCheckSummary(secretCheck)}\n`);
     return;
   }
-  io.stdout.write(`Secret check (warn): ${renderSecretCheckSummary(secretCheck)}; pushed anyway because metadata.workflow.secret_check is warn.\n`);
+  io.stdout.write(
+    failed
+      ? `Secret check (warn): ${renderSecretCheckSummary(secretCheck)}; the push went ahead because metadata.workflow.secret_check is warn, and then failed (below).\n`
+      : `Secret check (warn): ${renderSecretCheckSummary(secretCheck)}; pushed anyway because metadata.workflow.secret_check is warn.\n`,
+  );
   for (const line of renderSecretMatchLines(secretCheck.unallowed)) {
     io.stdout.write(`- ${line}\n`);
   }
@@ -3827,6 +3863,7 @@ function usageText() {
     '  vibecompass sync-agents [options]',
     '  vibecompass push [options]',
     '                                        Checks every canonical document for common key formats first; refuses to upload on a match by default', // D-406
+    '                                        A push over 4 MB goes compressed in parts (up to 25 MB compressed, 50 MB uncompressed, 4 MB per document)', // D-422
     '  vibecompass secret-check [--json] [--allow <path>:<line> [--fingerprint <fp>] --reason <text>] [options]',
     '                                        Read-only: the check push runs, over the whole root; exits 1 on a match no record allows. --allow records a match that is not a secret', // D-406
     '  vibecompass bootstrap --bundle <file> [--root <dir>]',

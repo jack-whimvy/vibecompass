@@ -77,6 +77,29 @@ Upgrading: nothing changes for a project that never runs `ready-for-review` or
 `list-sessions --json`. The role text changes at the root's next
 `refresh-workflow --apply`.
 
+### Large hosted pushes
+
+- `push` takes a root over 4 MB. A push of 4 MB or less goes as one request,
+  as before. A larger one goes gzip-compressed, in parts of up to 4 MB each:
+  `push` starts an upload, sends the parts, and asks the hosted app to commit
+  it. The hosted app applies an upload at most once and keeps its answer, so a
+  retry after a lost reply gets the original answer. Limits: 25 MB compressed,
+  50 MB uncompressed, 4 MB per document, and 5,000 documents. Before this, a
+  root over Vercel's 4.5 MB request limit got a bare 413.
+- Upgrading: nothing to change. A hosted app that predates large pushes still
+  takes a push of up to 5 MB as one request; above that, `push` says the hosted
+  app needs an update and sends nothing more. A push of up to 5 MB that holds a
+  document over 4 MB keeps the single request, as before.
+- Messages: `Push refused before upload` (nothing was sent), `Push refused`
+  (the hosted memory didn't change), and `The push's outcome is unknown` (run
+  `vibecompass status`, or push again). `push` never follows a redirect on a
+  request that carries a large body.
+- When a push fails after the secret check, `push` and `promote-hosted` print
+  the check's report as they do on success, in `warn` mode too.
+- After a push succeeds, `push` fetches the notes the hosted app left out of
+  its answer (more than 1,000, or one it shortened). If it can't, it says how
+  many are missing and names the run that stores them.
+
 ## 0.18.3 - 2026-11-16
 
 A lane-lifecycle release: a lane's new branch starts from an up-to-date base,

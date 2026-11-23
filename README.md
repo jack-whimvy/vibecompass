@@ -516,6 +516,27 @@ hosted dashboard could not build from your files, such as a file whose decision
 links could not be read. The push itself succeeded; the note names the file so
 you can check it.
 
+#### Large pushes
+
+`push` sends your whole root. A push of 4 MB or less goes as one request. A
+larger one goes compressed, in parts of up to 4 MB, and the hosted app applies
+it once all the parts have arrived. You don't have to do anything different.
+
+- Limits: 25 MB compressed and 50 MB uncompressed for the whole push, 4 MB for
+  any one document, and 5,000 documents.
+- Messages tell three cases apart: `Push refused before upload` (nothing was
+  sent), `Push refused` (the hosted memory didn't change), and `The push's
+  outcome is unknown` (run `vibecompass status`, or push again; a push that
+  already applied answers `already current`).
+- A push never follows a redirect. If your `sync.api_url` redirects, set it to
+  the final address.
+- A hosted app that predates large pushes still takes a push of up to 5 MB the
+  way it always did; above that, `push` says the hosted app needs an update.
+- If the hosted app reports more than 1,000 notes, or shortens a long one,
+  `push` fetches the rest after the push succeeds. If it can't, it says how
+  many are missing and names the run that stores them; the push itself still
+  succeeded.
+
 ### Secret check before push
 
 Before `push` uploads anything, it checks every canonical document it is about

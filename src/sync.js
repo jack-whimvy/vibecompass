@@ -20,6 +20,14 @@ import {
   readSyncCursor,
   resolveSyncBinding,
 } from './sync-binding.js';
+import {
+  choosePushTransport,
+  completePushDetails,
+  LEGACY_SINGLE_MAX_BYTES,
+  PushOutcomeError,
+  sendLargeSinglePush,
+  uploadPush,
+} from './push-upload.js';
 
 const DEFAULT_EXPORT_PATH = 'state/pull-export.json';
 
@@ -44,7 +52,18 @@ export async function pushProjectMemory(options = {}, environment = {}) {
     documents,
   };
 
-  const response = await postJson(context, 'push', body);
+  let sent;
+  try {
+    sent = await sendPush(context, body, documents);
+  } catch (error) {
+    // D-406 item 4: the documents may already have been sent, so every error
+    // after the check carries its report, in warn mode too.
+    if (secretCheck && error && typeof error === 'object' && error.secretCheck === undefined) {
+      error.secretCheck = secretCheck;
+    }
+    throw error;
+  }
+  const response = sent.answer;
   const now = new Date().toISOString();
   const sync = buildSyncStateWithCursor(manifest.sync, context.binding, {
     ...cursor,
@@ -57,18 +76,54 @@ export async function pushProjectMemory(options = {}, environment = {}) {
   });
   const updatedManifest = await writeStateManifest(context.rootDir, { sync });
 
+  // The cursor is written before anything else is fetched: a details fetch
+  // that fails never undoes a successful push.
+  const details = sent.uploaded ? await completePushDetails(context, response) : null;
+
   return {
     status: response.status ?? 'completed',
     rootDir: context.rootDir,
     manifestPath: updatedManifest.manifestPath,
     runId: response.run_id,
     remoteRevisionId: response.remote_revision_id,
-    appliedProposalIds: response.applied_proposal_ids ?? [],
-    staleProposalIds: response.stale_proposal_ids ?? [],
-    warnings: readProjectionWarnings(response),
+    appliedProposalIds: details ? details.lists.applied_proposal_ids : response.applied_proposal_ids ?? [],
+    staleProposalIds: details ? details.lists.stale_proposal_ids : response.stale_proposal_ids ?? [],
+    warnings: readProjectionWarnings(details ? { projection: { warnings: details.warnings } } : response),
+    ...(details ? { totals: details.totals, detailsIncomplete: details.incomplete } : {}),
+    transport: sent.transport,
     secretCheck,
     message: `Pushed ${documents.length} canonical document${documents.length === 1 ? '' : 's'} to hosted project memory.`,
   };
+}
+
+/**
+ * Sends a push by its serialized size: the single request up to 4,000,000
+ * bytes (unchanged), the single request for a body up to 5,000,000 bytes
+ * with a document over 4,000,000 bytes, and otherwise the compressed upload.
+ * Against an older app without the upload routes, a body up to 5,000,000
+ * bytes falls back to the single request, as an older package sent it.
+ */
+async function sendPush(context, body, documents) {
+  const bodyText = JSON.stringify(body);
+  const bodyBytes = Buffer.byteLength(bodyText, 'utf8');
+  const transport = choosePushTransport(bodyBytes, documents);
+  if (transport === 'single') {
+    return { answer: await postJson(context, 'push', body), transport };
+  }
+  if (transport === 'single-large') {
+    return { answer: await sendLargeSinglePush(context, bodyText, documents), transport };
+  }
+  const uploaded = await uploadPush(context, bodyText, documents.length);
+  if (uploaded.olderApp) {
+    if (bodyBytes <= LEGACY_SINGLE_MAX_BYTES) {
+      return { answer: await sendLargeSinglePush(context, bodyText, documents), transport: 'single-fallback' };
+    }
+    throw new PushOutcomeError(
+      `This hosted app doesn't take pushes over ${(LEGACY_SINGLE_MAX_BYTES / 1_000_000).toFixed(1)} MB yet (this push is ${(bodyBytes / 1_000_000).toFixed(1)} MB). Nothing was uploaded. The hosted app needs an update.`,
+      { outcome: 'refused_before_upload', status: 404, code: 'push_upload_unsupported' },
+    );
+  }
+  return { answer: uploaded.answer, transport, uploaded: true };
 }
 
 /**
@@ -128,6 +183,10 @@ function readProjectionWarnings(response) {
       code: typeof warning.code === 'string' && warning.code ? warning.code : 'projection_warning',
       message: warning.message,
       ...(typeof warning.path === 'string' && warning.path ? { path: warning.path } : {}),
+      // A message the hosted app cut keeps its marks until its full text replaces it.
+      ...(warning.message_truncated === true
+        ? { message_truncated: true, ...(Number.isInteger(warning.message_bytes) ? { message_bytes: warning.message_bytes } : {}) }
+        : {}),
     }));
 }
 
@@ -564,6 +623,8 @@ async function loadSyncContext(options, environment) {
     project,
     manifestPath,
     fetch: fetchImpl,
+    // Test seam for the push path's waits; real timers otherwise.
+    ...(typeof environment.runtime?.sleep === 'function' ? { sleep: environment.runtime.sleep } : {}),
     credential,
     credentialSource: resolution.source,
     apiUrl: binding.apiUrl,
