@@ -19,7 +19,8 @@ package's installed text, command output, and help do.
   `address review` turn and repeats until a clean pass or the cap; otherwise,
   or with `--one-pass`, it runs one pass and stops. Each stop prints the
   reason, the open findings, the choices (each command runs as printed, from
-  any folder), and in the loop `claude --resume <id>`.
+  any folder, with the options the run was started with), and in the loop
+  `claude --resume <id>`.
   Flags: `--recover`, `--past-cap`, `--one-pass`, `--conversation-closed`,
   `--confirm-each-round`, `--reviewer`, `--reviewer-model`, `--fresh-reviewer`,
   `--builder-mode`, `--reviewer-timeout`, and `--builder-timeout`. It never
@@ -38,13 +39,16 @@ package's installed text, command output, and help do.
 - A relayed write has two recoverable halves, `wip.md` then `handoff.md`, each
   written only over what it expects to replace; `review-relay --recover`
   finishes an interrupted one as complete, superseded, or discarded, and sends
-  no signal to a process it finds from an earlier run. One relay runs per lane
-  and per conversation. `close-session` refuses while a relay runs on the lane
-  or left a write or a turn unfinished.
+  no signal to a process it finds from an earlier run; a turn whose process it
+  couldn't record stays reserved until the owner confirms at `--recover` that
+  none is left. One relay runs per lane and per conversation. `close-session`
+  refuses while a relay runs on the lane or left a write or a turn unfinished.
+  The relay's own `git` reads start no fsmonitor, hook, filter, or fetch.
 - `vibecompass ready-for-review --session <lane-id> [--path <path>…]`: the
   builder marks a round ready. The mark holds SHA-256 fingerprints of
   `handoff.md` › `## Builder → Reviewer`, `wip.md` › `## Review log`, and the
-  work (the lane's worktrees and each named path), and the builder's Claude
+  work (the lane's worktrees, read file by file with their checked-out
+  submodules, and each named path), and the builder's Claude
   Code conversation when it runs inside one. It is refused while a finding
   waits for the builder's response. It works on every platform; in a lane
   reviewed by hand it changes only the lane's stage.

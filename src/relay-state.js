@@ -495,6 +495,12 @@ export async function inspectRelayForClose({ laneDir, laneId, table = createProc
     return `close-session is refused: ${error.message} It records whether a relayed write finished; run \`${recover}\`, or move the file aside to close without it.`;
   }
   if (!state) return null;
+  if (turnUnfinished(state) && !state.turn.pgid) {
+    // A turn recorded before its process started and never with it: the
+    // group can't be inspected, so only the owner can settle it.
+    const since = state.turn.started_at ? new Date(state.turn.started_at).toString() : 'an unknown time';
+    return `close-session is refused: the relay's ${state.turn.role} turn on lane ${laneId}, started ${since}, was never recorded with its process, so it can't be inspected. Check that no ${state.turn.command ?? 'tool'} process started then or later is left (\`ps -A -o pid,pgid,lstart,command\`), then run \`${recover}\` in a terminal, which asks you to confirm.`; // D-419 item 10
+  }
   if (turnUnfinished(state) && state.turn.pgid) {
     const group = await inspectProcessGroup(table, { pgid: state.turn.pgid, pid: state.turn.pid, startedAt: state.turn.process_started_at });
     if (group.state !== 'ended') {

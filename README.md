@@ -378,11 +378,12 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
 
 - **The mark.** `ready-for-review` writes `sessions/active/<lane-id>/ready.json`
   with SHA-256 fingerprints of `handoff.md` › `## Builder → Reviewer`, of
-  `wip.md` › `## Review log`, and of the work: each lane worktree's `HEAD`,
-  staged and working diffs, and untracked files, plus each `--path` you name
-  (`<repo-id>:<path>` or a path in the memory root) for shared files outside the
-  worktrees. It is refused while a finding waits for the builder's response.
-  When it runs inside Claude Code, it records that conversation.
+  `wip.md` › `## Review log`, and of the work: each lane worktree's `HEAD`, its
+  staged diff, its tracked files as they are in the working tree, its untracked
+  files, and each checked-out submodule's work the same way, plus each `--path`
+  you name (`<repo-id>:<path>` or a path in the memory root) for shared files
+  outside the worktrees. It is refused while a finding waits for the builder's
+  response. When it runs inside Claude Code, it records that conversation.
 - **The reviewer** is Codex (the default) or Claude Code, started read-only on
   your own sign-in: it answers in a fixed JSON form and writes no file. The
   relay checks the answer (exactly one verdict for each finding waiting for the
@@ -400,12 +401,14 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   conversation is closed and was started in the folder it prints
   (`--conversation-closed` confirms both). Otherwise, or with `--one-pass`, it
   runs one pass and stops; you type `address review` in the builder's window.
-  `--confirm-each-round` waits for your Enter before each builder turn. If a
-  newer mark names another conversation, or none, the loop stops before any
-  turn.
+  `--confirm-each-round` waits for your Enter before each builder turn, and
+  after the Enter the relay reads the mark and the log again. If a newer mark
+  names another conversation, or none, the loop stops before any turn.
 - **Stops.** Every stop prints the reason, the open findings, your choices, and
   in the loop `claude --resume <id>`, which continues from the relayed turns.
-  Each command a choice names runs as printed, from any folder. At
+  Each command a choice names runs as printed, from any folder, with the
+  options you started the relay with (all but `--conversation-closed`, which
+  it asks again). At
   the cap, `--past-cap` runs one more pass, recorded with an owner line. A
   failure, an invalid answer, a change to the work during the review, a refused
   builder action, or a timeout (45 minutes for a reviewer turn, 60 for a builder
@@ -417,9 +420,11 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   In its builder turns, pushes are rewritten to fail, `gh` has no sign-in, and
   `close-session`, `review-relay`, and the hosted commands refuse. It reads no
   command, path, mode, or model from a committed file, and passes no bypass
-  mode. Its own `git` reads start no fsmonitor, hook, or filter a repository
-  configures. `close-session` refuses while a relay runs or left a write
-  unfinished; `review-relay --session <lane-id> --recover` finishes it. The mark
+  mode. Its own `git` reads start no fsmonitor, hook, filter, or fetch, and a
+  read that needs an object a partial clone lacks refuses instead.
+  `close-session` refuses while a relay runs or left a write or turn
+  unfinished; `review-relay --session <lane-id> --recover` finishes it, and asks
+  you to confirm a turn whose process it couldn't record is gone. The mark
   and the relay's state live in the lane folder and go at close.
 - **Platforms.** macOS only until a Linux run is recorded; `ready-for-review`
   and the lane's stage (`list-sessions`) work everywhere. An install that never

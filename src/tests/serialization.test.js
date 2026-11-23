@@ -455,6 +455,35 @@ test('release leaves a foreign lock in place (token compare)', async () => {
   }
 });
 
+test('a lock judged abandoned whose folder is gone by the reclaim is claimed afresh, not an error', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-lock-gone-'));
+  const rootDir = path.join(tempDir, '.compass');
+  try {
+    // A holder whose process has exited: the waiter judges its lock abandoned.
+    // Before the waiter reclaims, the holder's release removes the lock and the
+    // state/ it had made on the missing root, as a holder that releases and
+    // exits between the waiter's two reads does.
+    const lockDir = memoryRootLockPath(rootDir);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999999, token: 'gone', label: 'released' })}\n`, 'utf8');
+    let removed = false;
+    const beforeReclaim = async () => {
+      if (removed) return;
+      removed = true;
+      await rm(rootDir, { recursive: true, force: true });
+    };
+    let ran = false;
+    await withMemoryRootLock(rootDir, 'after-a-release', async () => {
+      ran = true;
+    }, { beforeReclaim });
+    assert.equal(removed, true, 'the waiter reached the reclaim');
+    assert.equal(ran, true, 'the waiter held the lock');
+    await assert.rejects(stat(`${lockDir}.reclaim`), { code: 'ENOENT' });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('two processes that both judge one lock abandoned before either reclaims it never hold it together', async () => {
   const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-rendezvous-');
   try {

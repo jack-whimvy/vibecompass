@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { lstat, readFile, readdir, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -28,24 +29,39 @@ const ROOT_LOCAL_ONLY_PREFIXES = ['state/', 'sessions/active/'];
 const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MARK_FORMAT = 1;
 
-/** The git environment for the relay's own reads: no optional index writes. */
+// Git's repository-location variables: the relay's reads are about the
+// repository at the folder each runs in, never one the environment names.
+const GIT_LOCATION_VARIABLES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'];
+
+/**
+ * The git environment for the relay's own reads: no optional index writes, no
+ * prompt, no fetch of a missing object, and no repository the environment
+ * names. Discovery crosses filesystems, as the relay's own search for a
+ * `.git` does (D-423 item 3).
+ */
 export function readOnlyGitEnv(baseEnv = process.env) {
-  return { ...baseEnv, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
+  const env = { ...baseEnv, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_DISCOVERY_ACROSS_FILESYSTEM: '1' };
+  for (const name of GIT_LOCATION_VARIABLES) delete env[name];
+  return env;
 }
 
 // The relay's own git reads run on the host, outside any reviewer sandbox, so
-// none of them may start a helper a repository's configuration names: the
-// filesystem monitor (any command that reads the index), hooks, and filter
-// drivers (a working-tree diff cleans each changed file). Diffs also pass
-// --no-ext-diff and --no-textconv, and leave submodules' working trees alone,
-// since a submodule's own git would read its own configuration.
-const HELPERS_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
+// none of them may start a program a repository's configuration names
+// (D-423). The filesystem monitor and hooks are turned off on the command
+// line, which no configuration overrides, and so is every transport, so a
+// read that needs an object a partial clone lacks fails instead of fetching
+// it. No read runs a working file through a filter: the work fingerprint
+// reads working files itself, and the staged diff compares stored objects,
+// with --no-ext-diff and --no-textconv.
+const HELPERS_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never'];
+const STAGED_DIFF = ['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=dirty'];
+const MAX_SUBMODULE_DEPTH = 8;
 
 function spawnGit(args, cwd, env, onStdout) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn('git', args, { cwd, env: readOnlyGitEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn('git', [...HELPERS_OFF, ...args], { cwd, env: readOnlyGitEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) {
       resolve({ code: null, stderr: String(error?.message ?? error) });
       return;
@@ -62,76 +78,161 @@ function spawnGit(args, cwd, env, onStdout) {
 }
 
 /**
- * The `-c` arguments that turn every helper off for one read in `cwd`: the
- * fixed ones, and each filter driver git's configuration names there emptied.
- * Throws when the configuration can't be read, or names a driver whose name
- * a `-c` argument can't carry.
- */
-export async function gitHelpersOff(cwd, env = process.env) {
-  const out = [];
-  const listed = await spawnGit([...HELPERS_OFF, 'config', '-z', '--get-regexp', '^filter\\.'], cwd, env, (chunk) => out.push(chunk));
-  // Exit 1: no filter driver is configured.
-  if (listed.code !== 0 && listed.code !== 1) {
-    throw new Error(`git's configuration couldn't be read in ${cwd}: ${listed.stderr || `git config exited ${listed.code}`}`);
-  }
-  const names = new Set();
-  for (const entry of Buffer.concat(out).toString('utf8').split('\0')) {
-    const key = entry.split('\n')[0];
-    const last = key.lastIndexOf('.');
-    if (!key.startsWith('filter.') || last <= 'filter.'.length) continue;
-    names.add(key.slice('filter.'.length, last));
-  }
-  const args = [...HELPERS_OFF];
-  for (const name of [...names].sort()) {
-    if (name.includes('=')) {
-      throw new Error(`git's configuration in ${cwd} names a filter driver (${JSON.stringify(name)}) the relay can't turn off for its own reads.`);
-    }
-    for (const key of ['clean', 'smudge', 'process']) args.push('-c', `filter.${name}.${key}=`);
-    args.push('-c', `filter.${name}.required=false`);
-  }
-  return args;
-}
-
-/**
- * Runs git, with every repository-selected helper off, and hashes its
+ * Runs git, with the repository's helpers and fetching off, and hashes its
  * standard output as it streams, so a large diff never sits in memory.
  * Resolves `{ ok, code, hash, bytes, stderr }`.
  */
 export async function gitHash(args, cwd, env = process.env) {
-  let off;
-  try {
-    off = await gitHelpersOff(cwd, env);
-  } catch (error) {
-    return { ok: false, code: null, hash: null, bytes: 0, stderr: error.message };
-  }
   const hash = createHash('sha256');
   let bytes = 0;
-  const result = await spawnGit([...off, ...args], cwd, env, (chunk) => {
+  const result = await spawnGit(args, cwd, env, (chunk) => {
     bytes += chunk.length;
     hash.update(chunk);
   });
   return { ok: result.code === 0, code: result.code, hash: result.code === null ? null : hash.digest('hex'), bytes, stderr: result.stderr };
 }
 
-/** Runs git, with every repository-selected helper off, and returns its output as text (small outputs only). */
+/** Runs git, with the repository's helpers and fetching off, and returns its output as text. */
 export async function gitText(args, cwd, env = process.env) {
-  let off;
-  try {
-    off = await gitHelpersOff(cwd, env);
-  } catch (error) {
-    return { ok: false, code: null, stdout: '', stderr: error.message };
-  }
   const out = [];
-  const result = await spawnGit([...off, ...args], cwd, env, (chunk) => out.push(chunk));
+  const result = await spawnGit(args, cwd, env, (chunk) => out.push(chunk));
   return { ok: result.code === 0, code: result.code, stdout: result.code === null ? '' : Buffer.concat(out).toString('utf8'), stderr: result.stderr };
 }
 
+/** The nearest folder at or above `dir` that holds a `.git`, or null. */
+async function folderHoldingGit(dir) {
+  let current = path.resolve(dir);
+  for (;;) {
+    try {
+      await lstat(path.join(current, '.git'));
+      return current;
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/**
+ * The top level of the repository `dir` is in, or null when no folder at or
+ * above it holds a `.git`. Inside a repository a git error throws, so a
+ * repository's folder is never read as plain files (D-423 item 3).
+ */
+export async function repositoryTopLevel(dir, env = process.env) {
+  const result = await gitText(['rev-parse', '--show-toplevel'], dir, env);
+  if (result.ok) return result.stdout.trim();
+  const holder = await folderHoldingGit(dir);
+  if (holder === null) return null;
+  throw new Error(`git couldn't read the repository at ${holder} (${result.stderr || (result.code === null ? 'git didn\'t start' : `git exited ${result.code}`)}), so the relay doesn't read ${dir} as plain files.`);
+}
+
+async function hashStream(filePath) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+/** A file's content hash, a symbolic link's target, or what else is there; never a read of a pipe. */
 async function hashFile(filePath) {
   const info = await lstat(filePath);
   if (info.isSymbolicLink()) {
     return sha256Hex(`symlink:${await readlink(filePath)}`);
   }
-  return createHash('sha256').update(await readFile(filePath)).digest('hex');
+  if (!info.isFile()) return sha256Hex(info.isDirectory() ? 'directory:' : 'special:');
+  return hashStream(filePath);
+}
+
+/**
+ * What is at an index entry's path in the working tree (D-423 item 1): a
+ * regular file's bytes and executable bit, a symbolic link's target, or that
+ * it is missing, a directory, or something else.
+ */
+async function workingState(filePath) {
+  let info;
+  try {
+    info = await lstat(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return 'missing';
+    throw error;
+  }
+  if (info.isSymbolicLink()) return `symlink ${sha256Hex(await readlink(filePath))}`;
+  if (info.isDirectory()) return 'directory';
+  if (!info.isFile()) return 'special';
+  return `file ${(info.mode & 0o111) !== 0 ? 'x' : '-'} ${await hashStream(filePath)}`;
+}
+
+/** Whether a folder holds a checkout of its own: a `.git` file or folder. */
+async function holdsCheckout(dir) {
+  try {
+    await lstat(path.join(dir, '.git'));
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
+  }
+}
+
+/**
+ * One checkout's entries for the work fingerprint (D-419 item 4, D-423): its
+ * HEAD, a hash of its staged diff, a hash of its index entries with what is at
+ * each path in the working tree, where a checked-out submodule gives its own
+ * fingerprint, and each untracked, not-ignored file. No git command here
+ * reads a working file through a filter.
+ */
+async function fingerprintCheckout(dir, label, env, depth = 0) {
+  const head = await gitText(['rev-parse', '--verify', 'HEAD'], dir, env);
+  if (!head.ok) {
+    throw new Error(`${label} at ${dir} isn't a readable git checkout (${head.stderr || 'git rev-parse HEAD failed'}).`);
+  }
+  const headSha = head.stdout.trim();
+  const staged = await gitHash(STAGED_DIFF, dir, env);
+  if (!staged.ok) {
+    throw new Error(`git diff --cached failed in ${label} at ${dir}: ${staged.stderr}`);
+  }
+  const index = await gitText(['ls-files', '--stage', '-z'], dir, env);
+  if (!index.ok) {
+    throw new Error(`git ls-files --stage failed in ${label} at ${dir}: ${index.stderr}`);
+  }
+  const working = createHash('sha256');
+  let submodules = 0;
+  for (const record of splitNul(index.stdout)) {
+    const tab = record.indexOf('\t');
+    const [mode, oid, stage] = record.slice(0, tab).split(' ');
+    const relative = record.slice(tab + 1);
+    const full = path.join(dir, relative);
+    let state;
+    if (mode === '160000' && (await pathKind(full)) === 'directory' && (await holdsCheckout(full))) {
+      if (depth + 1 > MAX_SUBMODULE_DEPTH) {
+        throw new Error(`${label} nests checked-out submodules deeper than ${MAX_SUBMODULE_DEPTH} at ${full}; the relay doesn't fingerprint work that deep.`); // D-423 item 2
+      }
+      const inner = await fingerprintCheckout(full, `submodule ${relative} of ${label}`, env, depth + 1);
+      submodules += 1 + inner.submodules;
+      state = `submodule ${inner.fingerprint}`;
+    } else if (mode === '160000') {
+      state = (await pathKind(full)) === 'directory' ? 'submodule not checked out' : await workingState(full);
+    } else {
+      state = await workingState(full);
+    }
+    working.update(`${relative}\0${mode}\0${oid}\0${stage}\0${state}\n`);
+  }
+  const untracked = await gitText(['ls-files', '--others', '--exclude-standard', '-z'], dir, env);
+  if (!untracked.ok) {
+    throw new Error(`git ls-files failed in ${label} at ${dir}: ${untracked.stderr}`);
+  }
+  const untrackedFiles = splitNul(untracked.stdout).sort();
+  const entries = [`head\t${headSha}`, `staged\t${staged.hash}`, `working\t${working.digest('hex')}`];
+  for (const relative of untrackedFiles) {
+    if (relative.endsWith('/')) {
+      // git lists a repository inside the worktree that isn't a submodule as
+      // a folder and doesn't look inside it.
+      throw new Error(`${label} at ${dir} holds a git repository that isn't a submodule (${relative}); the relay can't tell when its work changes. Add it as a submodule, ignore it, or move it out.`);
+    }
+    entries.push(`untracked\t${relative}\t${await hashFile(path.join(dir, relative))}`);
+  }
+  entries.sort();
+  return { head: headSha, entries, untracked: untrackedFiles.length, submodules, fingerprint: sha256Hex(entries.join('\n')) };
 }
 
 async function pathKind(filePath) {
@@ -143,11 +244,6 @@ async function pathKind(filePath) {
     if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return 'missing';
     throw error;
   }
-}
-
-async function gitTopLevel(dir, env) {
-  const result = await gitText(['rev-parse', '--show-toplevel'], dir, env);
-  return result.ok ? result.stdout.trim() : null;
 }
 
 function splitNul(text) {
@@ -237,9 +333,10 @@ function isLaneOwnFile(absolute, laneDir) {
 }
 
 /**
- * The work fingerprint (D-419 item 4): SHA-256 over sorted entries from each
- * recorded worktree (its HEAD, a hash of the staged diff, a hash of the
- * working diff, and each untracked, not-ignored file) and each named path.
+ * The work fingerprint (D-419 item 4, D-423): SHA-256 over sorted entries from
+ * each recorded worktree (its HEAD, a hash of the staged diff, a hash of its
+ * index entries with their working files and checked-out submodules, and each
+ * untracked, not-ignored file) and each named path.
  */
 export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env, marking = false }) {
   const entries = [];
@@ -248,28 +345,9 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
 
   for (const repoId of Object.keys(worktrees).sort()) {
     const dir = path.resolve(worktrees[repoId]);
-    const head = await gitText(['rev-parse', '--verify', 'HEAD'], dir, env);
-    if (!head.ok) {
-      throw new Error(`Lane worktree ${repoId} at ${dir} isn't a readable git checkout (${head.stderr || 'git rev-parse HEAD failed'}).`);
-    }
-    const headSha = head.stdout.trim();
-    const staged = await gitHash(['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=dirty'], dir, env);
-    const unstaged = await gitHash(['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=dirty'], dir, env);
-    if (!staged.ok || !unstaged.ok) {
-      throw new Error(`git diff failed in lane worktree ${repoId} at ${dir}: ${(staged.ok ? unstaged : staged).stderr}`);
-    }
-    const untracked = await gitText(['ls-files', '--others', '--exclude-standard', '-z'], dir, env);
-    if (!untracked.ok) {
-      throw new Error(`git ls-files failed in lane worktree ${repoId} at ${dir}: ${untracked.stderr}`);
-    }
-    const untrackedFiles = splitNul(untracked.stdout).sort();
-    entries.push(`worktree\t${repoId}\thead\t${headSha}`);
-    entries.push(`worktree\t${repoId}\tstaged\t${staged.hash}`);
-    entries.push(`worktree\t${repoId}\tunstaged\t${unstaged.hash}`);
-    for (const relative of untrackedFiles) {
-      entries.push(`worktree\t${repoId}\tuntracked\t${relative}\t${await hashFile(path.join(dir, relative))}`);
-    }
-    covers.worktrees.push({ repo: repoId, path: dir, head: headSha, untracked: untrackedFiles.length });
+    const checkout = await fingerprintCheckout(dir, `Lane worktree ${repoId}`, env);
+    for (const entry of checkout.entries) entries.push(`worktree\t${repoId}\t${entry}`);
+    covers.worktrees.push({ repo: repoId, path: dir, head: checkout.head, untracked: checkout.untracked, ...(checkout.submodules > 0 ? { submodules: checkout.submodules } : {}) });
   }
 
   const seen = new Set();
@@ -307,10 +385,19 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
     }
     for (const file of listing.files) {
       const relative = toPosix(path.relative(resolved.absolute, file));
-      // A tracked file deleted in the working tree is still listed: it counts as missing.
-      entries.push((await pathKind(file)) === 'missing'
-        ? `path\t${resolved.spec}\tmissing\t${relative}`
-        : `path\t${resolved.spec}\tfile\t${relative}\t${await hashFile(file)}`);
+      const fileKind = await pathKind(file);
+      // A tracked file deleted in the working tree is still listed: it counts
+      // as missing. A listed folder is a submodule: checked out, it gives its
+      // own fingerprint (D-423 item 2).
+      if (fileKind === 'missing') {
+        entries.push(`path\t${resolved.spec}\tmissing\t${relative}`);
+      } else if (fileKind === 'directory') {
+        entries.push((await holdsCheckout(file))
+          ? `path\t${resolved.spec}\tsubmodule\t${relative}\t${(await fingerprintCheckout(file, `submodule ${relative} under ${resolved.spec}`, env, 1)).fingerprint}`
+          : `path\t${resolved.spec}\tsubmodule not checked out\t${relative}`);
+      } else {
+        entries.push(`path\t${resolved.spec}\tfile\t${relative}\t${await hashFile(file)}`);
+      }
     }
     covers.paths.push({ spec: resolved.spec, kind: 'directory', covered: listing.files.length, ignored: listing.ignored, git: listing.git });
   }
@@ -325,7 +412,8 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
  * root's state/ or sessions/active/, and never the lane's own files.
  */
 async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
-  const top = await gitTopLevel(dir, env);
+  // Walked as plain files only outside every repository (D-423 item 3).
+  const top = await repositoryTopLevel(dir, env);
   let files;
   let ignored = 0;
   if (top) {
@@ -344,7 +432,10 @@ async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
     // Every ignored file is counted: without --directory, git lists the files
     // inside a wholly ignored directory instead of one entry for it.
     const ignoredListing = await gitText(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', relative], top, env);
-    ignored = ignoredListing.ok ? splitNul(ignoredListing.stdout).length : 0;
+    if (!ignoredListing.ok) {
+      throw new Error(`git ls-files failed for ${dir}: ${ignoredListing.stderr}`);
+    }
+    ignored = splitNul(ignoredListing.stdout).length;
   } else {
     files = await walkFiles(dir);
   }

@@ -407,12 +407,146 @@ test('the relay\'s own git reads start no helper a repository configures: no fil
   assert.deepEqual(await readdir(marks), []);
 });
 
-test('a filter driver whose name a -c argument can\'t carry refuses the relay\'s read', async (t) => {
+test('a filter configured after the mark, under any name, never runs in a comparison, and the change it would hide still counts', async (t) => {
   const ws = await createWorkspace(t);
-  const lane = await openLane(ws, 'helpers-name', { worktree: true });
-  git(lane.worktreeDir, ['config', 'filter.a=b.clean', 'cat']);
+  const lane = await openLane(ws, 'helpers-late', { worktree: true });
+  const projectRepos = [{ id: 'app' }];
+  const worktrees = { app: lane.worktreeDir };
+  const marked = await mark(ws, lane, { paths: ['app:src'] });
+  assert.equal(marked.code, 0, marked.stderr());
+  const marks = path.join(ws.tempDir, 'late-marks');
+  await mkdir(marks);
+  // After the mark: two drivers, one whose name no -c argument could carry,
+  // each a clean filter that turns any change back into what is staged.
+  for (const name of ['late', 'a=b']) {
+    const file = path.join(ws.tempDir, `clean-${name.replace('=', '-')}.sh`);
+    await writeFile(file, `#!/bin/sh\ntouch '${path.join(marks, name.replace('=', '-'))}'\ncat >/dev/null\ngit show ":$1"\n`, { mode: 0o755 });
+    git(lane.worktreeDir, ['config', `filter.${name}.clean`, `${file} %f`]);
+  }
+  await writeFile(path.join(lane.worktreeDir, '.git', 'info', 'attributes'), 'src/index.js filter=late\nREADME.md filter=a=b\n', 'utf8').catch(async () => {
+    // A linked worktree keeps info/ in the common directory.
+    const common = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: lane.worktreeDir, encoding: 'utf8' }).stdout.trim();
+    await mkdir(path.resolve(lane.worktreeDir, common, 'info'), { recursive: true });
+    await writeFile(path.resolve(lane.worktreeDir, common, 'info', 'attributes'), 'src/index.js filter=late\nREADME.md filter=a=b\n', 'utf8');
+  });
+  await writeFile(path.join(lane.worktreeDir, 'src', 'index.js'), 'export const answer = 7;\n', 'utf8');
+  await writeFile(path.join(lane.worktreeDir, 'README.md'), 'changed\n', 'utf8');
+  // The control: git's own working-tree diff runs both filters, which hide both changes.
+  const plain = spawnSync('git', ['diff', '--name-only'], { cwd: lane.worktreeDir, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, encoding: 'utf8' });
+  assert.equal(plain.stdout.trim(), '', 'the filters hide the changes from git diff');
+  assert.deepEqual((await readdir(marks)).sort(), ['a-b', 'late']);
+  for (const name of await readdir(marks)) await rm(path.join(marks, name));
+  const compared = await compareMark(marked.mark, { rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, projectRepos });
+  assert.equal(compared.current, false, 'the change counts');
+  assert.deepEqual(compared.differences, ['work']);
+  assert.deepEqual(await readdir(marks), [], 'no filter ran');
+});
+
+test('a checked-out submodule\'s edits and untracked files change the work, every time; one not checked out counts as its entry', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'submodule-lane', { worktree: true });
+  const lib = path.join(ws.tempDir, 'lib');
+  await mkdir(lib);
+  git(lib, ['init', '-q', '-b', 'main']);
+  git(lib, ['config', 'user.email', 'test@example.com']);
+  git(lib, ['config', 'user.name', 'Test']);
+  await writeFile(path.join(lib, 'lib.js'), 'export const one = 1;\n', 'utf8');
+  git(lib, ['add', '.']);
+  git(lib, ['commit', '-q', '-m', 'lib']);
+  git(lane.worktreeDir, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib']);
+  git(lane.worktreeDir, ['commit', '-q', '-m', 'vendor lib']);
+  const worktrees = { app: lane.worktreeDir };
+  const projectRepos = [{ id: 'app' }];
+  const first = await mark(ws, lane);
+  assert.equal(first.code, 0, first.stderr());
+  assert.match(first.stdout(), /0 untracked files, 1 checked-out submodule/);
+  const sub = path.join(lane.worktreeDir, 'vendor', 'lib', 'lib.js');
+  // git's own diff shows the submodule only as dirty, whatever the edit.
+  await writeFile(sub, 'export const one = 2;\n', 'utf8');
+  assert.equal((await compare(ws, lane)).current, false, 'a tracked edit in the submodule counts');
+  const second = await mark(ws, lane);
+  await writeFile(sub, 'export const one = 3;\n', 'utf8');
+  assert.equal((await compareMark(second.mark, { rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, projectRepos })).current, false, 'a second edit counts too');
+  const third = await mark(ws, lane);
+  await writeFile(path.join(lane.worktreeDir, 'vendor', 'lib', 'new.js'), 'x\n', 'utf8');
+  assert.equal((await compareMark(third.mark, { rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, projectRepos })).current, false, 'an untracked file in the submodule counts');
+  // Not checked out: the entry alone, and the mark still works.
+  git(lane.worktreeDir, ['submodule', 'deinit', '-q', '-f', 'vendor/lib']);
+  const fourth = await mark(ws, lane);
+  assert.equal(fourth.code, 0, fourth.stderr());
+  assert.doesNotMatch(fourth.stdout(), /checked-out submodule/);
+  // A repository inside the worktree that isn't a submodule is refused, by name.
+  const nested = path.join(lane.worktreeDir, 'scratch-repo');
+  await mkdir(nested);
+  git(nested, ['init', '-q']);
+  await assert.rejects(mark(ws, lane), /holds a git repository that isn't a submodule \(scratch-repo\/\)/);
+});
+
+test('a partial clone whose staged diff needs a missing object refuses the work without fetching it', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'partial-lane');
+  const source = path.join(ws.tempDir, 'source');
+  await mkdir(source);
+  git(source, ['init', '-q', '-b', 'main']);
+  git(source, ['config', 'user.email', 'test@example.com']);
+  git(source, ['config', 'user.name', 'Test']);
+  git(source, ['config', 'uploadpack.allowFilter', 'true']);
+  await writeFile(path.join(source, 'f.txt'), 'a\n', 'utf8');
+  git(source, ['add', '.']);
+  git(source, ['commit', '-q', '-m', 'A']);
+  await writeFile(path.join(source, 'f.txt'), 'b\n', 'utf8');
+  git(source, ['commit', '-q', '-am', 'B']);
+  const clone = path.join(ws.tempDir, 'clone');
+  git(ws.tempDir, ['clone', '-q', '--filter=blob:none', `file://${source}`, clone]);
+  // HEAD moves back to A, whose blob was never fetched; the index keeps B's.
+  git(clone, ['reset', '-q', '--soft', 'HEAD~1']);
+  const objects = async () => (await readdir(path.join(clone, '.git', 'objects'), { recursive: true })).length;
+  const before = await objects();
   await assert.rejects(
-    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: lane.worktreeDir }, projectRepos: [{ id: 'app' }] }),
-    /names a filter driver \("a=b"\) the relay can't turn off/,
+    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: clone }, projectRepos: [{ id: 'app' }] }),
+    /git diff --cached failed in Lane worktree app at .+(not allowed|could not fetch)/,
   );
+  assert.equal(await objects(), before, 'nothing was fetched');
+  // The control: git as anyone would run it fetches the object.
+  spawnSync('git', ['diff', '--cached', '--binary'], { cwd: clone, encoding: 'utf8' });
+  assert.ok((await objects()) > before);
+});
+
+test('a named directory in a repository git can\'t read is refused, never walked; outside every repository it is walked', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'no-git-lane');
+  await writeFile(path.join(ws.appDir, '.gitignore'), 'cache.bin\n', 'utf8');
+  await writeFile(path.join(ws.appDir, 'src', 'cache.bin'), 'ignored\n', 'utf8');
+  const projectRepos = [{ id: 'app' }];
+  const withGit = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:src'], projectRepos });
+  assert.equal(withGit.covers.paths[0].covered, 1);
+  const noGit = { ...process.env, PATH: path.join(ws.tempDir, 'no-such-bin') };
+  await assert.rejects(
+    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:src'], projectRepos, env: noGit }),
+    new RegExp(`git couldn't read the repository at ${ws.appDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(.+\\), so the relay doesn't read .+src as plain files`),
+  );
+  // A folder no repository holds is plain files, with git or without.
+  const plain = path.join(ws.tempDir, 'plain');
+  await mkdir(plain);
+  await writeFile(path.join(plain, 'a.txt'), 'a\n', 'utf8');
+  await writeFile(path.join(plain, 'b.txt'), 'b\n', 'utf8');
+  const repos = [{ id: 'plain', path: 'plain' }];
+  const walked = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['plain:.'], projectRepos: repos, env: noGit });
+  assert.equal(walked.covers.paths[0].covered, 2);
+  assert.equal(walked.covers.paths[0].git, false);
+});
+
+test('the relay\'s git reads ignore a repository the environment names', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'env-repo', { worktree: true });
+  git(lane.worktreeDir, ['config', 'user.email', 'test@example.com']);
+  git(lane.worktreeDir, ['config', 'user.name', 'Test']);
+  git(lane.worktreeDir, ['commit', '-q', '--allow-empty', '-m', 'lane commit']);
+  const laneHead = git(lane.worktreeDir, ['rev-parse', 'HEAD']).trim();
+  const appHead = git(ws.appDir, ['rev-parse', 'HEAD']).trim();
+  assert.notEqual(laneHead, appHead);
+  // A shell that exported GIT_DIR and GIT_WORK_TREE for the app checkout.
+  const env = { ...process.env, GIT_DIR: path.join(ws.appDir, '.git'), GIT_WORK_TREE: ws.appDir, GIT_INDEX_FILE: path.join(ws.appDir, '.git', 'index') };
+  const work = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: lane.worktreeDir }, projectRepos: [{ id: 'app' }], env });
+  assert.equal(work.covers.worktrees[0].head, laneHead, 'the worktree is read, not the repository the environment names');
 });

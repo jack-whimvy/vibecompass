@@ -153,6 +153,9 @@ async function runActions(actions = [], context) {
 }
 
 async function codex() {
+  // `ignoreSigterm`: a tool that keeps running through SIGTERM, as one still
+  // starting might, until SIGKILL.
+  if (spec.ignoreSigterm && args[0] !== '--version') process.on('SIGTERM', () => {});
   if (args[0] === '--version') {
     process.stdout.write(`codex-cli ${spec.version ?? '0.0.0'}\n`);
     return versionExitCode();
@@ -162,6 +165,8 @@ async function codex() {
   const turn = nextTurn('review');
   if (turn.startedMarker) writeFileSync(turn.startedMarker, String(process.pid));
   const prompt = await readStdin();
+  // Written once stdin has closed: with the prompt in it, the model turn has begun.
+  if (turn.promptMarker) writeFileSync(turn.promptMarker, prompt);
   record({ kind: 'review', args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN) });
   if (turn.lingeringPidFile) spawnLingering(turn.lingeringPidFile);
   if (turn.pipeHolderPidFile) spawnPipeHolder(turn.pipeHolderPidFile);

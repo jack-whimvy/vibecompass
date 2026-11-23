@@ -1852,7 +1852,7 @@ function renderReadyMarkText(context, result) {
     `- Work: ${mark.fingerprints.work.slice(0, 12)}`,
   ];
   for (const worktree of mark.covers.worktrees) {
-    lines.push(`  - worktree ${worktree.repo} at ${worktree.head.slice(0, 12)}: staged and working changes, ${worktree.untracked} untracked file${worktree.untracked === 1 ? '' : 's'}`);
+    lines.push(`  - worktree ${worktree.repo} at ${worktree.head.slice(0, 12)}: staged and working changes, ${worktree.untracked} untracked file${worktree.untracked === 1 ? '' : 's'}${worktree.submodules ? `, ${worktree.submodules} checked-out submodule${worktree.submodules === 1 ? '' : 's'}` : ''}`);
   }
   for (const item of mark.covers.paths) {
     if (item.kind === 'directory') {
@@ -4052,7 +4052,7 @@ function usageText() {
     '  --session <lane-id>                  Lane to mark. Omitted: nearest worktree lane marker, else the single active lane; 2+ active lanes require --session or a marker',
     '  --path <repo-id>:<path>|<path>       Repeatable: a file or folder under review outside the lane\'s worktrees, in a project.yaml repository or relative to the memory root',
     '                                        Writes sessions/active/<lane-id>/ready.json: SHA-256 of handoff.md › ## Builder → Reviewer, of wip.md › ## Review log, and of the work',
-    '                                        (each worktree\'s HEAD, staged and working diffs, and untracked files, plus each --path), the round id they make, and the',
+    '                                        (each worktree\'s HEAD, staged diff, tracked and untracked files, and checked-out submodules, plus each --path), the round id they make, and the',
     '                                        builder\'s Claude Code conversation when CLAUDE_CODE_SESSION_ID is set. Refused while a finding waits for the builder\'s response',
     '                                        and no owner line defers it, and when the lane has no worktree and no --path. In a hand-run lane it changes only the stage',
     '  --json                               Print the mark as JSON',

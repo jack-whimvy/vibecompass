@@ -314,14 +314,21 @@ async function isAbandonedLock(lockDir, staleMs) {
  * abandoned there is renamed away. Nothing else changes a lock while it
  * exists (its owner is gone, other reclaimers wait, and a claim needs the
  * path empty), so the rename moves exactly the lock judged. Returns `busy`
- * while another waiter reclaims. A mutex whose holder died inside this step
- * is never removed automatically: the error names it.
+ * while another waiter reclaims, and `gone` when the lock's folder has gone
+ * with it. A mutex whose holder died inside this step is never removed
+ * automatically: the error names it.
  */
 async function reclaimAbandonedLock(lockDir, staleMs) {
   const mutex = `${lockDir}.reclaim`;
   try {
     await mkdir(mutex);
   } catch (error) {
+    // The lock's folder is gone: its holder released the lock, removed the
+    // state/ it had made, and exited after the lock was judged. Nothing is
+    // left to reclaim; the caller claims afresh and makes the folder again.
+    if (error?.code === 'ENOENT') {
+      return 'gone';
+    }
     if (error?.code !== 'EEXIST') {
       throw error;
     }

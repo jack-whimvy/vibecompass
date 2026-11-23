@@ -471,17 +471,26 @@ export function remarkCommand({ laneId, rootDir, paths = [] }) {
 
 /**
  * The relay command the owner runs next, as this run was started: the memory
- * root, the lane, the reviewer and its model, one-pass, and the builder mode,
- * so a stop's command runs as printed from any folder.
+ * root, the lane, the reviewer and its model, and every operating option the
+ * owner chose (one pass, the Enter before each builder turn, a fresh reviewer,
+ * the builder mode, and the timeouts), so a stop's command runs as printed
+ * from any folder and runs the way this run did. `--conversation-closed` is
+ * never carried: it confirms the conversation as it was when this run
+ * started, and a stop prints the command that reopens it. `--past-cap` is
+ * added only by the stop that offers it.
  */
-export function relayCommand({ laneId, rootDir, reviewerTool = 'codex', reviewerModel = null, onePass = false, builderMode = null }, extra = []) {
+export function relayCommand({ laneId, rootDir, reviewerTool = 'codex', reviewerModel = null, onePass = false, confirmEachRound = false, freshReviewer = false, builderMode = null, reviewerTimeout = null, builderTimeout = null }, extra = []) {
   const words = ['vibecompass', 'review-relay', '--root', shellWord(rootDir), '--session', shellWord(laneId)];
   if (extra.includes('--recover')) return [...words, ...extra].join(' ');
   words.push('--reviewer', reviewerTool);
   if (reviewerModel) words.push('--reviewer-model', shellWord(reviewerModel));
   else if (reviewerTool === 'codex') words.push('--reviewer-model', '<model>');
-  if (onePass) words.push('--one-pass');
+  if (onePass && !extra.includes('--one-pass')) words.push('--one-pass');
+  if (confirmEachRound) words.push('--confirm-each-round');
+  if (freshReviewer) words.push('--fresh-reviewer');
   if (builderMode && builderMode !== 'default') words.push('--builder-mode', shellWord(builderMode));
+  if (reviewerTimeout !== null && reviewerTimeout !== undefined) words.push('--reviewer-timeout', shellWord(reviewerTimeout));
+  if (builderTimeout !== null && builderTimeout !== undefined) words.push('--builder-timeout', shellWord(builderTimeout));
   return [...words, ...extra].join(' ');
 }
 

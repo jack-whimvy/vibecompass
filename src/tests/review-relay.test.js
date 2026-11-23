@@ -221,10 +221,12 @@ test('a change only to what is staged during a review discards the verdict', asy
   await writeFile(file, 'hello\n', 'utf8');
   await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, actions: [{ type: 'write-file', path: path.join(s.ws.tempDir, 'stage-now'), content: '' }] }] } });
   await s.mark(null);
-  // The stand-in's action can't run git, so the test stages while the turn waits.
-  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, waitFor: path.join(s.ws.tempDir, 'staged-now') }] } });
+  // The stand-in's action can't run git, so the test stages while the turn
+  // waits: once the reviewer has its prompt, after the first comparison.
+  const prompted = path.join(s.ws.tempDir, 'reviewer-prompted');
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, promptMarker: prompted, waitFor: path.join(s.ws.tempDir, 'staged-now') }] } });
   const running = s.relay(codexArgs);
-  await new Promise((resolve) => setTimeout(resolve, 600));
+  while (!existsSync(prompted)) await new Promise((resolve) => setTimeout(resolve, 25));
   git(s.lane.worktreeDir, ['add', 'README.md']);
   await writeFile(path.join(s.ws.tempDir, 'staged-now'), '', 'utf8');
   const result = await running;
@@ -463,11 +465,13 @@ test('the cap: lowered during a run, raised during a run, and --past-cap', async
 test('Ctrl-C during the reviewer\'s turn stops the relay; a restart repeats the pass once', async (t) => {
   const s = await setup(t);
   const started = path.join(s.ws.tempDir, 'reviewer-started');
+  const prompted = path.join(s.ws.tempDir, 'reviewer-prompted');
   const release = path.join(s.ws.tempDir, 'never');
-  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, startedMarker: started, waitFor: release }, { answer: CLEAN_ANSWER }] } });
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, startedMarker: started, promptMarker: prompted, waitFor: release }, { answer: CLEAN_ANSWER }] } });
   await s.mark(null);
   const running = s.relay(codexArgs);
-  while (!existsSync(started)) await new Promise((resolve) => setTimeout(resolve, 50));
+  // Ctrl-C once the prompt is in: the model turn has begun.
+  while (!existsSync(prompted)) await new Promise((resolve) => setTimeout(resolve, 50));
   s.signals.emit('SIGINT');
   const stopped = await running;
   assert.equal(stopped.code, 0);
@@ -490,7 +494,7 @@ test('a reviewer turn past its timeout ends the group and stops', async (t) => {
   const result = await s.relay([...codexArgs, '--reviewer-timeout', '0.01']);
   assert.ok(Date.now() - started < 9_000);
   assert.equal(result.code, 1);
-  assert.match(result.out, /the reviewer's turn ran past 0 minutes; its process group was ended, and no pass was recorded\./);
+  assert.match(result.out, /the reviewer's turn ran past 1 second; its process group was ended, and no pass was recorded\./);
   assert.equal(parse(await s.wip()).passCount, 0);
 });
 
@@ -703,7 +707,7 @@ test('a timeout ends a descendant that ignores SIGTERM and outlives its leader b
   const result = await s.relay([...codexArgs, '--reviewer-timeout', '0.01'], { relayKillGraceMs: 300, relayGroupSettleMs: 3000 });
   assert.equal(result.code, 1, result.out);
   assert.match(result.out, /Stopped: the reviewer's turn ran past/);
-  assert.match(result.out, /Choices:\n- run `vibecompass review-relay --root \S+ --session relay-lane --reviewer codex --reviewer-model gpt-test` again to repeat the turn, with a longer --reviewer-timeout if it needs one\n- review by hand\n/);
+  assert.match(result.out, /Choices:\n- run `vibecompass review-relay --root \S+ --session relay-lane --reviewer codex --reviewer-model gpt-test --reviewer-timeout 0\.01` again to repeat the turn, with a longer --reviewer-timeout if it needs one\n- review by hand\n/);
   assert.doesNotMatch(result.out, /reopen it below/, 'a one-pass stop offers no conversation it doesn\'t print');
   const lingering = Number(await readFile(pidFile, 'utf8'));
   assert.equal(isRunning(lingering), false, 'the descendant is gone when the relay returns');
@@ -1012,7 +1016,8 @@ test('a failed save of the turn\'s process with a group that won\'t end keeps an
     },
   };
   let failures = 0;
-  const result = await s.relay([...codexArgs, '--conversation-closed'], { relayProcessTable: ghost, relayKillGraceMs: 200, relayGroupSettleMs: 500, relayOnTurnRecord: async () => { failures += 1; throw new Error('disk full'); } });
+  // Only the first record fails; the late record of the identity succeeds.
+  const result = await s.relay([...codexArgs, '--conversation-closed'], { relayProcessTable: ghost, relayKillGraceMs: 200, relayGroupSettleMs: 500, relayOnTurnRecord: async ({ stage }) => { if (stage !== 'identity') return; failures += 1; throw new Error('disk full'); } });
   assert.equal(failures, 1);
   assert.match(result.out, /was still present after SIGKILL\. The lane and conversation stay reserved/);
   const state = await readRelayState(s.lane.laneDir);
@@ -1053,4 +1058,154 @@ test('a stop\'s commands run as printed: the past-cap command from another folde
   assert.equal(code, 0, capture.stdout() + capture.stderr());
   assert.match(capture.stdout(), /Stopped: pass 2 is clean/);
   assert.equal(parse(await s.wip()).passCount, 2);
+});
+
+// Pass 4's cases: the printed continuation, an unrecorded turn, the lane
+// changing during the owner's Enter, polling after the exit, and a stop
+// before the prompt.
+
+test('the pause command, run as printed, keeps the owner\'s options: the Enter, a fresh reviewer, and the timeouts', async (t) => {
+  const s = await setup(t, { laneId: 'verbatim' });
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }, { answer: CONFIRM_R11 }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }] } });
+  await s.mark();
+  const first = await s.relay([...codexArgs, '--conversation-closed', '--confirm-each-round', '--fresh-reviewer', '--reviewer-timeout', '30', '--builder-timeout', '50'], { confirm: async () => 'stop' });
+  assert.match(first.out, /Stopped: the owner stopped after pass 1, before the builder's turn\./);
+  const printed = /run `(vibecompass review-relay [^`]+)` again to continue/.exec(first.out)?.[1];
+  assert.ok(printed, first.out);
+  for (const flag of ['--confirm-each-round', '--fresh-reviewer', '--reviewer-timeout 30', '--builder-timeout 50', '--reviewer-model gpt-test']) {
+    assert.ok(printed.includes(flag), `${flag} in ${printed}`);
+  }
+  assert.ok(!printed.includes('--conversation-closed'), 'the conversation is confirmed again, since the stop prints the command that reopens it');
+  // Followed as printed, from a folder with no lane: the relay asks about the
+  // conversation, then asks for the Enter again before the builder's turn.
+  const elsewhere = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-relay-verbatim-'));
+  t.after(() => rm(elsewhere, { recursive: true, force: true }));
+  const asked = [];
+  const capture = captureIo();
+  const code = await runCli(printed.split(' ').slice(1), capture.io, { cwd: elsewhere, env: s.standin.env, platform: 'darwin', supportedReviewerVersions: SUPPORTED, userInfo: { homedir: s.home }, signals: s.signals, confirm: async (question) => { asked.push(question); return /closed in every terminal/.test(question) ? 'y' : 'stop'; } });
+  assert.equal(code, 0, capture.stdout());
+  assert.equal(asked.length, 2, asked.join('\n'));
+  assert.match(asked[1], /^Pass 1 is recorded\. Press Enter to send the builder its turn/);
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'builder').length, 0, 'no builder turn without the Enter');
+});
+
+test('a turn whose process was never recorded stays reserved through a restart and close until the owner confirms at --recover', async (t) => {
+  const s = await setup(t, { laneId: 'unrecorded' });
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER }] }, claude: { version: '2.1.318' } });
+  await s.mark();
+  // Both records of the process fail: the first, and the late one after it.
+  const stages = [];
+  const result = await s.relay([...codexArgs, '--conversation-closed'], { relayOnTurnRecord: async ({ stage }) => { stages.push(stage); throw new Error('disk full'); } });
+  assert.deepEqual(stages, ['identity', 'late identity']);
+  assert.equal(result.code, 1);
+  assert.match(result.out, /relay\.json couldn't record that either \(disk full\), so the lane and conversation stay reserved: run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal/);
+  for (const review of (await s.standin.calls()).filter((item) => item.kind === 'review')) assert.equal(review.prompt, '', 'the tool got no prompt');
+  const state = await readRelayState(s.lane.laneDir);
+  assert.equal(state.turn.pgid, null);
+  assert.equal(state.turn.ended, null, 'the turn stays unfinished');
+  assert.equal(state.turn.command, 'codex');
+  const lockPath = path.join(s.home, '.config', 'vibecompass', 'relay-locks', `${CONV}.json`);
+  assert.ok(existsSync(lockPath), 'the conversation lock is kept');
+  // A restart starts nothing and stays reserved.
+  const reviewsBefore = (await s.standin.calls()).filter((item) => item.kind === 'review').length;
+  const again = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.equal(again.code, 1);
+  assert.match(again.out, /the reviewer turn for pass 1, started .+, was never recorded with its process, so the relay can't inspect it\. Its prompt was never sent.+a codex process may be left\. The lane and conversation stay reserved\./);
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'review').length, reviewsBefore, 'no reviewer started');
+  // Close refuses.
+  await assert.rejects(closeProjectSession({ cwd: s.ws.tempDir, rootDir: s.ws.rootDir, sessionId: s.lane.laneId, ...CLOSE }), /close-session is refused: the relay's reviewer turn on lane unrecorded, started .+, was never recorded with its process, so it can't be inspected/);
+  // --recover with no terminal, then with a no: still reserved.
+  assert.match((await s.relay(['--recover'])).out, /run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal, which asks you to confirm/);
+  const questions = [];
+  const declined = await s.relay(['--recover'], { confirm: async (question) => { questions.push(question); return 'n'; } });
+  assert.equal(declined.code, 1);
+  assert.match(questions[0], /^The reviewer turn for pass 1, started .+, was never recorded with its process\. Check `ps -A -o pid,pgid,lstart,command` for a codex process started then or later\. Is every such process gone\? \[y\/N\]$/);
+  assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null);
+  // The owner confirms: the turn is settled, and the lane runs again.
+  const confirmed = await s.relay(['--recover'], { confirm: async () => 'y' });
+  assert.equal(confirmed.code, 0, confirmed.out);
+  assert.match(confirmed.out, /You confirmed none of its processes is left\./);
+  // The first relay's process has exited, as a real relay's does after its run;
+  // here every relay runs in the test's own process.
+  const lock = JSON.parse(await readFile(lockPath, 'utf8'));
+  await writeFile(lockPath, JSON.stringify({ ...lock, pid: 999_999 }), 'utf8');
+  const go = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.equal(go.code, 0, go.out);
+  assert.match(go.out, /Took over conversation [0-9a-f-]+'s lock: run [0-9a-f]+ on lane unrecorded has ended\./, 'the settled run\'s lock is taken over');
+  assert.equal(parse(await s.wip()).passCount, 1);
+});
+
+test('the lane changing while the relay waits for the Enter: no builder turn goes to a conversation the lane no longer names', async (t) => {
+  const OTHER = '9e8d7c6b-2222-4333-8444-555566667777';
+  for (const [laneId, conversationId] of [['enter-other', OTHER], ['enter-same', CONV]]) {
+    const s = await setup(t, { laneId });
+    await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }, { answer: CONFIRM_R11 }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }] } });
+    await s.mark();
+    // At the Enter: the owner answers by hand and marks again, from another
+    // conversation or from this one, then presses Enter.
+    const atEnter = async () => {
+      await writeReviewLog(s.lane, [...extractReviewLogLines(await s.wip()).lines.map((line) => line.text).filter((line) => line.trim() !== ''), '- response 1 | 2026-11-21 22:00 -08:00 | Claude Opus 5.5', '  - R1.1 | P2 | accepted | fixed the time pattern']);
+      await writeFile(path.join(s.lane.worktreeDir, 'src', 'index.js'), 'export const answer = 43;\n', 'utf8');
+      await s.mark(conversationId);
+      return '';
+    };
+    const result = await s.relay([...codexArgs, '--conversation-closed', '--confirm-each-round'], { confirm: atEnter });
+    assert.match(result.out, /Not sending the builder its turn for pass 1: the ready-for-review mark changed/, laneId);
+    assert.equal((await s.standin.calls()).filter((item) => item.kind === 'builder').length, 0, `${laneId}: no builder turn`);
+    if (conversationId === OTHER) {
+      assert.equal(result.code, 1);
+      assert.match(result.out, new RegExp(`now names Claude Code conversation ${OTHER}, not ${CONV}, which this run resumes\\. Nothing was sent to either\\.`));
+      assert.equal(parse(await s.wip()).passCount, 1);
+    } else {
+      // The same conversation's new round gets its pass.
+      assert.equal(result.code, 0, result.out);
+      assert.match(result.out, /Stopped: pass 2 is clean/);
+    }
+  }
+});
+
+test('after the leader exits, a group member that stays is read once per poll interval, not continuously', async (t) => {
+  const s = await setup(t, { laneId: 'poll-rate' });
+  const started = path.join(s.ws.tempDir, 'leader-started');
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER, startedMarker: started }] } });
+  await s.mark(null);
+  // The real table, read at most once a second, with one member of the
+  // turn's group that stays 1.5 s: each read is cheap, so only the relay's
+  // own pacing bounds how often it reads.
+  const real = createProcessTable();
+  let cached = null;
+  let member = null;
+  const reads = [];
+  const table = {
+    async list() {
+      const now = Date.now();
+      if (!member && existsSync(started)) member = { pgid: Number(await readFile(started, 'utf8')), until: now + 1500 };
+      if (member) reads.push(now);
+      if (!cached || now - cached.at > 1000) cached = { at: now, rows: await real.list() };
+      return [...cached.rows, ...(member && now < member.until ? [{ pid: 999_992, pgid: member.pgid, startedAt: 'Fri Dec 31 23:59:59 2099', command: 'a member that stays' }] : [])];
+    },
+    killGroup: (pgid, signal) => real.killGroup(pgid, signal),
+  };
+  const result = await s.relay(codexArgs, { relayProcessTable: table });
+  assert.equal(result.code, 0, result.out);
+  assert.ok(reads.length >= 3, `the group was read while the member stayed (${reads.length})`);
+  assert.ok(reads.length <= 16, `${reads.length} reads in about 1.5 s; one per 250 ms poll allows a few more than 6`);
+});
+
+test('a timeout while the process is being recorded closes stdin empty: no prompt reaches a tool still running', async (t) => {
+  const s = await setup(t, { laneId: 'late-prompt' });
+  await s.standin.setScenario({ codex: { version: '0.171.0', ignoreSigterm: true, reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  // The record takes a second; the limit is a fraction of that. The tool keeps
+  // running through SIGTERM, so it would read whatever stdin carried.
+  const result = await s.relay([...codexArgs, '--reviewer-timeout', '0.002'], { relayKillGraceMs: 4000, relayOnTurnRecord: async ({ stage }) => { if (stage === 'identity') await new Promise((resolve) => setTimeout(resolve, 1000)); } });
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.out, /Stopped: the reviewer's turn reached its 1 second limit before its prompt was sent, so no model turn ran; its process group was ended, and no pass was recorded\./);
+  const reviews = (await s.standin.calls()).filter((item) => item.kind === 'review');
+  assert.equal(reviews.length, 1);
+  assert.equal(reviews[0].prompt, '', 'the tool read an empty stdin');
+  const state = await readRelayState(s.lane.laneDir);
+  assert.equal(state.turn.prompt_sent, false);
+  assert.equal(state.turn.possibly_partial, false);
+  assert.equal(parse(await s.wip()).passCount, 0);
 });

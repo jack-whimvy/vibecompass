@@ -36,6 +36,7 @@ import {
   findingsWaitingForBuilder,
   gitText,
   readReadyMark,
+  repositoryTopLevel,
   resolveMarkPath,
   shortRound,
 } from './relay-mark.js';
@@ -129,6 +130,16 @@ function parseMinutes(value, flag, fallback) {
     throw new Error(`${flag} must be a positive number of minutes; got "${value}".`);
   }
   return minutes;
+}
+
+/** A turn's limit in words: "45 minutes", or seconds for a limit under a minute. */
+function formatMinutes(ms) {
+  if (ms < 60_000) {
+    const seconds = Math.max(1, Math.round(ms / 1000));
+    return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  }
+  const minutes = Math.round(ms / 60_000);
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
 }
 
 function newId(bytes = 6) {
@@ -260,13 +271,16 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   } catch (error) {
     recordError = error instanceof Error ? error.message : String(error);
   }
-  if (recordError || active.interrupted) {
-    // Stopped, or not recorded, before the prompt went out: close stdin empty
-    // and end the group.
+  // The prompt goes out only to a recorded process that nothing has begun to
+  // stop: not after Ctrl-C, a timeout, or the relay's own end of the turn,
+  // any of which may have come while the identity was being recorded.
+  const promptSent = !recordError && !active.interrupted && terminatedAt === null;
+  if (promptSent) {
+    child.stdin.end(input);
+  } else {
+    // Stdin closes empty, and the group is ended.
     child.stdin.end();
     endGroup();
-  } else {
-    child.stdin.end(input);
   }
 
   // A tool's own child can outlive it: the turn runs until its process has
@@ -283,7 +297,10 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
       }
     }
     if (terminatedAt !== null && Date.now() - terminatedAt > killGraceMs + settleMs) break;
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS))]);
+    // Before the exit, the wait ends at the exit or the next poll; after it,
+    // the group is read once per poll interval.
+    const poll = new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+    await (exitInfo ? poll : Promise.race([exited, poll]));
   }
   clearTimeout(timer);
   if (groupEnded && killTimer) {
@@ -301,7 +318,7 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
     child.stderr.destroy();
   }
   active.group = null;
-  return { code: exitInfo?.code ?? null, signal: exitInfo?.signal ?? null, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, groupEnded, pipesHeld: !pipesClosed, pid, pgid, startedAt };
+  return { code: exitInfo?.code ?? null, signal: exitInfo?.signal ?? null, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, promptSent, groupEnded, pipesHeld: !pipesClosed, pid, pgid, startedAt };
 }
 
 /**
@@ -311,7 +328,7 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
 function groupStillRunning(ctx, role, passNumber, result, unrecorded = null) {
   const recover = ctx.commands.recover;
   if (unrecorded) {
-    return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}, process ${result.pid}) was still present after SIGKILL, and relay.json couldn't record it (${unrecorded}). The next run on this lane can't inspect that group: its recovery will finish the turn as never sent. Before running the relay on this lane again, check that no process in group ${result.pgid} is left (\`ps -A -o pid,pgid,command\`), then run \`${recover}\`.`, { reserved: true }); // D-419 item 10
+    return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}, process ${result.pid}) was still present after SIGKILL, and relay.json couldn't record it (${unrecorded}). The lane and conversation stay reserved until you settle it: check that no process in group ${result.pgid} is left (\`ps -A -o pid,pgid,command\`), stop any you find, then run \`${recover}\` in a terminal, which asks you to confirm.`, { reserved: true }); // D-419 item 10
   }
   return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}) was still present after SIGKILL. The lane and conversation stay reserved; when those processes are gone, run \`${recover}\`.`, { reserved: true }); // D-419 item 10
 }
@@ -324,6 +341,7 @@ function groupStillRunning(ctx, role, passNumber, result, unrecorded = null) {
 async function recordLateIdentity(ctx, result) {
   const turn = ctx.getState().turn;
   try {
+    if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord({ stage: 'late identity' });
     await ctx.save({
       turn: {
         ...turn,
@@ -339,6 +357,28 @@ async function recordLateIdentity(ctx, result) {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+/**
+ * After a turn's process has run: a process that couldn't be recorded gets its
+ * identity recorded late, and a group that didn't end keeps the turn
+ * unfinished. Throws the stop for either; returns when the turn is settled.
+ */
+async function settleTurnStart(ctx, role, passNumber, result) {
+  if (result.recordError) {
+    const lateError = await recordLateIdentity(ctx, result);
+    if (!result.groupEnded) throw groupStillRunning(ctx, role, passNumber, result, lateError);
+    throw new RelayStop(lateError ? 'interrupted' : 'failure', `the ${role}'s process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.${lateError ? ` relay.json couldn't record that either (${lateError}), so the lane and conversation stay reserved: run \`${ctx.commands.recover}\` in a terminal, which asks you to confirm that no process of the turn is left.` : ''}`);
+  }
+  if (!result.groupEnded) {
+    // A turn stopped before its prompt went out says so in relay.json.
+    if (!result.promptSent) await ctx.save({ turn: { ...ctx.getState().turn, prompt_sent: false } }).catch(() => {});
+    throw groupStillRunning(ctx, role, passNumber, result);
+  }
+}
+
+function turnEndHow(result) {
+  return result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : result.aborted ? 'ended by the relay' : 'exited';
 }
 
 async function remoteRefs(dirs) {
@@ -404,7 +444,18 @@ export async function runReviewRelay(options = {}, deps = {}) {
   const turnDir = path.join(laneDir, RELAY_TURN_DIR);
   const active = { group: null, interrupted: false };
   // The commands a stop prints, as this run was started, so each runs as printed.
-  const commandSpec = { laneId, rootDir, reviewerTool, reviewerModel: options.reviewerModel ?? null, onePass: Boolean(options.onePass), builderMode: options.builderMode ?? null };
+  const commandSpec = {
+    laneId,
+    rootDir,
+    reviewerTool,
+    reviewerModel: options.reviewerModel ?? null,
+    onePass: Boolean(options.onePass),
+    confirmEachRound: Boolean(options.confirmEachRound),
+    freshReviewer: Boolean(options.freshReviewer),
+    builderMode: options.builderMode ?? null,
+    reviewerTimeout: options.reviewerTimeout ?? null,
+    builderTimeout: options.builderTimeout ?? null,
+  };
   const commands = {
     relay: (extra = []) => relayCommand(commandSpec, extra),
     recover: relayCommand(commandSpec, ['--recover']),
@@ -441,7 +492,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
     }
 
     // Recovery first: settle a recorded write, inspect an interrupted turn.
-    const recovered = await recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands });
+    const recovered = await recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands, confirm: deps.confirm, recoverMode: Boolean(options.recover) });
     state = recovered.state;
     if (recovered.reserved) {
       throw new RelayStop('interrupted', recovered.stopReason);
@@ -694,7 +745,7 @@ function markConversation(mark) {
  * state, and inspect a turn that was running when a relay died. It sends no
  * signal to a group recovered from disk.
  */
-async function recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands }) {
+async function recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands, confirm = null, recoverMode = false }) {
   const notes = [];
   let stopReason = null;
   let reserved = false;
@@ -708,10 +759,23 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
   if (turnUnfinished(current)) {
     const turn = current.turn;
     if (!turn.pgid) {
-      // The prompt is sent only after the process is recorded, so an
-      // unrecorded process never got it: a tool whose stdin closes empty exits.
-      current = await saveRelayState(laneDir, { ...current, turn: { ...turn, ended: { at: new Date().toISOString(), how: 'prompt never sent' } } });
-      notes.push(`The ${turn.role} turn for pass ${turn.pass} was never recorded as started, so its prompt was never sent: no model turn ran.`);
+      // Recorded before its process started and never with it: the prompt
+      // goes out only after that record, so no model turn ran, but a process
+      // may be left that the relay can't inspect. It stays reserved until the
+      // owner, at --recover in a terminal, confirms none is left.
+      const tool = turn.command ?? 'tool';
+      const since = turn.started_at ? new Date(turn.started_at).toString() : 'an unknown time';
+      const answer = recoverMode && typeof confirm === 'function'
+        ? String(await confirm(`The ${turn.role} turn for pass ${turn.pass}, started ${since}, was never recorded with its process. Check \`ps -A -o pid,pgid,lstart,command\` for a ${tool} process started then or later. Is every such process gone? [y/N]`)).trim().toLowerCase()
+        : null;
+      if (answer === 'y' || answer === 'yes') {
+        current = await saveRelayState(laneDir, { ...current, turn: { ...turn, ended: { at: new Date().toISOString(), how: 'prompt never sent; the owner confirmed no process is left' } } });
+        notes.push(`The ${turn.role} turn for pass ${turn.pass} was never recorded with its process, so its prompt was never sent: no model turn ran. You confirmed none of its processes is left.`);
+      } else {
+        reserved = true;
+        stopReason = `the ${turn.role} turn for pass ${turn.pass}, started ${since}, was never recorded with its process, so the relay can't inspect it. Its prompt was never sent, since the prompt goes out only after that record, so no model turn ran; but a ${tool} process may be left. The lane and conversation stay reserved. Check that no ${tool} process started then or later is left (\`ps -A -o pid,pgid,lstart,command\`), stop any you find, then run \`${commands.recover}\` in a terminal, which asks you to confirm.`; // D-419 item 10
+        notes.push(stopReason);
+      }
     } else {
       const group = await inspectProcessGroup(table, { pgid: turn.pgid, pid: turn.pid, startedAt: turn.process_started_at });
       if (group.state === 'ended') {
@@ -829,6 +893,8 @@ async function relayLoop(ctx) {
           throw new RelayStop('owner-pause', `the owner stopped after pass ${recorded.number}, before the builder's turn.`);
         }
       }
+      // A turn not sent because the lane changed meanwhile: the loop reads
+      // the lane again.
       await builderTurn(ctx, recorded.number, mark);
       continue;
     }
@@ -904,7 +970,7 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
   }
   const prompt = reviewerPrompt({ laneId, passNumber, rootDir, roundId: mark.round_id });
   out(`Pass ${passNumber}: ${TOOL_NAMES[ctx.reviewerTool]} ${version.version} reviewing round ${shortRound(mark.round_id)}${threadId ? ` (resuming ${threadId})` : ''}…`);
-  await save({ step: 'reviewer-turn', round: { id: mark.round_id, fingerprints: mark.fingerprints }, turn: { id: newId(), role: 'reviewer', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null }, answer: null });
+  await save({ step: 'reviewer-turn', round: { id: mark.round_id, fingerprints: mark.fingerprints }, turn: { id: newId(), role: 'reviewer', command: launch.command, pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null }, answer: null });
   // A Claude Code reviewer's stream is checked as it arrives: a hook event, an
   // event before init, or an init outside what the reviewer may load ends the
   // group at once (D-419 item 5, D-421).
@@ -942,7 +1008,7 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     killGraceMs: ctx.killGraceMs,
     settleMs: ctx.settleMs,
     onSpawned: async ({ pid, pgid, startedAt }) => {
-      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord();
+      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord({ stage: 'identity' });
       await save({ turn: { ...ctx.getState().turn, pid, pgid, process_started_at: startedAt, prompt_sent: true } });
     },
   });
@@ -950,17 +1016,15 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
     throw new RelayStop('failure', `the reviewer couldn't start: ${result.spawnError}.`);
   }
-  const lateError = result.recordError ? await recordLateIdentity(ctx, result) : null;
-  if (!result.groupEnded) throw groupStillRunning(ctx, 'reviewer', passNumber, result, lateError);
-  if (result.recordError) {
-    throw new RelayStop('failure', `the reviewer's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
-  }
-  const partialReviewer = Boolean(result.timedOut || result.interrupted || result.aborted);
-  const ended = { at: new Date().toISOString(), how: result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : result.aborted ? 'ended by the relay' : 'exited', exit_code: result.code ?? null };
-  await save({ turn: { ...ctx.getState().turn, ended, possibly_partial: partialReviewer, partial_reported_at: partialReviewer ? new Date().toISOString() : null } });
-  if (result.interrupted) throw new RelayStop('owner-pause', 'Ctrl-C: the owner stopped the relay during the reviewer\'s turn; no pass was recorded.');
-  if (result.timedOut) throw new RelayStop('timeout', `the reviewer's turn ran past ${Math.round(ctx.reviewerTimeoutMs / 60000)} minutes; its process group was ended, and no pass was recorded.`);
-  if (result.aborted) throw new RelayStop('refusal', `${result.aborted}; the relay ended the turn, and its answer is discarded.`);
+  await settleTurnStart(ctx, 'reviewer', passNumber, result);
+  const sent = result.promptSent;
+  const partialReviewer = sent && Boolean(result.timedOut || result.interrupted || result.aborted);
+  const ended = { at: new Date().toISOString(), how: turnEndHow(result), exit_code: result.code ?? null };
+  await save({ turn: { ...ctx.getState().turn, prompt_sent: sent, ended, possibly_partial: partialReviewer, partial_reported_at: partialReviewer ? new Date().toISOString() : null } });
+  const unsent = 'before its prompt was sent, so no model turn ran';
+  if (result.interrupted) throw new RelayStop('owner-pause', sent ? 'Ctrl-C: the owner stopped the relay during the reviewer\'s turn; no pass was recorded.' : `Ctrl-C: the owner stopped the relay ${unsent}; no pass was recorded.`);
+  if (result.timedOut) throw new RelayStop('timeout', sent ? `the reviewer's turn ran past ${formatMinutes(ctx.reviewerTimeoutMs)}; its process group was ended, and no pass was recorded.` : `the reviewer's turn reached its ${formatMinutes(ctx.reviewerTimeoutMs)} limit ${unsent}; its process group was ended, and no pass was recorded.`);
+  if (result.aborted) throw new RelayStop('refusal', `${result.aborted}; the relay ended the turn${sent ? '' : ` ${unsent}`}, and its answer is discarded.`);
 
   let answer = null;
   let model = ctx.options.reviewerModel ?? null;
@@ -1083,18 +1147,26 @@ async function builderTurn(ctx, passNumber, markBefore) {
   const gate = checkBuilderVersion({ version: version.ok ? version.version : null });
   if (!gate.ok) throw new RelayStop('unsupported', gate.message);
 
-  const wipBefore = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
-  const parsedBefore = parseLog(wipBefore);
-  const handoffBefore = await readFile(path.join(laneDir, 'handoff.md'), 'utf8').catch(() => '');
-  const reviewerSectionBefore = readSectionBody(handoffBefore, REVIEWER_TO_BUILDER_HEADING);
   const coveredRepos = await coveredRepositories(ctx, markBefore);
   const refsBefore = await remoteRefs(coveredRepos);
   const ghConfigDir = path.join(turnDir, 'gh-config-empty');
   await mkdir(ghConfigDir, { recursive: true });
   const launch = claudeBuilderLaunch({ conversationId: ctx.conversationId, mode: ctx.builderMode });
   const logPath = path.join(turnDir, `pass-${passNumber}-${ctx.runId}-builder.jsonl`);
+  // Last before the turn, after the owner's Enter and the checks above: the
+  // mark, its conversation, and the findings waiting on this pass are read
+  // again. Anything changed, and the loop looks at the lane afresh instead.
+  const wipBefore = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
+  const parsedBefore = parseLog(wipBefore);
+  const due = await builderTurnDue(ctx, passNumber, markBefore, parsedBefore, wipBefore);
+  if (!due.ok) {
+    out(`Not sending the builder its turn for pass ${passNumber}: ${due.reason}. Reading the lane again.`);
+    return { sent: false };
+  }
+  const handoffBefore = await readFile(path.join(laneDir, 'handoff.md'), 'utf8').catch(() => '');
+  const reviewerSectionBefore = readSectionBody(handoffBefore, REVIEWER_TO_BUILDER_HEADING);
   out(`Builder turn for pass ${passNumber}: resuming conversation ${ctx.conversationId} in ${ctx.builderMode} mode…`);
-  await save({ step: 'builder-turn', turn: { id: newId(), role: 'builder', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
+  await save({ step: 'builder-turn', turn: { id: newId(), role: 'builder', command: launch.command, pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
 
   // The stream is read in order: hook events may come before init; anything
   // else, or an init naming another mode or conversation, ends the turn.
@@ -1132,7 +1204,7 @@ async function builderTurn(ctx, passNumber, markBefore) {
     killGraceMs: ctx.killGraceMs,
     settleMs: ctx.settleMs,
     onSpawned: async ({ pid, pgid, startedAt }) => {
-      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord();
+      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord({ stage: 'identity' });
       await save({ turn: { ...ctx.getState().turn, pid, pgid, process_started_at: startedAt, prompt_sent: true } });
     },
   });
@@ -1140,16 +1212,14 @@ async function builderTurn(ctx, passNumber, markBefore) {
     await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
     throw new RelayStop('failure', `the builder couldn't start: ${result.spawnError}.`);
   }
-  const lateError = result.recordError ? await recordLateIdentity(ctx, result) : null;
-  if (!result.groupEnded) throw groupStillRunning(ctx, 'builder', passNumber, result, lateError);
-  if (result.recordError) {
-    throw new RelayStop('failure', `the builder's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
-  }
-  const partial = Boolean(result.timedOut || result.interrupted || result.aborted);
-  await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : result.aborted ? 'ended by the relay' : 'exited', exit_code: result.code ?? null }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null } });
-  if (result.interrupted) throw new RelayStop('owner-pause', 'Ctrl-C: the owner stopped the relay during the builder\'s turn, which may have run partly.');
-  if (result.timedOut) throw new RelayStop('timeout', `the builder's turn ran past ${Math.round(ctx.builderTimeoutMs / 60000)} minutes; its process group was ended, and the turn may have run partly.`);
-  if (result.aborted) throw new RelayStop('failure', `${result.aborted}; the relay ended the turn, which may have run partly.`);
+  await settleTurnStart(ctx, 'builder', passNumber, result);
+  const sent = result.promptSent;
+  const partial = sent && Boolean(result.timedOut || result.interrupted || result.aborted);
+  await save({ turn: { ...ctx.getState().turn, prompt_sent: sent, ended: { at: new Date().toISOString(), how: turnEndHow(result), exit_code: result.code ?? null }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null } });
+  const unsent = 'before its prompt was sent, so no model turn ran';
+  if (result.interrupted) throw new RelayStop('owner-pause', sent ? 'Ctrl-C: the owner stopped the relay during the builder\'s turn, which may have run partly.' : `Ctrl-C: the owner stopped the relay ${unsent}.`);
+  if (result.timedOut) throw new RelayStop('timeout', sent ? `the builder's turn ran past ${formatMinutes(ctx.builderTimeoutMs)}; its process group was ended, and the turn may have run partly.` : `the builder's turn reached its ${formatMinutes(ctx.builderTimeoutMs)} limit ${unsent}; its process group was ended.`);
+  if (result.aborted) throw new RelayStop('failure', `${result.aborted}; the relay ended the turn${sent ? ', which may have run partly' : ` ${unsent}`}.`);
 
   const stream = readClaudeStream(result.stdout);
   const initProblem = checkBuilderInit(stream, { conversationId: ctx.conversationId, mode: ctx.builderMode });
@@ -1211,21 +1281,50 @@ async function builderTurn(ctx, passNumber, markBefore) {
     throw new RelayStop('builder-question', `the builder's turn ended ${responded ? 'without a new ready-for-review mark' : `without a response line for pass ${passNumber}`}${waiting.length > 0 ? `; ${waiting.join(', ')} still ${waiting.length === 1 ? 'waits' : 'wait'} for the builder` : ''}.`, { print: last ? `The builder's last message:\n${last.slice(0, 4000)}` : null });
   }
   out(`The builder marked round ${shortRound(markAfter.round_id)} ready.`);
+  return { sent: true };
+}
+
+/**
+ * Whether the builder's turn for `passNumber` is still due, as the loop saw it
+ * before the owner's Enter: the same mark, naming this run's conversation, and
+ * that pass on its round with findings still waiting for the builder. These
+ * are the loop's own conditions, so a turn found not due is never chosen
+ * again from the same lane.
+ */
+async function builderTurnDue(ctx, passNumber, markBefore, parsed, wip) {
+  const mark = await readReadyMark(ctx.laneDir).catch(() => null);
+  if (!mark) return { ok: false, reason: 'the ready-for-review mark is gone' };
+  if (mark.round_id !== markBefore.round_id || mark.marked_at !== markBefore.marked_at) {
+    return { ok: false, reason: `the ready-for-review mark changed (now round ${shortRound(mark.round_id)})` };
+  }
+  if (markConversation(mark) !== ctx.conversationId) return { ok: false, reason: 'the mark names another conversation' };
+  if (!parsed.ok) return { ok: false, reason: 'the review log no longer parses' };
+  if (passOnRound(parsed, mark.round_id)?.number !== passNumber) return { ok: false, reason: `pass ${passNumber} is no longer the pass on this round` };
+  if (findingsWaitingForBuilder(wip).waiting.length === 0) return { ok: false, reason: 'no finding waits for the builder' };
+  return { ok: true };
 }
 
 /** The git repositories a mark covers: the lane's worktrees and each named path's repository. */
 export async function coveredRepositories(ctx, mark) {
   const dirs = new Set(Object.values(ctx.worktrees).map((dir) => path.resolve(dir)));
   for (const spec of mark.paths ?? []) {
+    let resolved;
     try {
-      const resolved = resolveMarkPath(spec, { rootDir: ctx.rootDir, projectRepos: ctx.projectRepos, worktrees: ctx.worktrees });
-      const kind = await stat(resolved.absolute).then((info) => (info.isDirectory() ? 'directory' : 'file')).catch(() => 'missing');
-      const start = kind === 'directory' ? resolved.absolute : kind === 'file' ? path.dirname(resolved.absolute) : resolved.base;
-      const top = await gitText(['rev-parse', '--show-toplevel'], start);
-      if (top.ok) dirs.add(top.stdout.trim());
+      resolved = resolveMarkPath(spec, { rootDir: ctx.rootDir, projectRepos: ctx.projectRepos, worktrees: ctx.worktrees });
     } catch {
       // A path that can't be resolved covers no repository.
+      continue;
     }
+    const kind = await stat(resolved.absolute).then((info) => (info.isDirectory() ? 'directory' : 'file')).catch(() => 'missing');
+    const start = kind === 'directory' ? resolved.absolute : kind === 'file' ? path.dirname(resolved.absolute) : resolved.base;
+    // A path inside a repository git can't read stops the relay (D-423 item 3).
+    let top;
+    try {
+      top = await repositoryTopLevel(start, ctx.env);
+    } catch (error) {
+      throw new RelayStop('failure', error instanceof Error ? error.message : String(error));
+    }
+    if (top) dirs.add(top);
   }
   return [...dirs].sort();
 }
