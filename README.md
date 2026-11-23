@@ -529,12 +529,14 @@ it once all the parts have arrived. You don't have to do anything different.
   outcome is unknown` (run `vibecompass status`, or push again; a push that
   already applied answers `already current`).
 - `push` records a push locally only when the hosted app's answer names the
-  run and the hosted revision. An answer that's cut off or malformed, or one
-  after a lost reply that doesn't say what happened to that upload, leaves the
-  outcome unknown and records nothing.
+  run and the hosted revision. An answer that's cut off or malformed, a
+  connection that drops after the push was sent, or an answer after a lost
+  reply that doesn't say what happened to that upload, leaves the outcome
+  unknown and records nothing. If the app can't be reached at all, nothing was
+  sent.
 - A refused push shows what the hosted app recorded: the reason, the path,
-  the hosted head and the run when you need to pull first, and up to 20 schema
-  issues with a count of the rest.
+  the hosted head and the run when you need to pull first, every schema issue
+  it kept, and a count of any it didn't.
 - A push never follows a redirect. If your `sync.api_url` redirects, set it to
   the final address.
 - A hosted app that predates large pushes still takes a push of up to 5 MB the

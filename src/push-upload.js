@@ -163,6 +163,39 @@ export function invalidAnswerError(status) {
   );
 }
 
+const UNREACHABLE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH']);
+
+/** The system error codes behind a fetch failure: its cause chain and any AggregateError members. */
+function errorCodes(error, depth = 0) {
+  if (!error || typeof error !== 'object' || depth > 4) return [];
+  const own = typeof error.code === 'string' ? [error.code] : [];
+  const members = Array.isArray(error.errors) ? error.errors.flatMap((member) => errorCodes(member, depth + 1)) : [];
+  return [...own, ...members, ...errorCodes(error.cause, depth + 1)];
+}
+
+/**
+ * A single request's connection failure, worded by what it proves. A
+ * connection that was never made (refused, or a name that doesn't resolve)
+ * sent nothing. Any other failure while sending or while reading the answer
+ * may have followed an applied push, so its outcome is unknown, and the
+ * request is never sent again without a receipt.
+ */
+export function singleRequestFailure(context, error, phase) {
+  if (error instanceof PushOutcomeError) return error;
+  const codes = [...new Set(errorCodes(error))];
+  if (phase === 'send' && codes.length > 0 && codes.every((code) => UNREACHABLE_CODES.has(code))) {
+    return new PushOutcomeError(
+      `Push failed before upload: the hosted app at ${context.apiUrl} couldn't be reached (${codes.join(', ')}). Nothing was sent.`,
+      { outcome: 'refused_before_upload', code: 'app_unreachable' },
+    );
+  }
+  const cause = codes.length > 0 ? codes.join(', ') : String(error?.message ?? error);
+  return new PushOutcomeError(
+    `The push's outcome is unknown: the connection to the hosted app failed ${phase === 'send' ? 'before its answer arrived' : 'while its answer was read'} (${cause}). Nothing was recorded locally. ${UNKNOWN_NEXT_STEP}`,
+    { outcome: 'unknown', code: 'connection_failed' },
+  );
+}
+
 /** A fetch on the push path that never follows a redirect, so no body goes to another address. */
 async function send(context, url, init) {
   try {
@@ -199,11 +232,16 @@ function serverReason(body, text) {
  * the outcome unknown. Vercel's own 413 becomes the too-large message.
  */
 export async function sendLargeSinglePush(context, bodyText, documents) {
-  const response = await send(context, endpoint(context, 'push'), {
-    method: 'POST',
-    headers: authHeaders(context, { 'content-type': 'application/json' }),
-    body: bodyText,
-  });
+  let response;
+  try {
+    response = await send(context, endpoint(context, 'push'), {
+      method: 'POST',
+      headers: authHeaders(context, { 'content-type': 'application/json' }),
+      body: bodyText,
+    });
+  } catch (error) {
+    throw singleRequestFailure(context, error, 'send');
+  }
   let text;
   try {
     text = await readResponseText(response);
@@ -417,12 +455,11 @@ async function commitUpload(context, uploadId, packedSha256) {
   );
 }
 
-const MAX_ISSUE_LINES = 20;
-
 /**
- * A definitive refusal, worded with the receipt's bounded fields: the reason
- * and code, the path, the hosted head, the run (a needs_rebase audit run), and
- * up to 20 schema issues, then how many more there were.
+ * A definitive refusal, worded with the receipt's fields: the reason and
+ * code, the path, the hosted head, the run (a needs_rebase audit run), every
+ * schema issue the answer carries (a stored receipt is at most 16,384 bytes),
+ * then how many more the hosted app counted but didn't keep.
  */
 function refusalError(status, body, text) {
   const reason = serverReason(body, text).replace(/\.$/, '');
@@ -434,13 +471,17 @@ function refusalError(status, body, text) {
   ].filter(Boolean).join(', ');
   const lines = [`Push refused (${status}): ${reason}${detail ? ` (${detail})` : ''}. The hosted memory didn't change.`];
   const issues = Array.isArray(body.issues) ? body.issues.filter((issue) => issue && typeof issue === 'object') : [];
-  const shown = issues.slice(0, MAX_ISSUE_LINES);
-  for (const issue of shown) {
+  for (const issue of issues) {
     const where = typeof issue.path === 'string' && issue.path ? `${issue.path}: ` : '';
     lines.push(`  - ${where}${typeof issue.message === 'string' ? issue.message : 'invalid'}`);
   }
-  const total = Number.isInteger(body.issues_total) ? body.issues_total : issues.length;
-  if (total > shown.length) lines.push(`  - and ${total - shown.length} more (${total} in all)`);
+  const omitted = Number.isInteger(body.issues_omitted) && body.issues_omitted > 0
+    ? body.issues_omitted
+    : Number.isInteger(body.issues_total) ? Math.max(0, body.issues_total - issues.length) : 0;
+  if (omitted > 0) {
+    const total = Number.isInteger(body.issues_total) ? body.issues_total : issues.length + omitted;
+    lines.push(`  - and ${omitted} more the hosted app counted but didn't keep (${total} in all)`);
+  }
   const error = new PushOutcomeError(lines.join('\n'), {
     outcome: 'refused',
     status,
@@ -454,9 +495,9 @@ function refusalError(status, body, text) {
  * After a valid 202: fetch what the answer left out (omitted warnings and
  * ids, and the full text of each cut warning) within 60 seconds and the
  * request windows; every request and body read is bounded by that budget.
- * Each page and chunk is checked before it's used: a cut warning's full text
- * replaces its preview only when its chunks account for every byte the app
- * declared. Never undoes the push; reports what it couldn't fetch.
+ * Each page and chunk is checked before it's used: it must name this run (and
+ * a page its list), and a cut warning's full text replaces its preview only
+ * when its chunks account for every byte the app declared. Never undoes the push; reports what it couldn't fetch.
  */
 export async function completePushDetails(context, answer) {
   const projection = answer.projection ?? {};
@@ -513,6 +554,7 @@ export async function completePushDetails(context, answer) {
     for (;;) {
       const chunk = await getJson(`list=warnings&item=${index}&message_offset=${messageOffset}`);
       if (
+        chunk.run_id !== runId ||
         chunk.item !== index ||
         chunk.message_offset !== messageOffset ||
         typeof chunk.text !== 'string' ||
@@ -537,6 +579,8 @@ export async function completePushDetails(context, answer) {
       while (offset < totals[name]) {
         const page = await getJson(`list=${name}&offset=${offset}`);
         if (
+          page.run_id !== runId ||
+          page.list !== name ||
           page.offset !== offset ||
           !Array.isArray(page.items) ||
           page.items.length === 0 ||
@@ -551,7 +595,15 @@ export async function completePushDetails(context, answer) {
     let offset = warnings.length;
     pages: while (offset < totals.warnings) {
       const page = await getJson(`list=warnings&offset=${offset}`);
-      if (page.offset !== offset || !Array.isArray(page.items) || page.items.length === 0) break;
+      if (
+        page.run_id !== runId ||
+        page.list !== 'warnings' ||
+        page.offset !== offset ||
+        !Array.isArray(page.items) ||
+        page.items.length === 0
+      ) {
+        break;
+      }
       for (const item of page.items) {
         // Each item must be the next warning in order.
         if (

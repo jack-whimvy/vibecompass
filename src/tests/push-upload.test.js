@@ -419,7 +419,7 @@ test('after a valid 202 the package fetches omitted warnings, both lists, and ea
       const offset = Number(url.searchParams.get('offset'));
       const source = list === 'warnings' ? warnings : applied;
       const items = source.slice(offset, offset + 200).map((item, i) => (list === 'warnings' ? { index: offset + i, ...item } : item));
-      return send(200, { list, total: source.length, offset, items, next_offset: offset + items.length < source.length ? offset + items.length : null });
+      return send(200, { run_id: runId, list, total: source.length, offset, items, next_offset: offset + items.length < source.length ? offset + items.length : null });
     },
   });
   try {
@@ -712,14 +712,17 @@ test('the CLI prints a refusal\'s recorded details: the needs_rebase run and hea
   const auditRun = randomUUID();
   const head = randomUUID();
   const issues = Array.from({ length: 25 }, (_, i) => ({ path: `documents.${i}.raw_text`, message: `Document ${i} is invalid` }));
-  for (const kind of ['needs_rebase', 'issues', 'needs_rebase-replayed']) {
+  for (const kind of ['needs_rebase', 'issues-all-kept', 'issues-omitted-replayed', 'needs_rebase-replayed']) {
     let commits = 0;
     const standIn = await startStandIn({
       commit: ({ send, response, upload, state }) => {
         commits += 1;
         const uploadId = [...state.uploads.entries()].find(([, value]) => value === upload)[0];
-        if (kind === 'needs_rebase-replayed' && commits === 1) return response.destroy();
-        if (kind === 'issues') {
+        if (kind.endsWith('-replayed') && commits === 1) return response.destroy();
+        if (kind === 'issues-all-kept') {
+          return send(422, { error: 'Invalid push request', upload_id: uploadId, issues, issues_total: 25, issues_omitted: 0 });
+        }
+        if (kind === 'issues-omitted-replayed') {
           return send(422, { error: 'Invalid push request', upload_id: uploadId, issues, issues_total: 40, issues_omitted: 15 });
         }
         return send(409, { error: 'Remote project-memory head has advanced; pull before pushing.', upload_id: uploadId, status: 'needs_rebase', target_remote_revision_id: head, run_id: auditRun });
@@ -731,12 +734,14 @@ test('the CLI prints a refusal\'s recorded details: the needs_rebase run and hea
       await addDocument(rootDir, 'b', 2_200_000);
       const { code, stderr } = await runCliProcess(tempDir);
       assert.equal(code, 1, kind);
-      if (kind === 'issues') {
-        assert.match(stderr, /Error: Push refused \(422\): Invalid push request\. The hosted memory didn't change\./);
-        assert.match(stderr, /\n {2}- documents\.0\.raw_text: Document 0 is invalid\n/);
-        assert.match(stderr, /\n {2}- documents\.19\.raw_text: Document 19 is invalid\n/);
-        assert.doesNotMatch(stderr, /documents\.20\.raw_text/);
-        assert.match(stderr, /\n {2}- and 20 more \(40 in all\)/);
+      if (kind.startsWith('issues')) {
+        assert.match(stderr, /Error: Push refused \(422\): Invalid push request\. The hosted memory didn't change\./, kind);
+        // Every issue the receipt kept is printed, the 25th included.
+        for (const i of [0, 19, 20, 24]) {
+          assert.match(stderr, new RegExp(`\\n {2}- documents\\.${i}\\.raw_text: Document ${i} is invalid\\n`), `${kind}: issue ${i}`);
+        }
+        if (kind === 'issues-all-kept') assert.doesNotMatch(stderr, /more the hosted app counted/, kind);
+        else assert.match(stderr, /\n {2}- and 15 more the hosted app counted but didn't keep \(40 in all\)/, kind);
       } else {
         assert.match(stderr, new RegExp(`Error: Push refused \\(409\\): Remote project-memory head has advanced; pull before pushing \\(needs_rebase, hosted head ${head}, run ${auditRun}\\)\\. The hosted memory didn't change\\.`), kind);
       }
@@ -930,4 +935,122 @@ test('a body read gives up when its signal aborts, even on a stream that never s
     clearInterval(keepAlive);
   }
   assert.ok(Date.now() - started < 5_000);
+});
+
+test('a details response naming another run or another list is not used: the preview and missing ids stay, reported incomplete', async () => {
+  for (const fault of ['chunk-other-run', 'page-other-list', 'page-other-run', 'warnings-page-other-run', 'warnings-page-other-list']) {
+    const runId = randomUUID();
+    const long = 'é'.repeat(600);
+    const applied = Array.from({ length: 1_200 }, () => randomUUID());
+    const standIn = await startStandIn({
+      commit: ({ send }) =>
+        send(202, validAnswer({
+          run_id: runId,
+          applied_proposal_ids: applied.slice(0, 1_000),
+          applied_proposal_ids_total: 1_200,
+          projection: { counts: {}, warnings: [{ code: 'unknown_status', message: 'é'.repeat(500), message_truncated: true, message_bytes: 1_200 }], warnings_total: 2 },
+          details_truncated: true,
+        })),
+      details: ({ send, url }) => {
+        if (url.searchParams.has('item')) {
+          const body = { run_id: runId, item: 0, message_bytes: 1_200, message_offset: 0, text: long, next_message_offset: null };
+          return send(200, fault === 'chunk-other-run' ? { ...body, run_id: randomUUID() } : body);
+        }
+        const offset = Number(url.searchParams.get('offset'));
+        if (url.searchParams.get('list') === 'warnings') {
+          const warningsPage = { run_id: runId, list: 'warnings', total: 2, offset, items: [{ index: 1, code: 'unknown_status', message: 'second' }], next_offset: null };
+          if (fault === 'warnings-page-other-run') return send(200, { ...warningsPage, run_id: randomUUID() });
+          if (fault === 'warnings-page-other-list') return send(200, { ...warningsPage, list: 'stale_proposal_ids' });
+          return send(200, warningsPage);
+        }
+        const items = applied.slice(offset, offset + 500);
+        const page = { run_id: runId, list: 'applied_proposal_ids', total: 1_200, offset, items, next_offset: null };
+        if (fault === 'page-other-list') return send(200, { ...page, list: 'stale_proposal_ids' });
+        if (fault === 'page-other-run') return send(200, { ...page, run_id: randomUUID() });
+        return send(200, page);
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      await addDocument(rootDir, 'a', 2_200_000);
+      await addDocument(rootDir, 'b', 2_200_000);
+      const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+      assert.equal(result.runId, runId, fault);
+      if (fault === 'chunk-other-run') {
+        assert.equal(result.warnings[0].message_truncated, true, fault);
+        assert.equal(result.detailsIncomplete.cutWarnings, 1, fault);
+        assert.equal(result.appliedProposalIds.length, 1_200, fault);
+      } else if (fault.startsWith('warnings-page')) {
+        assert.equal(result.warnings.length, 1, fault);
+        assert.equal(result.detailsIncomplete.warnings, 1, fault);
+        assert.equal(result.appliedProposalIds.length, 1_200, fault);
+      } else {
+        assert.equal(result.appliedProposalIds.length, 1_000, fault);
+        assert.equal(result.detailsIncomplete.applied_proposal_ids, 200, fault);
+        assert.equal(result.warnings[0].message, long, fault);
+        assert.equal(result.warnings[1].message, 'second', fault);
+      }
+    } finally {
+      await standIn.close();
+    }
+  }
+});
+
+test('a single request whose connection fails is an unknown outcome, never resent, and an unreachable app sent nothing', async () => {
+  for (const kind of ['large-reset-before-answer', 'small-reset-mid-answer']) {
+    let posts = 0;
+    const standIn = await startStandIn({
+      intercept: async ({ route, response }) => {
+        if (route !== 'push') return false;
+        posts += 1;
+        if (kind === 'large-reset-before-answer') {
+          response.socket.destroy();
+        } else {
+          response.writeHead(202, { 'content-type': 'application/json' });
+          response.write('{"run_id":"');
+          setTimeout(() => response.socket.destroy(), 20);
+        }
+        return true;
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url, { secretCheck: 'warn' });
+      if (kind === 'large-reset-before-answer') {
+        // Over 4,000,000 bytes with a document over 4,000,000: the large single request.
+        await addDocument(rootDir, 'large', 4_100_000);
+      } else await addDocument(rootDir, 'a', 10_000);
+      const before = await readManifestSync(rootDir);
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.ok(error instanceof PushOutcomeError, kind);
+        assert.equal(error.outcome, 'unknown', kind);
+        assert.equal(error.code, 'connection_failed', kind);
+        assert.match(error.message, /The push's outcome is unknown: the connection to the hosted app failed/, kind);
+        assert.ok(error.secretCheck, `${kind}: the error carries the secret-check report`);
+        return true;
+      });
+      assert.equal(posts, 1, `${kind}: the request is not resent`);
+      assert.deepEqual(await readManifestSync(rootDir), before, `${kind}: nothing recorded`);
+      // The message the user sees.
+      const { code, stdout, stderr } = await runCliProcess(tempDir);
+      assert.equal(code, 1, kind);
+      assert.match(stderr, /Error: The push's outcome is unknown: the connection to the hosted app failed (before its answer arrived|while its answer was read) \(.+\)\. Nothing was recorded locally\. Run vibecompass status/, kind);
+      assert.match(stdout, /Secret check: passed/, `${kind}: the report is printed on failure`);
+    } finally {
+      await standIn.close();
+    }
+  }
+
+  // Nothing listens: the connection was never made, so nothing was sent.
+  const closed = http.createServer();
+  await new Promise((resolve) => closed.listen(0, '127.0.0.1', resolve));
+  const { port } = closed.address();
+  await new Promise((resolve) => closed.close(resolve));
+  const { tempDir, rootDir } = await createRoot(`http://127.0.0.1:${port}`);
+  await addDocument(rootDir, 'a', 10_000);
+  await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+    assert.equal(error.outcome, 'refused_before_upload');
+    assert.equal(error.code, 'app_unreachable');
+    assert.match(error.message, /couldn't be reached \(ECONNREFUSED\)\. Nothing was sent\./);
+    return true;
+  });
 });

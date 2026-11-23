@@ -28,6 +28,7 @@ import {
   LEGACY_SINGLE_MAX_BYTES,
   PushOutcomeError,
   sendLargeSinglePush,
+  singleRequestFailure,
   uploadPush,
 } from './push-upload.js';
 
@@ -114,15 +115,7 @@ async function sendPush(context, body, documents) {
   const bodyBytes = Buffer.byteLength(bodyText, 'utf8');
   const transport = choosePushTransport(bodyBytes, documents);
   if (transport === 'single') {
-    let answer;
-    try {
-      answer = await postJson(context, 'push', body);
-    } catch (error) {
-      // A success status whose body isn't JSON: the push may have applied.
-      if (error instanceof SyntaxError) throw invalidAnswerError(null);
-      throw error;
-    }
-    return { answer, transport };
+    return { answer: await postSmallPush(context, body), transport };
   }
   if (transport === 'single-large') {
     return { answer: await sendLargeSinglePush(context, bodyText, documents), transport };
@@ -673,6 +666,49 @@ async function postJson(context, routeName, body) {
   }
 
   return typeof response.json === 'function' ? response.json() : {};
+}
+
+/**
+ * The single request up to 4,000,000 bytes, sent as before. A connection that
+ * fails after it may have been sent, or while its answer is read, leaves the
+ * outcome unknown; a success whose body isn't JSON does too. The request is
+ * never resent.
+ */
+async function postSmallPush(context, body) {
+  const url = new URL(
+    `api/sync/projects/${encodeURIComponent(context.projectId)}/push`,
+    ensureTrailingSlash(context.apiUrl),
+  );
+  let response;
+  try {
+    response = await context.fetch(url.href, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${context.credential}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw singleRequestFailure(context, error, 'send');
+  }
+  if (!response.ok) {
+    let responseText = '';
+    try {
+      responseText = typeof response.text === 'function' ? await response.text() : '';
+    } catch {
+      // The status already says the push was refused or failed.
+    }
+    throw new Error(`Hosted push failed with ${response.status}${responseText ? `: ${responseText}` : ''}`);
+  }
+  try {
+    return typeof response.json === 'function' ? await response.json() : {};
+  } catch (error) {
+    // A success status whose body isn't JSON, or a body cut off: the push may have applied.
+    if (error instanceof SyntaxError) throw invalidAnswerError(response.status);
+    throw singleRequestFailure(context, error, 'read');
+  }
 }
 
 async function readPushDocuments(rootDir, documents) {
