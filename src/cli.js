@@ -285,6 +285,11 @@ export async function runCli(argv, io = createDefaultIo(), runtime = {}) {
       supportedReviewerVersions: runtime.supportedReviewerVersions,
       userInfo: runtime.userInfo,
       signals: runtime.signals,
+      // Test seams for the relay's own timing and failure paths.
+      killGraceMs: runtime.relayKillGraceMs,
+      groupSettleMs: runtime.relayGroupSettleMs,
+      beforeStopSave: runtime.relayBeforeStopSave,
+      onTurnRecord: runtime.relayOnTurnRecord,
     });
     return result.exitCode;
   }

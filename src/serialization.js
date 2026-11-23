@@ -238,7 +238,10 @@ async function acquireDiskLock(key, label, options) {
     }
 
     if (await isAbandonedLock(lockDir, staleMs)) {
-      await reclaimAbandonedLock(lockDir);
+      if (options.beforeReclaim) await options.beforeReclaim();
+      if ((await reclaimAbandonedLock(lockDir, staleMs)) === 'busy') {
+        await delay(RETRY_BASE_DELAY_MS);
+      }
       continue;
     }
 
@@ -291,23 +294,57 @@ async function isAbandonedLock(lockDir, staleMs) {
 }
 
 /**
- * Reclaims an abandoned lock via atomic rename so racing waiters cannot
- * double-free: exactly one contender wins the rename and deletes the moved
- * directory; the others see ENOENT and simply retry the mkdir claim. This can
- * never delete a freshly acquired lock, because a new claim creates a new
- * directory at the original path rather than reusing the renamed one.
+ * Reclaims an abandoned lock. Two waiters can both judge the same lock
+ * abandoned, and a bare rename would let the second move away the lock the
+ * first had just claimed. So reclaiming is serialized by a mutex directory
+ * beside the lock, and the lock is judged again inside it: only a lock still
+ * abandoned there is renamed away. Nothing else changes a lock while it
+ * exists (its owner is gone, other reclaimers wait, and a claim needs the
+ * path empty), so the rename moves exactly the lock judged. Returns `busy`
+ * while another waiter reclaims. A mutex whose holder died inside this step
+ * is never removed automatically: the error names it.
  */
-async function reclaimAbandonedLock(lockDir) {
-  const reclaimPath = `${lockDir}.reclaim-${process.pid}-${randomUUID()}`;
+async function reclaimAbandonedLock(lockDir, staleMs) {
+  const mutex = `${lockDir}.reclaim`;
   try {
-    await rename(lockDir, reclaimPath);
+    await mkdir(mutex);
   } catch (error) {
-    if (error?.code === 'ENOENT') {
-      return;
+    if (error?.code !== 'EEXIST') {
+      throw error;
     }
-    throw error;
+    const owner = await readLockOwner(mutex);
+    let dead = owner && Number.isInteger(owner.pid) && !isProcessAlive(owner.pid);
+    if (!owner) {
+      const stats = await stat(mutex).catch(() => null);
+      dead = Boolean(stats) && Date.now() - stats.mtimeMs > staleMs;
+    }
+    if (dead) {
+      throw new MemoryRootLockError(
+        `An earlier reclaim of the abandoned project-memory lock at ${lockDir} didn't finish (${mutex}). `
+          + `If no other vibecompass command is running against this root, remove ${mutex} and retry.`,
+      );
+    }
+    return 'busy';
   }
-  await rm(reclaimPath, { recursive: true, force: true });
+  try {
+    await writeFile(path.join(mutex, OWNER_FILE_NAME), `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, 'utf8');
+    if (!(await isAbandonedLock(lockDir, staleMs))) {
+      return 'claimed';
+    }
+    const reclaimPath = `${lockDir}.reclaim-${process.pid}-${randomUUID()}`;
+    try {
+      await rename(lockDir, reclaimPath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return 'claimed';
+      }
+      throw error;
+    }
+    await rm(reclaimPath, { recursive: true, force: true });
+    return 'reclaimed';
+  } finally {
+    await rm(mutex, { recursive: true, force: true });
+  }
 }
 
 /**

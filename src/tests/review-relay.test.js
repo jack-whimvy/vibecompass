@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,7 +11,8 @@ import { runCli } from '../cli.js';
 import { readReadyMark } from '../relay-mark.js';
 import { prepareRelayWrite } from '../relay-record.js';
 import { computeCurrentFingerprints } from '../relay-mark.js';
-import { emptyRelayState, readRelayState, saveRelayState } from '../relay-state.js';
+import { createProcessTable, emptyRelayState, readRelayState, saveRelayState } from '../relay-state.js';
+import { coveredRepositories } from '../review-relay.js';
 import { REVIEWER_TO_BUILDER_HEADING, readSectionBody } from '../relay-sections.js';
 import { extractReviewLogLines, parseReviewLog } from '../review-log.js';
 import { closeProjectSession, listProjectSessions } from '../session.js';
@@ -671,4 +673,195 @@ test('the role text carries the mark, the relay, a relayed pass, and the project
   for (const text of [context, guide]) {
     assert.doesNotMatch(text, /\bD-\d{3}\b/, 'installed text names no decision number');
   }
+});
+
+// ---------------------------------------------------------------------------
+// Pass 2's cases: process groups, ownership of the record, recovery, and stops.
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+test('a timeout ends a descendant that ignores SIGTERM and outlives its leader before the turn counts as ended', async (t) => {
+  const s = await setup(t);
+  const pidFile = path.join(s.ws.tempDir, 'lingering.pid');
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ lingeringPidFile: pidFile, sleepMs: 30_000, answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  const result = await s.relay([...codexArgs, '--reviewer-timeout', '0.01'], { relayKillGraceMs: 300, relayGroupSettleMs: 3000 });
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.out, /Stopped: the reviewer's turn ran past/);
+  assert.match(result.out, /Choices:\n- run `vibecompass review-relay --session relay-lane` again to repeat the turn/);
+  const lingering = Number(await readFile(pidFile, 'utf8'));
+  assert.equal(isRunning(lingering), false, 'the descendant is gone when the relay returns');
+  assert.ok((await readRelayState(s.lane.laneDir)).turn.ended, 'the turn ended once its group was gone');
+});
+
+test('a group still present after SIGKILL keeps the turn unfinished and the conversation reserved', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ sleepMs: 30_000, answer: CLEAN_ANSWER }] }, claude: { version: '2.1.318' } });
+  await s.mark();
+  // A process table that keeps showing a later-started member of every group the relay ends.
+  const real = createProcessTable();
+  const ended = new Set();
+  const ghost = {
+    async list() {
+      return [...(await real.list()), ...[...ended].map((pgid) => ({ pid: 999_990, pgid, startedAt: 'Fri Dec 31 23:59:59 2099', command: 'ghost' }))];
+    },
+    killGroup(pgid, signal) {
+      ended.add(pgid);
+      return real.killGroup(pgid, signal);
+    },
+  };
+  const result = await s.relay([...codexArgs, '--reviewer-timeout', '0.01', '--conversation-closed'], { relayProcessTable: ghost, relayKillGraceMs: 200, relayGroupSettleMs: 500 });
+  assert.match(result.out, /was still present after SIGKILL\. The lane and conversation stay reserved/);
+  const state = await readRelayState(s.lane.laneDir);
+  assert.equal(state.turn.ended, null, 'the turn stays unfinished');
+  assert.ok(existsSync(path.join(s.home, '.config', 'vibecompass', 'relay-locks', `${CONV}.json`)), 'the conversation lock is kept');
+  // The next run finds the group still uncertain and keeps it reserved.
+  const again = await s.relay([...codexArgs, '--conversation-closed'], { relayProcessTable: ghost });
+  assert.match(again.out, /from a stopped relay is (uncertain|still running)/);
+});
+
+test('a Claude Code reviewer whose init lists a plugin is ended at init, not after it finishes', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ claude: { version: '2.1.318', reviewTurns: [{ plugins: [{ name: 'market', path: '/plugins/market', source: 'market@market' }], sleepMs: 20_000, answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  const started = Date.now();
+  const result = await s.relay(['--reviewer', 'claude']);
+  assert.ok(Date.now() - started < 12_000, 'the turn was ended at init');
+  assert.match(result.out, /the reviewer's init lists a plugin \(market\); the relay ended the turn, and its answer is discarded/);
+  assert.equal(parse(await s.wip()).passCount, 0);
+});
+
+test('the stop is recorded while the run still holds its lane lock', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  let lockDuringStop = null;
+  const result = await s.relay(codexArgs, {
+    relayBeforeStopSave: async () => {
+      await sleep(150);
+      lockDuringStop = existsSync(path.join(s.lane.laneDir, 'relay.lock'));
+    },
+  });
+  assert.equal(result.code, 0, result.out);
+  assert.equal(lockDuringStop, true);
+  assert.equal(existsSync(path.join(s.lane.laneDir, 'relay.lock')), false, 'released after the stop is recorded');
+  assert.equal((await readRelayState(s.lane.laneDir)).run.stopped.kind, 'clean');
+});
+
+test('a builder turn that changes an earlier review line, or adds a record besides its response, stops the relay', async (t) => {
+  const edit = await setup(t, { laneId: 'edit-earlier' });
+  await edit.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: [{ type: 'replace-in-file', path: edit.lane.wipPath, from: 'the parser accepts a bad time', to: 'nothing that matters' }, ...answerR11(edit.lane)] }] } });
+  await edit.mark();
+  const edited = await edit.relay([...codexArgs, '--conversation-closed']);
+  assert.match(edited.out, /Stopped: the builder changed earlier lines of ## Review log during its turn; a relayed turn may only append its response\./);
+
+  const owner = await setup(t, { laneId: 'owner-line' });
+  await owner.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: [{ type: 'append-review-log', lines: ['- response 1 | 2026-11-21 22:00 -08:00 | Claude Opus 5.5', '  - R1.1 | P2 | accepted | fixed', '- owner | 2026-11-21 22:01 -08:00 | the owner | another round | written by the builder'] }, { type: 'write-file', path: path.join(owner.lane.worktreeDir, 'src', 'index.js'), content: 'export const answer = 43;\n' }, { type: 'mark-ready' }] }] } });
+  await owner.mark();
+  const added = await owner.relay([...codexArgs, '--conversation-closed']);
+  assert.match(added.out, /Stopped: the builder added a record other than its response to pass 1 during its turn \(.*owner.*\)/);
+});
+
+test('the builder re-marks with the memory root and the last mark\'s named paths', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }, { answer: CONFIRM_R11 }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }] } });
+  const capture = captureIo();
+  assert.equal(await runCli(['ready-for-review', '--root', s.ws.rootDir, '--session', s.lane.laneId, '--path', 'architecture/platform/relay.md'], capture.io, { cwd: s.ws.tempDir, env: { ...process.env, CLAUDE_CODE_SESSION_ID: CONV } }), 0, capture.stderr());
+  const result = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.equal(result.code, 0, result.out);
+  assert.match(result.out, /Stopped: pass 2 is clean/);
+  const remark = (await s.standin.calls()).find((item) => item.action === 'mark-ready');
+  assert.deepEqual(remark.argv, ['ready-for-review', '--root', s.ws.rootDir, '--session', s.lane.laneId, '--path', 'architecture/platform/relay.md']);
+  assert.deepEqual((await readReadyMark(s.lane.laneDir)).paths, ['architecture/platform/relay.md']);
+});
+
+test('a reviewer turn that finished in a relay that died before its write is reported once, then repeated on a new go', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  await saveRelayState(s.lane.laneDir, { ...emptyRelayState(s.lane.laneId), run: { id: 'dead', go: { kind: 'normal', ceiling: 3, mode: 'one-pass', pass_count_at_go: 0 }, stopped: null }, step: 'reviewer-turn', turn: { role: 'reviewer', pass: 1, pid: 4400, pgid: 4400, process_started_at: 'x', prompt_sent: true, ended: { at: new Date().toISOString(), how: 'exited', exit_code: 0 } }, writes: [] });
+  const first = await s.relay(codexArgs);
+  assert.match(first.out, /the reviewer's turn for pass 1 finished \(exited\) in a relay that stopped before recording a pass from it/);
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'review').length, 0, 'no turn repeated without the owner\'s go');
+  const second = await s.relay(codexArgs);
+  assert.equal(second.code, 0, second.out);
+  assert.match(second.out, /Stopped: pass 1 is clean/);
+});
+
+test('a stop before the run is saved still prints the reopen command from the current mark', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.160.0' }, claude: { version: '2.1.318' } });
+  await s.mark();
+  const result = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.match(result.out, /isn't a supported reviewer version/);
+  assert.match(result.out, new RegExp(`Reopen the builder's conversation: claude --resume ${CONV}`));
+});
+
+test('a failed save of the turn\'s process closes its stdin empty and ends its group: no model turn', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  const result = await s.relay(codexArgs, { relayOnTurnRecord: async () => { throw new Error('disk full'); } });
+  assert.equal(result.code, 1);
+  assert.match(result.out, /the reviewer's process couldn't be recorded \(disk full\), so its stdin was closed empty and its process group ended: no model turn ran/);
+  // The tool may be ended before it records anything; if it did, it read no prompt.
+  for (const review of (await s.standin.calls()).filter((item) => item.kind === 'review')) assert.equal(review.prompt, '', 'the tool got no prompt');
+  assert.equal(parse(await s.wip()).passCount, 0);
+});
+
+test('a version command that fails is no version, even when it prints one', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', versionExit: 1, reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await s.mark(null);
+  const result = await s.relay(codexArgs);
+  assert.match(result.out, /version couldn't be read/);
+  assert.doesNotMatch(result.out, /Review relay on lane/, 'stopped by the check before the run starts');
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'review').length, 0);
+  // The check before each turn: a probe that passes at the start and fails before the turn.
+  const later = await setup(t, { laneId: 'version-later' });
+  await later.standin.setScenario({ codex: { version: '0.171.0', versionExitFrom: 2, reviewTurns: [{ answer: CLEAN_ANSWER }] } });
+  await later.mark(null);
+  const turn = await later.relay(codexArgs);
+  assert.match(turn.out, /Review relay on lane version-later/);
+  assert.match(turn.out, /version couldn't be read/);
+  assert.equal((await later.standin.calls()).filter((item) => item.kind === 'review').length, 0);
+});
+
+test('recovery that finds a write superseded stops the run before any builder turn', async (t) => {
+  const s = await setup(t);
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }] } });
+  await s.mark();
+  const now = await computeCurrentFingerprints({ rootDir: s.ws.rootDir, laneDir: s.lane.laneDir, worktrees: { app: s.lane.worktreeDir }, paths: [], projectRepos: [{ id: 'app' }] });
+  const write = prepareRelayWrite({ wipContent: now.wipContent, handoffContent: now.handoffContent, answer: ONE_FINDING, passNumber: 1, time: '2026-11-21 22:00 -08:00', reviewerLabel: 'Codex 0.171.0 (gpt-test requested) via the relay', roundId: now.roundId, fingerprints: now.fingerprints, laneId: s.lane.laneId });
+  write.paths = [];
+  await saveRelayState(s.lane.laneDir, { ...emptyRelayState(s.lane.laneId), run: { id: 'dead', go: { kind: 'normal', ceiling: 3, mode: 'loop', pass_count_at_go: 0 }, stopped: null }, step: 'write', write, builder: { conversation_id: CONV, mode: 'default' } });
+  const wip = await s.wip();
+  await writeFile(s.lane.wipPath, wip.replace(/## Review log\n?[\s\S]*$/, `## Review log\n${write.wip.body.join('\n')}\n`), 'utf8');
+  const handoff = await s.handoff();
+  await writeFile(s.lane.handoffPath, handoff.replace('- Opened session', '- Moved on; opened session'), 'utf8');
+  const result = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.match(result.out, new RegExp(`relay write ${write.id} is superseded`));
+  assert.match(result.out, /Stopped: relay write/);
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'builder').length, 0, 'no builder turn after a superseded write');
+});
+
+test('a named repository is found from the directory itself, outside the tooling root too', async (t) => {
+  const ws = await createWorkspace(t);
+  const external = await mkdtemp(path.join(os.tmpdir(), 'vibecompass-relay-external-'));
+  t.after(() => rm(external, { recursive: true, force: true }));
+  git(external, ['init', '-q', '-b', 'main']);
+  await writeFile(path.join(external, 'README.md'), 'x\n', 'utf8');
+  const ctx = { worktrees: {}, rootDir: ws.rootDir, projectRepos: [{ id: 'ext', path: external }] };
+  const top = await realpath(external);
+  assert.deepEqual(await coveredRepositories(ctx, { paths: ['ext:.'] }), [top]);
+  assert.deepEqual(await coveredRepositories(ctx, { paths: ['ext:README.md'] }), [top]);
 });

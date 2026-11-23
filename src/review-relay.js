@@ -75,6 +75,9 @@ export const DEFAULT_REVIEWER_TIMEOUT_MINUTES = 45;
 export const DEFAULT_BUILDER_TIMEOUT_MINUTES = 60;
 const GROUP_POLL_MS = 250;
 const KILL_GRACE_MS = 5000;
+// After SIGKILL, how long a group may take to disappear before it counts as
+// uncertain and stays reserved.
+const GROUP_SETTLE_MS = 5000;
 
 /** The commands a relayed builder turn may not run (D-419 item 8). */
 export const RELAY_TURN_REFUSED_COMMANDS = new Set([
@@ -166,7 +169,7 @@ function openFindingLines(parsed) {
  * then the prompt is sent and stdin closed. The turn runs until every process
  * in the group has exited. `onLine` may return a reason to end the group.
  */
-async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpawned, onLine = () => null, logPath, active }) {
+async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpawned, onLine = () => null, logPath, active, killGraceMs = KILL_GRACE_MS, settleMs = GROUP_SETTLE_MS }) {
   let child;
   try {
     child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -182,10 +185,19 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   let aborted = null;
   let timedOut = false;
   let pgid = null;
+  let terminatedAt = null;
+  let killTimer = null;
+  // Ending the group: SIGTERM now, SIGKILL after the grace period. The kill
+  // timer is tracked, keeps the process alive until it fires, and is cleared
+  // once the whole group is gone.
   const endGroup = () => {
-    if (pgid === null) return;
+    if (pgid === null || terminatedAt !== null) return;
+    terminatedAt = Date.now();
     table.killGroup(pgid, 'SIGTERM');
-    setTimeout(() => table.killGroup(pgid, 'SIGKILL'), KILL_GRACE_MS).unref();
+    killTimer = setTimeout(() => {
+      killTimer = null;
+      table.killGroup(pgid, 'SIGKILL');
+    }, killGraceMs);
   };
   const stdoutLines = [];
   const stderrChunks = [];
@@ -214,7 +226,7 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   const pid = child.pid;
   pgid = pid;
   // Ctrl-C from here on ends this group.
-  active.group = { pgid, kill: (signal) => table.killGroup(pgid, signal) };
+  active.group = { pgid, kill: (signal) => table.killGroup(pgid, signal), terminate: endGroup };
   const timer = setTimeout(() => {
     timedOut = true;
     endGroup();
@@ -222,9 +234,15 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   timer.unref();
   // The tool waits with stdin open and the prompt unsent while its identity is recorded.
   const startedAt = await processStartTime(table, pid).catch(() => null);
-  await onSpawned({ pid, pgid, startedAt });
-  if (active.interrupted) {
-    // Stopped before the prompt went out: close stdin empty and end the group.
+  let recordError = null;
+  try {
+    await onSpawned({ pid, pgid, startedAt });
+  } catch (error) {
+    recordError = error instanceof Error ? error.message : String(error);
+  }
+  if (recordError || active.interrupted) {
+    // Stopped, or not recorded, before the prompt went out: close stdin empty
+    // and end the group.
     child.stdin.end();
     endGroup();
   } else {
@@ -232,15 +250,34 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   }
 
   const [code, signal] = await closed;
-  // A tool's own child can outlive it: the turn runs until its group is empty.
-  while (!timedOut) {
+  // A tool's own child can outlive it: the turn runs until its whole group is
+  // gone. A group being ended gets SIGKILL after the grace period; one still
+  // there after that is uncertain, and the caller keeps it reserved.
+  let groupEnded = false;
+  for (;;) {
     const group = await inspectProcessGroup(table, { pgid, pid, startedAt });
-    if (group.state === 'ended') break;
+    if (group.state === 'ended') {
+      groupEnded = true;
+      break;
+    }
+    if (terminatedAt !== null && Date.now() - terminatedAt > killGraceMs + settleMs) break;
     await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
   }
   clearTimeout(timer);
+  if (groupEnded && killTimer) {
+    clearTimeout(killTimer);
+    killTimer = null;
+  }
   active.group = null;
-  return { code, signal, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, pid, pgid, startedAt };
+  return { code, signal, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, groupEnded, pid, pgid, startedAt };
+}
+
+/**
+ * A turn whose group couldn't be seen to end: the turn stays unfinished in
+ * relay.json, so the lane and conversation stay reserved for recovery.
+ */
+function groupStillRunning(role, passNumber, result) {
+  return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}) was still present after SIGKILL. The lane and conversation stay reserved; when those processes are gone, run \`vibecompass review-relay --recover\`.`, { reserved: true }); // D-419 item 10
 }
 
 async function remoteRefs(dirs) {
@@ -312,12 +349,12 @@ export async function runReviewRelay(options = {}, deps = {}) {
   }
   let conversationLock = null;
   let state = null;
+  // What the current mark names, for a stop before this run's state is saved.
+  let stopConversation = null;
+  let stopMode = null;
   const onSigint = () => {
     active.interrupted = true;
-    if (active.group) {
-      active.group.kill('SIGTERM');
-      setTimeout(() => active.group?.kill('SIGKILL'), KILL_GRACE_MS).unref();
-    }
+    active.group?.terminate();
   };
   const signals = deps.signals ?? process;
   signals.on('SIGINT', onSigint);
@@ -344,7 +381,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
       throw new RelayStop('recovered', recovered.summary || 'nothing to recover');
     }
     if (recovered.stopReason) {
-      throw new RelayStop('interrupted', recovered.stopReason);
+      throw new RelayStop(recovered.stopKind ?? 'interrupted', recovered.stopReason);
     }
 
     const mark = await readReadyMark(laneDir).catch((error) => {
@@ -355,12 +392,14 @@ export async function runReviewRelay(options = {}, deps = {}) {
     }
     const conversationId = mark.builder?.tool === 'claude-code' ? mark.builder.conversation_id : null;
     const mode = conversationId && !options.onePass ? 'loop' : 'one-pass';
+    stopConversation = conversationId;
+    stopMode = mode;
 
     const reviewerVersion = await readToolVersion(reviewerTool, { env });
     if (reviewerVersion.missing) {
       throw new RelayStop('unsupported', `${reviewerTool} wasn't found on PATH. The relay installs nothing; install ${TOOL_NAMES[reviewerTool]}, choose the other reviewer, or review by hand.`);
     }
-    const reviewerGate = checkReviewerVersion({ tool: reviewerTool, version: reviewerVersion.version, platform, supported, otherTool: REVIEWER_TOOLS.find((tool) => tool !== reviewerTool) });
+    const reviewerGate = checkReviewerVersion({ tool: reviewerTool, version: reviewerVersion.ok ? reviewerVersion.version : null, platform, supported, otherTool: REVIEWER_TOOLS.find((tool) => tool !== reviewerTool) });
     if (!reviewerGate.ok) {
       throw new RelayStop('unsupported', reviewerGate.message);
     }
@@ -370,7 +409,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
       if (builderVersion.missing) {
         throw new RelayStop('unsupported', 'claude wasn\'t found on PATH, so the relay can\'t resume the builder\'s conversation. Run one pass with --one-pass instead.');
       }
-      const builderGate = checkBuilderVersion({ version: builderVersion.version });
+      const builderGate = checkBuilderVersion({ version: builderVersion.ok ? builderVersion.version : null });
       if (!builderGate.ok) throw new RelayStop('unsupported', builderGate.message);
       if (builderGate.message) out(builderGate.message);
     }
@@ -426,6 +465,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
       rootDir, laneDir, laneId, worktrees, projectRepos, toolingRoot, relayCwd, turnDir, runId, token,
       reviewerTool, reviewerVersion: reviewerVersion.version, builderVersion: builderVersion?.version ?? null,
       builderMode, reviewerTimeoutMs, builderTimeoutMs, conversationId, mode, go, supported, platform,
+      killGraceMs: deps.killGraceMs ?? KILL_GRACE_MS, settleMs: deps.groupSettleMs ?? GROUP_SETTLE_MS,
     };
     await mkdir(turnDir, { recursive: true });
     await relayLoop(runCtx);
@@ -437,11 +477,13 @@ export async function runReviewRelay(options = {}, deps = {}) {
       }
       throw error;
     }
-    return finishStop({ error, state, laneDir, laneId, runId, out, save, conversationId: state?.builder?.conversation_id ?? null, mode: state?.run?.go?.mode ?? null });
+    // Awaited here, so the stop is recorded while this run still holds its locks.
+    return await finishStop({ error, state, laneDir, laneId, runId, out, save, deps, conversationId: stopConversation ?? state?.builder?.conversation_id ?? null, mode: stopMode ?? state?.run?.go?.mode ?? null });
   } finally {
     signals.off?.('SIGINT', onSigint);
     signals.removeListener?.('SIGINT', onSigint);
-    await releaseConversationLock(conversationLock).catch(() => {});
+    // A turn whose group may still be running keeps the conversation reserved.
+    if (!turnUnfinished(state)) await releaseConversationLock(conversationLock).catch(() => {});
     await releaseLaneLock(laneLock).catch(() => {});
   }
 }
@@ -451,7 +493,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
  * gives them, the choices, and in the loop the command that reopens the
  * builder's conversation.
  */
-async function finishStop({ error, state, laneDir, laneId, runId, out, save, conversationId, mode }) {
+async function finishStop({ error, state, laneDir, laneId, runId, out, save, deps = {}, conversationId, mode }) {
   const kind = error.kind;
   let parsed = null;
   try {
@@ -459,9 +501,15 @@ async function finishStop({ error, state, laneDir, laneId, runId, out, save, con
   } catch {
     parsed = null;
   }
+  let unrecorded = null;
   if (state && kind !== 'recovered' && state.run?.id === runId) {
     const at = new Date().toISOString();
-    await save({ step: 'stopped', run: { ...state.run, stopped: { at, kind } }, last_stop: { at, kind, reason: summarizeStop(kind, error.reason) } }).catch(() => {});
+    try {
+      if (deps.beforeStopSave) await deps.beforeStopSave();
+      await save({ step: 'stopped', run: { ...state.run, stopped: { at, kind } }, last_stop: { at, kind, reason: summarizeStop(kind, error.reason) } });
+    } catch (saveError) {
+      unrecorded = saveError instanceof Error ? saveError.message : String(saveError);
+    }
   }
   out('');
   out(`Stopped: ${error.reason}`);
@@ -479,7 +527,11 @@ async function finishStop({ error, state, laneDir, laneId, runId, out, save, con
     out('');
     out(error.details.print);
   }
-  return { exitCode: ORDINARY_STOPS.has(kind) ? 0 : 1, kind, reason: error.reason };
+  if (unrecorded) {
+    out('');
+    out(`Warning: this stop couldn't be recorded in ${path.join(laneDir, 'relay.json')} (${unrecorded}); run \`vibecompass review-relay --session ${laneId} --recover\` before the next run.`);
+  }
+  return { exitCode: ORDINARY_STOPS.has(kind) && !unrecorded ? 0 : 1, kind, reason: error.reason };
 }
 
 function summarizeStop(kind, reason) {
@@ -525,6 +577,24 @@ function defaultChoices(kind, laneId) {
       return ['the other reviewer adapter, or hand-run review'];
     case 'interrupted':
       return [`let the turn finish or stop its processes, then run \`vibecompass review-relay --session ${laneId} --recover\``];
+    case 'timeout':
+      return [
+        `run \`vibecompass review-relay --session ${laneId}\` again to repeat the turn, with a longer --reviewer-timeout or --builder-timeout if it needs one`,
+        'look at what the builder did in its conversation (reopen it below), and answer there yourself',
+        'review by hand',
+      ];
+    case 'owner-pause':
+      return [`run \`vibecompass review-relay --session ${laneId}\` again to continue`, 'answer in the builder\'s conversation yourself (reopen it below)'];
+    case 'failure':
+      return [`fix what the reason names, then run \`vibecompass review-relay --session ${laneId}\` again`, 'review by hand'];
+    case 'refusal':
+      return ['answer in the builder\'s conversation (reopen it below), then have it mark ready again and run the relay again', 'review by hand'];
+    case 'no-mark':
+      return [`the builder runs \`vibecompass ready-for-review --session ${laneId}\` when the round is ready, then run the relay again`];
+    case 'nothing-open':
+      return ['close the lane in the builder\'s conversation, or continue by hand'];
+    case 'refused':
+      return ['do what the reason names, then run the relay again'];
     default:
       return [];
   }
@@ -567,6 +637,19 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
       }
     }
   }
+  // A reviewer turn that finished in a run that recorded no stop, with no pass
+  // recorded from it: the relay died between the turn and its write. It is
+  // reported, and the run is closed, so repeating it takes the owner's next go.
+  const lastTurn = current.turn;
+  const writeForTurn = (pass) => (current.writes ?? []).some((item) => item.pass === pass) || current.write?.pass === pass;
+  if (!stopReason && lastTurn?.role === 'reviewer' && lastTurn.ended && !lastTurn.unrecorded_reported_at && current.run && !current.run.stopped && !writeForTurn(lastTurn.pass)) {
+    const at = new Date().toISOString();
+    const text = `the reviewer's turn for pass ${lastTurn.pass} finished (${lastTurn.ended.how}) in a relay that stopped before recording a pass from it, so no pass was written. Running the relay again repeats the pass, on your go.`;
+    current = await saveRelayState(laneDir, { ...current, turn: { ...lastTurn, unrecorded_reported_at: at }, step: 'stopped', run: { ...current.run, stopped: { at, kind: 'interrupted' } }, last_stop: { at, kind: 'interrupted', reason: text.slice(0, 300) } });
+    notes.push(text);
+    stopReason = text;
+  }
+  let stopKind = null;
   if (writeUnfinished(current)) {
     const recheck = makeRecheck({ rootDir, laneDir, worktrees, paths: current.write.paths ?? [], projectRepos, env });
     const result = await settleRelayWrite({
@@ -580,6 +663,11 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
     });
     current = await saveRelayState(laneDir, { ...current, write: result.write, writes: [...(current.writes ?? []), { id: result.write.id, pass: result.write.pass, state: result.write.state, at: new Date().toISOString() }] });
     notes.push(describeWriteEnd(result.write));
+    if (result.write.state === 'superseded' || result.write.state === 'discarded') {
+      // As on the live path: this run stops, and any next turn is the owner's next run.
+      stopReason = stopReason ?? describeWriteEnd(result.write);
+      stopKind = result.write.state === 'discarded' ? 'fingerprint' : 'refusal';
+    }
     if (result.unwritten === 'summary') {
       notes.push(`The summary that wasn't written:\n${result.write.handoff.body.join('\n')}`);
     } else if (result.unwritten === 'pass') {
@@ -590,7 +678,7 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
   for (const note of notes) {
     if (note !== stopReason || !reserved) out(note);
   }
-  return { state: current, summary: notes.join(' '), stopReason, reserved };
+  return { state: current, summary: notes.join(' '), stopReason, stopKind, reserved };
 }
 
 /** The run, one step at a time, from the record and the mark. */
@@ -678,8 +766,10 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
   const state = ctx.getState();
   // Before each turn the installed version is checked again.
   const version = await readToolVersion(ctx.reviewerTool, { env: ctx.env });
-  const gate = checkReviewerVersion({ tool: ctx.reviewerTool, version: version.version, platform: ctx.platform, supported: ctx.supported });
+  const gate = checkReviewerVersion({ tool: ctx.reviewerTool, version: version.ok ? version.version : null, platform: ctx.platform, supported: ctx.supported });
   if (!gate.ok) throw new RelayStop('unsupported', gate.message);
+  // The pass is labelled with the version checked for this turn.
+  ctx.reviewerVersion = version.version;
 
   const fresh = ctx.options.freshReviewer || !state.reviewer || state.reviewer.tool !== ctx.reviewerTool || !state.reviewer.thread_id;
   const threadId = fresh ? null : state.reviewer.thread_id;
@@ -703,6 +793,29 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
   const prompt = reviewerPrompt({ laneId, passNumber, rootDir, roundId: mark.round_id });
   out(`Pass ${passNumber}: ${TOOL_NAMES[ctx.reviewerTool]} ${version.version} reviewing round ${shortRound(mark.round_id)}${threadId ? ` (resuming ${threadId})` : ''}…`);
   await save({ step: 'reviewer-turn', round: { id: mark.round_id, fingerprints: mark.fingerprints }, turn: { role: 'reviewer', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null }, answer: null });
+  // A Claude Code reviewer's stream is checked as it arrives: a hook event, an
+  // event before init, or an init outside what the reviewer may load ends the
+  // group at once (D-419 item 5, D-421).
+  let sawReviewerInit = false;
+  const onLine = ctx.reviewerTool === 'claude'
+    ? (line) => {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return null;
+      }
+      if (event?.type === 'system' && typeof event.subtype === 'string' && event.subtype.startsWith('hook')) {
+        return checkClaudeReviewerStream({ hookEvents: [event], init: null });
+      }
+      if (sawReviewerInit) return null;
+      if (event?.type === 'system' && event.subtype === 'init') {
+        sawReviewerInit = true;
+        return checkClaudeReviewerStream({ hookEvents: [], init: event });
+      }
+      return `the reviewer's stream had an event (${event?.type ?? 'unknown'}) before init`;
+    }
+    : () => null;
   const result = await runTurn({
     command: launch.command,
     args: launch.args,
@@ -713,15 +826,28 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     table,
     active,
     logPath,
+    onLine,
+    killGraceMs: ctx.killGraceMs,
+    settleMs: ctx.settleMs,
     onSpawned: async ({ pid, pgid, startedAt }) => {
+      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord();
       await save({ turn: { ...ctx.getState().turn, pid, pgid, process_started_at: startedAt, prompt_sent: true } });
     },
   });
-  const ended = { at: new Date().toISOString(), how: result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : 'exited', exit_code: result.code ?? null };
-  await save({ turn: { ...ctx.getState().turn, ended, possibly_partial: Boolean(result.timedOut || result.interrupted), partial_reported_at: result.timedOut || result.interrupted ? new Date().toISOString() : null } });
-  if (result.spawnError) throw new RelayStop('failure', `the reviewer couldn't start: ${result.spawnError}.`);
+  if (result.spawnError) {
+    await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
+    throw new RelayStop('failure', `the reviewer couldn't start: ${result.spawnError}.`);
+  }
+  if (!result.groupEnded) throw groupStillRunning('reviewer', passNumber, result);
+  if (result.recordError) {
+    throw new RelayStop('failure', `the reviewer's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
+  }
+  const partialReviewer = Boolean(result.timedOut || result.interrupted || result.aborted);
+  const ended = { at: new Date().toISOString(), how: result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : result.aborted ? 'ended by the relay' : 'exited', exit_code: result.code ?? null };
+  await save({ turn: { ...ctx.getState().turn, ended, possibly_partial: partialReviewer, partial_reported_at: partialReviewer ? new Date().toISOString() : null } });
   if (result.interrupted) throw new RelayStop('owner-pause', 'Ctrl-C: the owner stopped the relay during the reviewer\'s turn; no pass was recorded.');
   if (result.timedOut) throw new RelayStop('timeout', `the reviewer's turn ran past ${Math.round(ctx.reviewerTimeoutMs / 60000)} minutes; its process group was ended, and no pass was recorded.`);
+  if (result.aborted) throw new RelayStop('refusal', `${result.aborted}; the relay ended the turn, and its answer is discarded.`);
 
   let answer = null;
   let model = ctx.options.reviewerModel ?? null;
@@ -795,6 +921,7 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     rootDir,
     laneDir,
     write,
+    recheck: makeRecheck({ rootDir, laneDir, worktrees: ctx.worktrees, paths: write.paths, projectRepos: ctx.projectRepos, env: ctx.env }),
     onStep: async (step) => {
       await save({ write: step });
     },
@@ -837,7 +964,7 @@ function printResponse(out, wipContent, passNumber) {
 async function builderTurn(ctx, passNumber, markBefore) {
   const { laneDir, laneId, out, save, table, active, turnDir } = ctx;
   const version = await readToolVersion('claude', { env: ctx.env });
-  const gate = checkBuilderVersion({ version: version.version });
+  const gate = checkBuilderVersion({ version: version.ok ? version.version : null });
   if (!gate.ok) throw new RelayStop('unsupported', gate.message);
 
   const wipBefore = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
@@ -880,19 +1007,29 @@ async function builderTurn(ctx, passNumber, markBefore) {
     args: launch.args,
     cwd: ctx.relayCwd,
     env: builderTurnEnv(ctx.env, { ghConfigDir, relayToken: ctx.token }),
-    input: builderPrompt({ laneId, passNumber }),
+    input: builderPrompt({ laneId, passNumber, rootDir: ctx.rootDir, paths: markBefore.paths ?? [] }),
     timeoutMs: ctx.builderTimeoutMs,
     table,
     active,
     logPath,
     onLine,
+    killGraceMs: ctx.killGraceMs,
+    settleMs: ctx.settleMs,
     onSpawned: async ({ pid, pgid, startedAt }) => {
+      if (ctx.deps.onTurnRecord) await ctx.deps.onTurnRecord();
       await save({ turn: { ...ctx.getState().turn, pid, pgid, process_started_at: startedAt, prompt_sent: true } });
     },
   });
+  if (result.spawnError) {
+    await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
+    throw new RelayStop('failure', `the builder couldn't start: ${result.spawnError}.`);
+  }
+  if (!result.groupEnded) throw groupStillRunning('builder', passNumber, result);
+  if (result.recordError) {
+    throw new RelayStop('failure', `the builder's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
+  }
   const partial = Boolean(result.timedOut || result.interrupted || result.aborted);
   await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: result.timedOut ? 'timed out' : result.interrupted ? 'interrupted' : result.aborted ? 'ended by the relay' : 'exited', exit_code: result.code ?? null }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null } });
-  if (result.spawnError) throw new RelayStop('failure', `the builder couldn't start: ${result.spawnError}.`);
   if (result.interrupted) throw new RelayStop('owner-pause', 'Ctrl-C: the owner stopped the relay during the builder\'s turn, which may have run partly.');
   if (result.timedOut) throw new RelayStop('timeout', `the builder's turn ran past ${Math.round(ctx.builderTimeoutMs / 60000)} minutes; its process group was ended, and the turn may have run partly.`);
   if (result.aborted) throw new RelayStop('failure', `${result.aborted}; the relay ended the turn, which may have run partly.`);
@@ -925,6 +1062,18 @@ async function builderTurn(ctx, passNumber, markBefore) {
   if (parsedAfter.passCount !== parsedBefore.passCount) {
     throw new RelayStop('refusal', 'a pass line the relay didn\'t write appeared during the builder\'s turn.'); // D-419 item 8
   }
+  // The builder may only append its response to this pass: every earlier line
+  // of the review log stays as it was (D-419 item 8).
+  const logBefore = extractReviewLogLines(wipBefore).lines.map((line) => line.text);
+  while (logBefore.length > 0 && logBefore.at(-1).trim() === '') logBefore.pop();
+  const logAfter = extractReviewLogLines(wipAfter).lines.map((line) => line.text);
+  if (logBefore.some((line, index) => logAfter[index] !== line)) {
+    throw new RelayStop('refusal', 'the builder changed earlier lines of ## Review log during its turn; a relayed turn may only append its response.'); // D-419 item 8
+  }
+  const added = parsedAfter.records.slice(parsedBefore.records.length);
+  if (added.length > 1 || added.some((record) => !(record.kind === 'response' && record.number === passNumber))) {
+    throw new RelayStop('refusal', `the builder added a record other than its response to pass ${passNumber} during its turn (${added.map((record) => `${record.kind} ${record.number ?? ''}`.trim()).join(', ')}).`); // D-419 item 8
+  }
   const handoffAfter = await readFile(path.join(laneDir, 'handoff.md'), 'utf8').catch(() => '');
   if (readSectionBody(handoffAfter, REVIEWER_TO_BUILDER_HEADING) !== reviewerSectionBefore) {
     throw new RelayStop('refusal', '## Reviewer → Builder changed during the builder\'s turn; the relay writes that section.'); // D-419 item 8
@@ -941,12 +1090,15 @@ async function builderTurn(ctx, passNumber, markBefore) {
   out(`The builder marked round ${shortRound(markAfter.round_id)} ready.`);
 }
 
-async function coveredRepositories(ctx, mark) {
+/** The git repositories a mark covers: the lane's worktrees and each named path's repository. */
+export async function coveredRepositories(ctx, mark) {
   const dirs = new Set(Object.values(ctx.worktrees).map((dir) => path.resolve(dir)));
   for (const spec of mark.paths ?? []) {
     try {
       const resolved = resolveMarkPath(spec, { rootDir: ctx.rootDir, projectRepos: ctx.projectRepos, worktrees: ctx.worktrees });
-      const top = await gitText(['rev-parse', '--show-toplevel'], (await exists(resolved.absolute)) ? path.dirname(resolved.absolute) : resolved.base);
+      const kind = await stat(resolved.absolute).then((info) => (info.isDirectory() ? 'directory' : 'file')).catch(() => 'missing');
+      const start = kind === 'directory' ? resolved.absolute : kind === 'file' ? path.dirname(resolved.absolute) : resolved.base;
+      const top = await gitText(['rev-parse', '--show-toplevel'], start);
       if (top.ok) dirs.add(top.stdout.trim());
     } catch {
       // A path that can't be resolved covers no repository.

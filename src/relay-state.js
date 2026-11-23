@@ -422,21 +422,26 @@ export async function releaseConversationLock(lock) {
  * else is left alone, and so is a lock whose record names another
  * conversation, lane, or root.
  */
-export async function removeConversationLockForLane({ state, rootDir, laneId, userInfo }) {
+export async function removeConversationLockForLane({ state, rootDir, laneId, userInfo, table = createProcessTable(), beforeRemove = null }) {
   const conversationId = state?.builder?.conversation_id;
   if (!state?.conversation_lock || !isConversationId(conversationId)) return null;
   const expected = conversationLockPath(conversationId, userInfo);
   const recorded = state.conversation_lock.path;
   if (typeof recorded !== 'string' || path.resolve(recorded) !== path.resolve(expected)) return null;
-  const existing = await readLockRecord(expected);
-  if (existing.record
-    && existing.record.conversation_id === conversationId
-    && existing.record.lane === laneId
-    && path.resolve(existing.record.root ?? '') === path.resolve(rootDir)) {
-    await rm(expected, { force: true });
-    return expected;
-  }
-  return null;
+  // Read and removed under the takeover mutex, so another root's takeover
+  // can't replace the lock between the check and the removal.
+  return withTakeoverMutex(path.dirname(expected), table, async () => {
+    const existing = await readLockRecord(expected);
+    if (existing.record
+      && existing.record.conversation_id === conversationId
+      && existing.record.lane === laneId
+      && path.resolve(existing.record.root ?? '') === path.resolve(rootDir)) {
+      if (beforeRemove) await beforeRemove();
+      await rm(expected, { force: true });
+      return expected;
+    }
+    return null;
+  });
 }
 
 // ---------------------------------------------------------------------------

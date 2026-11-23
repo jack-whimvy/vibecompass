@@ -24,18 +24,21 @@ import {
   readCodexEvents,
   reviewerPrompt,
   reviewerTurnEnv,
+  shellWord,
   validateBuilderMode,
 } from '../relay-adapters.js';
 import {
   classifyAppsCheck,
   classifyFixtureCheck,
   classifyWriteCheck,
+  qualificationVerdict,
   readClaudeWriteEvidence,
   readCodexRollout,
   runWatchedTurn,
   startedBefore,
   versionVerdict,
   waitForNoFixture,
+  watchCovered,
   watchProcesses,
 } from '../../scripts/relay-capability-check.js';
 
@@ -74,7 +77,7 @@ test('the package lists only versions whose capability checks held', () => {
   }
   assert.ok(Object.isFrozen(SUPPORTED_REVIEWER_VERSIONS));
   // Exactly the versions the real-tool checks passed on, and no other platform.
-  assert.deepEqual(JSON.parse(JSON.stringify(SUPPORTED_REVIEWER_VERSIONS)), { codex: { darwin: ['0.171.0'] }, claude: { darwin: ['2.1.318'] } });
+  assert.deepEqual(JSON.parse(JSON.stringify(SUPPORTED_REVIEWER_VERSIONS)), { codex: { darwin: ['0.171.0'] }, claude: { darwin: [] } });
 });
 
 test('the builder gate: the minimum, and newer versions run with a note', () => {
@@ -181,6 +184,13 @@ test('streams: Codex thread ids and failures; Claude Code init, hooks, and resul
     const reason = checkClaudeReviewerStream(readClaudeStream(mixed));
     assert.match(reason, new RegExp(`lists a plugin \\(${name}\\)$`));
   }
+  // An init that doesn't list its tools, MCP servers, or plugins can't be checked, so it ends the turn.
+  for (const [key, label] of [['tools', 'tools'], ['mcp_servers', 'MCP servers'], ['plugins', 'plugins']]) {
+    const init = { type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [], plugins: [] };
+    delete init[key];
+    assert.match(checkClaudeReviewerStream(readClaudeStream(JSON.stringify(init))), new RegExp(`init doesn't list its ${label}`));
+    assert.match(checkClaudeReviewerStream(readClaudeStream(JSON.stringify({ ...init, [key]: 'x' }))), new RegExp(`init doesn't list its ${label}`));
+  }
   // A hook event or an MCP server still ends a turn whose plugins are all built in.
   const builtInWithMcp = JSON.stringify({ type: 'system', subtype: 'init', tools: ['Read'], mcp_servers: [{ name: 'x' }], plugins: builtIn });
   assert.match(checkClaudeReviewerStream(readClaudeStream(builtInWithMcp)), /MCP server \(x\)/);
@@ -191,9 +201,12 @@ test('the fixed text carries only the lane id, the pass number, paths, and the r
   assert.match(reviewer, /^review handoff lane-x\n/);
   assert.match(reviewer, /pass 3, round aaaaaaaaaaaa/);
   assert.match(reviewer, /Write no file and change nothing/);
-  const builder = builderPrompt({ laneId: 'lane-x', passNumber: 3 });
+  const builder = builderPrompt({ laneId: 'lane-x', passNumber: 3, rootDir: '/w/vibecompass-docs', paths: ['app:src', "docs/it's here.md"] });
   assert.match(builder, /^address review lane-x\n/);
-  assert.match(builder, /vibecompass ready-for-review --session lane-x/);
+  // The memory root and the last mark's paths, so the new mark covers the same work from any folder.
+  assert.ok(builder.includes("`vibecompass ready-for-review --root /w/vibecompass-docs --session lane-x --path app:src --path 'docs/it'\\''s here.md'`"), builder);
+  assert.equal(shellWord('/plain/path-1.md'), '/plain/path-1.md');
+  assert.equal(shellWord('a b'), "'a b'");
   assert.match(builder, /don't close the lane, push code or project memory, merge, publish, release, start a reviewer, run the relay/);
   assert.doesNotMatch(reviewer + builder, /D-\d{3}/, 'no decision number in installed text');
 });
@@ -266,20 +279,63 @@ test('the apps check: the control shows the account\'s apps one way or another, 
   }
 });
 
+test('a restricted run seen through a gap, or whose fixture wrote its marker, never holds', () => {
+  const control = { seen: true, marker: true };
+  assert.equal(classifyFixtureCheck({ control, restricted: { seen: false, marker: false, covered: true } }).verdict, 'held');
+  assert.equal(classifyFixtureCheck({ control, restricted: { seen: false, marker: false, covered: false } }).verdict, 'inconclusive');
+  assert.equal(classifyFixtureCheck({ control, restricted: { seen: false, marker: false } }).verdict, 'inconclusive');
+  assert.match(classifyFixtureCheck({ control, restricted: { seen: false, marker: true, covered: true } }).reason, /marker was written under the reviewer's launch/);
+  assert.equal(classifyFixtureCheck({ control, restricted: { seen: false, marker: true, covered: false } }).verdict, 'loaded');
+  // Coverage: reads before the start and after the end, and no failed read.
+  const coverage = (failures = []) => ({ polls: 5, failures, firstAt: 1000, lastAt: 9000 });
+  assert.equal(watchCovered(coverage(), { startedAt: 1500, endedAt: 8000 }), true);
+  assert.equal(watchCovered(coverage([{ at: 4000, error: 'ps failed' }]), { startedAt: 1500, endedAt: 8000 }), false);
+  assert.equal(watchCovered(coverage(), { startedAt: 1500, endedAt: 9500 }), false);
+  assert.equal(watchCovered({ polls: 0, failures: [], firstAt: null, lastAt: null }, { startedAt: 1, endedAt: 2 }), false);
+});
+
+test('a version passes only with every expected check, clean launches, an empty-stdin exit, and accepted turns', () => {
+  const held = (name) => ({ check: name, verdict: 'held' });
+  const expected = ['a (fresh)', 'a (resumed)'];
+  const ok = { checks: expected.map(held), expected, launches: [{ name: 'fresh', exit: 0 }, { name: 'resumed', exit: 0 }], emptyStdin: { exit: 1, model_turn: false } };
+  assert.equal(qualificationVerdict(ok).verdict, 'pass');
+  assert.match(qualificationVerdict({ ...ok, checks: [held('a (fresh)')] }).reasons.join(), /missing checks: a \(resumed\)/);
+  assert.equal(qualificationVerdict({ ...ok, checks: [held('a (fresh)')] }).verdict, 'inconclusive');
+  assert.equal(qualificationVerdict({ ...ok, launches: [{ name: 'resumed', exit: 'not run' }] }).verdict, 'inconclusive');
+  assert.equal(qualificationVerdict({ ...ok, emptyStdin: null }).verdict, 'inconclusive');
+  assert.equal(qualificationVerdict({ ...ok, emptyStdin: { exit: 0, model_turn: true } }).verdict, 'fail');
+  assert.equal(qualificationVerdict({ ...ok, turnChecks: { 'the fresh turn': 'accepted', 'the resumed turn': 'the reviewer\'s init lists a plugin (x)' } }).verdict, 'fail');
+  assert.equal(qualificationVerdict({ ...ok, turnChecks: { 'the fresh turn': 'accepted', 'the resumed turn': 'accepted' } }).verdict, 'pass');
+  assert.equal(qualificationVerdict({ ...ok, checks: [held('a (fresh)'), { check: 'a (resumed)', verdict: 'inconclusive' }] }).verdict, 'inconclusive');
+});
+
 test('write checks need the tool\'s record of a refused attempt', () => {
   assert.equal(classifyWriteCheck({ fileCreated: true, attempted: true, refusalEvidence: 'x' }).verdict, 'failed');
   assert.equal(classifyWriteCheck({ fileCreated: false, attempted: false, refusalEvidence: null }).verdict, 'inconclusive');
   assert.equal(classifyWriteCheck({ fileCreated: false, attempted: true, refusalEvidence: null }).verdict, 'inconclusive');
   assert.equal(classifyWriteCheck({ fileCreated: false, attempted: true, refusalEvidence: 'touch: probe.txt: Operation not permitted' }).verdict, 'held');
   const rollout = [
-    JSON.stringify({ type: 'turn_context', payload: { type: 'turn_context', sandbox_policy: { type: 'read-only' } } }),
-    JSON.stringify({ type: 'response_item', payload: { type: 'function_call', arguments: '{"command":["touch","probe.txt"]}' } }),
-    JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', output: 'touch: probe.txt: Operation not permitted' } }),
+    JSON.stringify({ type: 'turn_context', payload: { sandbox_policy: { type: 'read-only' } } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Run touch probe.txt; touch probe-2.txt is not permitted here' } }),
+    JSON.stringify({ type: 'response_item', payload: { type: 'function_call', call_id: 'c1', arguments: '{"command":["touch","probe.txt"]}' } }),
+    JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'c1', output: 'touch: probe.txt: Operation not permitted' } }),
+    JSON.stringify({ type: 'turn_context', payload: { sandbox_policy: { type: 'read-only' } } }),
+    JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'c2', input: 'exec touch probe-2.txt' } }),
+    JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'c3', input: 'exec ls' } }),
+    JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'c3', output: 'ls: x: Operation not permitted' } }),
   ].join('\n');
-  const evidence = readCodexRollout(rollout, 'probe.txt');
+  const evidence = readCodexRollout(rollout, 'probe.txt', { turn: 0 });
   assert.equal(evidence.attempted, true);
-  assert.match(evidence.refused, /Operation not permitted/);
+  assert.match(evidence.refused, /touch: probe\.txt: Operation not permitted/);
   assert.deepEqual(evidence.sandboxPolicies, ['{"type":"read-only"}']);
+  // In the second turn the probe's own call has no recorded output: another
+  // call's denial and the prompt's words don't count, so there's no refusal.
+  const second = readCodexRollout(rollout, 'probe-2.txt', { turn: 1 });
+  assert.equal(second.attempted, true);
+  assert.equal(second.refused, null);
+  assert.equal(classifyWriteCheck({ fileCreated: false, attempted: second.attempted, refusalEvidence: second.refused }).verdict, 'inconclusive');
+  // A probe named only in the prompt was never attempted.
+  assert.equal(readCodexRollout(rollout, 'probe-2.txt', { turn: 0 }).attempted, false);
   const stream = [
     JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu-1', name: 'Write', input: { file_path: '/x/probe.txt' } }] } }),
     JSON.stringify({ type: 'result', permission_denials: [{ tool_name: 'Write', tool_use_id: 'tu-1' }] }),

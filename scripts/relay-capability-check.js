@@ -20,11 +20,19 @@ export function watchProcesses({ table = createProcessTable(), token, intervalMs
   let seen = false;
   const rows = [];
   const ignored = [];
+  // Every read of the table is counted, and every failed one kept: a watch
+  // with a gap can't show that a fixture never ran.
+  const coverage = { polls: 0, failures: [], firstAt: null, lastAt: null };
   let running = true;
   const loop = (async () => {
     while (running) {
       try {
-        for (const row of await table.list()) {
+        const listed = await table.list();
+        const at = Date.now();
+        coverage.polls += 1;
+        coverage.firstAt = coverage.firstAt ?? at;
+        coverage.lastAt = at;
+        for (const row of listed) {
           if (!row.command.includes(token) || rows.some((item) => item.pid === row.pid) || ignored.some((item) => item.pid === row.pid)) continue;
           // A process that started before this turn (a fixture an earlier run
           // left running) isn't this turn's; `ps` gives start times to the second.
@@ -35,8 +43,8 @@ export function watchProcesses({ table = createProcessTable(), token, intervalMs
           seen = true;
           rows.push(row);
         }
-      } catch {
-        // An unreadable table this round; the next one is read again.
+      } catch (error) {
+        coverage.failures.push({ at: Date.now(), error: error instanceof Error ? error.message : String(error) });
       }
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
@@ -45,9 +53,21 @@ export function watchProcesses({ table = createProcessTable(), token, intervalMs
     async stop() {
       running = false;
       await loop;
-      return { seen, rows, ignored };
+      return { seen, rows, ignored, coverage };
+    },
+    peek() {
+      return coverage;
     },
   };
+}
+
+/**
+ * Whether a watch covered a turn: at least one read before the turn's
+ * process started, one after it ended, and no read failed between.
+ */
+export function watchCovered(coverage, { startedAt, endedAt }) {
+  if (!coverage || coverage.failures.length > 0 || coverage.polls === 0) return false;
+  return coverage.firstAt <= startedAt + 1000 && coverage.lastAt >= endedAt;
 }
 
 /**
@@ -69,8 +89,9 @@ export async function waitForNoFixture({ table = createProcessTable(), token, ti
     let left = [];
     try {
       left = (await table.list()).filter((row) => row.command.includes(token));
-    } catch {
-      left = [];
+    } catch (error) {
+      // An unreadable table proves nothing is left: not waited.
+      return { waited: false, left: [], error: error instanceof Error ? error.message : String(error) };
     }
     if (left.length === 0) return { waited: true, left: [] };
     if (Date.now() >= deadline) return { waited: false, left };
@@ -83,6 +104,10 @@ export async function runWatchedTurn({ command, args, cwd, env, input = '', time
   const before = await waitForNoFixture({ table, token });
   const startedAt = new Date();
   const watcher = watchProcesses({ table, token, startedAfter: startedAt });
+  // The first read happens before the tool starts.
+  for (let waited = 0; watcher.peek().polls === 0 && watcher.peek().failures.length === 0 && waited < 2000; waited += 20) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
   const child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const closed = once(child, 'close').catch(() => [null, null]);
   let stdout = '';
@@ -97,11 +122,13 @@ export async function runWatchedTurn({ command, args, cwd, env, input = '', time
   }, timeoutMs);
   child.stdin.end(input);
   const [code] = await closed;
+  const endedAt = Date.now();
   clearTimeout(timer);
   // Keep watching briefly: a fixture started late in the turn still shows.
   await new Promise((resolve) => setTimeout(resolve, 500));
   const watched = await watcher.stop();
-  return { code, stdout, stderr, seen: watched.seen, rows: watched.rows, ignored: watched.ignored, leftBefore: before.left, startedAt: startedAt.toISOString(), marker: markerPath ? existsSync(markerPath) : false };
+  const covered = before.waited && watchCovered(watched.coverage, { startedAt: startedAt.getTime(), endedAt });
+  return { code, stdout, stderr, seen: watched.seen, rows: watched.rows, ignored: watched.ignored, leftBefore: before.left, waitedBefore: before.waited, startedAt: startedAt.toISOString(), coverage: watched.coverage, covered, marker: markerPath ? existsSync(markerPath) : false };
 }
 
 /**
@@ -117,7 +144,14 @@ export function classifyFixtureCheck({ control, restricted }) {
   if (restricted?.seen) {
     return { verdict: 'loaded', reason: restricted.marker ? 'the fixture ran under the reviewer\'s launch and wrote its marker' : 'the fixture ran under the reviewer\'s launch without writing its marker, which counts as loaded' };
   }
-  return { verdict: 'held', reason: 'the fixture never appeared in the process table during the reviewer\'s turn, and the control showed it' };
+  // A marker is the fixture's own record that it ran, seen or not.
+  if (restricted?.marker) {
+    return { verdict: 'loaded', reason: 'the fixture\'s marker was written under the reviewer\'s launch, though the process table never showed it' };
+  }
+  if (restricted?.covered !== true) {
+    return { verdict: 'inconclusive', reason: 'the process table wasn\'t read for the whole of the reviewer\'s turn (a read failed, or the watch didn\'t span the turn), so the fixture\'s absence proves nothing' };
+  }
+  return { verdict: 'held', reason: 'the fixture never appeared in the process table during the reviewer\'s turn, which was watched throughout, and the control showed it' };
 }
 
 /**
@@ -161,24 +195,76 @@ export function versionVerdict(checks) {
   return 'inconclusive';
 }
 
-/** Codex's thread record: did a command run, and what did it print? */
-export function readCodexRollout(text, commandFragment) {
+const CODEX_CALL_TYPES = new Set(['custom_tool_call', 'function_call', 'local_shell_call']);
+const CODEX_OUTPUT_TYPES = new Set(['custom_tool_call_output', 'function_call_output', 'local_shell_call_output']);
+
+/**
+ * Codex's thread record: the tool calls whose own input names the probe, in
+ * the given turn (0 for the first, counted by `turn_context` records), and
+ * the output recorded for each of those calls by its call id. A refusal
+ * elsewhere in the record (a prompt, another call's output) never counts.
+ */
+export function readCodexRollout(text, commandFragment, { turn = null } = {}) {
   const lines = String(text ?? '').split('\n').filter(Boolean);
-  let attempted = false;
+  const calls = new Map();
   let refused = null;
+  let turnIndex = -1;
   const sandbox = new Set();
   for (const line of lines) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
-    const payload = event.payload ?? event;
-    const serialized = JSON.stringify(payload);
-    if (payload?.type === 'turn_context' && payload.sandbox_policy) sandbox.add(JSON.stringify(payload.sandbox_policy));
-    if (serialized.includes(commandFragment)) attempted = true;
-    if (attempted && /Operation not permitted|Read-only file system/.test(serialized)) {
-      refused = refused ?? (serialized.match(/[^"]*(Operation not permitted|Read-only file system)[^"]*/)?.[0] ?? 'Operation not permitted');
+    const payload = event.payload ?? {};
+    if (event.type === 'turn_context' || payload.type === 'turn_context') {
+      turnIndex += 1;
+      if (payload.sandbox_policy) sandbox.add(JSON.stringify(payload.sandbox_policy));
+      continue;
+    }
+    if (turn !== null && turnIndex !== turn) continue;
+    if (CODEX_CALL_TYPES.has(payload.type) && payload.call_id) {
+      const input = typeof payload.input === 'string' ? payload.input : typeof payload.arguments === 'string' ? payload.arguments : JSON.stringify(payload.action ?? payload.input ?? '');
+      if (input.includes(commandFragment)) calls.set(payload.call_id, { name: payload.name ?? payload.type, turn: turnIndex });
+    }
+    if (CODEX_OUTPUT_TYPES.has(payload.type) && calls.has(payload.call_id)) {
+      const output = typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output ?? '');
+      const match = output.match(/[^"\\]*(Operation not permitted|Read-only file system)[^"\\]*/);
+      if (match) refused = refused ?? match[0];
     }
   }
-  return { attempted, refused, sandboxPolicies: [...sandbox] };
+  return { attempted: calls.size > 0, refused, calls: [...calls.keys()], sandboxPolicies: [...sandbox] };
+}
+
+/**
+ * A version's verdict with everything its report needs (D-419 item 5): each
+ * expected check present and held, each launch exited 0, the empty-stdin run
+ * exited without a model turn, and, for Claude Code, the relay's own turn
+ * check accepting each reviewer turn. Anything missing is inconclusive.
+ */
+export function qualificationVerdict({ checks = [], expected = [], launches = [], emptyStdin = null, turnChecks = null }) {
+  const reasons = [];
+  let failed = false;
+  const names = new Set(checks.map((check) => check.check));
+  const missing = expected.filter((name) => !names.has(name));
+  if (missing.length > 0) reasons.push(`missing checks: ${missing.join(', ')}`);
+  const base = versionVerdict(checks);
+  if (base === 'fail') failed = true;
+  else if (base !== 'pass') reasons.push('a check was inconclusive');
+  for (const launch of launches) {
+    if (launch.exit !== 0) reasons.push(`the ${launch.name} launch exited ${launch.exit}`);
+  }
+  if (!emptyStdin) reasons.push('no empty-stdin run');
+  else if (emptyStdin.model_turn) {
+    failed = true;
+    reasons.push('a model turn ran on empty stdin');
+  } else if (emptyStdin.exit === 0) reasons.push('the empty-stdin run exited 0');
+  if (turnChecks !== null) {
+    for (const [name, result] of Object.entries(turnChecks)) {
+      if (result !== 'accepted') {
+        failed = true;
+        reasons.push(`the relay's turn check discards ${name}: ${result}`);
+      }
+    }
+  }
+  return { verdict: failed ? 'fail' : reasons.length > 0 ? 'inconclusive' : 'pass', reasons };
 }
 
 /**

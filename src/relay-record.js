@@ -306,12 +306,19 @@ async function readText(filePath) {
  * when the half hasn't landed and every section in it still matches its
  * expected predecessor. Returns `landed`, `wrote`, or `changed`.
  */
-async function writeWipHalf({ rootDir, laneDir, write }) {
+async function writeWipHalf({ rootDir, laneDir, write, recheck = null }) {
   const wipPath = path.join(laneDir, 'wip.md');
   return withMemoryRootLock(rootDir, 'review-relay', async () => {
     const content = await readFile(wipPath, 'utf8');
     if (wipHalfLanded(content, write.id)) return 'landed';
     if (fingerprintSection(content, REVIEW_LOG_HEADING) !== write.wip.predecessor) return 'changed';
+    // The covered work and the builder's handoff, checked again inside the
+    // lock just before the pass is recorded: a change queued behind this lock
+    // discards the pass (D-419 item 4).
+    if (recheck) {
+      const now = await recheck();
+      if (now.work !== write.fingerprints.work || now.handoff !== write.fingerprints.handoff) return 'work-changed';
+    }
     await writeFileAtomic(wipPath, replaceSectionBody(content, REVIEW_LOG_HEADING, write.wip.body));
     return 'wrote';
   });
@@ -338,8 +345,9 @@ async function writeHandoffHalf({ rootDir, laneDir, write }) {
  * instead), or `discarded` (the wip.md half never landed). A write already in
  * an end state is returned untouched, so recovery replays nothing.
  *
- * `recheck` (recovery) re-checks the round's work and handoff fingerprints
- * before the wip.md half. `onStep` records each half as it lands.
+ * `recheck` re-checks the round's work and handoff fingerprints inside the
+ * wip.md half's lock, just before the pass is written. `onStep` records each
+ * half as it lands.
  */
 export async function settleRelayWrite({ rootDir, laneDir, write, recheck = null, onStep = async () => {} }) {
   if (['complete', 'superseded', 'discarded'].includes(write.state)) {
@@ -349,15 +357,12 @@ export async function settleRelayWrite({ rootDir, laneDir, write, recheck = null
   let current = { ...write };
   const wipNow = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
   if (!wipHalfLanded(wipNow, write.id)) {
-    if (recheck) {
-      const now = await recheck();
-      if (now.work !== write.fingerprints.work || now.handoff !== write.fingerprints.handoff) {
-        current = { ...current, state: 'discarded', reason: 'the work or the handoff changed after the review' };
-        await onStep(current);
-        return { write: current, wrote, unwritten: 'pass' };
-      }
+    const wipResult = await writeWipHalf({ rootDir, laneDir, write: current, recheck });
+    if (wipResult === 'work-changed') {
+      current = { ...current, state: 'discarded', reason: 'the work or the handoff changed after the review' };
+      await onStep(current);
+      return { write: current, wrote, unwritten: 'pass' };
     }
-    const wipResult = await writeWipHalf({ rootDir, laneDir, write: current });
     if (wipResult === 'changed') {
       current = { ...current, state: 'discarded', reason: 'wip.md › ## Review log changed before the pass was written' };
       await onStep(current);

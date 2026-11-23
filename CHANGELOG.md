@@ -27,8 +27,9 @@ package's installed text, command output, and help do.
 - A reviewer runs only on an exact tool version listed as supported for its
   platform, each listed once its read-only checks held on that version; an
   unlisted version stops before launch and names the choices. Listed on macOS:
-  Codex 0.171.0 and Claude Code 2.1.318. The builder needs Claude Code 2.1.318
-  or later.
+  Codex 0.171.0. No Claude Code reviewer version is listed: its read-only `git`
+  commands can run helpers a repository's own configuration names, which
+  nothing confines to reading. The builder needs Claude Code 2.1.318 or later.
 - Inside a relayed builder turn, `close-session`, `end-session`,
   `review-relay`, `push`, `promote-hosted`, `demote-hosted`, `connect-hosted`,
   and `sync-adopt` refuse, pushes are rewritten to fail, and `gh` has no

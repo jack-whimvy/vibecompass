@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -450,6 +450,115 @@ test('release leaves a foreign lock in place (token compare)', async () => {
     const owner = JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8'));
     assert.equal(owner.token, 'someone-else', 'release must not delete a lock it does not own');
     await rm(lockDir, { recursive: true, force: true });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('two processes that both judge one lock abandoned before either reclaims it never hold it together', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-rendezvous-');
+  try {
+    const lockDir = memoryRootLockPath(rootDir);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999999, token: 'dead', label: 'crashed', acquired_at: '2026-01-01T00:00:00.000Z' })}\n`, 'utf8');
+    const serializationUrl = new URL('../serialization.js', import.meta.url).href;
+    const logPath = path.join(tempDir, 'rendezvous-log.txt');
+    const barrier = path.join(tempDir, 'barrier');
+    await mkdir(barrier);
+    // Each waiter, having judged the lock abandoned, waits for the other to
+    // judge it too before reclaiming: the ordering a bare rename got wrong.
+    const childScript = (name) => `
+      import { appendFile, readdir, writeFile } from 'node:fs/promises';
+      const { withMemoryRootLock } = await import(${JSON.stringify(serializationUrl)});
+      const beforeReclaim = async () => {
+        await writeFile(${JSON.stringify(barrier)} + '/${name}', '');
+        const until = Date.now() + 1500;
+        while ((await readdir(${JSON.stringify(barrier)})).length < 2 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+      };
+      await withMemoryRootLock(${JSON.stringify(rootDir)}, ${JSON.stringify(name)}, async () => {
+        await appendFile(${JSON.stringify(logPath)}, 'start-${name}' + '\\n');
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await appendFile(${JSON.stringify(logPath)}, 'end-${name}' + '\\n');
+      }, { beforeReclaim });
+    `;
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await Promise.all([
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('a')]),
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('b')]),
+    ]);
+    assert.equal((await readdir(barrier)).length, 2, 'both waiters judged the lock abandoned');
+    const events = (await readFile(logPath, 'utf8')).trim().split('\n');
+    assert.equal(events.length, 4, 'both children must run');
+    for (let index = 0; index < events.length; index += 2) {
+      const name = events[index].split('-')[1];
+      assert.equal(events[index], `start-${name}`);
+      assert.equal(events[index + 1], `end-${name}`, 'critical sections must not interleave');
+    }
+    await assert.rejects(stat(`${lockDir}.reclaim`), { code: 'ENOENT' }, 'the reclaim mutex is gone');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a waiter that judged a lock abandoned and reaches the reclaim after another waiter has claimed it judges again and waits', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-stagger-');
+  try {
+    const lockDir = memoryRootLockPath(rootDir);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999999, token: 'dead' })}\n`, 'utf8');
+    const serializationUrl = new URL('../serialization.js', import.meta.url).href;
+    const logPath = path.join(tempDir, 'stagger-log.txt');
+    const barrier = path.join(tempDir, 'barrier');
+    await mkdir(barrier);
+    // Both judge the dead lock abandoned. Then "a" reclaims and enters, and only
+    // after that does "b" go on to the reclaim, with its old judgment.
+    const childScript = (name) => `
+      import { appendFile, readFile, readdir, writeFile } from 'node:fs/promises';
+      const { withMemoryRootLock } = await import(${JSON.stringify(serializationUrl)});
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      let first = true;
+      const beforeReclaim = async () => {
+        if (!first) return;
+        first = false;
+        await writeFile(${JSON.stringify(barrier)} + '/${name}', '');
+        const until = Date.now() + 3000;
+        while ((await readdir(${JSON.stringify(barrier)})).length < 2 && Date.now() < until) await sleep(10);
+        if ('${name}' === 'b') {
+          while (!(await readFile(${JSON.stringify(logPath)}, 'utf8').catch(() => '')).includes('start-a') && Date.now() < until + 3000) await sleep(10);
+        }
+      };
+      await withMemoryRootLock(${JSON.stringify(rootDir)}, ${JSON.stringify(name)}, async () => {
+        await appendFile(${JSON.stringify(logPath)}, 'start-${name}' + '\\n');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await appendFile(${JSON.stringify(logPath)}, 'end-${name}' + '\\n');
+      }, { beforeReclaim });
+    `;
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await Promise.all([
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('a')]),
+      execFileAsync(process.execPath, ['--input-type=module', '-e', childScript('b')]),
+    ]);
+    const events = (await readFile(logPath, 'utf8')).trim().split('\n');
+    assert.deepEqual(events, ['start-a', 'end-a', 'start-b', 'end-b'], 'b never enters while a holds the lock');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a reclaim mutex left by a dead process is kept, and the error names it', async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-dead-mutex-');
+  try {
+    const lockDir = memoryRootLockPath(rootDir);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999999, token: 'dead' })}\n`, 'utf8');
+    await mkdir(`${lockDir}.reclaim`);
+    await writeFile(path.join(`${lockDir}.reclaim`, 'owner.json'), `${JSON.stringify({ pid: 999999998 })}\n`, 'utf8');
+    await assert.rejects(withMemoryRootLock(rootDir, 'test', async () => {}), /An earlier reclaim of the abandoned project-memory lock at .* didn't finish \(.*\.reclaim\)/);
+    assert.equal(JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8')).token, 'dead', 'the abandoned lock is untouched');
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
