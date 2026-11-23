@@ -33,55 +33,97 @@ export function readOnlyGitEnv(baseEnv = process.env) {
   return { ...baseEnv, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
 }
 
-/**
- * Runs git and hashes its standard output as it streams, so a large diff
- * never sits in memory. Resolves `{ ok, code, hash, bytes, stderr }`.
- */
-export function gitHash(args, cwd, env = process.env) {
+// The relay's own git reads run on the host, outside any reviewer sandbox, so
+// none of them may start a helper a repository's configuration names: the
+// filesystem monitor (any command that reads the index), hooks, and filter
+// drivers (a working-tree diff cleans each changed file). Diffs also pass
+// --no-ext-diff and --no-textconv, and leave submodules' working trees alone,
+// since a submodule's own git would read its own configuration.
+const HELPERS_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
+
+function spawnGit(args, cwd, env, onStdout) {
   return new Promise((resolve) => {
     let child;
     try {
       child = spawn('git', args, { cwd, env: readOnlyGitEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (error) {
-      resolve({ ok: false, code: null, hash: null, bytes: 0, stderr: String(error?.message ?? error) });
+      resolve({ code: null, stderr: String(error?.message ?? error) });
       return;
     }
-    const hash = createHash('sha256');
-    let bytes = 0;
     let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      bytes += chunk.length;
-      hash.update(chunk);
-    });
+    child.stdout.on('data', onStdout);
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       if (stderr.length < 4096) stderr += chunk;
     });
-    child.on('error', (error) => resolve({ ok: false, code: null, hash: null, bytes, stderr: String(error?.message ?? error) }));
-    child.on('close', (code) => resolve({ ok: code === 0, code, hash: hash.digest('hex'), bytes, stderr: stderr.trim() }));
+    child.on('error', (error) => resolve({ code: null, stderr: String(error?.message ?? error) }));
+    child.on('close', (code) => resolve({ code, stderr: stderr.trim() }));
   });
 }
 
-/** Runs git and returns its output as text (small outputs only). */
-export function gitText(args, cwd, env = process.env) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn('git', args, { cwd, env: readOnlyGitEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (error) {
-      resolve({ ok: false, code: null, stdout: '', stderr: String(error?.message ?? error) });
-      return;
+/**
+ * The `-c` arguments that turn every helper off for one read in `cwd`: the
+ * fixed ones, and each filter driver git's configuration names there emptied.
+ * Throws when the configuration can't be read, or names a driver whose name
+ * a `-c` argument can't carry.
+ */
+export async function gitHelpersOff(cwd, env = process.env) {
+  const out = [];
+  const listed = await spawnGit([...HELPERS_OFF, 'config', '-z', '--get-regexp', '^filter\\.'], cwd, env, (chunk) => out.push(chunk));
+  // Exit 1: no filter driver is configured.
+  if (listed.code !== 0 && listed.code !== 1) {
+    throw new Error(`git's configuration couldn't be read in ${cwd}: ${listed.stderr || `git config exited ${listed.code}`}`);
+  }
+  const names = new Set();
+  for (const entry of Buffer.concat(out).toString('utf8').split('\0')) {
+    const key = entry.split('\n')[0];
+    const last = key.lastIndexOf('.');
+    if (!key.startsWith('filter.') || last <= 'filter.'.length) continue;
+    names.add(key.slice('filter.'.length, last));
+  }
+  const args = [...HELPERS_OFF];
+  for (const name of [...names].sort()) {
+    if (name.includes('=')) {
+      throw new Error(`git's configuration in ${cwd} names a filter driver (${JSON.stringify(name)}) the relay can't turn off for its own reads.`);
     }
-    const out = [];
-    let stderr = '';
-    child.stdout.on('data', (chunk) => out.push(chunk));
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => {
-      if (stderr.length < 4096) stderr += chunk;
-    });
-    child.on('error', (error) => resolve({ ok: false, code: null, stdout: '', stderr: String(error?.message ?? error) }));
-    child.on('close', (code) => resolve({ ok: code === 0, code, stdout: Buffer.concat(out).toString('utf8'), stderr: stderr.trim() }));
+    for (const key of ['clean', 'smudge', 'process']) args.push('-c', `filter.${name}.${key}=`);
+    args.push('-c', `filter.${name}.required=false`);
+  }
+  return args;
+}
+
+/**
+ * Runs git, with every repository-selected helper off, and hashes its
+ * standard output as it streams, so a large diff never sits in memory.
+ * Resolves `{ ok, code, hash, bytes, stderr }`.
+ */
+export async function gitHash(args, cwd, env = process.env) {
+  let off;
+  try {
+    off = await gitHelpersOff(cwd, env);
+  } catch (error) {
+    return { ok: false, code: null, hash: null, bytes: 0, stderr: error.message };
+  }
+  const hash = createHash('sha256');
+  let bytes = 0;
+  const result = await spawnGit([...off, ...args], cwd, env, (chunk) => {
+    bytes += chunk.length;
+    hash.update(chunk);
   });
+  return { ok: result.code === 0, code: result.code, hash: result.code === null ? null : hash.digest('hex'), bytes, stderr: result.stderr };
+}
+
+/** Runs git, with every repository-selected helper off, and returns its output as text (small outputs only). */
+export async function gitText(args, cwd, env = process.env) {
+  let off;
+  try {
+    off = await gitHelpersOff(cwd, env);
+  } catch (error) {
+    return { ok: false, code: null, stdout: '', stderr: error.message };
+  }
+  const out = [];
+  const result = await spawnGit([...off, ...args], cwd, env, (chunk) => out.push(chunk));
+  return { ok: result.code === 0, code: result.code, stdout: result.code === null ? '' : Buffer.concat(out).toString('utf8'), stderr: result.stderr };
 }
 
 async function hashFile(filePath) {
@@ -211,8 +253,8 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       throw new Error(`Lane worktree ${repoId} at ${dir} isn't a readable git checkout (${head.stderr || 'git rev-parse HEAD failed'}).`);
     }
     const headSha = head.stdout.trim();
-    const staged = await gitHash(['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], dir, env);
-    const unstaged = await gitHash(['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color'], dir, env);
+    const staged = await gitHash(['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=dirty'], dir, env);
+    const unstaged = await gitHash(['diff', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=dirty'], dir, env);
     if (!staged.ok || !unstaged.ok) {
       throw new Error(`git diff failed in lane worktree ${repoId} at ${dir}: ${(staged.ok ? unstaged : staged).stderr}`);
     }

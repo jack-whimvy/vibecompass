@@ -22,10 +22,14 @@ import {
   readClaudeStream,
   readCodexEvents,
   readToolVersion,
+  relayCommand,
+  remarkCommand,
   reviewerPrompt,
   reviewerTurnEnv,
   validateBuilderMode,
 } from './relay-adapters.js';
+
+export { describeListedReviewers } from './relay-adapters.js';
 import {
   RELAY_TURN_DIR,
   compareMark,
@@ -78,6 +82,9 @@ const KILL_GRACE_MS = 5000;
 // After SIGKILL, how long a group may take to disappear before it counts as
 // uncertain and stays reserved.
 const GROUP_SETTLE_MS = 5000;
+// Once the group is gone, how long its output may take to reach the relay
+// before the relay closes a pipe something outside the group still holds.
+const DRAIN_MS = 2000;
 
 /** The commands a relayed builder turn may not run (D-419 item 8). */
 export const RELAY_TURN_REFUSED_COMMANDS = new Set([
@@ -169,7 +176,7 @@ function openFindingLines(parsed) {
  * then the prompt is sent and stdin closed. The turn runs until every process
  * in the group has exited. `onLine` may return a reason to end the group.
  */
-async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpawned, onLine = () => null, logPath, active, killGraceMs = KILL_GRACE_MS, settleMs = GROUP_SETTLE_MS }) {
+async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpawned, onLine = () => null, logPath, active, killGraceMs = KILL_GRACE_MS, settleMs = GROUP_SETTLE_MS, drainMs = DRAIN_MS }) {
   let child;
   try {
     child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -177,7 +184,20 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
     return { spawnError: error instanceof Error ? error.message : String(error) };
   }
   // Every listener is attached before the first await, so no event is missed.
-  const closed = once(child, 'close').catch(() => [null, null]);
+  // The turn follows the process's exit and its group, never the pipes: a
+  // helper that left the group can hold stdout open long after both.
+  let exitInfo = null;
+  const exited = once(child, 'exit').then(([code, signal]) => {
+    exitInfo = { code, signal };
+  }).catch(() => {
+    exitInfo = { code: null, signal: null };
+  });
+  let pipesClosed = false;
+  const closed = once(child, 'close').then(() => {
+    pipesClosed = true;
+  }).catch(() => {
+    pipesClosed = true;
+  });
   const spawned = Promise.race([
     once(child, 'spawn').then(() => null),
     once(child, 'error').then(([error]) => error),
@@ -249,35 +269,76 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
     child.stdin.end(input);
   }
 
-  const [code, signal] = await closed;
-  // A tool's own child can outlive it: the turn runs until its whole group is
-  // gone. A group being ended gets SIGKILL after the grace period; one still
-  // there after that is uncertain, and the caller keeps it reserved.
+  // A tool's own child can outlive it: the turn runs until its process has
+  // exited and its whole group is gone. A group being ended gets SIGKILL after
+  // the grace period; one still there after that is uncertain, and the caller
+  // keeps it reserved.
   let groupEnded = false;
   for (;;) {
-    const group = await inspectProcessGroup(table, { pgid, pid, startedAt });
-    if (group.state === 'ended') {
-      groupEnded = true;
-      break;
+    if (exitInfo) {
+      const group = await inspectProcessGroup(table, { pgid, pid, startedAt });
+      if (group.state === 'ended') {
+        groupEnded = true;
+        break;
+      }
     }
     if (terminatedAt !== null && Date.now() - terminatedAt > killGraceMs + settleMs) break;
-    await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS))]);
   }
   clearTimeout(timer);
   if (groupEnded && killTimer) {
     clearTimeout(killTimer);
     killTimer = null;
   }
+  // What the group wrote is read to the end, for a bounded time: a pipe still
+  // held by a process outside the group is closed on the relay's side.
+  if (!pipesClosed) {
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, drainMs))]);
+  }
+  if (!pipesClosed) {
+    reader.close();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
   active.group = null;
-  return { code, signal, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, groupEnded, pid, pgid, startedAt };
+  return { code: exitInfo?.code ?? null, signal: exitInfo?.signal ?? null, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, groupEnded, pipesHeld: !pipesClosed, pid, pgid, startedAt };
 }
 
 /**
  * A turn whose group couldn't be seen to end: the turn stays unfinished in
  * relay.json, so the lane and conversation stay reserved for recovery.
  */
-function groupStillRunning(role, passNumber, result) {
-  return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}) was still present after SIGKILL. The lane and conversation stay reserved; when those processes are gone, run \`vibecompass review-relay --recover\`.`, { reserved: true }); // D-419 item 10
+function groupStillRunning(ctx, role, passNumber, result, unrecorded = null) {
+  const recover = ctx.commands.recover;
+  if (unrecorded) {
+    return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}, process ${result.pid}) was still present after SIGKILL, and relay.json couldn't record it (${unrecorded}). The next run on this lane can't inspect that group: its recovery will finish the turn as never sent. Before running the relay on this lane again, check that no process in group ${result.pgid} is left (\`ps -A -o pid,pgid,command\`), then run \`${recover}\`.`, { reserved: true }); // D-419 item 10
+  }
+  return new RelayStop('interrupted', `the ${role} turn for pass ${passNumber} was ended, but its process group (${result.pgid}) was still present after SIGKILL. The lane and conversation stay reserved; when those processes are gone, run \`${recover}\`.`, { reserved: true }); // D-419 item 10
+}
+
+/**
+ * A turn whose process couldn't be recorded before its prompt: the prompt was
+ * never sent, and its identity is recorded now, so recovery and close can
+ * inspect a group that hasn't ended. Returns the save's error, if any.
+ */
+async function recordLateIdentity(ctx, result) {
+  const turn = ctx.getState().turn;
+  try {
+    await ctx.save({
+      turn: {
+        ...turn,
+        pid: result.pid,
+        pgid: result.pgid,
+        process_started_at: result.startedAt,
+        prompt_sent: false,
+        identity_recorded_late: true,
+        ended: result.groupEnded ? { at: new Date().toISOString(), how: 'prompt never sent' } : null,
+      },
+    });
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 async function remoteRefs(dirs) {
@@ -342,6 +403,13 @@ export async function runReviewRelay(options = {}, deps = {}) {
   const token = newId(16);
   const turnDir = path.join(laneDir, RELAY_TURN_DIR);
   const active = { group: null, interrupted: false };
+  // The commands a stop prints, as this run was started, so each runs as printed.
+  const commandSpec = { laneId, rootDir, reviewerTool, reviewerModel: options.reviewerModel ?? null, onePass: Boolean(options.onePass), builderMode: options.builderMode ?? null };
+  const commands = {
+    relay: (extra = []) => relayCommand(commandSpec, extra),
+    recover: relayCommand(commandSpec, ['--recover']),
+    remark: (paths = []) => remarkCommand({ laneId, rootDir, paths }),
+  };
 
   const laneLock = await acquireLaneLock({ laneDir, laneId, runId, token, table, rootDir });
   if (laneLock.tookOver) {
@@ -352,6 +420,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
   // What the current mark names, for a stop before this run's state is saved.
   let stopConversation = null;
   let stopMode = null;
+  const stopMark = { paths: [] };
   const onSigint = () => {
     active.interrupted = true;
     active.group?.terminate();
@@ -372,7 +441,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
     }
 
     // Recovery first: settle a recorded write, inspect an interrupted turn.
-    const recovered = await recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out });
+    const recovered = await recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands });
     state = recovered.state;
     if (recovered.reserved) {
       throw new RelayStop('interrupted', recovered.stopReason);
@@ -388,12 +457,13 @@ export async function runReviewRelay(options = {}, deps = {}) {
       throw new RelayStop('failure', error.message);
     });
     if (!mark) {
-      throw new RelayStop('no-mark', `lane ${laneId} has no ready-for-review mark. The builder runs \`vibecompass ready-for-review --session ${laneId}\` when the round is ready.`);
+      throw new RelayStop('no-mark', `lane ${laneId} has no ready-for-review mark. The builder runs \`${commands.remark()}\` when the round is ready.`);
     }
-    const conversationId = mark.builder?.tool === 'claude-code' ? mark.builder.conversation_id : null;
+    const conversationId = markConversation(mark);
     const mode = conversationId && !options.onePass ? 'loop' : 'one-pass';
     stopConversation = conversationId;
     stopMode = mode;
+    stopMark.paths = mark.paths ?? [];
 
     const reviewerVersion = await readToolVersion(reviewerTool, { env });
     if (reviewerVersion.missing) {
@@ -466,6 +536,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
       reviewerTool, reviewerVersion: reviewerVersion.version, builderVersion: builderVersion?.version ?? null,
       builderMode, reviewerTimeoutMs, builderTimeoutMs, conversationId, mode, go, supported, platform,
       killGraceMs: deps.killGraceMs ?? KILL_GRACE_MS, settleMs: deps.groupSettleMs ?? GROUP_SETTLE_MS,
+      commands, stopMark,
     };
     await mkdir(turnDir, { recursive: true });
     await relayLoop(runCtx);
@@ -478,7 +549,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
       throw error;
     }
     // Awaited here, so the stop is recorded while this run still holds its locks.
-    return await finishStop({ error, state, laneDir, laneId, runId, out, save, deps, conversationId: stopConversation ?? state?.builder?.conversation_id ?? null, mode: stopMode ?? state?.run?.go?.mode ?? null });
+    return await finishStop({ error, state, laneDir, laneId, runId, out, save, deps, commands, markPaths: stopMark.paths, conversationId: stopConversation ?? state?.builder?.conversation_id ?? null, mode: stopMode ?? state?.run?.go?.mode ?? null });
   } finally {
     signals.off?.('SIGINT', onSigint);
     signals.removeListener?.('SIGINT', onSigint);
@@ -493,7 +564,7 @@ export async function runReviewRelay(options = {}, deps = {}) {
  * gives them, the choices, and in the loop the command that reopens the
  * builder's conversation.
  */
-async function finishStop({ error, state, laneDir, laneId, runId, out, save, deps = {}, conversationId, mode }) {
+async function finishStop({ error, state, laneDir, laneId, runId, out, save, deps = {}, commands, markPaths = [], conversationId, mode }) {
   const kind = error.kind;
   let parsed = null;
   try {
@@ -515,12 +586,13 @@ async function finishStop({ error, state, laneDir, laneId, runId, out, save, dep
   out(`Stopped: ${error.reason}`);
   out('Open findings:');
   for (const line of openFindingLines(parsed)) out(line);
-  const choices = error.details.choices ?? defaultChoices(kind, laneId);
+  const reopens = mode === 'loop' && Boolean(conversationId);
+  const choices = error.details.choices ?? defaultChoices(kind, { laneId, reopens, commands, markPaths });
   if (choices.length > 0) {
     out('Choices:');
     for (const choice of choices) out(`- ${choice}`);
   }
-  if (mode === 'loop' && conversationId) {
+  if (reopens) {
     out(`Reopen the builder's conversation: claude --resume ${conversationId}`); // D-419 item 3
   }
   if (error.details.print) {
@@ -529,7 +601,7 @@ async function finishStop({ error, state, laneDir, laneId, runId, out, save, dep
   }
   if (unrecorded) {
     out('');
-    out(`Warning: this stop couldn't be recorded in ${path.join(laneDir, 'relay.json')} (${unrecorded}); run \`vibecompass review-relay --session ${laneId} --recover\` before the next run.`);
+    out(`Warning: this stop couldn't be recorded in ${path.join(laneDir, 'relay.json')} (${unrecorded}); run \`${commands.recover}\` before the next run.`);
   }
   return { exitCode: ORDINARY_STOPS.has(kind) && !unrecorded ? 0 : 1, kind, reason: error.reason };
 }
@@ -551,46 +623,58 @@ function summarizeStop(kind, reason) {
     'no-mark': 'no ready-for-review mark',
     refused: 'refused',
     'nothing-open': 'nothing waits for the reviewer',
+    conversation: 'the mark names another conversation',
   };
   return `${labels[kind] ?? kind}: ${String(reason).slice(0, 300)}`;
 }
 
-function defaultChoices(kind, laneId) {
+/**
+ * The choices a stop prints, rendered from how the run was started: each
+ * command runs as printed, and the builder's conversation is offered only
+ * when the stop prints the command that reopens it.
+ */
+function defaultChoices(kind, { laneId, reopens, commands, markPaths = [] }) {
+  const relay = (extra) => `\`${commands.relay(extra)}\``;
+  const answer = reopens
+    ? 'answer in the builder\'s conversation (reopen it below)'
+    : `answer in the builder's window (\`address review ${laneId}\`)`;
   switch (kind) {
     case 'clean':
       return ['close the lane in the builder\'s conversation; the relay never closes'];
     case 'one-pass':
-      return [`type \`address review ${laneId}\` in the builder's window; the builder marks ready again, and you run the relay again`];
+      return [`type \`address review ${laneId}\` in the builder's window; the builder marks ready again, and you run ${relay()} again`];
     case 'cap':
       return [
-        `run \`vibecompass review-relay --session ${laneId} --past-cap\` for one more pass (it runs past the cap)`,
+        `run ${relay(['--past-cap'])} for one more pass (it runs past the cap)`,
         'defer findings in the builder\'s conversation (an owner line)',
         'leave the lane open',
       ];
     case 'ceiling':
-      return [`run \`vibecompass review-relay --session ${laneId}\` again: a new run continues up to the current cap`];
+      return [`run ${relay()} again: a new run continues up to the current cap`];
     case 'builder-question':
-      return ['answer in the builder\'s conversation (reopen it below), then have it mark ready again and run the relay again'];
+      return [`${answer}, then have it mark ready again and run ${relay()} again`];
     case 'fingerprint':
-      return [`the builder runs \`vibecompass ready-for-review --session ${laneId}\` again once the round is ready, then run the relay again`];
+      return [`the builder runs \`${commands.remark(markPaths)}\` again once the round is ready, then run ${relay()} again`];
     case 'unsupported':
       return ['the other reviewer adapter, or hand-run review'];
     case 'interrupted':
-      return [`let the turn finish or stop its processes, then run \`vibecompass review-relay --session ${laneId} --recover\``];
+      return [`let the turn finish or stop its processes, then run \`${commands.recover}\``];
     case 'timeout':
-      return [
-        `run \`vibecompass review-relay --session ${laneId}\` again to repeat the turn, with a longer --reviewer-timeout or --builder-timeout if it needs one`,
-        'look at what the builder did in its conversation (reopen it below), and answer there yourself',
-        'review by hand',
-      ];
+      return reopens
+        ? [
+          `run ${relay()} again to repeat the turn, with a longer --reviewer-timeout or --builder-timeout if it needs one`,
+          'look at what the builder did in its conversation (reopen it below), and answer there yourself',
+          'review by hand',
+        ]
+        : [`run ${relay()} again to repeat the turn, with a longer --reviewer-timeout if it needs one`, 'review by hand'];
     case 'owner-pause':
-      return [`run \`vibecompass review-relay --session ${laneId}\` again to continue`, 'answer in the builder\'s conversation yourself (reopen it below)'];
+      return [`run ${relay()} again to continue`, reopens ? 'answer in the builder\'s conversation yourself (reopen it below)' : 'review by hand'];
     case 'failure':
-      return [`fix what the reason names, then run \`vibecompass review-relay --session ${laneId}\` again`, 'review by hand'];
+      return [`fix what the reason names, then run ${relay()} again`, 'review by hand'];
     case 'refusal':
-      return ['answer in the builder\'s conversation (reopen it below), then have it mark ready again and run the relay again', 'review by hand'];
+      return [`${answer}, then have it mark ready again and run ${relay()} again`, 'review by hand'];
     case 'no-mark':
-      return [`the builder runs \`vibecompass ready-for-review --session ${laneId}\` when the round is ready, then run the relay again`];
+      return [`the builder runs \`${commands.remark(markPaths)}\` when the round is ready, then run ${relay()}`];
     case 'nothing-open':
       return ['close the lane in the builder\'s conversation, or continue by hand'];
     case 'refused':
@@ -600,16 +684,27 @@ function defaultChoices(kind, laneId) {
   }
 }
 
+/** The Claude Code conversation a mark names, or null for a mark from elsewhere. */
+function markConversation(mark) {
+  return mark?.builder?.tool === 'claude-code' ? mark.builder.conversation_id ?? null : null;
+}
+
 /**
  * Recovery (D-419 items 6 and 10): settle a recorded write without an end
  * state, and inspect a turn that was running when a relay died. It sends no
  * signal to a group recovered from disk.
  */
-async function recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out }) {
+async function recoverLane({ state, save, table, rootDir, laneDir, laneId, worktrees, projectRepos, env, out, commands }) {
   const notes = [];
   let stopReason = null;
   let reserved = false;
   let current = state;
+  // Reporting a turn and closing its run are one save, so a turn is reported once.
+  const reportTurn = async (turn, text) => {
+    const at = new Date().toISOString();
+    const run = current.run && !current.run.stopped ? { ...current.run, stopped: { at, kind: 'interrupted' } } : current.run;
+    current = await saveRelayState(laneDir, { ...current, turn: { ...turn, reported_at: at }, ...(run !== current.run ? { step: 'stopped', run, last_stop: { at, kind: 'interrupted', reason: text.slice(0, 300) } } : {}) });
+  };
   if (turnUnfinished(current)) {
     const turn = current.turn;
     if (!turn.pgid) {
@@ -621,31 +716,34 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
       const group = await inspectProcessGroup(table, { pgid: turn.pgid, pid: turn.pid, startedAt: turn.process_started_at });
       if (group.state === 'ended') {
         const partial = Boolean(turn.prompt_sent);
-        current = await saveRelayState(laneDir, { ...current, turn: { ...turn, ended: { at: new Date().toISOString(), how: 'observed ended' }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null } });
+        const ended = { ...turn, ended: { at: new Date().toISOString(), how: 'observed ended' }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null };
         if (partial) {
           const text = `The ${turn.role} turn for pass ${turn.pass} was running when a relay stopped, and its process group has ended (${group.reason}): it may have run partly. Running the relay again repeats it, on your go; or answer in the conversation yourself.`;
+          await reportTurn(ended, text);
           notes.push(text);
           stopReason = text;
         } else {
+          current = await saveRelayState(laneDir, { ...current, turn: ended });
           notes.push(`The ${turn.role} turn for pass ${turn.pass} ended before its prompt was sent: no model turn ran.`);
         }
       } else {
         const listed = group.processes.map((row) => `${row.pid} ${row.command}`.trim()).join('; ');
         reserved = true;
-        stopReason = `the ${turn.role} turn for pass ${turn.pass} from a stopped relay is ${group.state === 'active' ? 'still running' : 'uncertain'} (${group.reason}${listed ? `: ${listed}` : ''}). The lane and conversation stay reserved; the relay sends no signal. Let it finish, or stop those processes yourself, then run --recover again.`; // D-419 item 10
+        stopReason = `the ${turn.role} turn for pass ${turn.pass} from a stopped relay is ${group.state === 'active' ? 'still running' : 'uncertain'} (${group.reason}${listed ? `: ${listed}` : ''}). The lane and conversation stay reserved; the relay sends no signal. Let it finish, or stop those processes yourself, then run \`${commands.recover}\` again.`; // D-419 item 10
         notes.push(stopReason);
       }
     }
   }
-  // A reviewer turn that finished in a run that recorded no stop, with no pass
-  // recorded from it: the relay died between the turn and its write. It is
+  // A reviewer turn that ran its prompt and finished in a run that recorded no
+  // stop, with no write from that same turn: the relay died between the turn
+  // and its write. A write is bound to its turn by the turn's id, never by the
+  // pass number, since a discarded write leaves the number unused. It is
   // reported, and the run is closed, so repeating it takes the owner's next go.
   const lastTurn = current.turn;
-  const writeForTurn = (pass) => (current.writes ?? []).some((item) => item.pass === pass) || current.write?.pass === pass;
-  if (!stopReason && lastTurn?.role === 'reviewer' && lastTurn.ended && !lastTurn.unrecorded_reported_at && current.run && !current.run.stopped && !writeForTurn(lastTurn.pass)) {
-    const at = new Date().toISOString();
+  const writeFromTurn = (turn) => Boolean(turn.id) && ((current.writes ?? []).some((item) => item.turn_id === turn.id) || current.write?.turn_id === turn.id);
+  if (!stopReason && lastTurn?.role === 'reviewer' && lastTurn.ended && lastTurn.prompt_sent && !lastTurn.reported_at && current.run && !current.run.stopped && !writeFromTurn(lastTurn)) {
     const text = `the reviewer's turn for pass ${lastTurn.pass} finished (${lastTurn.ended.how}) in a relay that stopped before recording a pass from it, so no pass was written. Running the relay again repeats the pass, on your go.`;
-    current = await saveRelayState(laneDir, { ...current, turn: { ...lastTurn, unrecorded_reported_at: at }, step: 'stopped', run: { ...current.run, stopped: { at, kind: 'interrupted' } }, last_stop: { at, kind: 'interrupted', reason: text.slice(0, 300) } });
+    await reportTurn(lastTurn, text);
     notes.push(text);
     stopReason = text;
   }
@@ -661,7 +759,7 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
         current = await saveRelayState(laneDir, { ...current, write });
       },
     });
-    current = await saveRelayState(laneDir, { ...current, write: result.write, writes: [...(current.writes ?? []), { id: result.write.id, pass: result.write.pass, state: result.write.state, at: new Date().toISOString() }] });
+    current = await saveRelayState(laneDir, { ...current, write: result.write, writes: [...(current.writes ?? []), { id: result.write.id, pass: result.write.pass, turn_id: result.write.turn_id ?? null, state: result.write.state, at: new Date().toISOString() }] });
     notes.push(describeWriteEnd(result.write));
     if (result.write.state === 'superseded' || result.write.state === 'discarded') {
       // As on the live path: this run stops, and any next turn is the owner's next run.
@@ -694,6 +792,18 @@ async function relayLoop(ctx) {
     }
     const mark = await readReadyMark(laneDir).catch(() => null);
     if (!mark) throw new RelayStop('no-mark', 'the ready-for-review mark is gone.');
+    ctx.stopMark.paths = mark.paths ?? [];
+    // The loop resumes the conversation the run started with; a newer mark
+    // made in another conversation, or from a plain shell, stops it before any
+    // turn, so a finding never goes to a conversation the mark doesn't name.
+    if (mode === 'loop' && markConversation(mark) !== ctx.conversationId) {
+      const named = markConversation(mark);
+      throw new RelayStop('conversation', `the ready-for-review mark (round ${shortRound(mark.round_id)}) now ${named ? `names Claude Code conversation ${named}` : 'names no Claude Code conversation (it was made from a shell)'}, not ${ctx.conversationId}, which this run resumes. Nothing was sent to either.`, {
+        choices: named
+          ? [`run \`${ctx.commands.relay()}\` again to continue with conversation ${named}: the relay asks you to confirm it is closed`, `run \`${ctx.commands.relay(['--one-pass'])}\` for one pass, and answer in the builder's window`]
+          : [`run \`${ctx.commands.relay()}\` again for one pass, and answer in the builder's window`, `have the builder mark ready again from its Claude Code conversation, then run \`${ctx.commands.relay()}\` again for the loop`],
+      });
+    }
     const recorded = passOnRound(parsed, mark.round_id);
 
     if (recorded) {
@@ -707,6 +817,17 @@ async function relayLoop(ctx) {
       }
       if (waiting.length === 0) {
         throw new RelayStop('nothing-open', `pass ${recorded.number}'s findings wait for nobody's answer.`);
+      }
+      // The owner's Enter comes right before each builder turn, after a fresh
+      // pass and after a restart or recovery alike.
+      if (ctx.options.confirmEachRound) {
+        if (typeof ctx.deps.confirm !== 'function') {
+          throw new RelayStop('owner-pause', '--confirm-each-round needs a terminal for the owner\'s Enter.');
+        }
+        const answer = String(await ctx.deps.confirm(`Pass ${recorded.number} is recorded. Press Enter to send the builder its turn, or type anything else to stop here.`));
+        if (answer.trim() !== '') {
+          throw new RelayStop('owner-pause', `the owner stopped after pass ${recorded.number}, before the builder's turn.`);
+        }
       }
       await builderTurn(ctx, recorded.number, mark);
       continue;
@@ -741,15 +862,6 @@ async function relayLoop(ctx) {
     }
     if (mode !== 'loop') {
       throw new RelayStop('one-pass', `pass ${passNumber} is recorded.`);
-    }
-    if (ctx.options.confirmEachRound) {
-      if (typeof ctx.deps.confirm !== 'function') {
-        throw new RelayStop('owner-pause', '--confirm-each-round needs a terminal for the owner\'s Enter.');
-      }
-      const answer = String(await ctx.deps.confirm('Press Enter to send the builder its turn, or type anything else to stop here.'));
-      if (answer.trim() !== '') {
-        throw new RelayStop('owner-pause', `the owner stopped after pass ${passNumber}.`);
-      }
     }
   }
 }
@@ -792,7 +904,7 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
   }
   const prompt = reviewerPrompt({ laneId, passNumber, rootDir, roundId: mark.round_id });
   out(`Pass ${passNumber}: ${TOOL_NAMES[ctx.reviewerTool]} ${version.version} reviewing round ${shortRound(mark.round_id)}${threadId ? ` (resuming ${threadId})` : ''}…`);
-  await save({ step: 'reviewer-turn', round: { id: mark.round_id, fingerprints: mark.fingerprints }, turn: { role: 'reviewer', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null }, answer: null });
+  await save({ step: 'reviewer-turn', round: { id: mark.round_id, fingerprints: mark.fingerprints }, turn: { id: newId(), role: 'reviewer', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null }, answer: null });
   // A Claude Code reviewer's stream is checked as it arrives: a hook event, an
   // event before init, or an init outside what the reviewer may load ends the
   // group at once (D-419 item 5, D-421).
@@ -838,7 +950,8 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
     throw new RelayStop('failure', `the reviewer couldn't start: ${result.spawnError}.`);
   }
-  if (!result.groupEnded) throw groupStillRunning('reviewer', passNumber, result);
+  const lateError = result.recordError ? await recordLateIdentity(ctx, result) : null;
+  if (!result.groupEnded) throw groupStillRunning(ctx, 'reviewer', passNumber, result, lateError);
   if (result.recordError) {
     throw new RelayStop('failure', `the reviewer's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
   }
@@ -916,6 +1029,9 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
     throw error;
   }
   write.paths = mark.paths ?? [];
+  // The write names the turn it came from, so recovery never takes another
+  // turn's write for this one.
+  write.turn_id = ctx.getState().turn?.id ?? null;
   await save({ step: 'write', write });
   const settled = await settleRelayWrite({
     rootDir,
@@ -926,7 +1042,7 @@ async function reviewerTurn(ctx, { passNumber, mark, comparison, parsed, pastCap
       await save({ write: step });
     },
   });
-  await save({ write: settled.write, writes: [...(ctx.getState().writes ?? []), { id: settled.write.id, pass: passNumber, state: settled.write.state, at: new Date().toISOString() }], step: 'running' });
+  await save({ write: settled.write, writes: [...(ctx.getState().writes ?? []), { id: settled.write.id, pass: passNumber, turn_id: write.turn_id, state: settled.write.state, at: new Date().toISOString() }], step: 'running' });
   if (settled.write.state === 'discarded') {
     throw new RelayStop('fingerprint', `${describeWriteEnd(settled.write)}`, { print: `The answer:\n${JSON.stringify(checked.answer, null, 2)}` });
   }
@@ -978,7 +1094,7 @@ async function builderTurn(ctx, passNumber, markBefore) {
   const launch = claudeBuilderLaunch({ conversationId: ctx.conversationId, mode: ctx.builderMode });
   const logPath = path.join(turnDir, `pass-${passNumber}-${ctx.runId}-builder.jsonl`);
   out(`Builder turn for pass ${passNumber}: resuming conversation ${ctx.conversationId} in ${ctx.builderMode} mode…`);
-  await save({ step: 'builder-turn', turn: { role: 'builder', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
+  await save({ step: 'builder-turn', turn: { id: newId(), role: 'builder', pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
 
   // The stream is read in order: hook events may come before init; anything
   // else, or an init naming another mode or conversation, ends the turn.
@@ -1024,7 +1140,8 @@ async function builderTurn(ctx, passNumber, markBefore) {
     await save({ turn: { ...ctx.getState().turn, ended: { at: new Date().toISOString(), how: 'never started' } } });
     throw new RelayStop('failure', `the builder couldn't start: ${result.spawnError}.`);
   }
-  if (!result.groupEnded) throw groupStillRunning('builder', passNumber, result);
+  const lateError = result.recordError ? await recordLateIdentity(ctx, result) : null;
+  if (!result.groupEnded) throw groupStillRunning(ctx, 'builder', passNumber, result, lateError);
   if (result.recordError) {
     throw new RelayStop('failure', `the builder's process couldn't be recorded (${result.recordError}), so its stdin was closed empty and its process group ended: no model turn ran.`);
   }
@@ -1069,6 +1186,12 @@ async function builderTurn(ctx, passNumber, markBefore) {
   const logAfter = extractReviewLogLines(wipAfter).lines.map((line) => line.text);
   if (logBefore.some((line, index) => logAfter[index] !== line)) {
     throw new RelayStop('refusal', 'the builder changed earlier lines of ## Review log during its turn; a relayed turn may only append its response.'); // D-419 item 8
+  }
+  // What it appends starts with its response line: an indented line before
+  // it would join the reviewer's pass above, as a finding or as evidence.
+  const firstAppended = logAfter.slice(logBefore.length).find((line) => line.trim() !== '');
+  if (firstAppended !== undefined && !new RegExp(`^- response ${passNumber} \\|`).test(firstAppended)) {
+    throw new RelayStop('refusal', `the builder appended to ## Review log before its response line (\`${firstAppended.trim().slice(0, 120)}\`); a relayed turn's lines start with \`- response ${passNumber} |\`, and every line it adds is part of that response.`); // D-419 item 8
   }
   const added = parsedAfter.records.slice(parsedBefore.records.length);
   if (added.length > 1 || added.some((record) => !(record.kind === 'response' && record.number === passNumber))) {

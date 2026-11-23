@@ -239,9 +239,22 @@ async function acquireDiskLock(key, label, options) {
 
     if (await isAbandonedLock(lockDir, staleMs)) {
       if (options.beforeReclaim) await options.beforeReclaim();
-      if ((await reclaimAbandonedLock(lockDir, staleMs)) === 'busy') {
-        await delay(RETRY_BASE_DELAY_MS);
+      if ((await reclaimAbandonedLock(lockDir, staleMs)) !== 'busy') {
+        continue;
       }
+      // Another live process is reclaiming: wait for it as for a live holder,
+      // within the same attempts, and never disturb it or its mutex.
+      if (attempt >= attempts) {
+        const mutex = `${lockDir}.reclaim`;
+        const reclaimer = await readLockOwner(mutex);
+        throw new MemoryRootLockError(
+          `Timed out waiting for the project-memory lock at ${lockDir}: its owner is gone, and ` +
+            `${reclaimer && Number.isInteger(reclaimer.pid) ? `live pid ${reclaimer.pid}` : 'another process'} has held the reclaim mutex ${mutex} since ${reclaimer?.at ?? 'unknown'}. ` +
+            'A live reclaimer is never interrupted. ' +
+            `If no other vibecompass command is running against this root, remove ${mutex} and retry.`,
+        );
+      }
+      await delay(RETRY_BASE_DELAY_MS + Math.floor(Math.random() * RETRY_MAX_DELAY_MS));
       continue;
     }
 

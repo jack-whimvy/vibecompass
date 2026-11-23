@@ -22,7 +22,7 @@ import {
   toPublicSecretCheckResult,
 } from './secret-check.js';
 import { shortRound, writeReadyMark } from './relay-mark.js';
-import { defaultConfirm, refuseInsideRelayTurn, runReviewRelay } from './review-relay.js';
+import { defaultConfirm, describeListedReviewers, refuseInsideRelayTurn, runReviewRelay } from './review-relay.js';
 import { checkProjectSessionReview, closeProjectSession, continueProjectSession, listProjectSessions, readLaneEnvironment, rebuildActiveSessionIndex, renderLaneInventoryLines, resolveActiveLaneContext, startProjectSession, switchProjectSession, writeLaneMarkerForSession } from './session.js';
 import { appendDecisionEntry, formatDecisionId, readNextDecisionId } from './decisions.js';
 import { countPassesPastCap } from './review-log.js';
@@ -3815,7 +3815,7 @@ function usageText() {
     '  vibecompass lane-env [--session <lane-id>] [--json] [--no-conventional] [options]',
     '  vibecompass review-check [--session <lane-id>] [--json] [options]',
     '                                        Read-only: parse and check the lane\'s review log as close-session would; exits 1 when the check fails', // D-394
-    '  vibecompass review-relay --session <lane-id> [--recover] [--past-cap] [--one-pass] [--conversation-closed] [--confirm-each-round] [options]',
+    '  vibecompass review-relay --session <lane-id> --reviewer-model <model> [--recover] [--past-cap] [--one-pass] [--conversation-closed] [--confirm-each-round] [options]',
     '                                        Owner: relay review rounds for one lane, a read-only reviewer\'s pass and the builder\'s answer; macOS only', // D-419
     '  vibecompass ready-for-review [--session <lane-id>] [--path <repo-id>:<path>|<root-path>...] [--json] [options]',
     '                                        Builder: mark the round ready for review (fingerprints the handoff, the record, and the work)', // D-419
@@ -4031,7 +4031,8 @@ function usageText() {
     '  --session <lane-id>                  Required every time, even with one active lane: the builder lane to relay',
     '  --root <path>                        Project-memory root. Explicit --root wins; otherwise the nearest worktree lane marker supplies it, else .compass',
     '  --reviewer <codex|claude>            The reviewer tool (default codex); it runs read-only, only on a version listed as supported, and writes no file',
-    '  --reviewer-model <model>             The reviewer\'s model; required for Codex',
+    `                                        Listed on macOS: ${describeListedReviewers('darwin')}`,
+    '  --reviewer-model <model>             The reviewer\'s model; required for Codex, which the relay starts without your Codex settings\' model',
     '  --fresh-reviewer                     Start a new reviewer thread instead of resuming the lane\'s',
     '  --one-pass                           Run one pass and stop, even when the mark names a Claude Code conversation (keep its window open)',
     '  --conversation-closed                Confirm, for the loop, that the builder\'s conversation is closed and was started in this folder',

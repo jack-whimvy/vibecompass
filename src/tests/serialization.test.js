@@ -564,6 +564,28 @@ test('a reclaim mutex left by a dead process is kept, and the error names it', a
   }
 });
 
+test('a live reclaimer that stalls beside an abandoned lock times waiters out by name, and is left alone', { timeout: 20_000 }, async () => {
+  const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-busy-mutex-');
+  try {
+    const lockDir = memoryRootLockPath(rootDir);
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, 'owner.json'), `${JSON.stringify({ pid: 999999999, token: 'dead' })}\n`, 'utf8');
+    // This test's own process stands for the live, stalled reclaimer.
+    await mkdir(`${lockDir}.reclaim`);
+    await writeFile(path.join(`${lockDir}.reclaim`, 'owner.json'), `${JSON.stringify({ pid: process.pid, at: '2026-11-22T00:00:00.000Z' })}\n`, 'utf8');
+    const started = Date.now();
+    await assert.rejects(
+      withMemoryRootLock(rootDir, 'test', async () => {}, { attempts: 5 }),
+      new RegExp(`Timed out waiting for the project-memory lock at .*: its owner is gone, and live pid ${process.pid} has held the reclaim mutex .*\\.reclaim since 2026-11-22T00:00:00\\.000Z`),
+    );
+    assert.ok(Date.now() - started < 5000, 'bounded by the attempts');
+    assert.equal(JSON.parse(await readFile(path.join(`${lockDir}.reclaim`, 'owner.json'), 'utf8')).pid, process.pid, 'the live reclaimer\'s mutex is kept');
+    assert.equal(JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8')).token, 'dead', 'the abandoned lock is untouched');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('cross-process waiters reclaim an abandoned lock without double-holding', async () => {
   const { tempDir, rootDir } = await createInitializedRoot('vibecompass-lock-xproc-');
 

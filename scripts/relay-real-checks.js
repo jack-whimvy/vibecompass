@@ -28,7 +28,9 @@ import {
 import { REVIEWER_ANSWER_SCHEMA } from '../src/relay-record.js';
 import {
   classifyAppsCheck,
+  classifyCodexSandbox,
   classifyFixtureCheck,
+  combineChecks,
   classifyWriteCheck,
   qualificationVerdict,
   readClaudeWriteEvidence,
@@ -206,7 +208,7 @@ async function checkCodex(options) {
     save(base, `${name}.stderr.txt`, result.stderr);
     const seenTokens = allTokens.filter((value) => result.rows.some((row) => row.command.includes(value)));
     const markersWritten = readdirSync(markers);
-    report.runs[name] = { args: [...prefix, ...args], exit: result.code, started_at: result.startedAt, seenTokens, markersWritten, fixtures_seen: describeRows(result.rows, allTokens), earlier_fixtures_ignored: describeRows(result.ignored, allTokens), fixtures_left_before: describeRows(result.leftBefore, allTokens), watch: { covered: result.covered, polls: result.coverage.polls, failed_reads: result.coverage.failures.length, waited_before: result.waitedBefore }, apps_cache_written: appsCacheWritten };
+    report.runs[name] = { args: [...prefix, ...args], exit: result.code, signal: result.signal, timed_out: result.timedOut, started_at: result.startedAt, seenTokens, markersWritten, fixtures_seen: describeRows(result.rows, allTokens), earlier_fixtures_ignored: describeRows(result.ignored, allTokens), fixtures_left_before: describeRows(result.leftBefore, allTokens), watch: { covered: result.covered, group_ended: result.group.ended, group: result.group.reason, polls: result.coverage.polls, failed_reads: result.coverage.failures.length, waited_before: result.waitedBefore }, apps_cache_written: appsCacheWritten };
     return { ...result, seenTokens, markersWritten, appsCacheWritten };
   };
 
@@ -246,8 +248,10 @@ async function checkCodex(options) {
     if (!restricted) continue;
     const rollout = id ? rolloutFor(home, id) : null;
     const evidence = rollout ? readCodexRollout(readFileSync(rollout, 'utf8'), file, { turn }) : { attempted: false, refused: null, sandboxPolicies: [] };
-    const check = classifyWriteCheck({ fileCreated: existsSync(path.join(project, file)), attempted: evidence.attempted, refusalEvidence: evidence.refused ? `the thread record shows the command and "${evidence.refused}"` : null });
-    checks.push({ check: `write and wider sandbox (${mode})`, ...check, sandbox_policies: evidence.sandboxPolicies });
+    const write = classifyWriteCheck({ fileCreated: existsSync(path.join(project, file)), attempted: evidence.attempted, refusalEvidence: evidence.refused ? `the thread record shows the command and "${evidence.refused}"` : null });
+    // The turn's own recorded sandbox decides the wider-sandbox half.
+    const sandbox = classifyCodexSandbox(evidence.sandboxPolicies);
+    checks.push({ check: `write and wider sandbox (${mode})`, ...combineChecks([write, sandbox]), write, sandbox, sandbox_policies: evidence.sandboxPolicies });
   }
   // The account's apps and remote plugins (connected tools that come with the
   // sign-in, not a config file): the control's thread lists their tools, its
@@ -267,7 +271,7 @@ async function checkCodex(options) {
   }
   report.thread_id_present = Boolean(threadId);
   report.checks = checks;
-  report.empty_stdin = { exit: emptyRun.code, new_rollouts: report.runs['empty-stdin'].new_rollouts, model_turn: report.runs['empty-stdin'].new_rollouts > 0 || report.runs['empty-stdin'].events.completed };
+  report.empty_stdin = { exit: emptyRun.code, signal: emptyRun.signal, timed_out: emptyRun.timedOut, new_rollouts: report.runs['empty-stdin'].new_rollouts, model_turn: report.runs['empty-stdin'].new_rollouts > 0 || report.runs['empty-stdin'].events.completed };
   const codexExpected = ['user MCP server', 'user hook', 'user notify program', 'project MCP server', 'project hook', 'write and wider sandbox', 'account apps and plugins'].flatMap((kind) => ['fresh', 'resumed'].map((mode) => `${kind} (${mode})`));
   const codexQualification = qualificationVerdict({ checks, expected: codexExpected, launches: [{ name: 'fresh', exit: fresh.code }, { name: 'resumed', exit: resumed ? resumed.code : 'not run' }], emptyStdin: report.empty_stdin });
   report.verdict = codexQualification.verdict;
@@ -320,13 +324,15 @@ async function checkClaudeReviewer(options) {
     const stream = readClaudeStream(result.stdout);
     report.runs[name] = {
       exit: result.code,
+      signal: result.signal,
+      timed_out: result.timedOut,
       started_at: result.startedAt,
       seenTokens,
       markersWritten,
       fixtures_seen: describeRows(result.rows, allTokens),
       earlier_fixtures_ignored: describeRows(result.ignored, allTokens),
       fixtures_left_before: describeRows(result.leftBefore, allTokens),
-      watch: { covered: result.covered, polls: result.coverage.polls, failed_reads: result.coverage.failures.length, waited_before: result.waitedBefore },
+      watch: { covered: result.covered, group_ended: result.group.ended, group: result.group.reason, polls: result.coverage.polls, failed_reads: result.coverage.failures.length, waited_before: result.waitedBefore },
       hook_events: stream.hookEvents.map((event) => `${event.subtype}${event.hook_name ? ` ${event.hook_name}` : ''}`),
       init: stream.init ? { permissionMode: stream.init.permissionMode, model: stream.init.model, tools: stream.init.tools, mcp_servers: (stream.init.mcp_servers ?? []).map((server) => server?.name ?? server), plugins: (stream.init.plugins ?? []).map((plugin) => plugin?.name ?? plugin), session_present: Boolean(stream.init.session_id) } : null,
       result: stream.result ? { subtype: stream.result.subtype, is_error: stream.result.is_error, permission_denials: (stream.result.permission_denials ?? []).map((item) => item.tool_name), structured: Boolean(stream.result.structured_output) } : null,
@@ -378,7 +384,7 @@ async function checkClaudeReviewer(options) {
     report.runs[`restricted-${mode}`].relay_turn_check = checkClaudeReviewerStream(restricted.stream) ?? 'accepted';
   }
   report.checks = checks;
-  report.empty_stdin = { exit: empty.code, model_turn: Boolean(empty.stream.result && !empty.stream.result.is_error) };
+  report.empty_stdin = { exit: empty.code, signal: empty.signal ?? null, timed_out: Boolean(empty.timedOut), model_turn: Boolean(empty.stream.result && !empty.stream.result.is_error) };
   const claudeExpected = ['user MCP server', 'user hook', 'project MCP server', 'project hook', 'Write and Edit tools', 'shell write: touch', 'shell write: git diff --output', 'shell write: a redirect'].flatMap((kind) => ['fresh', 'resumed'].map((mode) => `${kind} (${mode})`));
   const claudeQualification = qualificationVerdict({
     checks,
@@ -499,7 +505,7 @@ async function checkClaudeBuilder(options) {
   await run('builder-other-folder', claudeBuilderLaunch({ conversationId: conversation, mode: 'default' }).args, 'Reply with the single word ready, and nothing else.', other, turnEnv);
   report.conversation_note = 'a conversation the check started with claude -p --session-id; its id is in the run streams';
   report.deny_list = BUILDER_DENY_LIST;
-  report.empty_stdin = { exit: empty.code, model_turn: Boolean(empty.stream.result && !empty.stream.result.is_error) };
+  report.empty_stdin = { exit: empty.code, signal: empty.signal ?? null, timed_out: Boolean(empty.timedOut), model_turn: Boolean(empty.stream.result && !empty.stream.result.is_error) };
   save(base, 'report.json', report);
   printReport(report, base);
 }
@@ -561,10 +567,10 @@ function printReport(report, base) {
   if (report.verdict) process.stdout.write(`Verdict: ${report.verdict}${report.verdict_reasons?.length ? ` (${report.verdict_reasons.join('; ')})` : ''}\n`);
   for (const check of report.checks ?? []) process.stdout.write(`- ${check.check}: ${check.verdict} — ${check.reason}\n`);
   for (const [name, run] of Object.entries(report.runs)) {
-    process.stdout.write(`Run ${name}: exit ${run.exit}${run.seenTokens ? `; fixtures seen: ${run.seenTokens.length}` : ''}${run.earlier_fixtures_ignored?.length ? `; earlier runs' fixtures ignored: ${run.earlier_fixtures_ignored.length}` : ''}${run.markersWritten ? `; markers: ${run.markersWritten.join(', ') || 'none'}` : ''}${run.watch ? `; process table watched throughout: ${run.watch.covered ? 'yes' : `no (${run.watch.failed_reads} failed reads, ${run.watch.polls} reads)`}` : ''}${'apps_cache_written' in run ? `; apps cache written: ${run.apps_cache_written ? 'yes' : 'no'}` : ''}${run.first_non_hook_event ? `; first non-hook event: ${run.first_non_hook_event}` : ''}${run.init?.cwd ? `; init cwd: ${run.init.cwd}` : ''}${run.init && 'same_session' in run.init ? `; same conversation: ${run.init.same_session ? 'yes' : 'no'}` : ''}${run.permission_denials?.length ? `; denials: ${run.permission_denials.map((item) => item.command ?? item.tool).join(' | ')}` : ''}${run.relay_turn_check ? `; the relay's turn check: ${run.relay_turn_check}` : ''}${run.transcript_lines ? `; transcript lines ${run.transcript_lines.before} -> ${run.transcript_lines.after}${run.transcript_lines.added ? ` (added: ${run.transcript_lines.added.join(', ') || 'nothing'}; messages added: ${run.transcript_lines.messages_added})` : ''}` : ''}${'remote_refs' in run ? `; remote refs: ${run.remote_refs || 'none'}` : ''}\n`);
+    process.stdout.write(`Run ${name}: exit ${run.exit}${run.seenTokens ? `; fixtures seen: ${run.seenTokens.length}` : ''}${run.earlier_fixtures_ignored?.length ? `; earlier runs' fixtures ignored: ${run.earlier_fixtures_ignored.length}` : ''}${run.markersWritten ? `; markers: ${run.markersWritten.join(', ') || 'none'}` : ''}${run.watch ? `; process table watched throughout: ${run.watch.covered ? 'yes' : `no (${run.watch.failed_reads} failed reads, ${run.watch.polls} reads${run.watch.group_ended === false ? `; the group wasn't seen to end: ${run.watch.group}` : ''})`}` : ''}${'apps_cache_written' in run ? `; apps cache written: ${run.apps_cache_written ? 'yes' : 'no'}` : ''}${run.first_non_hook_event ? `; first non-hook event: ${run.first_non_hook_event}` : ''}${run.init?.cwd ? `; init cwd: ${run.init.cwd}` : ''}${run.init && 'same_session' in run.init ? `; same conversation: ${run.init.same_session ? 'yes' : 'no'}` : ''}${run.permission_denials?.length ? `; denials: ${run.permission_denials.map((item) => item.command ?? item.tool).join(' | ')}` : ''}${run.relay_turn_check ? `; the relay's turn check: ${run.relay_turn_check}` : ''}${run.transcript_lines ? `; transcript lines ${run.transcript_lines.before} -> ${run.transcript_lines.after}${run.transcript_lines.added ? ` (added: ${run.transcript_lines.added.join(', ') || 'nothing'}; messages added: ${run.transcript_lines.messages_added})` : ''}` : ''}${'remote_refs' in run ? `; remote refs: ${run.remote_refs || 'none'}` : ''}\n`);
   }
   for (const item of report.push_rewrite ?? []) process.stdout.write(`Push rewrite, no model: ${item.command} -> exit ${item.exit}: ${item.stderr_first_line}; remote refs: ${item.remote_refs || 'none'}\n`);
-  if (report.empty_stdin) process.stdout.write(`Empty stdin: exit ${report.empty_stdin.exit}; model turn: ${report.empty_stdin.model_turn ? 'yes' : 'no'}\n`);
+  if (report.empty_stdin) process.stdout.write(`Empty stdin: exit ${report.empty_stdin.exit}${report.empty_stdin.signal ? `; signal ${report.empty_stdin.signal}` : ''}${report.empty_stdin.timed_out ? '; timed out and killed' : ''}; model turn: ${report.empty_stdin.model_turn ? 'yes' : 'no'}\n`);
 }
 
 const { command, options } = parseArgs(process.argv.slice(2));

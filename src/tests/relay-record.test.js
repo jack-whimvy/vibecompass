@@ -236,7 +236,7 @@ for (const newer of ['a hand-run pass', 'a new builder handoff']) {
       },
     }).catch(() => {});
     // The wip.md half is in; close refuses while the write has no end state.
-    await assert.rejects(closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane.laneId, ...CLOSE }), /relay write [0-9a-f]{12} on lane .* has no end state\. Run `vibecompass review-relay --session .* --recover`/);
+    await assert.rejects(closeProjectSession({ cwd: ws.tempDir, rootDir: ws.rootDir, sessionId: lane.laneId, ...CLOSE }), /relay write [0-9a-f]{12} on lane .* has no end state\. Run `vibecompass review-relay --root \S+ --session .* --recover`/);
 
     if (newer === 'a hand-run pass') {
       const wip = await readFile(lane.wipPath, 'utf8');
@@ -621,7 +621,7 @@ test("a dead run's conversation lock: kept while its turn is unfinished, taken o
   // A second lane finds the first run's record and waits.
   await assert.rejects(
     acquireConversationLock({ conversationId, rootDir: ws.rootDir, laneId: other.laneId, runId: 'run-2', token: 't2', table, userInfo: userInfoAt(home) }),
-    /is still reserved: run run-dead on lane holder-lane left a turn unfinished; run `vibecompass review-relay --session holder-lane --recover` there/,
+    /is still reserved: run run-dead on lane holder-lane left a turn unfinished; run `vibecompass review-relay --root \S+ --session holder-lane --recover` there/,
   );
   // Once the holder's lane has closed, the lock is taken over with a message.
   await rm(holder.laneDir, { recursive: true, force: true });
@@ -651,7 +651,7 @@ test('close-session refuses while a live relay holds the lane, or a turn is acti
   const turn = { role: 'reviewer', pass: 1, pid: 4300, pgid: 4300, process_started_at: 'Sat Nov 21 21:00:00 2026', ended: null };
   await saveRelayState(lane.laneDir, { ...emptyRelayState(lane.laneId), run: { id: 'run-dead' }, step: 'reviewer-turn', turn });
   table.rows = [{ pid: 4300, pgid: 4300, startedAt: turn.process_started_at, command: 'codex exec' }];
-  assert.match(await inspectRelayForClose({ laneDir: lane.laneDir, laneId: lane.laneId, table }), /reviewer turn on lane close-refusals is still running .*4300 codex exec.*review-relay --session close-refusals --recover/);
+  assert.match(await inspectRelayForClose({ laneDir: lane.laneDir, laneId: lane.laneId, table }), /reviewer turn on lane close-refusals is still running .*4300 codex exec.*review-relay --root \S+ --session close-refusals --recover/);
   table.rows = [{ pid: 4301, pgid: 4300, startedAt: 'Sat Nov 21 21:00:05 2026', command: 'child' }];
   assert.match(await inspectRelayForClose({ laneDir: lane.laneDir, laneId: lane.laneId, table }), /is uncertain/);
   table.rows = [];

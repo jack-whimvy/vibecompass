@@ -4,6 +4,7 @@ import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/prom
 import os from 'node:os';
 import path from 'node:path';
 import { RELAY_LOCK_FILE, RELAY_STATE_FILE, isConversationId, writeFileAtomic } from './relay-mark.js';
+import { relayCommand } from './relay-adapters.js';
 import { withMemoryRootLock } from './serialization.js';
 
 // D-419 item 10: the relay's state, its two locks, and what a restarted relay
@@ -356,7 +357,7 @@ async function deadConversationLockReleasable(record) {
     return { ok: false, reason: `lane ${record.lane}'s relay state can't be read` };
   }
   if (state && state.run?.id === record.run_id && turnUnfinished(state)) {
-    return { ok: false, reason: `run ${record.run_id} on lane ${record.lane} left a turn unfinished; run \`vibecompass review-relay --session ${record.lane} --recover\` there` };
+    return { ok: false, reason: `run ${record.run_id} on lane ${record.lane} left a turn unfinished; run \`${relayCommand({ laneId: record.lane, rootDir: record.root }, ['--recover'])}\` there` };
   }
   return { ok: true, reason: `run ${record.run_id} on lane ${record.lane} has ended` };
 }
@@ -479,7 +480,7 @@ export async function readRelayView(laneDir, { table = createProcessTable() } = 
  * unfinished, so a lane that never ran the relay closes as before.
  */
 export async function inspectRelayForClose({ laneDir, laneId, table = createProcessTable() }) {
-  const recover = `vibecompass review-relay --session ${laneId} --recover`;
+  const recover = relayCommand({ laneId, rootDir: path.resolve(laneDir, '..', '..', '..') }, ['--recover']);
   const lock = await readLockRecord(path.join(laneDir, RELAY_LOCK_FILE));
   if (lock.unreadable) {
     return `close-session is refused: ${path.join(laneDir, RELAY_LOCK_FILE)} can't be read, so a relay may hold lane ${laneId}. If no relay is running, move it aside and close again.`;

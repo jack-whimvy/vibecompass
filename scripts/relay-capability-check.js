@@ -99,7 +99,27 @@ export async function waitForNoFixture({ table = createProcessTable(), token, ti
   }
 }
 
-export async function runWatchedTurn({ command, args, cwd, env, input = '', timeoutMs = 300_000, table = createProcessTable(), token, markerPath }) {
+/**
+ * Follows a process group until no member is left, up to `timeoutMs`. Ended
+ * only when a read of the table shows no member; an unreadable table, or a
+ * member still there at the deadline, leaves it unestablished.
+ */
+export async function waitForGroupEnd({ table = createProcessTable(), pgid, timeoutMs = 30_000, intervalMs = 100 }) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let members;
+    try {
+      members = (await table.list()).filter((row) => row.pgid === pgid);
+    } catch (error) {
+      return { ended: false, reason: `the process table couldn't be read (${error instanceof Error ? error.message : String(error)})`, left: [] };
+    }
+    if (members.length === 0) return { ended: true, reason: 'no process is left in the group', left: [] };
+    if (Date.now() >= deadline) return { ended: false, reason: `${members.length} process${members.length === 1 ? '' : 'es'} still in the group at the deadline`, left: members };
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+export async function runWatchedTurn({ command, args, cwd, env, input = '', timeoutMs = 300_000, table = createProcessTable(), token, markerPath, groupTimeoutMs = 30_000 }) {
   // An earlier run's fixture still running would look like this turn's.
   const before = await waitForNoFixture({ table, token });
   const startedAt = new Date();
@@ -109,7 +129,9 @@ export async function runWatchedTurn({ command, args, cwd, env, input = '', time
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   const child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  const closed = once(child, 'close').catch(() => [null, null]);
+  // The leader's exit and the group's end are followed, never the pipes.
+  const exited = once(child, 'exit').catch(() => [null, null]);
+  const closed = once(child, 'close').catch(() => null);
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8');
@@ -117,18 +139,26 @@ export async function runWatchedTurn({ command, args, cwd, env, input = '', time
   child.stdout.on('data', (chunk) => { stdout += chunk; });
   child.stderr.on('data', (chunk) => { if (stderr.length < 65_536) stderr += chunk; });
   child.stdin.on('error', () => {});
+  let timedOut = false;
   const timer = setTimeout(() => {
+    timedOut = true;
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
   }, timeoutMs);
   child.stdin.end(input);
-  const [code] = await closed;
-  const endedAt = Date.now();
+  const [code, signal] = await exited;
   clearTimeout(timer);
+  // The turn ends when its whole group is gone: a child that outlived the
+  // leader, with its pipes closed, is still part of the turn.
+  const group = await waitForGroupEnd({ table, pgid: child.pid, timeoutMs: groupTimeoutMs });
+  const endedAt = Date.now();
+  await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2000))]);
+  child.stdout.destroy();
+  child.stderr.destroy();
   // Keep watching briefly: a fixture started late in the turn still shows.
   await new Promise((resolve) => setTimeout(resolve, 500));
   const watched = await watcher.stop();
-  const covered = before.waited && watchCovered(watched.coverage, { startedAt: startedAt.getTime(), endedAt });
-  return { code, stdout, stderr, seen: watched.seen, rows: watched.rows, ignored: watched.ignored, leftBefore: before.left, waitedBefore: before.waited, startedAt: startedAt.toISOString(), coverage: watched.coverage, covered, marker: markerPath ? existsSync(markerPath) : false };
+  const covered = before.waited && group.ended && watchCovered(watched.coverage, { startedAt: startedAt.getTime(), endedAt });
+  return { code, signal, timedOut, group: { ended: group.ended, reason: group.reason }, stdout, stderr, seen: watched.seen, rows: watched.rows, ignored: watched.ignored, leftBefore: before.left, waitedBefore: before.waited, startedAt: startedAt.toISOString(), coverage: watched.coverage, covered, marker: markerPath ? existsSync(markerPath) : false };
 }
 
 /**
@@ -216,7 +246,8 @@ export function readCodexRollout(text, commandFragment, { turn = null } = {}) {
     const payload = event.payload ?? {};
     if (event.type === 'turn_context' || payload.type === 'turn_context') {
       turnIndex += 1;
-      if (payload.sandbox_policy) sandbox.add(JSON.stringify(payload.sandbox_policy));
+      // Only the requested turn's own policy counts.
+      if (payload.sandbox_policy && (turn === null || turnIndex === turn)) sandbox.add(JSON.stringify(payload.sandbox_policy));
       continue;
     }
     if (turn !== null && turnIndex !== turn) continue;
@@ -231,6 +262,31 @@ export function readCodexRollout(text, commandFragment, { turn = null } = {}) {
     }
   }
   return { attempted: calls.size > 0, refused, calls: [...calls.keys()], sandboxPolicies: [...sandbox] };
+}
+
+/**
+ * A Codex turn's sandbox, from its own `turn_context` records: held only when
+ * every policy recorded for the turn is read-only; none recorded is
+ * inconclusive, and any other policy fails, since a refused write alone can't
+ * show which sandbox applied.
+ */
+export function classifyCodexSandbox(policies = []) {
+  const parsed = policies.map((text) => {
+    try { return JSON.parse(text); } catch { return { type: String(text) }; }
+  });
+  if (parsed.length === 0) return { verdict: 'inconclusive', reason: 'the turn\'s record names no sandbox policy' };
+  const wider = parsed.filter((policy) => policy?.type !== 'read-only');
+  if (wider.length > 0) return { verdict: 'failed', reason: `the turn's record names a sandbox other than read-only (${wider.map((policy) => policy?.type ?? JSON.stringify(policy)).join(', ')})` };
+  return { verdict: 'held', reason: 'the turn\'s own record names a read-only sandbox' };
+}
+
+/** Checks that must all hold: any failure fails, else any inconclusive is inconclusive. */
+export function combineChecks(parts) {
+  const failed = parts.find((part) => part.verdict === 'failed' || part.verdict === 'loaded');
+  if (failed) return { verdict: failed.verdict, reason: failed.reason };
+  const open = parts.find((part) => part.verdict !== 'held');
+  if (open) return { verdict: open.verdict, reason: open.reason };
+  return { verdict: 'held', reason: parts.map((part) => part.reason).join('; ') };
 }
 
 /**
@@ -251,11 +307,16 @@ export function qualificationVerdict({ checks = [], expected = [], launches = []
   for (const launch of launches) {
     if (launch.exit !== 0) reasons.push(`the ${launch.name} launch exited ${launch.exit}`);
   }
+  // The empty-stdin run must be seen to exit on its own, non-zero: a run the
+  // harness killed, or ended by a signal, shows nothing about the tool.
   if (!emptyStdin) reasons.push('no empty-stdin run');
   else if (emptyStdin.model_turn) {
     failed = true;
     reasons.push('a model turn ran on empty stdin');
-  } else if (emptyStdin.exit === 0) reasons.push('the empty-stdin run exited 0');
+  } else if (emptyStdin.timed_out) reasons.push('the empty-stdin run timed out and was killed');
+  else if (emptyStdin.signal) reasons.push(`the empty-stdin run ended by ${emptyStdin.signal}, not by exiting`);
+  else if (!Number.isInteger(emptyStdin.exit)) reasons.push('the empty-stdin run\'s exit wasn\'t observed');
+  else if (emptyStdin.exit === 0) reasons.push('the empty-stdin run exited 0');
   if (turnChecks !== null) {
     for (const [name, result] of Object.entries(turnChecks)) {
       if (result !== 'accepted') {

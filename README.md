@@ -400,9 +400,12 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   conversation is closed and was started in the folder it prints
   (`--conversation-closed` confirms both). Otherwise, or with `--one-pass`, it
   runs one pass and stops; you type `address review` in the builder's window.
-  `--confirm-each-round` waits for your Enter after each pass.
+  `--confirm-each-round` waits for your Enter before each builder turn. If a
+  newer mark names another conversation, or none, the loop stops before any
+  turn.
 - **Stops.** Every stop prints the reason, the open findings, your choices, and
-  in the loop `claude --resume <id>`, which continues from the relayed turns. At
+  in the loop `claude --resume <id>`, which continues from the relayed turns.
+  Each command a choice names runs as printed, from any folder. At
   the cap, `--past-cap` runs one more pass, recorded with an owner line. A
   failure, an invalid answer, a change to the work during the review, a refused
   builder action, or a timeout (45 minutes for a reviewer turn, 60 for a builder
@@ -414,9 +417,10 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   In its builder turns, pushes are rewritten to fail, `gh` has no sign-in, and
   `close-session`, `review-relay`, and the hosted commands refuse. It reads no
   command, path, mode, or model from a committed file, and passes no bypass
-  mode. `close-session` refuses while a relay runs or left a write unfinished;
-  `review-relay --session <lane-id> --recover` finishes it. The mark and the
-  relay's state live in the lane folder and go at close.
+  mode. Its own `git` reads start no fsmonitor, hook, or filter a repository
+  configures. `close-session` refuses while a relay runs or left a write
+  unfinished; `review-relay --session <lane-id> --recover` finishes it. The mark
+  and the relay's state live in the lane folder and go at close.
 - **Platforms.** macOS only until a Linux run is recorded; `ready-for-review`
   and the lane's stage (`list-sessions`) work everywhere. An install that never
   runs the relay sees no change.

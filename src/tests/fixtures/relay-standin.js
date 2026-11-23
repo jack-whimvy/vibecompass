@@ -67,6 +67,14 @@ function spawnLingering(pidFile) {
   writeFileSync(pidFile, String(child.pid));
 }
 
+// A helper that leaves the tool's process group (a new session) and keeps the
+// tool's stdout and stderr open after the tool and its group are gone.
+function spawnPipeHolder(pidFile) {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+  child.unref();
+  writeFileSync(pidFile, String(child.pid));
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -124,8 +132,11 @@ async function runActions(actions = [], context) {
       // as written from the turn's folder.
       const fromPrompt = remarkFromPrompt(context.prompt);
       const cliArgs = fromPrompt ?? ['ready-for-review', '--root', scenario.rootDir, '--session', scenario.laneId, ...(action.paths ?? []).flatMap((item) => ['--path', item])];
+      // `conversationId` stands for a mark made elsewhere: null from a plain
+      // shell, or another conversation's id.
+      const conversation = action.conversationId !== undefined ? action.conversationId ?? '' : context.conversationId ?? '';
       const result = spawnSync(process.execPath, [scenario.cliPath, ...cliArgs], {
-        env: { ...process.env, CLAUDE_CODE_SESSION_ID: context.conversationId },
+        env: { ...process.env, CLAUDE_CODE_SESSION_ID: conversation },
         encoding: 'utf8',
         cwd: process.cwd(),
       });
@@ -153,6 +164,7 @@ async function codex() {
   const prompt = await readStdin();
   record({ kind: 'review', args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN) });
   if (turn.lingeringPidFile) spawnLingering(turn.lingeringPidFile);
+  if (turn.pipeHolderPidFile) spawnPipeHolder(turn.pipeHolderPidFile);
   if (turn.waitFor) await waitFor(turn.waitFor);
   if (turn.sleepMs) await sleep(turn.sleepMs);
   await runActions(turn.actions, {});

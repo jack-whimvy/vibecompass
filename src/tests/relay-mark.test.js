@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readFile, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { readFile, readdir, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { runCli } from '../cli.js';
@@ -364,4 +365,54 @@ test('writeReadyMark refuses work that names nothing', async (t) => {
   const ws = await createWorkspace(t);
   const lane = await openLane(ws, 'api-lane');
   await assert.rejects(writeReadyMark({ rootDir: ws.rootDir, laneId: lane.laneId, laneDir: lane.laneDir }), /name the work under review/);
+});
+
+test('the relay\'s own git reads start no helper a repository configures: no filesystem monitor, filter driver, or hook', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'helpers-off', { worktree: true });
+  const marks = path.join(ws.tempDir, 'helper-marks');
+  await mkdir(marks);
+  const hooks = path.join(ws.tempDir, 'helper-hooks');
+  await mkdir(hooks);
+  const script = async (file, name, tail) => {
+    await writeFile(file, `#!/bin/sh\ntouch '${path.join(marks, name)}'\n${tail}\n`, { mode: 0o755 });
+    return file;
+  };
+  git(lane.worktreeDir, ['config', 'core.fsmonitor', await script(path.join(ws.tempDir, 'fsmonitor.sh'), 'fsmonitor', 'exit 1')]);
+  git(lane.worktreeDir, ['config', 'filter.probe.clean', await script(path.join(ws.tempDir, 'clean.sh'), 'clean', 'cat')]);
+  git(lane.worktreeDir, ['config', 'filter.probe.required', 'true']);
+  git(lane.worktreeDir, ['config', 'core.hooksPath', hooks]);
+  await script(path.join(hooks, 'post-index-change'), 'hook', 'exit 0');
+  await writeFile(path.join(lane.worktreeDir, '.gitattributes'), '* filter=probe\n', 'utf8');
+  // A tracked file changed in the working tree: a diff cleans it.
+  await writeFile(path.join(lane.worktreeDir, 'src', 'index.js'), 'export const answer = 99;\n', 'utf8');
+  const projectRepos = [{ id: 'app' }];
+  const worktrees = { app: lane.worktreeDir };
+  // The control: git as anyone would run it starts the monitor and the filter here.
+  spawnSync('git', ['diff'], { cwd: lane.worktreeDir, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+  assert.deepEqual((await readdir(marks)).sort(), ['clean', 'fsmonitor'], 'the repository\'s helpers run under a plain git diff');
+  for (const name of await readdir(marks)) await rm(path.join(marks, name));
+
+  // Marking, comparing, and a named directory's listing: nothing starts.
+  const work = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, paths: ['app:src'], projectRepos, marking: true });
+  assert.equal(work.covers.paths[0].covered, 1);
+  const marked = await mark(ws, lane, { paths: ['app:src'] });
+  assert.equal(marked.code, 0, marked.stderr());
+  const compared = await compareMark(marked.mark, { rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, projectRepos });
+  assert.equal(compared.current, true);
+  assert.deepEqual(await readdir(marks), [], 'no repository-selected helper ran');
+  // The change still counts.
+  await writeFile(path.join(lane.worktreeDir, 'src', 'index.js'), 'export const answer = 100;\n', 'utf8');
+  assert.equal((await compareMark(marked.mark, { rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees, projectRepos })).current, false);
+  assert.deepEqual(await readdir(marks), []);
+});
+
+test('a filter driver whose name a -c argument can\'t carry refuses the relay\'s read', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'helpers-name', { worktree: true });
+  git(lane.worktreeDir, ['config', 'filter.a=b.clean', 'cat']);
+  await assert.rejects(
+    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: lane.worktreeDir }, projectRepos: [{ id: 'app' }] }),
+    /names a filter driver \("a=b"\) the relay can't turn off/,
+  );
 });

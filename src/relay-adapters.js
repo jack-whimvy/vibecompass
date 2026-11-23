@@ -469,6 +469,30 @@ export function remarkCommand({ laneId, rootDir, paths = [] }) {
   return ['vibecompass', 'ready-for-review', '--root', shellWord(rootDir), '--session', shellWord(laneId), ...paths.flatMap((item) => ['--path', shellWord(item)])].join(' ');
 }
 
+/**
+ * The relay command the owner runs next, as this run was started: the memory
+ * root, the lane, the reviewer and its model, one-pass, and the builder mode,
+ * so a stop's command runs as printed from any folder.
+ */
+export function relayCommand({ laneId, rootDir, reviewerTool = 'codex', reviewerModel = null, onePass = false, builderMode = null }, extra = []) {
+  const words = ['vibecompass', 'review-relay', '--root', shellWord(rootDir), '--session', shellWord(laneId)];
+  if (extra.includes('--recover')) return [...words, ...extra].join(' ');
+  words.push('--reviewer', reviewerTool);
+  if (reviewerModel) words.push('--reviewer-model', shellWord(reviewerModel));
+  else if (reviewerTool === 'codex') words.push('--reviewer-model', '<model>');
+  if (onePass) words.push('--one-pass');
+  if (builderMode && builderMode !== 'default') words.push('--builder-mode', shellWord(builderMode));
+  return [...words, ...extra].join(' ');
+}
+
+/** The listed reviewer versions on a platform, for help text: "Codex 0.171.0; no Claude Code version". */
+export function describeListedReviewers(platform = 'darwin', supported = SUPPORTED_REVIEWER_VERSIONS) {
+  return REVIEWER_TOOLS.map((tool) => {
+    const versions = supported[tool]?.[platform] ?? [];
+    return versions.length > 0 ? `${TOOL_NAMES[tool]} ${versions.join(', ')}` : `no ${TOOL_NAMES[tool]} version`;
+  }).join('; ');
+}
+
 export function builderPrompt({ laneId, passNumber, rootDir, paths = [] }) {
   return [
     `address review ${laneId}`,

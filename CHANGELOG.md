@@ -18,7 +18,8 @@ package's installed text, command output, and help do.
   owner has closed, the relay then sends that conversation a fixed
   `address review` turn and repeats until a clean pass or the cap; otherwise,
   or with `--one-pass`, it runs one pass and stops. Each stop prints the
-  reason, the open findings, the choices, and in the loop `claude --resume <id>`.
+  reason, the open findings, the choices (each command runs as printed, from
+  any folder), and in the loop `claude --resume <id>`.
   Flags: `--recover`, `--past-cap`, `--one-pass`, `--conversation-closed`,
   `--confirm-each-round`, `--reviewer`, `--reviewer-model`, `--fresh-reviewer`,
   `--builder-mode`, `--reviewer-timeout`, and `--builder-timeout`. It never
