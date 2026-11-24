@@ -251,10 +251,14 @@ test('an older app behind Vercel\'s 413 gets the too-large message, not Vercel\'
   }
 });
 
-test('redirects are refused on begin, parts, commit, the large-document request, the fallback, and the small push; no body leaves for the other address', async () => {
+test('redirects are refused on begin, parts, commit, the large-document request, the fallback, and the small push (each status fetch follows); no body leaves for the other address', async () => {
   const elsewhere = await startStandIn();
+  const cases = [
+    ...['push-uploads', 'parts', 'commit', 'push-large', 'fallback'].map((target) => [target, 307]),
+    ...[301, 302, 303, 307, 308].map((status) => ['push-small', status]),
+  ];
   try {
-    for (const target of ['push-uploads', 'parts', 'commit', 'push-large', 'fallback', 'push-small']) {
+    for (const [target, status] of cases) {
       const standIn = await startStandIn({
         noUploadRoutes: target === 'fallback',
         intercept: async ({ route, request, response }) => {
@@ -264,7 +268,7 @@ test('redirects are refused on begin, parts, commit, the large-document request,
             (target === 'commit' && /\/commit$/.test(route)) ||
             ((target === 'push-large' || target === 'fallback' || target === 'push-small') && route === 'push');
           if (!hit) return false;
-          response.writeHead(307, { location: `${elsewhere.url}${request.url}` });
+          response.writeHead(status, { location: `${elsewhere.url}${request.url}` });
           response.end();
           return true;
         },
@@ -279,8 +283,8 @@ test('redirects are refused on begin, parts, commit, the large-document request,
         }
         await assert.rejects(
           pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)),
-          (error) => error instanceof PushOutcomeError && error.code === 'redirect_refused',
-          target,
+          (error) => error instanceof PushOutcomeError && error.code === 'redirect_refused' && error.status === status,
+          `${target} ${status}`,
         );
       } finally {
         await standIn.close();
@@ -314,6 +318,54 @@ test('a commit retried after a network error succeeds; polls honour in-progress 
     assert.deepEqual(waits, [1000, 1000]);
   } finally {
     await standIn.close();
+  }
+});
+
+test('a 3xx that fetch doesn\'t follow (300, 304) is no redirect: a commit after a lost reply goes on to its stored receipt, and a small push reports the status', async () => {
+  for (const status of [300, 304]) {
+    const runId = randomUUID();
+    let commits = 0;
+    const standIn = await startStandIn({
+      commit: ({ send, response }) => {
+        commits += 1;
+        if (commits === 1) return response.destroy();
+        if (commits === 2) {
+          response.writeHead(status);
+          return response.end();
+        }
+        return send(202, { run_id: runId, status: 'completed', remote_revision_id: randomUUID(), projection: { warnings: [], warnings_total: 0 } });
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url);
+      await addDocument(rootDir, 'a', 2_200_000);
+      await addDocument(rootDir, 'b', 2_200_000);
+      const result = await pushProjectMemory({ rootDir: '.compass' }, environment(tempDir));
+      assert.equal(result.runId, runId, `${status}: the stored receipt is recovered`);
+      assert.equal(commits, 3, `${status}`);
+    } finally {
+      await standIn.close();
+    }
+
+    const small = await startStandIn({
+      intercept: async ({ route, response }) => {
+        if (route !== 'push') return false;
+        response.writeHead(status);
+        response.end();
+        return true;
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(small.url);
+      await addDocument(rootDir, 'a', 10_000);
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.notEqual(error.code, 'redirect_refused', `${status}`);
+        assert.match(error.message, new RegExp(`Hosted push failed with ${status}`), `${status}`);
+        return true;
+      });
+    } finally {
+      await small.close();
+    }
   }
 });
 

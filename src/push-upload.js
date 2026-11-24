@@ -196,16 +196,21 @@ export function singleRequestFailure(context, error, phase) {
   );
 }
 
+/** The statuses fetch follows as redirects; another 3xx (300, 304) is an ordinary answer. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
  * A fetch on the push path that never follows a redirect, so no body goes to
  * another address. Fetch's manual mode hands back the redirect itself, so a
- * redirect is known by its 3xx status, never by an error's text: a failure
- * before any answer (a name that doesn't resolve, say) keeps its own error.
- * The app received the redirected request, so the outcome is unknown.
+ * redirect is known by its status, the five fetch would follow, never by an
+ * error's text: a failure before any answer (a name that doesn't resolve,
+ * say) keeps its own error, and any other answer goes to its caller's
+ * handling. The app received the redirected request, so the outcome is
+ * unknown.
  */
 async function send(context, url, init) {
   const response = await context.fetch(url, { ...init, redirect: 'manual' });
-  if (response.status >= 300 && response.status < 400) {
+  if (REDIRECT_STATUSES.has(response.status)) {
     try {
       await response.body?.cancel?.();
     } catch {
