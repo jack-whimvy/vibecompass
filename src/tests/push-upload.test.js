@@ -251,10 +251,10 @@ test('an older app behind Vercel\'s 413 gets the too-large message, not Vercel\'
   }
 });
 
-test('redirects are refused on begin, parts, commit, the large-document request, and the fallback; no body leaves for the other address', async () => {
+test('redirects are refused on begin, parts, commit, the large-document request, the fallback, and the small push; no body leaves for the other address', async () => {
   const elsewhere = await startStandIn();
   try {
-    for (const target of ['push-uploads', 'parts', 'commit', 'push-large', 'fallback']) {
+    for (const target of ['push-uploads', 'parts', 'commit', 'push-large', 'fallback', 'push-small']) {
       const standIn = await startStandIn({
         noUploadRoutes: target === 'fallback',
         intercept: async ({ route, request, response }) => {
@@ -262,7 +262,7 @@ test('redirects are refused on begin, parts, commit, the large-document request,
             (target === 'push-uploads' && route === 'push-uploads') ||
             (target === 'parts' && /\/parts\//.test(route)) ||
             (target === 'commit' && /\/commit$/.test(route)) ||
-            ((target === 'push-large' || target === 'fallback') && route === 'push');
+            ((target === 'push-large' || target === 'fallback' || target === 'push-small') && route === 'push');
           if (!hit) return false;
           response.writeHead(307, { location: `${elsewhere.url}${request.url}` });
           response.end();
@@ -272,6 +272,7 @@ test('redirects are refused on begin, parts, commit, the large-document request,
       try {
         const { tempDir, rootDir } = await createRoot(standIn.url);
         if (target === 'push-large') await addDocument(rootDir, 'huge', 4_100_000);
+        else if (target === 'push-small') await addDocument(rootDir, 'a', 10_000);
         else {
           await addDocument(rootDir, 'a', 2_200_000);
           await addDocument(rootDir, 'b', 2_200_000);
@@ -1035,6 +1036,48 @@ test('a single request whose connection fails is an unknown outcome, never resen
       assert.equal(code, 1, kind);
       assert.match(stderr, /Error: The push's outcome is unknown: the connection to the hosted app failed (before its answer arrived|while its answer was read) \(.+\)\. Nothing was recorded locally\. Run vibecompass status/, kind);
       assert.match(stdout, /Secret check: passed/, `${kind}: the report is printed on failure`);
+    } finally {
+      await standIn.close();
+    }
+  }
+
+  // A small push answered with a redirect to an address that refuses the
+  // connection: the app received the POST, so the push never follows it and
+  // the outcome is unknown, never "nothing was sent".
+  {
+    const refused = http.createServer();
+    await new Promise((resolve) => refused.listen(0, '127.0.0.1', resolve));
+    const refusedPort = refused.address().port;
+    await new Promise((resolve) => refused.close(resolve));
+    let posts = 0;
+    const standIn = await startStandIn({
+      intercept: async ({ route, request, response }) => {
+        if (route !== 'push') return false;
+        posts += 1;
+        response.writeHead(303, { location: `http://127.0.0.1:${refusedPort}${request.url}` });
+        response.end();
+        return true;
+      },
+    });
+    try {
+      const { tempDir, rootDir } = await createRoot(standIn.url, { secretCheck: 'warn' });
+      await addDocument(rootDir, 'a', 10_000);
+      const before = await readManifestSync(rootDir);
+      await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(tempDir)), (error) => {
+        assert.ok(error instanceof PushOutcomeError);
+        assert.equal(error.outcome, 'unknown');
+        assert.equal(error.code, 'redirect_refused');
+        assert.doesNotMatch(error.message, /Nothing was sent/);
+        assert.ok(error.secretCheck, 'the error carries the secret-check report');
+        return true;
+      });
+      assert.equal(posts, 1, 'the redirect is not followed and the request is not resent');
+      assert.deepEqual(await readManifestSync(rootDir), before, 'nothing recorded');
+      const { code, stdout, stderr } = await runCliProcess(tempDir);
+      assert.equal(code, 1);
+      assert.match(stderr, /Error: The hosted app at .+ answered with a redirect, which a push never follows\./);
+      assert.doesNotMatch(stderr, /Nothing was sent/);
+      assert.match(stdout, /Secret check: passed/);
     } finally {
       await standIn.close();
     }

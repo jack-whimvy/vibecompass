@@ -28,6 +28,7 @@ import {
   LEGACY_SINGLE_MAX_BYTES,
   PushOutcomeError,
   sendLargeSinglePush,
+  sendWithoutRedirect,
   singleRequestFailure,
   uploadPush,
 } from './push-upload.js';
@@ -669,10 +670,11 @@ async function postJson(context, routeName, body) {
 }
 
 /**
- * The single request up to 4,000,000 bytes, sent as before. A connection that
- * fails after it may have been sent, or while its answer is read, leaves the
- * outcome unknown; a success whose body isn't JSON does too. The request is
- * never resent.
+ * The single request up to 4,000,000 bytes. Like the large-body requests, it
+ * never follows a redirect: a redirect is an unknown outcome, since the app
+ * received the request. A connection that fails after it may have been sent,
+ * or while its answer is read, leaves the outcome unknown; a success whose
+ * body isn't JSON does too. The request is never resent.
  */
 async function postSmallPush(context, body) {
   const url = new URL(
@@ -681,7 +683,7 @@ async function postSmallPush(context, body) {
   );
   let response;
   try {
-    response = await context.fetch(url.href, {
+    response = await sendWithoutRedirect(context, url.href, {
       method: 'POST',
       headers: {
         accept: 'application/json',

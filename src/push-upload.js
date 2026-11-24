@@ -211,6 +211,9 @@ async function send(context, url, init) {
   }
 }
 
+/** The same fetch for the push of 4,000,000 bytes or less, sent by sync.js. */
+export const sendWithoutRedirect = send;
+
 function isRedirectRefusal(error) {
   const text = `${error?.message ?? ''} ${error?.cause?.message ?? ''}`;
   return /redirect/i.test(text);

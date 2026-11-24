@@ -35,9 +35,10 @@ there, or run with `--builder-mode auto`. The review cap's default stays 3,
 and a cap already in `project.yaml` is kept: a new project chooses one with
 `init --review-round-cap <n>` or guided setup's question, an existing one with
 `review-settings --round-cap <n>`, and `refresh-workflow` still writes no
-`review:` block. `push` needs nothing
-changed: a root over 4 MB goes in parts to a hosted app that takes them.
-Against a hosted app that predates them, a push of up to 5 MB falls back to one
+`review:` block. `push` needs nothing changed unless `sync.api_url` answers
+with a redirect: no push follows one now, small or large, so set it to the
+app's final address. A root over 4 MB goes in parts to a hosted app that takes
+them. Against a hosted app that predates them, a push of up to 5 MB falls back to one
 request, which that app's host may still refuse (Vercel refuses a request over
 4.5 MB); above 5 MB, `push` says the hosted app needs an update and sends
 nothing more.
@@ -120,8 +121,10 @@ nothing more.
   that holds a document over 4 MB keeps the single request, as before.
 - Messages: `Push refused before upload` (nothing was sent), `Push refused`
   (the hosted memory didn't change), and `The push's outcome is unknown` (run
-  `vibecompass status`, or push again). `push` never follows a redirect on a
-  request that carries a large body.
+  `vibecompass status`, or push again). `push` never follows a redirect: a
+  push of any size answered with one stops with an unknown outcome, since the
+  hosted app received it, and says to set `sync.api_url` to the app's final
+  address. Before this, a push of 4 MB or less followed it.
 - Every push, small or large, is recorded locally only when the hosted app's
   answer names the run and the hosted revision. A cut-off or malformed answer,
   or a connection that drops after the push was sent, leaves the outcome
