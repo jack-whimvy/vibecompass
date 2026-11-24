@@ -50,6 +50,25 @@ export function createProcessTable({ exec = execFile } = {}) {
         });
       });
     },
+    // Each process with its environment after its command line (macOS
+    // `ps -E`). macOS shows the environment of the owner's own processes, but
+    // not of system programs such as /bin/sh.
+    listEnvironments() {
+      return new Promise((resolve, reject) => {
+        exec('ps', ['-A', '-wwE', '-o', 'pid=,pgid=,command='], { maxBuffer: 256 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } }, (error, stdout) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          const rows = [];
+          for (const line of String(stdout).split('\n')) {
+            const match = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line);
+            if (match) rows.push({ pid: Number(match[1]), pgid: Number(match[2]), text: match[3] });
+          }
+          resolve(rows);
+        });
+      });
+    },
     killGroup(pgid, signal = 'SIGTERM') {
       try {
         process.kill(-pgid, signal);
@@ -59,6 +78,39 @@ export function createProcessTable({ exec = execFile } = {}) {
       }
     },
   };
+}
+
+/**
+ * The variable each relayed turn's environment carries, set to the turn's id
+ * in relay.json, so recovery can tell that turn's processes from any other
+ * session's (D-419 item 10).
+ */
+export const RELAY_TURN_MARKER = 'VIBECOMPASS_RELAY_TURN_ID';
+
+/**
+ * The running processes whose environment carries a turn's marker. Resolves
+ * `{ ok, reason, processes }`; `ok` is false when the table can't show
+ * environments. A process that shows no environment, such as a system shell,
+ * or that dropped the variable, isn't found.
+ */
+export async function findMarkedProcesses(table, marker) {
+  if (!marker) return { ok: false, reason: 'the turn recorded no id to look for', processes: [] };
+  if (typeof table.listEnvironments !== 'function') return { ok: false, reason: 'this process table shows no environments', processes: [] };
+  let rows;
+  try {
+    rows = await table.listEnvironments();
+  } catch (error) {
+    return { ok: false, reason: `ps couldn't list the environments (${error instanceof Error ? error.message : String(error)})`, processes: [] };
+  }
+  const needle = `${RELAY_TURN_MARKER}=${marker}`;
+  const marked = rows.filter((row) => row.text.split(/\s+/).includes(needle));
+  let commands = new Map();
+  try {
+    commands = new Map((await table.list()).map((row) => [row.pid, row.command]));
+  } catch {
+    // The marked processes are listed without their commands.
+  }
+  return { ok: true, reason: null, processes: marked.map((row) => ({ pid: row.pid, pgid: row.pgid, command: String(commands.get(row.pid) ?? '').slice(0, 200) })) };
 }
 
 export async function processStartTime(table, pid) {
@@ -499,7 +551,7 @@ export async function inspectRelayForClose({ laneDir, laneId, table = createProc
     // A turn recorded before its process started and never with it: the
     // group can't be inspected, so only the owner can settle it.
     const since = state.turn.started_at ? new Date(state.turn.started_at).toString() : 'an unknown time';
-    return `close-session is refused: the relay's ${state.turn.role} turn on lane ${laneId}, started ${since}, was never recorded with its process, so it can't be inspected. Check that no ${state.turn.command ?? 'tool'} process started then or later is left (\`ps -A -o pid,pgid,lstart,command\`), then run \`${recover}\` in a terminal, which asks you to confirm.`; // D-419 item 10
+    return `close-session is refused: the relay's ${state.turn.role} turn on lane ${laneId}, started ${since}, was never recorded with its process, so its process group can't be inspected. Run \`${recover}\` in a terminal: it looks for the turn's own processes by the id in their environment, and with none found asks you to settle the turn.`; // D-419 item 10
   }
   if (turnUnfinished(state) && state.turn.pgid) {
     const group = await inspectProcessGroup(table, { pgid: state.turn.pgid, pid: state.turn.pid, startedAt: state.turn.process_started_at });

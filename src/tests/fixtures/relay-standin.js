@@ -167,7 +167,7 @@ async function codex() {
   const prompt = await readStdin();
   // Written once stdin has closed: with the prompt in it, the model turn has begun.
   if (turn.promptMarker) writeFileSync(turn.promptMarker, prompt);
-  record({ kind: 'review', args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN) });
+  record({ kind: 'review', args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN), turnId: process.env.VIBECOMPASS_RELAY_TURN_ID ?? null });
   if (turn.lingeringPidFile) spawnLingering(turn.lingeringPidFile);
   if (turn.pipeHolderPidFile) spawnPipeHolder(turn.pipeHolderPidFile);
   if (turn.waitFor) await waitFor(turn.waitFor);
@@ -207,12 +207,17 @@ async function claude() {
   const prompt = await readStdin();
   const resume = flagValue('--resume');
   const mode = flagValue('--permission-mode');
-  record({ kind, args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN), env: {
+  record({ kind, args, cwd: process.cwd(), prompt, relayTurn: Boolean(process.env.VIBECOMPASS_RELAY_TURN), turnId: process.env.VIBECOMPASS_RELAY_TURN_ID ?? null, env: {
     GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT ?? null,
     GH_CONFIG_DIR: process.env.GH_CONFIG_DIR ?? null,
     GH_TOKEN: process.env.GH_TOKEN ?? null,
     GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null,
   } });
+  if (!reviewer && prompt === '') {
+    // As Claude Code 2.1.318 does when resumed with an empty stdin: no turn.
+    process.stderr.write('Error: No deferred tool marker found in the resumed session. Provide a prompt to continue the conversation.\n');
+    return 1;
+  }
   const conversationId = turn.initSessionId ?? resume ?? turn.newSessionId ?? randomUUID();
   for (let index = 0; index < (turn.hooksBefore ?? 0); index += 1) {
     emit({ type: 'system', subtype: 'hook_started', hook_name: 'SessionStart:startup' });

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { constants as fsConstants, createReadStream } from 'node:fs';
 import { lstat, readFile, readdir, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -10,6 +10,7 @@ import {
   sha256Hex,
 } from './relay-sections.js';
 import { extractReviewLogLines, parseReviewLog } from './review-log.js';
+import { withMemoryRootLock } from './serialization.js';
 
 // D-419 item 4: the ready-for-review mark. The builder runs
 // `vibecompass ready-for-review` when a round's work is ready; the mark holds
@@ -38,9 +39,15 @@ const GIT_LOCATION_VARIABLES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'G
  * prompt, no fetch of a missing object, and no repository the environment
  * names. Discovery crosses filesystems, as the relay's own search for a
  * `.git` does (D-423 item 3).
+ *
+ * An empty GIT_ALLOW_PROTOCOL allows no transport at all, and git lets it
+ * override every protocol setting in any configuration, a repository's
+ * `protocol.<name>.allow` included, in this git and in each git it starts
+ * (git 2.6.1 and later). GIT_NO_LAZY_FETCH (git 2.45 and later) also turns
+ * off a partial clone's fetch of a missing object.
  */
 export function readOnlyGitEnv(baseEnv = process.env) {
-  const env = { ...baseEnv, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_DISCOVERY_ACROSS_FILESYSTEM: '1' };
+  const env = { ...baseEnv, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: '', GIT_NO_LAZY_FETCH: '1', GIT_DISCOVERY_ACROSS_FILESYSTEM: '1' };
   for (const name of GIT_LOCATION_VARIABLES) delete env[name];
   return env;
 }
@@ -48,9 +55,10 @@ export function readOnlyGitEnv(baseEnv = process.env) {
 // The relay's own git reads run on the host, outside any reviewer sandbox, so
 // none of them may start a program a repository's configuration names
 // (D-423). The filesystem monitor and hooks are turned off on the command
-// line, which no configuration overrides, and so is every transport, so a
-// read that needs an object a partial clone lacks fails instead of fetching
-// it. No read runs a working file through a filter: the work fingerprint
+// line, which no configuration overrides. Every transport is turned off by the
+// environment above, which overrides a repository's per-transport setting
+// where `protocol.allow` alone wouldn't, so a read that needs an object a
+// partial clone lacks fails instead of fetching it. No read runs a working file through a filter: the work fingerprint
 // reads working files itself, and the staged diff compares stored objects,
 // with --no-ext-diff and --no-textconv.
 const HELPERS_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never'];
@@ -99,20 +107,35 @@ export async function gitText(args, cwd, env = process.env) {
   return { ok: result.code === 0, code: result.code, stdout: result.code === null ? '' : Buffer.concat(out).toString('utf8'), stderr: result.stderr };
 }
 
-/** The nearest folder at or above `dir` that holds a `.git`, or null. */
+/**
+ * The nearest folder at or above `dir` that holds a `.git`, or null. Both the
+ * path as named and its physical path are searched: git finds a repository
+ * from the physical folder, so a folder reached through a symbolic link into
+ * a repository is inside it.
+ */
 async function folderHoldingGit(dir) {
-  let current = path.resolve(dir);
-  for (;;) {
-    try {
-      await lstat(path.join(current, '.git'));
-      return current;
-    } catch (error) {
-      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
+  const named = path.resolve(dir);
+  let physical = null;
+  try {
+    physical = await realpath(named);
+  } catch (error) {
+    if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
   }
+  for (const start of physical && physical !== named ? [named, physical] : [named]) {
+    let current = start;
+    for (;;) {
+      try {
+        await lstat(path.join(current, '.git'));
+        return current;
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return null;
 }
 
 /**
@@ -128,9 +151,13 @@ export async function repositoryTopLevel(dir, env = process.env) {
   throw new Error(`git couldn't read the repository at ${holder} (${result.stderr || (result.code === null ? 'git didn\'t start' : `git exited ${result.code}`)}), so the relay doesn't read ${dir} as plain files.`);
 }
 
+// A file is opened without following a link put in its place since it was
+// looked at, and without waiting on a pipe.
+const READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+
 async function hashStream(filePath) {
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  for await (const chunk of createReadStream(filePath, { flags: READ_FLAGS })) hash.update(chunk);
   return hash.digest('hex');
 }
 
@@ -147,7 +174,8 @@ async function hashFile(filePath) {
 /**
  * What is at an index entry's path in the working tree (D-423 item 1): a
  * regular file's bytes and executable bit, a symbolic link's target, or that
- * it is missing, a directory, or something else.
+ * it is missing, a directory, or something else. The executable bit is the
+ * owner's, the one git records: 0755 to 0655 is git's 100755 to 100644.
  */
 async function workingState(filePath) {
   let info;
@@ -160,7 +188,36 @@ async function workingState(filePath) {
   if (info.isSymbolicLink()) return `symlink ${sha256Hex(await readlink(filePath))}`;
   if (info.isDirectory()) return 'directory';
   if (!info.isFile()) return 'special';
-  return `file ${(info.mode & 0o111) !== 0 ? 'x' : '-'} ${await hashStream(filePath)}`;
+  return `file ${(info.mode & 0o100) !== 0 ? 'x' : '-'} ${await hashStream(filePath)}`;
+}
+
+/**
+ * The state of the first folder on the way to `relative` under `base` that
+ * isn't a real directory, or null when every one is. git doesn't look through
+ * a symbolic link that replaced a tracked folder, and neither does the relay:
+ * what is past it is never opened, and the link's target counts instead.
+ * `cache` holds each folder's answer for one listing.
+ */
+async function blockedLeadingPath(base, relative, cache) {
+  const parts = relative.split('/');
+  let prefix = '';
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    prefix = prefix ? `${prefix}/${parts[index]}` : parts[index];
+    let state = cache.get(prefix);
+    if (state === undefined) {
+      const full = path.join(base, prefix);
+      try {
+        const info = await lstat(full);
+        state = info.isDirectory() ? null : info.isSymbolicLink() ? `behind symlink ${prefix} ${sha256Hex(await readlink(full))}` : `behind non-directory ${prefix}`;
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+        state = 'missing';
+      }
+      cache.set(prefix, state);
+    }
+    if (state !== null) return state;
+  }
+  return null;
 }
 
 /** Whether a folder holds a checkout of its own: a `.git` file or folder. */
@@ -179,7 +236,9 @@ async function holdsCheckout(dir) {
  * HEAD, a hash of its staged diff, a hash of its index entries with what is at
  * each path in the working tree, where a checked-out submodule gives its own
  * fingerprint, and each untracked, not-ignored file. No git command here
- * reads a working file through a filter.
+ * reads a working file through a filter, and no file is read through a link
+ * that replaced a folder. `repositories` lists this checkout and each
+ * checked-out submodule in it, for the remote-ref check (D-419 item 8).
  */
 async function fingerprintCheckout(dir, label, env, depth = 0) {
   const head = await gitText(['rev-parse', '--verify', 'HEAD'], dir, env);
@@ -196,19 +255,24 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
     throw new Error(`git ls-files --stage failed in ${label} at ${dir}: ${index.stderr}`);
   }
   const working = createHash('sha256');
+  const leading = new Map();
+  const repositories = [dir];
   let submodules = 0;
   for (const record of splitNul(index.stdout)) {
     const tab = record.indexOf('\t');
     const [mode, oid, stage] = record.slice(0, tab).split(' ');
     const relative = record.slice(tab + 1);
     const full = path.join(dir, relative);
-    let state;
-    if (mode === '160000' && (await pathKind(full)) === 'directory' && (await holdsCheckout(full))) {
+    let state = await blockedLeadingPath(dir, relative, leading);
+    if (state !== null) {
+      // Past a link or a file that replaced a folder: nothing there is opened.
+    } else if (mode === '160000' && (await pathKind(full)) === 'directory' && (await holdsCheckout(full))) {
       if (depth + 1 > MAX_SUBMODULE_DEPTH) {
         throw new Error(`${label} nests checked-out submodules deeper than ${MAX_SUBMODULE_DEPTH} at ${full}; the relay doesn't fingerprint work that deep.`); // D-423 item 2
       }
       const inner = await fingerprintCheckout(full, `submodule ${relative} of ${label}`, env, depth + 1);
       submodules += 1 + inner.submodules;
+      repositories.push(...inner.repositories);
       state = `submodule ${inner.fingerprint}`;
     } else if (mode === '160000') {
       state = (await pathKind(full)) === 'directory' ? 'submodule not checked out' : await workingState(full);
@@ -229,10 +293,11 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
       // a folder and doesn't look inside it.
       throw new Error(`${label} at ${dir} holds a git repository that isn't a submodule (${relative}); the relay can't tell when its work changes. Add it as a submodule, ignore it, or move it out.`);
     }
-    entries.push(`untracked\t${relative}\t${await hashFile(path.join(dir, relative))}`);
+    const blocked = await blockedLeadingPath(dir, relative, leading);
+    entries.push(`untracked\t${relative}\t${blocked ?? await hashFile(path.join(dir, relative))}`);
   }
   entries.sort();
-  return { head: headSha, entries, untracked: untrackedFiles.length, submodules, fingerprint: sha256Hex(entries.join('\n')) };
+  return { head: headSha, entries, untracked: untrackedFiles.length, submodules, repositories, fingerprint: sha256Hex(entries.join('\n')) };
 }
 
 async function pathKind(filePath) {
@@ -336,16 +401,20 @@ function isLaneOwnFile(absolute, laneDir) {
  * The work fingerprint (D-419 item 4, D-423): SHA-256 over sorted entries from
  * each recorded worktree (its HEAD, a hash of the staged diff, a hash of its
  * index entries with their working files and checked-out submodules, and each
- * untracked, not-ignored file) and each named path.
+ * untracked, not-ignored file) and each named path. `repositories` lists
+ * every checkout the fingerprint read: the worktrees, the repository each
+ * named directory is in, and their checked-out submodules.
  */
 export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env, marking = false }) {
   const entries = [];
   const covers = { worktrees: [], paths: [] };
   const notes = [];
+  const repositories = new Set();
 
   for (const repoId of Object.keys(worktrees).sort()) {
     const dir = path.resolve(worktrees[repoId]);
     const checkout = await fingerprintCheckout(dir, `Lane worktree ${repoId}`, env);
+    for (const repository of checkout.repositories) repositories.add(repository);
     for (const entry of checkout.entries) entries.push(`worktree\t${repoId}\t${entry}`);
     covers.worktrees.push({ repo: repoId, path: dir, head: checkout.head, untracked: checkout.untracked, ...(checkout.submodules > 0 ? { submodules: checkout.submodules } : {}) });
   }
@@ -372,6 +441,7 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       continue;
     }
     const listing = await listDirectoryFiles(resolved.absolute, { rootDir, laneDir, env });
+    if (listing.top) repositories.add(listing.top);
     if (listing.files.length === 0) {
       // Marking refuses a directory with nothing to cover. Comparing against a
       // mark, a directory that lost its last file is changed work, never an
@@ -383,18 +453,41 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       covers.paths.push({ spec: resolved.spec, kind: 'directory', covered: 0, ignored: listing.ignored, git: listing.git });
       continue;
     }
+    const leading = new Map();
     for (const file of listing.files) {
       const relative = toPosix(path.relative(resolved.absolute, file));
+      const blocked = await blockedLeadingPath(resolved.absolute, relative, leading);
+      if (blocked !== null) {
+        entries.push(`path\t${resolved.spec}\t${blocked}\t${relative}`);
+        continue;
+      }
       const fileKind = await pathKind(file);
+      const gitlink = listing.gitlinks.get(file);
       // A tracked file deleted in the working tree is still listed: it counts
-      // as missing. A listed folder is a submodule: checked out, it gives its
-      // own fingerprint (D-423 item 2).
-      if (fileKind === 'missing') {
+      // as missing. A submodule counts with its index entry's commit and,
+      // checked out, its own fingerprint (D-423 item 2).
+      if (gitlink !== undefined) {
+        if (fileKind === 'directory' && (await holdsCheckout(file))) {
+          const inner = await fingerprintCheckout(file, `submodule ${relative} under ${resolved.spec}`, env, 1);
+          for (const repository of inner.repositories) repositories.add(repository);
+          entries.push(`path\t${resolved.spec}\tsubmodule\t${relative}\t${gitlink}\t${inner.fingerprint}`);
+        } else if (fileKind === 'file') {
+          entries.push(`path\t${resolved.spec}\tsubmodule replaced\t${relative}\t${gitlink}\t${await hashFile(file)}`);
+        } else {
+          entries.push(`path\t${resolved.spec}\tsubmodule not checked out\t${relative}\t${gitlink}`);
+        }
+      } else if (fileKind === 'missing') {
         entries.push(`path\t${resolved.spec}\tmissing\t${relative}`);
       } else if (fileKind === 'directory') {
-        entries.push((await holdsCheckout(file))
-          ? `path\t${resolved.spec}\tsubmodule\t${relative}\t${(await fingerprintCheckout(file, `submodule ${relative} under ${resolved.spec}`, env, 1)).fingerprint}`
-          : `path\t${resolved.spec}\tsubmodule not checked out\t${relative}`);
+        // A folder git lists as untracked without looking inside: a
+        // repository that isn't a submodule.
+        if (await holdsCheckout(file)) {
+          const inner = await fingerprintCheckout(file, `repository ${relative} under ${resolved.spec}`, env, 1);
+          for (const repository of inner.repositories) repositories.add(repository);
+          entries.push(`path\t${resolved.spec}\trepository\t${relative}\t${inner.fingerprint}`);
+        } else {
+          entries.push(`path\t${resolved.spec}\tdirectory\t${relative}`);
+        }
       } else {
         entries.push(`path\t${resolved.spec}\tfile\t${relative}\t${await hashFile(file)}`);
       }
@@ -403,19 +496,21 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
   }
 
   entries.sort();
-  return { fingerprint: sha256Hex(entries.join('\n')), entries, covers, notes };
+  return { fingerprint: sha256Hex(entries.join('\n')), entries, covers, notes, repositories: [...repositories].sort() };
 }
 
 /**
  * A named directory's files: in a git repository the tracked files and the
- * untracked ones git doesn't ignore; elsewhere every file. Never the memory
- * root's state/ or sessions/active/, and never the lane's own files.
+ * untracked ones git doesn't ignore, with each submodule's index commit in
+ * `gitlinks`; elsewhere every file. Never the memory root's state/ or
+ * sessions/active/, and never the lane's own files.
  */
 async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
   // Walked as plain files only outside every repository (D-423 item 3).
   const top = await repositoryTopLevel(dir, env);
   let files;
   let ignored = 0;
+  const gitlinks = new Map();
   if (top) {
     // Git names its top level by the physical path; the named directory may
     // be reached through a symlink. Both are resolved before the relative
@@ -424,11 +519,25 @@ async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
     const physicalTop = await realpath(top);
     const physicalDir = await realpath(dir);
     const relative = toPosix(path.relative(physicalTop, physicalDir)) || '.';
-    const listed = await gitText(['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', relative], top, env);
-    if (!listed.ok) {
-      throw new Error(`git ls-files failed for ${dir}: ${listed.stderr}`);
+    const underNamed = (item) => path.join(dir, path.relative(physicalDir, path.join(physicalTop, item)));
+    const staged = await gitText(['ls-files', '--stage', '-z', '--', relative], top, env);
+    if (!staged.ok) {
+      throw new Error(`git ls-files failed for ${dir}: ${staged.stderr}`);
     }
-    files = [...new Set(splitNul(listed.stdout))].map((item) => path.join(dir, path.relative(physicalDir, path.join(physicalTop, item))));
+    const listedFiles = new Set();
+    for (const record of splitNul(staged.stdout)) {
+      const tab = record.indexOf('\t');
+      const [mode, oid] = record.slice(0, tab).split(' ');
+      const file = underNamed(record.slice(tab + 1));
+      listedFiles.add(file);
+      if (mode === '160000') gitlinks.set(file, oid);
+    }
+    const others = await gitText(['ls-files', '--others', '--exclude-standard', '-z', '--', relative], top, env);
+    if (!others.ok) {
+      throw new Error(`git ls-files failed for ${dir}: ${others.stderr}`);
+    }
+    for (const item of splitNul(others.stdout)) listedFiles.add(underNamed(item));
+    files = [...listedFiles];
     // Every ignored file is counted: without --directory, git lists the files
     // inside a wholly ignored directory instead of one entry for it.
     const ignoredListing = await gitText(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', relative], top, env);
@@ -446,7 +555,7 @@ async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
     }
     kept.push(file);
   }
-  return { files: kept.sort(), ignored, git: Boolean(top) };
+  return { files: kept.sort(), ignored, git: Boolean(top), top: top ?? null, gitlinks };
 }
 
 /** The round id: SHA-256 of the three fingerprints (D-419 item 4). */
@@ -530,13 +639,7 @@ export function isConversationId(value) {
   return typeof value === 'string' && CONVERSATION_ID_PATTERN.test(value);
 }
 
-/**
- * `vibecompass ready-for-review`: writes the lane's `ready.json`. Refused, with
- * nothing written, while a finding waits for the builder's response and no
- * owner line defers it, and when there is no work to name.
- */
-export async function writeReadyMark({ rootDir, laneId, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env, now = new Date() }) {
-  const wipContent = await readFile(path.join(laneDir, 'wip.md'), 'utf8');
+function refuseWhileWaiting(wipContent) {
   let waiting;
   try {
     ({ waiting } = findingsWaitingForBuilder(wipContent));
@@ -546,6 +649,18 @@ export async function writeReadyMark({ rootDir, laneId, laneDir, worktrees = {},
   if (waiting.length > 0) {
     throw new Error(`ready-for-review is refused: ${waiting.join(', ')} ${waiting.length === 1 ? 'waits' : 'wait'} for the builder's response. Answer ${waiting.length === 1 ? 'it' : 'each'} with a response line (\`address review\`), or the owner defers ${waiting.length === 1 ? 'it' : 'them'}, then mark again.`); // D-419 item 4
   }
+}
+
+/**
+ * `vibecompass ready-for-review`: writes the lane's `ready.json`. Refused, with
+ * nothing written, while a finding waits for the builder's response and no
+ * owner line defers it, and when there is no work to name. The mark is
+ * written under the memory-root lock, which the relay holds while it checks
+ * the mark one last time and sends a builder its prompt, so a new mark lands
+ * either before that check or after the prompt has gone.
+ */
+export async function writeReadyMark({ rootDir, laneId, laneDir, worktrees = {}, paths = [], projectRepos = [], env = process.env, now = new Date() }) {
+  refuseWhileWaiting(await readFile(path.join(laneDir, 'wip.md'), 'utf8'));
   if (Object.keys(worktrees).length === 0 && paths.length === 0) {
     throw new Error('ready-for-review is refused: this lane has no worktree, so name the work under review with --path <repo-id>:<path> or a path relative to the memory root.'); // D-419 item 4
   }
@@ -557,23 +672,30 @@ export async function writeReadyMark({ rootDir, laneId, laneDir, worktrees = {},
     throw new Error(`ready-for-review is refused: the paths named cover no work (${current.work.covers.paths.map((item) => item.spec).join(', ')} ${current.work.covers.paths.length === 1 ? 'is the lane\'s own file' : 'are the lane\'s own files'}, never part of the work). Name the work under review with --path <repo-id>:<path> or a path relative to the memory root.`); // D-419 item 4
   }
   const { builder, warning } = readBuilderConversation(env);
-  const mark = {
-    format: MARK_FORMAT,
-    lane: laneId,
-    marked_at: now.toISOString(),
-    round_id: current.roundId,
-    fingerprints: current.fingerprints,
-    covers: {
-      handoff: `handoff.md › ${BUILDER_TO_REVIEWER_HEADING.slice(3)}`,
-      record: `wip.md › ${REVIEW_LOG_HEADING.slice(3)}`,
-      worktrees: current.work.covers.worktrees,
-      paths: current.work.covers.paths,
-    },
-    paths: current.work.covers.paths.filter((item) => item.kind !== 'lane file').map((item) => item.spec),
-    builder,
-  };
-  await writeFileAtomic(path.join(laneDir, READY_FILE), `${JSON.stringify(mark, null, 2)}\n`);
-  return { mark, notes: current.work.notes, warnings: warning ? [warning] : [], readyPath: path.join(laneDir, READY_FILE) };
+  return withMemoryRootLock(rootDir, 'ready-for-review', async () => {
+    // The lane's two files, read again under the lock: a pass the relay
+    // recorded meanwhile is checked, and the mark holds what is there now.
+    const files = await fingerprintLaneFiles(laneDir);
+    refuseWhileWaiting(files.wipContent);
+    const fingerprints = { handoff: files.handoff, record: files.record, work: current.fingerprints.work };
+    const mark = {
+      format: MARK_FORMAT,
+      lane: laneId,
+      marked_at: now.toISOString(),
+      round_id: computeRoundId(fingerprints),
+      fingerprints,
+      covers: {
+        handoff: `handoff.md › ${BUILDER_TO_REVIEWER_HEADING.slice(3)}`,
+        record: `wip.md › ${REVIEW_LOG_HEADING.slice(3)}`,
+        worktrees: current.work.covers.worktrees,
+        paths: current.work.covers.paths,
+      },
+      paths: current.work.covers.paths.filter((item) => item.kind !== 'lane file').map((item) => item.spec),
+      builder,
+    };
+    await writeFileAtomic(path.join(laneDir, READY_FILE), `${JSON.stringify(mark, null, 2)}\n`);
+    return { mark, notes: current.work.notes, warnings: warning ? [warning] : [], readyPath: path.join(laneDir, READY_FILE) };
+  });
 }
 
 /**

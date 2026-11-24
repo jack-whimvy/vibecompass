@@ -401,9 +401,10 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   conversation is closed and was started in the folder it prints
   (`--conversation-closed` confirms both). Otherwise, or with `--one-pass`, it
   runs one pass and stops; you type `address review` in the builder's window.
-  `--confirm-each-round` waits for your Enter before each builder turn, and
-  after the Enter the relay reads the mark and the log again. If a newer mark
-  names another conversation, or none, the loop stops before any turn.
+  `--confirm-each-round` waits for your Enter before each builder turn. After
+  the Enter, and again as each builder prompt goes out, the relay reads the
+  mark and the log; a mark made meanwhile means no prompt is sent. If a newer
+  mark names another conversation, or none, the loop stops before any turn.
 - **Stops.** Every stop prints the reason, the open findings, your choices, and
   in the loop `claude --resume <id>`, which continues from the relayed turns.
   Each command a choice names runs as printed, from any folder, with the
@@ -423,9 +424,11 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   mode. Its own `git` reads start no fsmonitor, hook, filter, or fetch, and a
   read that needs an object a partial clone lacks refuses instead.
   `close-session` refuses while a relay runs or left a write or turn
-  unfinished; `review-relay --session <lane-id> --recover` finishes it, and asks
-  you to confirm a turn whose process it couldn't record is gone. The mark
-  and the relay's state live in the lane folder and go at close.
+  unfinished; `review-relay --session <lane-id> --recover` finishes it. A turn
+  whose process it couldn't record stays reserved while any process carrying
+  that turn's id runs; with none found, `--recover` asks you to settle it. No
+  other session's process is named. The mark and the relay's state live in the
+  lane folder and go at close.
 - **Platforms.** macOS only until a Linux run is recorded; `ready-for-review`
   and the lane's stage (`list-sessions`) work everywhere. An install that never
   runs the relay sees no change.

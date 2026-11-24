@@ -20,7 +20,9 @@ package's installed text, command output, and help do.
   or with `--one-pass`, it runs one pass and stops. Each stop prints the
   reason, the open findings, the choices (each command runs as printed, from
   any folder, with the options the run was started with), and in the loop
-  `claude --resume <id>`.
+  `claude --resume <id>`. Before each builder turn, and again as its prompt
+  goes out, the relay reads the mark and the log, and a mark made meanwhile
+  withholds the prompt.
   Flags: `--recover`, `--past-cap`, `--one-pass`, `--conversation-closed`,
   `--confirm-each-round`, `--reviewer`, `--reviewer-model`, `--fresh-reviewer`,
   `--builder-mode`, `--reviewer-timeout`, and `--builder-timeout`. It never
@@ -39,9 +41,11 @@ package's installed text, command output, and help do.
 - A relayed write has two recoverable halves, `wip.md` then `handoff.md`, each
   written only over what it expects to replace; `review-relay --recover`
   finishes an interrupted one as complete, superseded, or discarded, and sends
-  no signal to a process it finds from an earlier run; a turn whose process it
-  couldn't record stays reserved until the owner confirms at `--recover` that
-  none is left. One relay runs per lane and per conversation. `close-session`
+  no signal to a process it finds from an earlier run. Each turn's processes
+  carry the turn's id in their environment: a turn whose process the relay
+  couldn't record stays reserved while a process with that id runs and, with
+  none found, until the owner settles it at `--recover`. One relay runs per
+  lane and per conversation. `close-session`
   refuses while a relay runs on the lane or left a write or a turn unfinished.
   The relay's own `git` reads start no fsmonitor, hook, filter, or fetch.
 - `vibecompass ready-for-review --session <lane-id> [--path <path>…]`: the
@@ -50,7 +54,8 @@ package's installed text, command output, and help do.
   work (the lane's worktrees, read file by file with their checked-out
   submodules, and each named path), and the builder's Claude
   Code conversation when it runs inside one. It is refused while a finding
-  waits for the builder's response. It works on every platform; in a lane
+  waits for the builder's response, and it writes the mark under the
+  memory-root lock. It works on every platform; in a lane
   reviewed by hand it changes only the lane's stage.
 - Lane inventories (`list-sessions`, and the inventories `continue-session`
   and `start-session` print) show a `stage:` line for a lane with a mark or

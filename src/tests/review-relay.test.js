@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
@@ -13,6 +13,7 @@ import { prepareRelayWrite } from '../relay-record.js';
 import { computeCurrentFingerprints } from '../relay-mark.js';
 import { createProcessTable, emptyRelayState, readRelayState, saveRelayState } from '../relay-state.js';
 import { coveredRepositories } from '../review-relay.js';
+import { withMemoryRootLock } from '../serialization.js';
 import { REVIEWER_TO_BUILDER_HEADING, readSectionBody } from '../relay-sections.js';
 import { extractReviewLogLines, parseReviewLog } from '../review-log.js';
 import { closeProjectSession, listProjectSessions } from '../session.js';
@@ -1104,27 +1105,33 @@ test('a turn whose process was never recorded stays reserved through a restart a
   assert.equal(state.turn.pgid, null);
   assert.equal(state.turn.ended, null, 'the turn stays unfinished');
   assert.equal(state.turn.command, 'codex');
+  const marker = `VIBECOMPASS_RELAY_TURN_ID=${state.turn.id}`;
   const lockPath = path.join(s.home, '.config', 'vibecompass', 'relay-locks', `${CONV}.json`);
   assert.ok(existsSync(lockPath), 'the conversation lock is kept');
   // A restart starts nothing and stays reserved.
   const reviewsBefore = (await s.standin.calls()).filter((item) => item.kind === 'review').length;
   const again = await s.relay([...codexArgs, '--conversation-closed']);
   assert.equal(again.code, 1);
-  assert.match(again.out, /the reviewer turn for pass 1, started .+, was never recorded with its process, so the relay can't inspect it\. Its prompt was never sent.+a codex process may be left\. The lane and conversation stay reserved\./);
+  assert.match(again.out, /the reviewer turn for pass 1, started .+, was never recorded with its process, so the relay can't inspect its process group\. Its prompt was never sent, since the prompt goes out only after that record, so no model turn ran\./);
+  assert.ok(again.out.includes(`No running process carries its id (${marker}), but a system program it started, such as a shell, doesn't show its environment`), again.out);
+  assert.match(again.out, /The lane and conversation stay reserved until you run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal, which asks you to settle it\. No other session's process needs stopping\./);
+  assert.match(again.out, /Choices:\n- run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal and settle the turn\n/);
+  assert.doesNotMatch(again.out, /codex process|started then or later|stop any you find/, 'nothing points at other sessions of the same tool');
   assert.equal((await s.standin.calls()).filter((item) => item.kind === 'review').length, reviewsBefore, 'no reviewer started');
   // Close refuses.
-  await assert.rejects(closeProjectSession({ cwd: s.ws.tempDir, rootDir: s.ws.rootDir, sessionId: s.lane.laneId, ...CLOSE }), /close-session is refused: the relay's reviewer turn on lane unrecorded, started .+, was never recorded with its process, so it can't be inspected/);
+  await assert.rejects(closeProjectSession({ cwd: s.ws.tempDir, rootDir: s.ws.rootDir, sessionId: s.lane.laneId, ...CLOSE }), /close-session is refused: the relay's reviewer turn on lane unrecorded, started .+, was never recorded with its process, so its process group can't be inspected\. Run `.+--recover` in a terminal: it looks for the turn's own processes by the id in their environment/);
   // --recover with no terminal, then with a no: still reserved.
-  assert.match((await s.relay(['--recover'])).out, /run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal, which asks you to confirm/);
+  assert.match((await s.relay(['--recover'])).out, /run `vibecompass review-relay --root \S+ --session unrecorded --recover` in a terminal, which asks you to settle it/);
   const questions = [];
   const declined = await s.relay(['--recover'], { confirm: async (question) => { questions.push(question); return 'n'; } });
   assert.equal(declined.code, 1);
-  assert.match(questions[0], /^The reviewer turn for pass 1, started .+, was never recorded with its process\. Check `ps -A -o pid,pgid,lstart,command` for a codex process started then or later\. Is every such process gone\? \[y\/N\]$/);
+  assert.match(questions[0], /^The reviewer turn for pass 1, started .+, was never recorded with its process, so its prompt was never sent and no model turn ran\. No running process carries its id \(VIBECOMPASS_RELAY_TURN_ID=[0-9a-f]{12}\), but a system program it started, such as a shell, doesn't show its environment, so the relay can't rule one out\. Settle the turn and release the lane and conversation\? Other sessions aren't affected\. \[y\/N\]$/);
+  assert.ok(questions[0].includes(marker));
   assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null);
   // The owner confirms: the turn is settled, and the lane runs again.
   const confirmed = await s.relay(['--recover'], { confirm: async () => 'y' });
   assert.equal(confirmed.code, 0, confirmed.out);
-  assert.match(confirmed.out, /You confirmed none of its processes is left\./);
+  assert.match(confirmed.out, /You settled it\./);
   // The first relay's process has exited, as a real relay's does after its run;
   // here every relay runs in the test's own process.
   const lock = JSON.parse(await readFile(lockPath, 'utf8'));
@@ -1162,6 +1169,156 @@ test('the lane changing while the relay waits for the Enter: no builder turn goe
       assert.match(result.out, /Stopped: pass 2 is clean/);
     }
   }
+});
+
+test('recovery names only the processes that carry the turn\'s id: another session of the same tool is left out', { skip: process.platform !== 'darwin' }, async (t) => {
+  const s = await setup(t, { laneId: 'marked-recovery' });
+  const turnId = 'a1b2c3d4e5f6';
+  await saveRelayState(s.lane.laneDir, { ...emptyRelayState(s.lane.laneId), step: 'builder-turn', turn: { id: turnId, role: 'builder', command: 'claude', pass: 1, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
+  // One process from the turn, carrying its id, and one from another session
+  // of the same tool, which doesn't.
+  const start = (extraEnv) => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', 'claude'], { env: { ...process.env, ...extraEnv }, detached: true, stdio: 'ignore' });
+    t.after(() => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    });
+    return child;
+  };
+  const fromTurn = start({ VIBECOMPASS_RELAY_TURN_ID: turnId });
+  const other = start({});
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const questions = [];
+  const ask = async (question) => {
+    questions.push(question);
+    return 'y';
+  };
+  const held = await s.relay(['--recover'], { confirm: ask });
+  assert.equal(held.code, 1);
+  assert.equal(questions.length, 0, 'with the turn\'s own process found, nothing is asked');
+  assert.match(held.out, new RegExp(`These processes carry its id \\(VIBECOMPASS_RELAY_TURN_ID=${turnId}\\): ${fromTurn.pid} in group ${fromTurn.pid} `));
+  assert.match(held.out, new RegExp(`\`kill -TERM -${fromTurn.pid}\``));
+  assert.ok(!held.out.includes(String(other.pid)), 'the other session\'s process isn\'t named');
+  assert.match(held.out, /No other process needs stopping\./);
+  assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null);
+  // The turn's process is gone: the owner is asked, and settles it.
+  process.kill(-fromTurn.pid, 'SIGKILL');
+  for (let tries = 0; tries < 50 && (await createProcessTable().list()).some((row) => row.pid === fromTurn.pid); tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const settled = await s.relay(['--recover'], { confirm: ask });
+  assert.equal(settled.code, 0, settled.out);
+  assert.equal(questions.length, 1);
+  assert.match(settled.out, /You settled it\./);
+  assert.match((await readRelayState(s.lane.laneDir)).turn.ended.how, /settled by the owner/);
+  assert.ok((await createProcessTable().list()).some((row) => row.pid === other.pid), 'the other session still runs');
+});
+
+test('a mark replaced while the builder\'s process is starting: the process gets no prompt, and the lane is read again', async (t) => {
+  const OTHER = '9e8d7c6b-2222-4333-8444-555566667777';
+  // While the process's identity is recorded; and from a holder of the
+  // memory-root lock that ready-for-review writes under, held across the
+  // relay's last check, which waits for it.
+  for (const [laneId, conversationId, timing] of [['startup-other', OTHER, 'identity'], ['startup-same', CONV, 'identity'], ['startup-locked', CONV, 'locked']]) {
+    const s = await setup(t, { laneId });
+    await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }, { answer: CONFIRM_R11 }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }] } });
+    await s.mark();
+    // After the relay's check before the turn, while the builder's process
+    // waits for its prompt: the owner answers by hand and marks again.
+    let remarked = false;
+    let holder = null;
+    const ownerAnswers = async () => {
+      await writeReviewLog(s.lane, [...extractReviewLogLines(await s.wip()).lines.map((line) => line.text).filter((line) => line.trim() !== ''), '- response 1 | 2026-11-21 22:00 -08:00 | Claude Opus 5.5', '  - R1.1 | P2 | accepted | fixed the time pattern']);
+      await writeFile(path.join(s.lane.worktreeDir, 'src', 'index.js'), 'export const answer = 43;\n', 'utf8');
+      await s.mark(conversationId);
+      remarked = true;
+    };
+    const duringStart = async ({ stage, role }) => {
+      if (stage !== 'identity' || role !== 'builder' || remarked || holder) return;
+      if (timing === 'identity') {
+        await ownerAnswers();
+        return;
+      }
+      let entered;
+      const inside = new Promise((resolve) => {
+        entered = resolve;
+      });
+      holder = withMemoryRootLock(s.ws.rootDir, 'owner', async () => {
+        entered();
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        await ownerAnswers();
+      });
+      await inside;
+    };
+    const result = await s.relay([...codexArgs, '--conversation-closed'], { relayOnTurnRecord: duringStart });
+    if (holder) await holder;
+    assert.ok(remarked, laneId);
+    assert.match(result.out, /Not sending the builder its turn for pass 1: the ready-for-review mark changed \(now round [0-9a-f]{12}\)\. Its process got no prompt, so no model turn ran\. Reading the lane again\./, laneId);
+    // The process is ended as its stdin closes empty, often before it can
+    // record anything; none ever read a prompt.
+    const builders = (await s.standin.calls()).filter((item) => item.kind === 'builder');
+    assert.ok(builders.length <= 1, laneId);
+    for (const builder of builders) assert.equal(builder.prompt, '', `${laneId}: no prompt`);
+    assert.equal(await readFile(path.join(s.lane.worktreeDir, 'src', 'index.js'), 'utf8'), 'export const answer = 43;\n');
+    assert.equal(parse(await s.wip()).records.filter((record) => record.kind === 'response').length, 1, `${laneId}: only the owner's response`);
+    if (conversationId === OTHER) {
+      assert.equal(result.code, 1);
+      assert.match(result.out, new RegExp(`now names Claude Code conversation ${OTHER}, not ${CONV}, which this run resumes\\. Nothing was sent to either\\.`));
+      const turn = (await readRelayState(s.lane.laneDir)).turn;
+      assert.equal(turn.role, 'builder');
+      assert.equal(turn.prompt_sent, false);
+      assert.equal(turn.ended.how, 'prompt withheld');
+    } else {
+      assert.equal(result.code, 0, result.out);
+      assert.match(result.out, /Stopped: pass 2 is clean/);
+    }
+  }
+});
+
+test('the remote-ref check around a builder turn covers checked-out submodules, nested ones too', async (t) => {
+  const s = await setup(t, { laneId: 'submodule-refs' });
+  const repo = async (name, file) => {
+    const dir = path.join(s.ws.tempDir, name);
+    await mkdir(dir);
+    git(dir, ['init', '-q', '-b', 'main']);
+    git(dir, ['config', 'user.email', 'test@example.com']);
+    git(dir, ['config', 'user.name', 'Test']);
+    await writeFile(path.join(dir, file), `${name}\n`, 'utf8');
+    git(dir, ['add', '.']);
+    git(dir, ['commit', '-q', '-m', name]);
+    return dir;
+  };
+  const deep = await repo('deep', 'deep.txt');
+  const lib = await repo('lib', 'lib.js');
+  git(lib, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', deep, 'deps/deep']);
+  git(lib, ['commit', '-q', '-m', 'deep']);
+  const wt = s.lane.worktreeDir;
+  git(wt, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib']);
+  git(wt, ['-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init', '--recursive']);
+  git(wt, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', 'vendor lib']);
+  const ctx = { worktrees: { app: wt }, rootDir: s.ws.rootDir, laneDir: s.lane.laneDir, projectRepos: [{ id: 'app' }], env: process.env };
+  const sub = path.join(wt, 'vendor', 'lib');
+  const nested = path.join(sub, 'deps', 'deep');
+  assert.deepEqual(await coveredRepositories(ctx, { paths: [] }), [wt, sub, nested].sort());
+  // A ref moved in the nested submodule during the builder's turn is seen.
+  const head = git(nested, ['rev-parse', 'HEAD']).trim();
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: [...answerR11(s.lane, { mark: false }), { type: 'run', command: 'git', args: ['-C', nested, 'update-ref', 'refs/remotes/origin/moved', head] }, { type: 'mark-ready' }] }] } });
+  await s.mark();
+  const result = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.out, /a remote-tracking ref moved during the builder's turn in .*vendor\/lib\/deps\/deep: something may have been pushed/);
+  // Each turn's processes carried that turn's own id (D-419 item 10).
+  const calls = await s.standin.calls();
+  const turn = (await readRelayState(s.lane.laneDir)).turn;
+  assert.equal(turn.role, 'builder');
+  assert.deepEqual(calls.filter((item) => item.kind === 'builder').map((item) => item.turnId), [turn.id]);
+  const reviewIds = calls.filter((item) => item.kind === 'review').map((item) => item.turnId);
+  assert.equal(reviewIds.length, 1);
+  assert.match(reviewIds[0], /^[0-9a-f]{12}$/);
+  assert.notEqual(reviewIds[0], turn.id);
 });
 
 test('after the leader exits, a group member that stays is read once per poll interval, not continuously', async (t) => {

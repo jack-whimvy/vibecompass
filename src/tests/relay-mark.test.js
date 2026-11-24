@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFile, readdir, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { chmod, readFile, readdir, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { runCli } from '../cli.js';
@@ -549,4 +549,158 @@ test('the relay\'s git reads ignore a repository the environment names', async (
   const env = { ...process.env, GIT_DIR: path.join(ws.appDir, '.git'), GIT_WORK_TREE: ws.appDir, GIT_INDEX_FILE: path.join(ws.appDir, '.git', 'index') };
   const work = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: lane.worktreeDir }, projectRepos: [{ id: 'app' }], env });
   assert.equal(work.covers.worktrees[0].head, laneHead, 'the worktree is read, not the repository the environment names');
+});
+
+test('a repository\'s own transport setting lets no relay read fetch, where protocol.allow on the command line alone would', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'transport-lane');
+  const source = path.join(ws.tempDir, 'source');
+  await mkdir(source);
+  git(source, ['init', '-q', '-b', 'main']);
+  git(source, ['config', 'user.email', 'test@example.com']);
+  git(source, ['config', 'user.name', 'Test']);
+  git(source, ['config', 'uploadpack.allowFilter', 'true']);
+  await writeFile(path.join(source, 'f.txt'), 'a\n', 'utf8');
+  git(source, ['add', '.']);
+  git(source, ['commit', '-q', '-m', 'A']);
+  await writeFile(path.join(source, 'f.txt'), 'b\n', 'utf8');
+  git(source, ['commit', '-q', '-am', 'B']);
+  const clone = path.join(ws.tempDir, 'clone');
+  git(ws.tempDir, ['clone', '-q', '--filter=blob:none', `file://${source}`, clone]);
+  git(clone, ['reset', '-q', '--soft', 'HEAD~1']);
+  // The repository allows its own transport, which outranks a default.
+  git(clone, ['config', 'protocol.file.allow', 'always']);
+  const objects = async () => (await readdir(path.join(clone, '.git', 'objects'), { recursive: true })).length;
+  const before = await objects();
+  await assert.rejects(
+    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, worktrees: { app: clone }, projectRepos: [{ id: 'app' }] }),
+    /git diff --cached failed in Lane worktree app at .+(not allowed|could not fetch)/,
+  );
+  assert.equal(await objects(), before, 'nothing was fetched');
+  // The control: the command-line default alone gives way to the setting.
+  const env = { ...process.env };
+  delete env.GIT_NO_LAZY_FETCH;
+  delete env.GIT_ALLOW_PROTOCOL;
+  spawnSync('git', ['-c', 'protocol.allow=never', 'diff', '--cached', '--binary'], { cwd: clone, env, encoding: 'utf8' });
+  assert.ok((await objects()) > before, 'protocol.allow=never alone fetched');
+});
+
+test('a named directory reached through a symbolic link into a repository is that repository\'s: git missing refuses it, never walks it', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'alias-lane');
+  await writeFile(path.join(ws.appDir, '.gitignore'), 'cache.bin\n', 'utf8');
+  await mkdir(path.join(ws.appDir, 'src', 'lib'));
+  await writeFile(path.join(ws.appDir, 'src', 'lib', 'keep.js'), 'kept\n', 'utf8');
+  await writeFile(path.join(ws.appDir, 'src', 'lib', 'cache.bin'), 'ignored\n', 'utf8');
+  // A folder no repository holds, with a link to a folder inside the app
+  // checkout (not its top, where the lookup for .git would go through the
+  // link), and the named directory below the link.
+  const plain = path.join(ws.tempDir, 'plain');
+  await mkdir(plain);
+  await symlink(path.join(ws.appDir, 'src'), path.join(plain, 'alias'));
+  const projectRepos = [{ id: 'plain', path: 'plain' }];
+  const withGit = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['plain:alias/lib'], projectRepos });
+  assert.equal(withGit.covers.paths[0].covered, 1);
+  assert.equal(withGit.covers.paths[0].ignored, 1);
+  const noGit = { ...process.env, PATH: path.join(ws.tempDir, 'no-such-bin') };
+  await assert.rejects(
+    fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['plain:alias/lib'], projectRepos, env: noGit }),
+    /git couldn't read the repository at \S+\/app \(.+\), so the relay doesn't read .+alias\/lib as plain files/,
+  );
+});
+
+test('a tracked file losing its executable bit changes the work, with group and other execute bits still set', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'mode-lane', { worktree: true });
+  const script = path.join(lane.worktreeDir, 'run.sh');
+  await writeFile(script, '#!/bin/sh\necho hi\n', 'utf8');
+  await chmod(script, 0o755);
+  git(lane.worktreeDir, ['add', 'run.sh']);
+  git(lane.worktreeDir, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', 'script']);
+  const marked = await mark(ws, lane);
+  assert.equal(marked.code, 0, marked.stderr());
+  await chmod(script, 0o655);
+  // The control: git records the change.
+  assert.match(git(lane.worktreeDir, ['diff', '--summary']), /mode change 100755 => 100644 run\.sh/);
+  const compared = await compare(ws, lane);
+  assert.equal(compared.current, false, 'the mode change counts');
+  assert.deepEqual(compared.differences, ['work']);
+});
+
+test('a named directory over a submodule that isn\'t checked out changes when the submodule\'s commit changes', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'gitlink-lane');
+  const lib = path.join(ws.tempDir, 'lib');
+  await mkdir(lib);
+  git(lib, ['init', '-q', '-b', 'main']);
+  git(lib, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '--allow-empty', '-m', 'one']);
+  git(ws.appDir, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib']);
+  git(ws.appDir, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', 'vendor lib']);
+  git(ws.appDir, ['submodule', 'deinit', '-q', '-f', 'vendor/lib']);
+  const projectRepos = [{ id: 'app' }];
+  const first = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:vendor'], projectRepos });
+  assert.equal(first.covers.paths[0].covered, 1);
+  // The submodule's entry now names another commit; nothing is checked out.
+  const other = git(ws.appDir, ['rev-parse', 'HEAD']).trim();
+  git(ws.appDir, ['update-index', '--cacheinfo', `160000,${other},vendor/lib`]);
+  assert.equal(git(ws.appDir, ['diff', '--cached', '--name-only']).trim(), 'vendor/lib', 'the control: git sees the change');
+  const second = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:vendor'], projectRepos });
+  assert.notEqual(second.fingerprint, first.fingerprint, 'the new commit counts');
+});
+
+test('a tracked folder replaced by a symbolic link: nothing past the link is read, and the link counts', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'link-lane', { worktree: true });
+  await mkdir(path.join(lane.worktreeDir, 'lib'));
+  await writeFile(path.join(lane.worktreeDir, 'lib', 'a.txt'), 'tracked\n', 'utf8');
+  git(lane.worktreeDir, ['add', 'lib']);
+  git(lane.worktreeDir, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', 'lib']);
+  const first = await mark(ws, lane);
+  assert.equal(first.code, 0, first.stderr());
+  // The folder becomes a link to one outside the checkout, with the same file in it.
+  const outside = path.join(ws.tempDir, 'outside');
+  await mkdir(outside);
+  await writeFile(path.join(outside, 'a.txt'), 'tracked\n', 'utf8');
+  await rm(path.join(lane.worktreeDir, 'lib'), { recursive: true });
+  await symlink(outside, path.join(lane.worktreeDir, 'lib'));
+  assert.equal((await compare(ws, lane)).current, false, 'the replacement counts');
+  const second = await mark(ws, lane);
+  assert.equal(second.code, 0, second.stderr());
+  // A change past the link is never read.
+  await writeFile(path.join(outside, 'a.txt'), 'changed outside\n', 'utf8');
+  assert.equal((await compare(ws, lane)).current, true, 'nothing past the link counts');
+  // Pointing the link elsewhere counts.
+  const elsewhere = path.join(ws.tempDir, 'elsewhere');
+  await mkdir(elsewhere);
+  await unlink(path.join(lane.worktreeDir, 'lib'));
+  await symlink(elsewhere, path.join(lane.worktreeDir, 'lib'));
+  assert.equal((await compare(ws, lane)).current, false, 'the link\'s new target counts');
+});
+
+test('ready-for-review writes its mark under the memory-root lock: it waits while the relay holds the lock to check and send a prompt', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'locked-mark', { worktree: true });
+  let entered;
+  const inside = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const holder = withMemoryRootLock(ws.rootDir, 'review-relay', async () => {
+    entered();
+    await gate;
+  });
+  await inside;
+  const marking = mark(ws, lane);
+  for (let tries = 0; tries < 30; tries += 1) {
+    assert.equal(await readReadyMark(lane.laneDir), null, 'no mark while the lock is held');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  release();
+  await holder;
+  const done = await marking;
+  assert.equal(done.code, 0, done.stderr());
+  assert.ok(done.mark, 'the mark lands once the lock is let go');
 });
