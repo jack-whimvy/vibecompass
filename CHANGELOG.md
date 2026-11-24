@@ -5,7 +5,40 @@ VibeCompass project's own decision log, which is private, not in your
 project's log. From 0.18.0 on, entries state each rule without a number, as the
 package's installed text, command output, and help do.
 
-## Unreleased
+## 0.19.0 - 2026-11-23
+
+A review relay release: the owner can relay a lane's review rounds between a
+read-only reviewer and the builder, a project chooses its review cap at setup,
+and `push` sends a root over 4 MB in parts.
+
+Upgrading: `ready-for-review`, `review-relay`, `review-settings`,
+`init --review-round-cap`, the lane's `stage:` line, and the push in parts work
+as soon as you upgrade. A project that never runs `ready-for-review` or
+`review-relay` sees no change apart from the `stage` and `stageReason` keys,
+null, in `list-sessions --json`. The role text changes at the root's next
+`refresh-workflow --dry-run`, then `--apply`: `context.md` gains the lane's
+mark and relay files, the builder's mark and the relay's builder turns, a
+relayed reviewer, a relayed pass in the Review log format, the relay's
+reviewer in who counts as a reviewer, the project manager's check of relayed
+passes, and `review-settings` in the Workflow defaults' cap line;
+`workflows/project-manager.md` gains the relay's reviewer in The review rule
+and how to check relayed passes; and the `npx` fallback in
+`workflows/docs-review.md` moves to 0.19.0. The managed agent blocks don't
+change, and lifecycle commands write their project facts as 0.18.3 does. The
+relay runs on macOS only. Its reviewer is Codex 0.171.0, the one listed
+version; any other version stops before launch, and you review by hand as
+before. Its loop needs Claude Code 2.1.318 or later as the builder; with an
+older one, run `--one-pass` and answer in the conversation yourself. In the
+default builder mode a relayed turn can't ask you, so a command the project's
+Claude Code settings don't allow (a test run, say) stops the loop: allow it
+there, or run with `--builder-mode auto`. The review cap's default stays 3,
+and a cap already in `project.yaml` is kept: a new project chooses one with
+`init --review-round-cap <n>` or guided setup's question, an existing one with
+`review-settings --round-cap <n>`, and `refresh-workflow` still writes no
+`review:` block. `push` needs nothing
+changed: a root over 4 MB goes in parts to a hosted app that takes them, and a
+hosted app that predates them still takes a push of up to 5 MB as one request,
+above which `push` says the hosted app needs an update and sends nothing more.
 
 ### The review relay, the ready-for-review mark, and the review cap at setup
 
@@ -72,11 +105,6 @@ package's installed text, command output, and help do.
   relayed reviewer, a relayed pass in the Review log format, and the project
   manager's check of relayed passes.
 
-Upgrading: nothing changes for a project that never runs `ready-for-review` or
-`review-relay`, apart from the `stage` and `stageReason` keys, null, in
-`list-sessions --json`. The role text changes at the root's next
-`refresh-workflow --apply`.
-
 ### Large hosted pushes
 
 - `push` takes a root over 4 MB. A push of 4 MB or less goes as one request,
@@ -85,11 +113,8 @@ Upgrading: nothing changes for a project that never runs `ready-for-review` or
   it. The hosted app applies an upload at most once and keeps its answer, so a
   retry after a lost reply gets the original answer. Limits: 25 MB compressed,
   50 MB uncompressed, 4 MB per document, and 5,000 documents. Before this, a
-  root over Vercel's 4.5 MB request limit got a bare 413.
-- Upgrading: nothing to change. A hosted app that predates large pushes still
-  takes a push of up to 5 MB as one request; above that, `push` says the hosted
-  app needs an update and sends nothing more. A push of up to 5 MB that holds a
-  document over 4 MB keeps the single request, as before.
+  root over Vercel's 4.5 MB request limit got a bare 413. A push of up to 5 MB
+  that holds a document over 4 MB keeps the single request, as before.
 - Messages: `Push refused before upload` (nothing was sent), `Push refused`
   (the hosted memory didn't change), and `The push's outcome is unknown` (run
   `vibecompass status`, or push again). `push` never follows a redirect on a
