@@ -1075,7 +1075,8 @@ test('a single request whose connection fails is an unknown outcome, never resen
       assert.deepEqual(await readManifestSync(rootDir), before, 'nothing recorded');
       const { code, stdout, stderr } = await runCliProcess(tempDir);
       assert.equal(code, 1);
-      assert.match(stderr, /Error: The hosted app at .+ answered with a redirect, which a push never follows\./);
+      assert.match(stderr, /Error: The push's outcome is unknown: the hosted app at .+ answered 303, a redirect, which a push never follows\. Nothing was recorded locally\./);
+      assert.match(stderr, /Set sync\.api_url to the app's final address, then run vibecompass status, or push again/);
       assert.doesNotMatch(stderr, /Nothing was sent/);
       assert.match(stdout, /Secret check: passed/);
     } finally {
@@ -1096,4 +1097,30 @@ test('a single request whose connection fails is an unknown outcome, never resen
     assert.match(error.message, /couldn't be reached \(ECONNREFUSED\)\. Nothing was sent\./);
     return true;
   });
+
+  // A name that doesn't resolve is unreachable even when it contains the word
+  // "redirect": a redirect is known by the answer's status, never by error text.
+  const hostname = 'sync-redirect.example.invalid';
+  const dnsFailure = async () => {
+    throw new TypeError('fetch failed', {
+      cause: Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: 'ENOTFOUND', hostname }),
+    });
+  };
+  for (const large of [false, true]) {
+    const { tempDir: dnsDir, rootDir: dnsRoot } = await createRoot(`http://${hostname}`);
+    if (large) {
+      await addDocument(dnsRoot, 'a', 2_200_000);
+      await addDocument(dnsRoot, 'b', 2_200_000);
+    } else await addDocument(dnsRoot, 'a', 10_000);
+    await assert.rejects(pushProjectMemory({ rootDir: '.compass' }, environment(dnsDir, { fetch: dnsFailure })), (error) => {
+      assert.notEqual(error.code, 'redirect_refused', `large: ${large}`);
+      assert.doesNotMatch(error.message, /a redirect, which a push never follows/, `large: ${large}`);
+      if (!large) {
+        assert.equal(error.outcome, 'refused_before_upload');
+        assert.equal(error.code, 'app_unreachable');
+        assert.match(error.message, /couldn't be reached \(ENOTFOUND\)\. Nothing was sent\./);
+      }
+      return true;
+    });
+  }
 });

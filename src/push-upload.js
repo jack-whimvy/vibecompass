@@ -196,28 +196,31 @@ export function singleRequestFailure(context, error, phase) {
   );
 }
 
-/** A fetch on the push path that never follows a redirect, so no body goes to another address. */
+/**
+ * A fetch on the push path that never follows a redirect, so no body goes to
+ * another address. Fetch's manual mode hands back the redirect itself, so a
+ * redirect is known by its 3xx status, never by an error's text: a failure
+ * before any answer (a name that doesn't resolve, say) keeps its own error.
+ * The app received the redirected request, so the outcome is unknown.
+ */
 async function send(context, url, init) {
-  try {
-    return await context.fetch(url, { ...init, redirect: 'error' });
-  } catch (error) {
-    if (isRedirectRefusal(error)) {
-      throw new PushOutcomeError(
-        `The hosted app at ${context.apiUrl} answered with a redirect, which a push never follows. Set sync.api_url to the app's final address.`,
-        { outcome: 'unknown', code: 'redirect_refused' },
-      );
+  const response = await context.fetch(url, { ...init, redirect: 'manual' });
+  if (response.status >= 300 && response.status < 400) {
+    try {
+      await response.body?.cancel?.();
+    } catch {
+      // The answer is refused either way.
     }
-    throw error;
+    throw new PushOutcomeError(
+      `The push's outcome is unknown: the hosted app at ${context.apiUrl} answered ${response.status}, a redirect, which a push never follows. Nothing was recorded locally. Set sync.api_url to the app's final address, then run vibecompass status, or push again: a push that already applied answers already current.`,
+      { outcome: 'unknown', code: 'redirect_refused', status: response.status },
+    );
   }
+  return response;
 }
 
 /** The same fetch for the push of 4,000,000 bytes or less, sent by sync.js. */
 export const sendWithoutRedirect = send;
-
-function isRedirectRefusal(error) {
-  const text = `${error?.message ?? ''} ${error?.cause?.message ?? ''}`;
-  return /redirect/i.test(text);
-}
 
 function authHeaders(context, extra = {}) {
   return { accept: 'application/json', authorization: `Bearer ${context.credential}`, ...extra };
