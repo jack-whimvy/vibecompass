@@ -1213,13 +1213,13 @@ test('recovery names only the processes that carry the turn\'s id: another sessi
   const held = await s.relay(['--recover'], { confirm: ask });
   assert.equal(held.code, 1);
   assert.equal(questions.length, 0, 'with the turn\'s own process found, nothing is asked');
-  assert.match(held.out, new RegExp(`These processes carry its id \\(VIBECOMPASS_RELAY_TURN_ID=${turnId}\\) in their environment: ${fromTurn.pid} in group ${fromTurn.pid} `));
-  assert.match(held.out, new RegExp(`\`kill -TERM -${fromTurn.pid}\``));
+  assert.match(held.out, new RegExp(`These processes show its id \\(VIBECOMPASS_RELAY_TURN_ID=${turnId}\\) in their environment: process ${fromTurn.pid} \\(`));
+  assert.match(held.out, /macOS shows a process's environment entries joined by spaces, so that can't prove each is the turn's, and the relay sends and suggests no signal\./);
+  assert.doesNotMatch(held.out, /kill -TERM|in group /, 'no signal is suggested, and no group is named');
   assert.ok(!held.out.includes(String(other.pid)), 'the other session\'s process isn\'t named');
   assert.ok(!held.out.includes(String(named.pid)), 'nor one whose shown environment lacks the id, whatever its arguments say');
   assert.match(held.out, new RegExp(`One process names its id where the relay can't tell its environment from its arguments.+process ${shell.pid} `));
-  assert.ok(!held.out.includes(`group ${shell.pid}`) && !held.out.includes(`kill -TERM -${shell.pid}`) && !held.out.includes(`kill -TERM ${shell.pid}`), 'the shell isn\'t called the turn\'s, and nothing says to stop it');
-  assert.match(held.out, /No other process needs stopping\./);
+  assert.match(held.out, /Choices:\n- run `vibecompass review-relay .+--recover` again once those processes are gone\n/);
   assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null);
   const gone = async (pid) => {
     for (let tries = 0; tries < 50 && (await createProcessTable().list()).some((row) => row.pid === pid); tries += 1) {
@@ -1232,8 +1232,8 @@ test('recovery names only the processes that carry the turn\'s id: another sessi
   const unclear = await s.relay(['--recover'], { confirm: ask });
   assert.equal(unclear.code, 1);
   assert.equal(questions.length, 0);
-  assert.match(unclear.out, /No process is shown to carry its id .+ in its environment\. One process names its id/);
-  assert.ok(!unclear.out.includes(`kill -TERM -${shell.pid}`));
+  assert.match(unclear.out, /No process shows its id .+ in its environment\. One process names its id/);
+  assert.doesNotMatch(unclear.out, /kill -TERM/);
   // Once it is gone too, the owner is asked, and settles the turn.
   process.kill(-shell.pid, 'SIGKILL');
   await gone(shell.pid);
@@ -1328,6 +1328,35 @@ test('a last check before the builder\'s prompt that fails stops the run: the bu
   assert.equal(unreadable.code, 1, unreadable.out);
   assert.match(unreadable.out, /Stopped: the last check before the builder's prompt failed \(.+ready\.json can't be read/);
   assert.equal((await readRelayState(u.lane.laneDir)).turn.ended.how, 'prompt not sent: the last check failed');
+
+  // So does a handoff.md that can't be read as a file at that check.
+  const h = await setup(t, { laneId: 'handoff-unreadable' });
+  await h.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(h.lane) }, { actions: answerR11(h.lane) }] } });
+  await h.mark();
+  const handoffKept = await h.handoff();
+  const handoffBroken = await h.relay([...codexArgs, '--conversation-closed'], { relayOnTurnRecord: async ({ stage, role }) => {
+    if (stage === 'identity' && role === 'builder') {
+      await rm(h.lane.handoffPath);
+      await mkdir(h.lane.handoffPath);
+    }
+  } });
+  assert.equal(handoffBroken.code, 1, handoffBroken.out);
+  assert.match(handoffBroken.out, /Stopped: the last check before the builder's prompt failed \(.*EISDIR.*\)/);
+  const handoffTurn = (await readRelayState(h.lane.laneDir)).turn;
+  assert.equal(handoffTurn.prompt_sent, false);
+  assert.equal(handoffTurn.ended.how, 'prompt not sent: the last check failed');
+  for (const builder of (await h.standin.calls()).filter((item) => item.kind === 'builder')) assert.equal(builder.prompt, '');
+  await rm(h.lane.handoffPath, { recursive: true });
+  await writeFile(h.lane.handoffPath, handoffKept, 'utf8');
+});
+
+test('a handoff.md that can\'t be read after the builder\'s turn stops the relay, naming the failure', async (t) => {
+  const s = await setup(t, { laneId: 'handoff-after' });
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: [...answerR11(s.lane), { type: 'run', command: 'sh', args: ['-c', 'rm "$0" && mkdir "$0"', s.lane.handoffPath] }] }] } });
+  await s.mark();
+  const result = await s.relay([...codexArgs, '--conversation-closed']);
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.out, /Stopped: handoff\.md couldn't be read after the builder's turn \(.*EISDIR.*\), so the relay can't check that ## Reviewer → Builder is unchanged\./);
 });
 
 test('a mark replaced while the builder\'s process is starting: the process gets no prompt, and the lane is read again', async (t) => {

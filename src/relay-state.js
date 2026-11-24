@@ -85,10 +85,13 @@ export const RELAY_TURN_MARKER = 'VIBECOMPASS_RELAY_TURN_ID';
 /**
  * The running processes whose environment carries a turn's marker, from two
  * reads of the process table: one with each command line alone, one with the
- * environment after it. A process counts as the turn's (`verified`) only when
- * both reads show it with the same group and start time, the second read's
- * line is the first's with the environment after it, and the marker is an
- * entry of that environment. A process whose line names the marker where the
+ * environment after it. A process shows the marker in its environment
+ * (`verified`) only when both reads show it with the same group and start
+ * time, the second read's line is the first's with the environment after it,
+ * and the marker is a word of that environment. macOS joins the entries with
+ * spaces, so even that can't prove the marker is an entry of its own rather
+ * than text inside another entry's value: the relay names these processes and
+ * suggests no signal for them. A process whose line names the marker where the
  * environment can't be told apart from its arguments (macOS shows no
  * environment for a system program such as /bin/sh), or that changed between
  * the reads, is `ambiguous`: it keeps a reservation but isn't called the

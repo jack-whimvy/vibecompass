@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmod, readFile, readdir, realpath, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { chmod, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { runCli } from '../cli.js';
-import { WORKING_READ_FLAGS, compareMark, fingerprintWork, readReadyMark, readWorkingFileHash, writeReadyMark } from '../relay-mark.js';
+import { WORKING_READ_FLAGS, compareMark, fingerprintNested, fingerprintWork, readReadyMark, readWorkingFileHash, writeReadyMark } from '../relay-mark.js';
 import { withMemoryRootLock } from '../serialization.js';
 import { listProjectSessions } from '../session.js';
 import {
@@ -750,4 +750,42 @@ test('a working file is read through one handle that no link in any part of its 
   await symlink(path.join(outside, 'dir', 'f.txt'), path.join(inside, 'leaf'));
   assert.equal(await readWorkingFileHash(path.join(inside, 'leaf')), null, 'so is a link at the end');
   assert.ok(WORKING_READ_FLAGS & 0x20000000, 'O_NOFOLLOW_ANY');
+});
+
+test('a nested checkout is read at the folder its parent admitted, and counts only if that folder is the same one afterwards', async (t) => {
+  const ws = await createWorkspace(t);
+  const base = await realpath(ws.tempDir);
+  const repo = async (name, text) => {
+    const dir = path.join(base, name);
+    await mkdir(dir, { recursive: true });
+    git(dir, ['init', '-q', '-b', 'main']);
+    await writeFile(path.join(dir, 'f.txt'), text, 'utf8');
+    git(dir, ['add', '.']);
+    git(dir, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', name]);
+    return dir;
+  };
+  const sub = await repo('parent/vendor/lib', 'inside\n');
+  const elsewhere = await repo('elsewhere', 'outside\n');
+  const plain = await fingerprintNested(sub, sub, 'submodule vendor/lib', process.env, 1);
+  assert.equal(plain.changed, undefined);
+  assert.match(plain.fingerprint, /^[0-9a-f]{64}$/);
+  // Replaced by a link to another checkout once the parent has checked it.
+  const linked = await fingerprintNested(sub, sub, 'submodule vendor/lib', process.env, 1, { afterAdmitted: async () => {
+    await rename(sub, path.join(base, 'parent', 'vendor', 'lib-away'));
+    await symlink(elsewhere, sub);
+  } });
+  assert.deepEqual(linked, { changed: true });
+  // Replaced by another real folder.
+  await unlink(sub);
+  await rename(path.join(base, 'parent', 'vendor', 'lib-away'), sub);
+  const other = await fingerprintNested(sub, sub, 'submodule vendor/lib', process.env, 1, { afterAdmitted: async () => {
+    await rename(sub, path.join(base, 'parent', 'vendor', 'lib-away'));
+    await rename(elsewhere, sub);
+  } });
+  assert.deepEqual(other, { changed: true });
+  // A link already there when the parent looks is never admitted.
+  await rename(sub, elsewhere);
+  await rename(path.join(base, 'parent', 'vendor', 'lib-away'), path.join(base, 'parent', 'vendor', 'lib-real'));
+  await symlink(elsewhere, sub);
+  assert.deepEqual(await fingerprintNested(sub, sub, 'submodule vendor/lib', process.env, 1), { changed: true });
 });

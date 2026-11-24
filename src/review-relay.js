@@ -150,6 +150,17 @@ function newId(bytes = 6) {
   return randomBytes(bytes).toString('hex');
 }
 
+// handoff.md as text: a missing file reads as empty, as the fingerprints read
+// it; any other failure throws, so it can never pass for an unchanged section.
+async function readHandoff(handoffPath) {
+  try {
+    return await readFile(handoffPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
 async function exists(filePath) {
   try {
     await stat(filePath);
@@ -801,10 +812,9 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
       const marker = turn.id ? `${RELAY_TURN_MARKER}=${turn.id}` : null;
       const found = await findMarkedProcesses(table, turn.id);
       const head = `the ${turn.role} turn for pass ${turn.pass}, started ${since}, was never recorded with its process, so the relay can't inspect its process group. Its prompt was never sent, since the prompt goes out only after that record, so no model turn ran.`;
-      // Stopping a group is suggested only where a process that leads it
-      // carries the id, so the group was made by the turn; any other process
-      // carrying it is named by its id alone.
-      const stopCommand = (row) => (row.pid === row.pgid ? `kill -TERM -${row.pgid}` : `kill -TERM ${row.pid}`);
+      // macOS `ps` shows a process's environment with its entries joined by
+      // spaces, so the id shown as an entry could be text inside another
+      // entry's value. The relay names what it sees and suggests no signal.
       const unclear = found.ok && found.ambiguous.length > 0
         ? `${found.ambiguous.length === 1 ? 'One process names' : `${found.ambiguous.length} processes name`} its id where the relay can't tell its environment from its arguments, or changed between two reads of the process table, so ${found.ambiguous.length === 1 ? 'it isn\'t' : 'they aren\'t'} taken for the turn's: ${found.ambiguous.map((row) => `process ${row.pid}${row.command ? ` (${row.command})` : ''}`).join('; ')}. The relay waits until ${found.ambiguous.length === 1 ? 'it is' : 'they are'} gone.`
         : '';
@@ -816,12 +826,12 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
         notes.push(stopReason);
       } else if (found.verified.length > 0) {
         reserved = true;
-        stopReason = `${head} These processes carry its id (${marker}) in their environment: ${found.verified.map((row) => `${row.pid} in group ${row.pgid}${row.command ? ` ${row.command}` : ''}`).join('; ')}. The lane and conversation stay reserved; the relay sends no signal. Let them finish, or stop them yourself (${[...new Set(found.verified.map((row) => `\`${stopCommand(row)}\``))].join(', ')}), then run \`${commands.recover}\` again.${unclear ? ` ${unclear}` : ''} No other process needs stopping.`; // D-419 item 10
-        choices = [`let those processes finish, or stop them (${[...new Set(found.verified.map(stopCommand))].join('; ')}), then run \`${commands.recover}\``];
+        stopReason = `${head} These processes show its id (${marker}) in their environment: ${found.verified.map((row) => `process ${row.pid}${row.command ? ` (${row.command})` : ''}`).join('; ')}. macOS shows a process's environment entries joined by spaces, so that can't prove each is the turn's, and the relay sends and suggests no signal. The lane and conversation stay reserved until they are gone: let them finish, or stop any you know to be this turn's, then run \`${commands.recover}\` again.${unclear ? ` ${unclear}` : ''}`; // D-419 item 10
+        choices = [`run \`${commands.recover}\` again once those processes are gone`];
         notes.push(stopReason);
       } else if (unclear) {
         reserved = true;
-        stopReason = `${head} No process is shown to carry its id (${marker}) in its environment. ${unclear} The lane and conversation stay reserved; run \`${commands.recover}\` again then. No other process needs stopping.`; // D-419 item 10
+        stopReason = `${head} No process shows its id (${marker}) in its environment. ${unclear} The lane and conversation stay reserved; run \`${commands.recover}\` again then. The relay suggests no signal.`; // D-419 item 10
         choices = [`run \`${commands.recover}\` again once ${found.ambiguous.length === 1 ? 'that process is' : 'those processes are'} gone`];
         notes.push(stopReason);
       } else {
@@ -1232,7 +1242,7 @@ async function builderTurn(ctx, passNumber, markBefore) {
     out(`Not sending the builder its turn for pass ${passNumber}: ${due.reason}. Reading the lane again.`);
     return { sent: false };
   }
-  let reviewerSectionBefore = readSectionBody(await readFile(handoffPath, 'utf8').catch(() => ''), REVIEWER_TO_BUILDER_HEADING);
+  let reviewerSectionBefore = readSectionBody(await readHandoff(handoffPath), REVIEWER_TO_BUILDER_HEADING);
   out(`Builder turn for pass ${passNumber}: resuming conversation ${ctx.conversationId} in ${ctx.builderMode} mode…`);
   const turnId = newId();
   await save({ step: 'builder-turn', turn: { id: turnId, role: 'builder', command: launch.command, pass: passNumber, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
@@ -1285,7 +1295,7 @@ async function builderTurn(ctx, passNumber, markBefore) {
       const parsedNow = parseLog(wipNow);
       const dueNow = await builderTurnDue(ctx, passNumber, markBefore, parsedNow, wipNow);
       if (!dueNow.ok) return dueNow.reason;
-      const reviewerSectionNow = readSectionBody(await readFile(handoffPath, 'utf8').catch(() => ''), REVIEWER_TO_BUILDER_HEADING);
+      const reviewerSectionNow = readSectionBody(await readHandoff(handoffPath), REVIEWER_TO_BUILDER_HEADING);
       if (!send()) return null;
       // What the turn is checked against afterwards is what it was sent on.
       wipBefore = wipNow;
@@ -1361,7 +1371,12 @@ async function builderTurn(ctx, passNumber, markBefore) {
   if (added.length > 1 || added.some((record) => !(record.kind === 'response' && record.number === passNumber))) {
     throw new RelayStop('refusal', `the builder added a record other than its response to pass ${passNumber} during its turn (${added.map((record) => `${record.kind} ${record.number ?? ''}`.trim()).join(', ')}).`); // D-419 item 8
   }
-  const handoffAfter = await readFile(path.join(laneDir, 'handoff.md'), 'utf8').catch(() => '');
+  let handoffAfter;
+  try {
+    handoffAfter = await readHandoff(handoffPath);
+  } catch (error) {
+    throw new RelayStop('failure', `handoff.md couldn't be read after the builder's turn (${error instanceof Error ? error.message : String(error)}), so the relay can't check that ## Reviewer → Builder is unchanged.`); // D-419 item 8
+  }
   if (readSectionBody(handoffAfter, REVIEWER_TO_BUILDER_HEADING) !== reviewerSectionBefore) {
     throw new RelayStop('refusal', '## Reviewer → Builder changed during the builder\'s turn; the relay writes that section.'); // D-419 item 8
   }

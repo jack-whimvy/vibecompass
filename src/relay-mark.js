@@ -275,25 +275,33 @@ async function holdsCheckout(dir) {
  * that replaced a folder. `repositories` lists this checkout and each
  * checked-out submodule in it, for the remote-ref check (D-419 item 8).
  */
-async function fingerprintCheckout(dir, label, env, depth = 0) {
-  const head = await gitText(['rev-parse', '--verify', 'HEAD'], dir, env);
+async function fingerprintCheckout(dir, label, env, depth = 0, admitted = null) {
+  // Read from the checkout's physical path (see WORKING_READ_FLAGS): for a
+  // nested checkout, the one its parent admitted, never resolved again.
+  let physical = admitted;
+  if (physical === null) {
+    try {
+      physical = await realpath(dir);
+    } catch (error) {
+      throw new Error(`${label} at ${dir} isn't a readable git checkout (${error instanceof Error ? error.message : String(error)}).`);
+    }
+  }
+  const head = await gitText(['rev-parse', '--verify', 'HEAD'], physical, env);
   if (!head.ok) {
     throw new Error(`${label} at ${dir} isn't a readable git checkout (${head.stderr || 'git rev-parse HEAD failed'}).`);
   }
   const headSha = head.stdout.trim();
-  const staged = await gitHash(STAGED_DIFF, dir, env);
+  const staged = await gitHash(STAGED_DIFF, physical, env);
   if (!staged.ok) {
     throw new Error(`git diff --cached failed in ${label} at ${dir}: ${staged.stderr}`);
   }
-  const index = await gitText(['ls-files', '--stage', '-z'], dir, env);
+  const index = await gitText(['ls-files', '--stage', '-z'], physical, env);
   if (!index.ok) {
     throw new Error(`git ls-files --stage failed in ${label} at ${dir}: ${index.stderr}`);
   }
   const working = createHash('sha256');
   const leading = new Map();
   const repositories = [dir];
-  // Files are read from the checkout's physical path (see WORKING_READ_FLAGS).
-  const physical = await realpath(dir);
   let submodules = 0;
   for (const record of splitNul(index.stdout)) {
     const tab = record.indexOf('\t');
@@ -307,10 +315,14 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
       if (depth + 1 > MAX_SUBMODULE_DEPTH) {
         throw new Error(`${label} nests checked-out submodules deeper than ${MAX_SUBMODULE_DEPTH} at ${full}; the relay doesn't fingerprint work that deep.`); // D-423 item 2
       }
-      const inner = await fingerprintCheckout(path.join(dir, relative), `submodule ${relative} of ${label}`, env, depth + 1);
-      submodules += 1 + inner.submodules;
-      repositories.push(...inner.repositories);
-      state = `submodule ${inner.fingerprint}`;
+      const inner = await fingerprintNested(path.join(dir, relative), full, `submodule ${relative} of ${label}`, env, depth + 1);
+      if (inner.changed) {
+        state = CHANGED_DURING_READ;
+      } else {
+        submodules += 1 + inner.submodules;
+        repositories.push(...inner.repositories);
+        state = `submodule ${inner.fingerprint}`;
+      }
     } else if (mode === '160000') {
       state = (await pathKind(full)) === 'directory' ? 'submodule not checked out' : await workingState(full);
     } else {
@@ -318,7 +330,7 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
     }
     working.update(`${relative}\0${mode}\0${oid}\0${stage}\0${state}\n`);
   }
-  const untracked = await gitText(['ls-files', '--others', '--exclude-standard', '-z'], dir, env);
+  const untracked = await gitText(['ls-files', '--others', '--exclude-standard', '-z'], physical, env);
   if (!untracked.ok) {
     throw new Error(`git ls-files failed in ${label} at ${dir}: ${untracked.stderr}`);
   }
@@ -335,6 +347,33 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
   }
   entries.sort();
   return { head: headSha, entries, untracked: untrackedFiles.length, submodules, repositories, fingerprint: sha256Hex(entries.join('\n')) };
+}
+
+/**
+ * A checkout inside one being read, at the physical path the parent checked
+ * (`admitted`): it is read there, never resolved again, and counts only when
+ * that path is the same real folder after the read as before it. Otherwise it
+ * gives `{ changed: true }`, which the caller records as changed while read,
+ * so a folder replaced during the scan never stands for the work.
+ * `afterAdmitted` is a test seam, called once the folder has been checked.
+ */
+export async function fingerprintNested(dir, admitted, label, env, depth, { afterAdmitted = null } = {}) {
+  const identity = async () => {
+    try {
+      const info = await lstat(admitted);
+      return info.isDirectory() ? `${info.dev}:${info.ino}` : null;
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+      throw error;
+    }
+  };
+  const before = await identity();
+  if (before === null) return { changed: true };
+  if (afterAdmitted) await afterAdmitted();
+  const inner = await fingerprintCheckout(dir, label, env, depth, admitted);
+  const after = await identity();
+  if (after !== before || (await realpath(admitted).catch(() => null)) !== admitted) return { changed: true };
+  return inner;
 }
 
 async function pathKind(filePath) {
@@ -509,9 +548,9 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       // checked out, its own fingerprint (D-423 item 2).
       if (gitlink !== undefined) {
         if (fileKind === 'directory' && (await holdsCheckout(file))) {
-          const inner = await fingerprintCheckout(listed, `submodule ${relative} under ${resolved.spec}`, env, 1);
-          for (const repository of inner.repositories) repositories.add(repository);
-          entries.push(`path\t${resolved.spec}\tsubmodule\t${relative}\t${gitlink}\t${inner.fingerprint}`);
+          const inner = await fingerprintNested(listed, file, `submodule ${relative} under ${resolved.spec}`, env, 1);
+          if (!inner.changed) for (const repository of inner.repositories) repositories.add(repository);
+          entries.push(`path\t${resolved.spec}\tsubmodule\t${relative}\t${gitlink}\t${inner.changed ? CHANGED_DURING_READ : inner.fingerprint}`);
         } else if (fileKind === 'file') {
           entries.push(`path\t${resolved.spec}\tsubmodule replaced\t${relative}\t${gitlink}\t${await hashFile(file)}`);
         } else {
@@ -523,9 +562,9 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
         // A folder git lists as untracked without looking inside: a
         // repository that isn't a submodule.
         if (await holdsCheckout(file)) {
-          const inner = await fingerprintCheckout(listed, `repository ${relative} under ${resolved.spec}`, env, 1);
-          for (const repository of inner.repositories) repositories.add(repository);
-          entries.push(`path\t${resolved.spec}\trepository\t${relative}\t${inner.fingerprint}`);
+          const inner = await fingerprintNested(listed, file, `repository ${relative} under ${resolved.spec}`, env, 1);
+          if (!inner.changed) for (const repository of inner.repositories) repositories.add(repository);
+          entries.push(`path\t${resolved.spec}\trepository\t${relative}\t${inner.changed ? CHANGED_DURING_READ : inner.fingerprint}`);
         } else {
           entries.push(`path\t${resolved.spec}\tdirectory\t${relative}`);
         }
