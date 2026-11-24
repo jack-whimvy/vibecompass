@@ -539,8 +539,10 @@ it once all the parts have arrived. You don't have to do anything different.
   it kept, and a count of any it didn't.
 - A push never follows a redirect. If your `sync.api_url` redirects, set it to
   the final address.
-- A hosted app that predates large pushes still takes a push of up to 5 MB the
-  way it always did; above that, `push` says the hosted app needs an update.
+- Against a hosted app that predates large pushes, a push of up to 5 MB goes
+  as one request, the way it always did, and that app's host may still refuse
+  it (Vercel refuses a request over 4.5 MB); above 5 MB, `push` says the hosted
+  app needs an update.
 - If the hosted app reports more than 1,000 notes, or shortens a long one,
   `push` fetches the rest after the push succeeds. If it can't, it says how
   many are missing and names the run that stores them; the push itself still

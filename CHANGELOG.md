@@ -13,9 +13,9 @@ and `push` sends a root over 4 MB in parts.
 
 Upgrading: `ready-for-review`, `review-relay`, `review-settings`,
 `init --review-round-cap`, the lane's `stage:` line, and the push in parts work
-as soon as you upgrade. A project that never runs `ready-for-review` or
-`review-relay` sees no change apart from the `stage` and `stageReason` keys,
-null, in `list-sessions --json`. The role text changes at the root's next
+as soon as you upgrade. In a project that never runs `ready-for-review` or
+`review-relay`, lane inventories change only by the `stage` and `stageReason`
+keys, null, in `list-sessions --json`. The role text changes at the root's next
 `refresh-workflow --dry-run`, then `--apply`: `context.md` gains the lane's
 mark and relay files, the builder's mark and the relay's builder turns, a
 relayed reviewer, a relayed pass in the Review log format, the relay's
@@ -36,19 +36,22 @@ and a cap already in `project.yaml` is kept: a new project chooses one with
 `init --review-round-cap <n>` or guided setup's question, an existing one with
 `review-settings --round-cap <n>`, and `refresh-workflow` still writes no
 `review:` block. `push` needs nothing
-changed: a root over 4 MB goes in parts to a hosted app that takes them, and a
-hosted app that predates them still takes a push of up to 5 MB as one request,
-above which `push` says the hosted app needs an update and sends nothing more.
+changed: a root over 4 MB goes in parts to a hosted app that takes them.
+Against a hosted app that predates them, a push of up to 5 MB falls back to one
+request, which that app's host may still refuse (Vercel refuses a request over
+4.5 MB); above 5 MB, `push` says the hosted app needs an update and sends
+nothing more.
 
 ### The review relay, the ready-for-review mark, and the review cap at setup
 
-- `vibecompass review-relay --session <lane-id>`: an optional command the
-  owner runs for one builder lane, on macOS. It starts a read-only reviewer
-  (Codex by default, or Claude Code with `--reviewer claude`) on the owner's own
+- `vibecompass review-relay --session <lane-id> --reviewer-model <model>`: an
+  optional command the owner runs for one builder lane, on macOS. It starts a
+  read-only reviewer (Codex; `--reviewer claude` names Claude Code, for which
+  no version is listed yet, below) on the owner's own
   sign-in, checks its answer (exactly one verdict for each finding waiting for
   the reviewer), and writes it as the lane's pass in the reviewer's two
-  sections. When the lane's mark names a Claude Code conversation that the
-  owner has closed, the relay then sends that conversation a fixed
+  sections. When the lane's mark names the builder's Claude Code conversation
+  and the owner has closed it, the relay then sends that conversation a fixed
   `address review` turn and repeats until a clean pass or the cap; otherwise,
   or with `--one-pass`, it runs one pass and stops. Each stop prints the
   reason, the open findings, the choices (each command runs as printed, from
