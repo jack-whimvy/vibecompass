@@ -43,8 +43,9 @@ package's installed text, command output, and help do.
   finishes an interrupted one as complete, superseded, or discarded, and sends
   no signal to a process it finds from an earlier run. Each turn's processes
   carry the turn's id in their environment: a turn whose process the relay
-  couldn't record stays reserved while a process with that id runs and, with
-  none found, until the owner settles it at `--recover`. One relay runs per
+  couldn't record stays reserved while a process with that id in its
+  environment runs or the relay can't look, and, with none found, until the
+  owner settles it at `--recover`. One relay runs per
   lane and per conversation. `close-session`
   refuses while a relay runs on the lane or left a write or a turn unfinished.
   The relay's own `git` reads start no fsmonitor, hook, filter, or fetch.

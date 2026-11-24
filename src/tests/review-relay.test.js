@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
@@ -11,7 +11,7 @@ import { runCli } from '../cli.js';
 import { readReadyMark } from '../relay-mark.js';
 import { prepareRelayWrite } from '../relay-record.js';
 import { computeCurrentFingerprints } from '../relay-mark.js';
-import { createProcessTable, emptyRelayState, readRelayState, saveRelayState } from '../relay-state.js';
+import { createProcessTable, emptyRelayState, findMarkedProcesses, readRelayState, saveRelayState } from '../relay-state.js';
 import { coveredRepositories } from '../review-relay.js';
 import { withMemoryRootLock } from '../serialization.js';
 import { REVIEWER_TO_BUILDER_HEADING, readSectionBody } from '../relay-sections.js';
@@ -1190,6 +1190,20 @@ test('recovery names only the processes that carry the turn\'s id: another sessi
   };
   const fromTurn = start({ VIBECOMPASS_RELAY_TURN_ID: turnId });
   const other = start({});
+  // Two more that name the id only in their arguments: a process whose
+  // environment macOS shows, without the id, and a shell, whose environment
+  // macOS doesn't show.
+  const named = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', `VIBECOMPASS_RELAY_TURN_ID=${turnId}`], { detached: true, stdio: 'ignore' });
+  const shell = spawn('/bin/sh', ['-c', 'sleep 60; :', `VIBECOMPASS_RELAY_TURN_ID=${turnId}`], { detached: true, stdio: 'ignore' });
+  for (const child of [named, shell]) {
+    t.after(() => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    });
+  }
   await new Promise((resolve) => setTimeout(resolve, 300));
   const questions = [];
   const ask = async (question) => {
@@ -1199,22 +1213,121 @@ test('recovery names only the processes that carry the turn\'s id: another sessi
   const held = await s.relay(['--recover'], { confirm: ask });
   assert.equal(held.code, 1);
   assert.equal(questions.length, 0, 'with the turn\'s own process found, nothing is asked');
-  assert.match(held.out, new RegExp(`These processes carry its id \\(VIBECOMPASS_RELAY_TURN_ID=${turnId}\\): ${fromTurn.pid} in group ${fromTurn.pid} `));
+  assert.match(held.out, new RegExp(`These processes carry its id \\(VIBECOMPASS_RELAY_TURN_ID=${turnId}\\) in their environment: ${fromTurn.pid} in group ${fromTurn.pid} `));
   assert.match(held.out, new RegExp(`\`kill -TERM -${fromTurn.pid}\``));
   assert.ok(!held.out.includes(String(other.pid)), 'the other session\'s process isn\'t named');
+  assert.ok(!held.out.includes(String(named.pid)), 'nor one whose shown environment lacks the id, whatever its arguments say');
+  assert.match(held.out, new RegExp(`One process names its id where the relay can't tell its environment from its arguments.+process ${shell.pid} `));
+  assert.ok(!held.out.includes(`group ${shell.pid}`) && !held.out.includes(`kill -TERM -${shell.pid}`) && !held.out.includes(`kill -TERM ${shell.pid}`), 'the shell isn\'t called the turn\'s, and nothing says to stop it');
   assert.match(held.out, /No other process needs stopping\./);
   assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null);
-  // The turn's process is gone: the owner is asked, and settles it.
+  const gone = async (pid) => {
+    for (let tries = 0; tries < 50 && (await createProcessTable().list()).some((row) => row.pid === pid); tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  };
+  // The turn's process is gone; the shell that only names the id still keeps the reservation, and nothing is asked.
   process.kill(-fromTurn.pid, 'SIGKILL');
-  for (let tries = 0; tries < 50 && (await createProcessTable().list()).some((row) => row.pid === fromTurn.pid); tries += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  await gone(fromTurn.pid);
+  const unclear = await s.relay(['--recover'], { confirm: ask });
+  assert.equal(unclear.code, 1);
+  assert.equal(questions.length, 0);
+  assert.match(unclear.out, /No process is shown to carry its id .+ in its environment\. One process names its id/);
+  assert.ok(!unclear.out.includes(`kill -TERM -${shell.pid}`));
+  // Once it is gone too, the owner is asked, and settles the turn.
+  process.kill(-shell.pid, 'SIGKILL');
+  await gone(shell.pid);
   const settled = await s.relay(['--recover'], { confirm: ask });
   assert.equal(settled.code, 0, settled.out);
   assert.equal(questions.length, 1);
   assert.match(settled.out, /You settled it\./);
   assert.match((await readRelayState(s.lane.laneDir)).turn.ended.how, /settled by the owner/);
   assert.ok((await createProcessTable().list()).some((row) => row.pid === other.pid), 'the other session still runs');
+});
+
+test('a turn\'s process is one seen twice the same way with its id among its environment entries; anything less is ambiguous', async () => {
+  const id = 'c0ffee123456';
+  const marker = `VIBECOMPASS_RELAY_TURN_ID=${id}`;
+  const at = 'Mon Nov 23 17:10:02 2026';
+  const plain = [
+    { pid: 10, pgid: 10, startedAt: at, command: 'node turn.js' },
+    { pid: 11, pgid: 11, startedAt: at, command: `node grep.js ${marker}` },
+    { pid: 12, pgid: 12, startedAt: at, command: `sh -c sleep ${marker}` },
+    { pid: 13, pgid: 13, startedAt: 'Mon Nov 23 17:11:00 2026', command: 'node reused.js' },
+    { pid: 14, pgid: 99, startedAt: at, command: 'node moved.js' },
+    { pid: 16, pgid: 10, startedAt: at, command: 'node child.js' },
+  ];
+  const withEnvironment = [
+    { pid: 10, pgid: 10, startedAt: at, text: `node turn.js HOME=/h ${marker}` },
+    // Its environment is shown, without the id: not the turn's.
+    { pid: 11, pgid: 11, startedAt: at, text: `node grep.js ${marker} HOME=/h` },
+    // No environment shown: the id is in its arguments, so it can't be told.
+    { pid: 12, pgid: 12, startedAt: at, text: `sh -c sleep ${marker}` },
+    // Another start time, another group, or gone by the second read.
+    { pid: 13, pgid: 13, startedAt: at, text: `node reused.js ${marker}` },
+    { pid: 14, pgid: 14, startedAt: at, text: `node moved.js ${marker}` },
+    { pid: 15, pgid: 15, startedAt: at, text: `node gone.js ${marker}` },
+    { pid: 16, pgid: 10, startedAt: at, text: `node child.js ${marker} PATH=/bin` },
+    // A longer id isn't this one.
+    { pid: 17, pgid: 17, startedAt: at, text: `node other.js ${marker}7` },
+  ];
+  const found = await findMarkedProcesses({ listEnvironments: async () => withEnvironment, list: async () => plain }, id);
+  assert.equal(found.ok, true);
+  assert.deepEqual(found.verified.map((row) => row.pid), [10, 16]);
+  assert.deepEqual(found.ambiguous.map((row) => row.pid), [12, 13, 14, 15]);
+  const failed = await findMarkedProcesses({ listEnvironments: async () => withEnvironment, list: async () => { throw new Error('no ps'); } }, id);
+  assert.equal(failed.ok, false);
+  assert.match(failed.reason, /no ps/);
+});
+
+test('recovery whose look for a turn\'s processes fails keeps the reservation and asks nothing', async (t) => {
+  const s = await setup(t, { laneId: 'failed-scan' });
+  await saveRelayState(s.lane.laneDir, { ...emptyRelayState(s.lane.laneId), step: 'builder-turn', turn: { id: 'b1c2d3e4f5a6', role: 'builder', command: 'claude', pass: 1, pid: null, pgid: null, process_started_at: null, prompt_sent: false, started_at: new Date().toISOString(), ended: null } });
+  const real = createProcessTable();
+  const broken = { list: () => real.list(), listEnvironments: async () => { throw new Error('ps: operation not permitted'); }, killGroup: (pgid, signal) => real.killGroup(pgid, signal) };
+  const questions = [];
+  const result = await s.relay(['--recover'], { relayProcessTable: broken, confirm: async (question) => { questions.push(question); return 'y'; } });
+  assert.equal(result.code, 1);
+  assert.equal(questions.length, 0, 'nothing is asked');
+  assert.match(result.out, /The relay couldn't look for its processes \(ps couldn't list the processes \(ps: operation not permitted\)\), so the lane and conversation stay reserved and nothing is asked\./);
+  assert.equal((await readRelayState(s.lane.laneDir)).turn.ended, null, 'the turn stays unfinished');
+});
+
+test('a last check before the builder\'s prompt that fails stops the run: the builder starts once, and no prompt goes out', { skip: process.getuid?.() === 0 }, async (t) => {
+  const s = await setup(t, { laneId: 'lock-fails' });
+  await s.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(s.lane) }, { actions: answerR11(s.lane) }] } });
+  await s.mark();
+  // While the builder's process starts, the memory-root lock can't be taken.
+  const stateDir = path.join(s.ws.rootDir, 'state');
+  await mkdir(stateDir, { recursive: true });
+  const restore = () => chmod(stateDir, 0o755).catch(() => {});
+  t.after(restore);
+  const result = await s.relay([...codexArgs, '--conversation-closed'], { relayOnTurnRecord: async ({ stage, role }) => {
+    if (stage === 'identity' && role === 'builder') await chmod(stateDir, 0o500);
+  } });
+  await restore();
+  assert.equal(result.code, 1, result.out);
+  assert.match(result.out, /Stopped: the last check before the builder's prompt failed \(.*EACCES.*\), so its stdin was closed empty and no model turn ran\. The relay doesn't try the turn again/);
+  const builders = (await s.standin.calls()).filter((item) => item.kind === 'builder');
+  assert.ok(builders.length <= 1, `the builder started once (${builders.length} recorded)`);
+  for (const builder of builders) assert.equal(builder.prompt, '');
+  assert.equal((await s.standin.calls()).filter((item) => item.kind === 'review').length, 1);
+  const turn = (await readRelayState(s.lane.laneDir)).turn;
+  assert.equal(turn.role, 'builder');
+  assert.equal(turn.prompt_sent, false);
+  assert.equal(turn.ended.how, 'prompt not sent: the last check failed');
+  assert.match(await readFile(path.join(s.lane.worktreeDir, 'src', 'index.js'), 'utf8'), /answer = 42/);
+
+  // A mark that can't be read at that check stops the run the same way.
+  const u = await setup(t, { laneId: 'mark-unreadable' });
+  await u.standin.setScenario({ codex: { version: '0.171.0', reviewTurns: [{ answer: ONE_FINDING }] }, claude: { version: '2.1.318', builderTurns: [{ actions: answerR11(u.lane) }, { actions: answerR11(u.lane) }] } });
+  await u.mark();
+  const unreadable = await u.relay([...codexArgs, '--conversation-closed'], { relayOnTurnRecord: async ({ stage, role }) => {
+    if (stage === 'identity' && role === 'builder') await writeFile(path.join(u.lane.laneDir, 'ready.json'), '{ not json', 'utf8');
+  } });
+  assert.equal(unreadable.code, 1, unreadable.out);
+  assert.match(unreadable.out, /Stopped: the last check before the builder's prompt failed \(.+ready\.json can't be read/);
+  assert.equal((await readRelayState(u.lane.laneDir)).turn.ended.how, 'prompt not sent: the last check failed');
 });
 
 test('a mark replaced while the builder\'s process is starting: the process gets no prompt, and the lane is read again', async (t) => {

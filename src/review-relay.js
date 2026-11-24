@@ -284,6 +284,7 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   // not when the caller's last check withholds it.
   let promptSent = false;
   let withheld = null;
+  let deliverError = null;
   const canSend = () => !recordError && !active.interrupted && terminatedAt === null;
   const send = () => {
     if (!canSend()) return false;
@@ -293,10 +294,12 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
   };
   if (canSend()) {
     if (deliver) {
+      // A reason not to send is a change the check saw; a check that failed
+      // (the lock or a read) is an error, never a reason to try again.
       try {
         withheld = await deliver(send);
       } catch (error) {
-        withheld = `the lane couldn't be read before the prompt (${error instanceof Error ? error.message : String(error)})`;
+        deliverError = error instanceof Error ? error.message : String(error);
       }
       if (promptSent) withheld = null;
     } else {
@@ -344,7 +347,7 @@ async function runTurn({ command, args, cwd, env, input, timeoutMs, table, onSpa
     child.stderr.destroy();
   }
   active.group = null;
-  return { code: exitInfo?.code ?? null, signal: exitInfo?.signal ?? null, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, promptSent, withheld, groupEnded, pipesHeld: !pipesClosed, pid, pgid, startedAt };
+  return { code: exitInfo?.code ?? null, signal: exitInfo?.signal ?? null, stdout: stdoutLines.join('\n'), stderr: stderrChunks.join('').trim(), timedOut, aborted, interrupted: active.interrupted, recordError, promptSent, withheld, deliverError, groupEnded, pipesHeld: !pipesClosed, pid, pgid, startedAt };
 }
 
 /**
@@ -798,16 +801,31 @@ async function recoverLane({ state, save, table, rootDir, laneDir, laneId, workt
       const marker = turn.id ? `${RELAY_TURN_MARKER}=${turn.id}` : null;
       const found = await findMarkedProcesses(table, turn.id);
       const head = `the ${turn.role} turn for pass ${turn.pass}, started ${since}, was never recorded with its process, so the relay can't inspect its process group. Its prompt was never sent, since the prompt goes out only after that record, so no model turn ran.`;
-      if (found.ok && found.processes.length > 0) {
-        const groups = [...new Set(found.processes.map((row) => row.pgid))];
+      // Stopping a group is suggested only where a process that leads it
+      // carries the id, so the group was made by the turn; any other process
+      // carrying it is named by its id alone.
+      const stopCommand = (row) => (row.pid === row.pgid ? `kill -TERM -${row.pgid}` : `kill -TERM ${row.pid}`);
+      const unclear = found.ok && found.ambiguous.length > 0
+        ? `${found.ambiguous.length === 1 ? 'One process names' : `${found.ambiguous.length} processes name`} its id where the relay can't tell its environment from its arguments, or changed between two reads of the process table, so ${found.ambiguous.length === 1 ? 'it isn\'t' : 'they aren\'t'} taken for the turn's: ${found.ambiguous.map((row) => `process ${row.pid}${row.command ? ` (${row.command})` : ''}`).join('; ')}. The relay waits until ${found.ambiguous.length === 1 ? 'it is' : 'they are'} gone.`
+        : '';
+      if (!found.ok) {
+        // An inspection that failed settles nothing (D-419 item 10).
         reserved = true;
-        stopReason = `${head} These processes carry its id (${marker}): ${found.processes.map((row) => `${row.pid} in group ${row.pgid}${row.command ? ` ${row.command}` : ''}`).join('; ')}. The lane and conversation stay reserved; the relay sends no signal. Let them finish, or stop those groups yourself (${groups.map((pgid) => `\`kill -TERM -${pgid}\``).join(', ')}), then run \`${commands.recover}\` again. No other process needs stopping.`; // D-419 item 10
-        choices = [`let those processes finish, or stop group${groups.length === 1 ? '' : 's'} ${groups.join(', ')}, then run \`${commands.recover}\``];
+        stopReason = `${head} The relay couldn't look for its processes (${found.reason}), so the lane and conversation stay reserved and nothing is asked. Run \`${commands.recover}\` again once the process table can be read.`; // D-419 item 10
+        choices = [`run \`${commands.recover}\` again once \`ps\` works`];
+        notes.push(stopReason);
+      } else if (found.verified.length > 0) {
+        reserved = true;
+        stopReason = `${head} These processes carry its id (${marker}) in their environment: ${found.verified.map((row) => `${row.pid} in group ${row.pgid}${row.command ? ` ${row.command}` : ''}`).join('; ')}. The lane and conversation stay reserved; the relay sends no signal. Let them finish, or stop them yourself (${[...new Set(found.verified.map((row) => `\`${stopCommand(row)}\``))].join(', ')}), then run \`${commands.recover}\` again.${unclear ? ` ${unclear}` : ''} No other process needs stopping.`; // D-419 item 10
+        choices = [`let those processes finish, or stop them (${[...new Set(found.verified.map(stopCommand))].join('; ')}), then run \`${commands.recover}\``];
+        notes.push(stopReason);
+      } else if (unclear) {
+        reserved = true;
+        stopReason = `${head} No process is shown to carry its id (${marker}) in its environment. ${unclear} The lane and conversation stay reserved; run \`${commands.recover}\` again then. No other process needs stopping.`; // D-419 item 10
+        choices = [`run \`${commands.recover}\` again once ${found.ambiguous.length === 1 ? 'that process is' : 'those processes are'} gone`];
         notes.push(stopReason);
       } else {
-        const looked = found.ok
-          ? `No running process carries its id (${marker}), but a system program it started, such as a shell, doesn't show its environment, so the relay can't rule one out.`
-          : `The relay couldn't look for its processes (${found.reason}).`;
+        const looked = `No running process carries its id (${marker}), but a system program it started, such as a shell, doesn't show its environment, so the relay can't rule one out.`;
         const answer = recoverMode && typeof confirm === 'function'
           ? String(await confirm(`The ${turn.role} turn for pass ${turn.pass}, started ${since}, was never recorded with its process, so its prompt was never sent and no model turn ran. ${looked} Settle the turn and release the lane and conversation? Other sessions aren't affected. [y/N]`)).trim().toLowerCase()
           : null;
@@ -1283,11 +1301,14 @@ async function builderTurn(ctx, passNumber, markBefore) {
   await settleTurnStart(ctx, 'builder', passNumber, result);
   const sent = result.promptSent;
   const partial = sent && Boolean(result.timedOut || result.interrupted || result.aborted);
-  const how = !sent && result.withheld ? 'prompt withheld' : turnEndHow(result);
+  const how = !sent && result.deliverError ? 'prompt not sent: the last check failed' : !sent && result.withheld ? 'prompt withheld' : turnEndHow(result);
   await save({ turn: { ...ctx.getState().turn, prompt_sent: sent, ended: { at: new Date().toISOString(), how, exit_code: result.code ?? null }, possibly_partial: partial, partial_reported_at: partial ? new Date().toISOString() : null } });
   const unsent = 'before its prompt was sent, so no model turn ran';
   if (result.interrupted) throw new RelayStop('owner-pause', sent ? 'Ctrl-C: the owner stopped the relay during the builder\'s turn, which may have run partly.' : `Ctrl-C: the owner stopped the relay ${unsent}.`);
   if (result.timedOut) throw new RelayStop('timeout', sent ? `the builder's turn ran past ${formatMinutes(ctx.builderTimeoutMs)}; its process group was ended, and the turn may have run partly.` : `the builder's turn reached its ${formatMinutes(ctx.builderTimeoutMs)} limit ${unsent}; its process group was ended.`);
+  if (!sent && result.deliverError) {
+    throw new RelayStop('failure', `the last check before the builder's prompt failed (${result.deliverError}), so its stdin was closed empty and no model turn ran. The relay doesn't try the turn again; run it again once the lane can be read and locked.`);
+  }
   if (!sent && result.withheld) {
     out(`Not sending the builder its turn for pass ${passNumber}: ${result.withheld}. Its process got no prompt, so no model turn ran. Reading the lane again.`);
     return { sent: false };
@@ -1365,7 +1386,8 @@ async function builderTurn(ctx, passNumber, markBefore) {
  * again from the same lane.
  */
 async function builderTurnDue(ctx, passNumber, markBefore, parsed, wip) {
-  const mark = await readReadyMark(ctx.laneDir).catch(() => null);
+  // An unreadable mark throws: a failed read is an error, never a change.
+  const mark = await readReadyMark(ctx.laneDir);
   if (!mark) return { ok: false, reason: 'the ready-for-review mark is gone' };
   if (mark.round_id !== markBefore.round_id || mark.marked_at !== markBefore.marked_at) {
     return { ok: false, reason: `the ready-for-review mark changed (now round ${shortRound(mark.round_id)})` };

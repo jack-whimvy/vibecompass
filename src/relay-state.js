@@ -50,22 +50,17 @@ export function createProcessTable({ exec = execFile } = {}) {
         });
       });
     },
-    // Each process with its environment after its command line (macOS
-    // `ps -E`). macOS shows the environment of the owner's own processes, but
-    // not of system programs such as /bin/sh.
+    // Each process as `list` gives it, with its environment after its
+    // command line (macOS `ps -E`). macOS shows the environment of the
+    // owner's own processes, but not of system programs such as /bin/sh.
     listEnvironments() {
       return new Promise((resolve, reject) => {
-        exec('ps', ['-A', '-wwE', '-o', 'pid=,pgid=,command='], { maxBuffer: 256 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } }, (error, stdout) => {
+        exec('ps', ['-A', '-wwE', '-o', 'pid=,pgid=,lstart=,command='], { maxBuffer: 256 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } }, (error, stdout) => {
           if (error) {
             reject(error);
             return;
           }
-          const rows = [];
-          for (const line of String(stdout).split('\n')) {
-            const match = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line);
-            if (match) rows.push({ pid: Number(match[1]), pgid: Number(match[2]), text: match[3] });
-          }
-          resolve(rows);
+          resolve(parseProcessTable(String(stdout)).map(({ command, ...row }) => ({ ...row, text: command })));
         });
       });
     },
@@ -88,29 +83,46 @@ export function createProcessTable({ exec = execFile } = {}) {
 export const RELAY_TURN_MARKER = 'VIBECOMPASS_RELAY_TURN_ID';
 
 /**
- * The running processes whose environment carries a turn's marker. Resolves
- * `{ ok, reason, processes }`; `ok` is false when the table can't show
- * environments. A process that shows no environment, such as a system shell,
- * or that dropped the variable, isn't found.
+ * The running processes whose environment carries a turn's marker, from two
+ * reads of the process table: one with each command line alone, one with the
+ * environment after it. A process counts as the turn's (`verified`) only when
+ * both reads show it with the same group and start time, the second read's
+ * line is the first's with the environment after it, and the marker is an
+ * entry of that environment. A process whose line names the marker where the
+ * environment can't be told apart from its arguments (macOS shows no
+ * environment for a system program such as /bin/sh), or that changed between
+ * the reads, is `ambiguous`: it keeps a reservation but isn't called the
+ * turn's. One whose environment is shown without the marker isn't the turn's,
+ * whatever its arguments say. Resolves `{ ok, reason, verified, ambiguous }`;
+ * `ok` is false when the table can't be read with environments.
  */
 export async function findMarkedProcesses(table, marker) {
-  if (!marker) return { ok: false, reason: 'the turn recorded no id to look for', processes: [] };
-  if (typeof table.listEnvironments !== 'function') return { ok: false, reason: 'this process table shows no environments', processes: [] };
-  let rows;
+  const none = { verified: [], ambiguous: [] };
+  if (!marker) return { ok: false, reason: 'the turn recorded no id to look for', ...none };
+  if (typeof table.listEnvironments !== 'function') return { ok: false, reason: 'this process table shows no environments', ...none };
+  let withEnvironment;
+  let plain;
   try {
-    rows = await table.listEnvironments();
+    withEnvironment = await table.listEnvironments();
+    plain = await table.list();
   } catch (error) {
-    return { ok: false, reason: `ps couldn't list the environments (${error instanceof Error ? error.message : String(error)})`, processes: [] };
+    return { ok: false, reason: `ps couldn't list the processes (${error instanceof Error ? error.message : String(error)})`, ...none };
   }
   const needle = `${RELAY_TURN_MARKER}=${marker}`;
-  const marked = rows.filter((row) => row.text.split(/\s+/).includes(needle));
-  let commands = new Map();
-  try {
-    commands = new Map((await table.list()).map((row) => [row.pid, row.command]));
-  } catch {
-    // The marked processes are listed without their commands.
+  const byPid = new Map(plain.map((row) => [row.pid, row]));
+  const verified = [];
+  const ambiguous = [];
+  for (const row of withEnvironment) {
+    if (!row.text.split(' ').includes(needle)) continue;
+    const seen = byPid.get(row.pid);
+    const shown = { pid: row.pid, pgid: row.pgid, command: String(seen?.command ?? '').slice(0, 200) };
+    if (!seen || seen.pgid !== row.pgid || seen.startedAt !== row.startedAt || !row.text.startsWith(`${seen.command} `)) {
+      ambiguous.push(shown);
+      continue;
+    }
+    if (row.text.slice(seen.command.length + 1).split(' ').includes(needle)) verified.push(shown);
   }
-  return { ok: true, reason: null, processes: marked.map((row) => ({ pid: row.pid, pgid: row.pgid, command: String(commands.get(row.pid) ?? '').slice(0, 200) })) };
+  return { ok: true, reason: null, verified, ambiguous };
 }
 
 export async function processStartTime(table, pid) {

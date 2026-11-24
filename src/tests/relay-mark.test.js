@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmod, readFile, readdir, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { chmod, readFile, readdir, realpath, rm, symlink, unlink, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { runCli } from '../cli.js';
-import { compareMark, fingerprintWork, readReadyMark, writeReadyMark } from '../relay-mark.js';
+import { WORKING_READ_FLAGS, compareMark, fingerprintWork, readReadyMark, readWorkingFileHash, writeReadyMark } from '../relay-mark.js';
 import { withMemoryRootLock } from '../serialization.js';
 import { listProjectSessions } from '../session.js';
 import {
@@ -703,4 +704,50 @@ test('ready-for-review writes its mark under the memory-root lock: it waits whil
   const done = await marking;
   assert.equal(done.code, 0, done.stderr());
   assert.ok(done.mark, 'the mark lands once the lock is let go');
+});
+
+test('a named directory over a submodule in a merge conflict changes when any stage\'s commit changes', async (t) => {
+  const ws = await createWorkspace(t);
+  const lane = await openLane(ws, 'conflict-lane');
+  const lib = path.join(ws.tempDir, 'lib');
+  await mkdir(lib);
+  git(lib, ['init', '-q', '-b', 'main']);
+  git(lib, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '--allow-empty', '-m', 'one']);
+  git(ws.appDir, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib']);
+  git(ws.appDir, ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '-m', 'vendor lib']);
+  git(ws.appDir, ['submodule', 'deinit', '-q', '-f', 'vendor/lib']);
+  const commits = [git(ws.appDir, ['rev-parse', 'HEAD']).trim(), git(lib, ['rev-parse', 'HEAD']).trim(), git(ws.appDir, ['rev-parse', 'HEAD~1']).trim()];
+  // The submodule's entry as a merge leaves it in conflict: three stages.
+  const stages = (second) => `0 ${'0'.repeat(40)}\tvendor/lib\n160000 ${commits[0]} 1\tvendor/lib\n160000 ${second} 2\tvendor/lib\n160000 ${commits[2]} 3\tvendor/lib\n`;
+  spawnSync('git', ['update-index', '--index-info'], { cwd: ws.appDir, input: stages(commits[1]), encoding: 'utf8' });
+  assert.equal(git(ws.appDir, ['ls-files', '--unmerged']).trim().split('\n').length, 3, 'the control: three stages');
+  const projectRepos = [{ id: 'app' }];
+  const first = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:vendor'], projectRepos });
+  // Only stage 2's commit changes.
+  spawnSync('git', ['update-index', '--index-info'], { cwd: ws.appDir, input: stages(commits[0]), encoding: 'utf8' });
+  assert.match(git(ws.appDir, ['ls-files', '--unmerged']), new RegExp(`${commits[0]} 2\tvendor/lib`));
+  const second = await fingerprintWork({ rootDir: ws.rootDir, laneDir: lane.laneDir, paths: ['app:vendor'], projectRepos });
+  assert.notEqual(second.fingerprint, first.fingerprint, 'the stage-2 commit counts');
+});
+
+test('a working file is read through one handle that no link in any part of its path can redirect', async (t) => {
+  const ws = await createWorkspace(t);
+  const inside = path.join(await realpath(ws.tempDir), 'inside');
+  await mkdir(path.join(inside, 'dir'), { recursive: true });
+  await writeFile(path.join(inside, 'dir', 'f.txt'), 'tracked\n', 'utf8');
+  assert.equal(await readWorkingFileHash(path.join(inside, 'dir', 'f.txt')), createHash('sha256').update('tracked\n').digest('hex'));
+  // A FIFO opens without waiting, and isn't read.
+  spawnSync('mkfifo', [path.join(inside, 'pipe')]);
+  assert.equal(await readWorkingFileHash(path.join(inside, 'pipe')), 'special');
+  if (process.platform !== 'darwin') return;
+  // On macOS a folder that became a link after it was checked can't lead the
+  // read elsewhere: the open refuses a link in any part of the path.
+  const outside = path.join(await realpath(ws.tempDir), 'outside');
+  await mkdir(path.join(outside, 'dir'), { recursive: true });
+  await writeFile(path.join(outside, 'dir', 'f.txt'), 'outside\n', 'utf8');
+  await symlink(outside, path.join(inside, 'swapped'));
+  assert.equal(await readWorkingFileHash(path.join(inside, 'swapped', 'dir', 'f.txt')), null, 'a link part-way is refused');
+  await symlink(path.join(outside, 'dir', 'f.txt'), path.join(inside, 'leaf'));
+  assert.equal(await readWorkingFileHash(path.join(inside, 'leaf')), null, 'so is a link at the end');
+  assert.ok(WORKING_READ_FLAGS & 0x20000000, 'O_NOFOLLOW_ANY');
 });

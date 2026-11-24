@@ -425,9 +425,10 @@ vibecompass review-relay --session auth-flow --reviewer codex --reviewer-model <
   read that needs an object a partial clone lacks refuses instead.
   `close-session` refuses while a relay runs or left a write or turn
   unfinished; `review-relay --session <lane-id> --recover` finishes it. A turn
-  whose process it couldn't record stays reserved while any process carrying
-  that turn's id runs; with none found, `--recover` asks you to settle it. No
-  other session's process is named. The mark and the relay's state live in the
+  whose process it couldn't record stays reserved while a process carrying
+  that turn's id in its environment runs, or while the relay can't look; with
+  none found, `--recover` asks you to settle it. No other session's process is
+  named. The mark and the relay's state live in the
   lane folder and go at close.
 - **Platforms.** macOS only until a Linux run is recorded; `ready-for-review`
   and the lane's stage (`list-sessions`) work everywhere. An install that never

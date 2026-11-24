@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants as fsConstants, createReadStream } from 'node:fs';
-import { lstat, readFile, readdir, readlink, realpath, rename, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, readFile, readdir, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   BUILDER_TO_REVIEWER_HEADING,
@@ -151,14 +151,45 @@ export async function repositoryTopLevel(dir, env = process.env) {
   throw new Error(`git couldn't read the repository at ${holder} (${result.stderr || (result.code === null ? 'git didn\'t start' : `git exited ${result.code}`)}), so the relay doesn't read ${dir} as plain files.`);
 }
 
-// A file is opened without following a link put in its place since it was
-// looked at, and without waiting on a pipe.
-const READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+// How a working file is opened, never waiting on a pipe. On macOS, where the
+// relay runs, O_NOFOLLOW_ANY (macOS 11, which Node 20 needs anyway) refuses a
+// symbolic link in any part of the path, so a folder replaced by a link after
+// it was checked can't lead the read outside the checkout: every read starts
+// from the checkout's physical path, and the open itself is the check. Where
+// the relay doesn't run, ready-for-review is the builder's own read of its own
+// files, and only the last part is guarded.
+const O_NOFOLLOW_ANY = 0x20000000;
+export const WORKING_READ_FLAGS = process.platform === 'darwin'
+  ? fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | O_NOFOLLOW_ANY
+  : fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+const CHANGED_DURING_READ = 'changed while read';
 
-async function hashStream(filePath) {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(filePath, { flags: READ_FLAGS })) hash.update(chunk);
-  return hash.digest('hex');
+/**
+ * A working file's SHA-256, read through one open handle: `null` when its path
+ * changed under the read (a link put in any part of it, or a part gone), and
+ * 'special' when what opened isn't a regular file.
+ */
+export async function readWorkingFileHash(filePath, flags = WORKING_READ_FLAGS) {
+  let handle;
+  try {
+    handle = await open(filePath, flags);
+  } catch (error) {
+    if (error?.code === 'ELOOP' || error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+    throw error;
+  }
+  try {
+    if (!(await handle.stat()).isFile()) return 'special';
+    const hash = createHash('sha256');
+    for await (const chunk of handle.createReadStream({ autoClose: false, start: 0 })) hash.update(chunk);
+    return hash.digest('hex');
+  } finally {
+    await handle.close();
+  }
+}
+
+// A file reached through the physical path of the folder it was named under.
+async function physicalFile(filePath) {
+  return path.join(await realpath(path.dirname(filePath)), path.basename(filePath));
 }
 
 /** A file's content hash, a symbolic link's target, or what else is there; never a read of a pipe. */
@@ -168,7 +199,8 @@ async function hashFile(filePath) {
     return sha256Hex(`symlink:${await readlink(filePath)}`);
   }
   if (!info.isFile()) return sha256Hex(info.isDirectory() ? 'directory:' : 'special:');
-  return hashStream(filePath);
+  const hash = await readWorkingFileHash(filePath);
+  return hash === null ? sha256Hex(`${CHANGED_DURING_READ}:`) : hash === 'special' ? sha256Hex('special:') : hash;
 }
 
 /**
@@ -188,7 +220,10 @@ async function workingState(filePath) {
   if (info.isSymbolicLink()) return `symlink ${sha256Hex(await readlink(filePath))}`;
   if (info.isDirectory()) return 'directory';
   if (!info.isFile()) return 'special';
-  return `file ${(info.mode & 0o100) !== 0 ? 'x' : '-'} ${await hashStream(filePath)}`;
+  const hash = await readWorkingFileHash(filePath);
+  if (hash === null) return CHANGED_DURING_READ;
+  if (hash === 'special') return 'special';
+  return `file ${(info.mode & 0o100) !== 0 ? 'x' : '-'} ${hash}`;
 }
 
 /**
@@ -257,20 +292,22 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
   const working = createHash('sha256');
   const leading = new Map();
   const repositories = [dir];
+  // Files are read from the checkout's physical path (see WORKING_READ_FLAGS).
+  const physical = await realpath(dir);
   let submodules = 0;
   for (const record of splitNul(index.stdout)) {
     const tab = record.indexOf('\t');
     const [mode, oid, stage] = record.slice(0, tab).split(' ');
     const relative = record.slice(tab + 1);
-    const full = path.join(dir, relative);
-    let state = await blockedLeadingPath(dir, relative, leading);
+    const full = path.join(physical, relative);
+    let state = await blockedLeadingPath(physical, relative, leading);
     if (state !== null) {
       // Past a link or a file that replaced a folder: nothing there is opened.
     } else if (mode === '160000' && (await pathKind(full)) === 'directory' && (await holdsCheckout(full))) {
       if (depth + 1 > MAX_SUBMODULE_DEPTH) {
         throw new Error(`${label} nests checked-out submodules deeper than ${MAX_SUBMODULE_DEPTH} at ${full}; the relay doesn't fingerprint work that deep.`); // D-423 item 2
       }
-      const inner = await fingerprintCheckout(full, `submodule ${relative} of ${label}`, env, depth + 1);
+      const inner = await fingerprintCheckout(path.join(dir, relative), `submodule ${relative} of ${label}`, env, depth + 1);
       submodules += 1 + inner.submodules;
       repositories.push(...inner.repositories);
       state = `submodule ${inner.fingerprint}`;
@@ -293,8 +330,8 @@ async function fingerprintCheckout(dir, label, env, depth = 0) {
       // a folder and doesn't look inside it.
       throw new Error(`${label} at ${dir} holds a git repository that isn't a submodule (${relative}); the relay can't tell when its work changes. Add it as a submodule, ignore it, or move it out.`);
     }
-    const blocked = await blockedLeadingPath(dir, relative, leading);
-    entries.push(`untracked\t${relative}\t${blocked ?? await hashFile(path.join(dir, relative))}`);
+    const blocked = await blockedLeadingPath(physical, relative, leading);
+    entries.push(`untracked\t${relative}\t${blocked ?? await hashFile(path.join(physical, relative))}`);
   }
   entries.sort();
   return { head: headSha, entries, untracked: untrackedFiles.length, submodules, repositories, fingerprint: sha256Hex(entries.join('\n')) };
@@ -436,7 +473,7 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       continue;
     }
     if (kind === 'file') {
-      entries.push(`path\t${resolved.spec}\tfile\t${await hashFile(resolved.absolute)}`);
+      entries.push(`path\t${resolved.spec}\tfile\t${await hashFile(await physicalFile(resolved.absolute))}`);
       covers.paths.push({ spec: resolved.spec, kind: 'file', covered: 1 });
       continue;
     }
@@ -454,21 +491,25 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
       continue;
     }
     const leading = new Map();
-    for (const file of listing.files) {
-      const relative = toPosix(path.relative(resolved.absolute, file));
-      const blocked = await blockedLeadingPath(resolved.absolute, relative, leading);
+    const physicalNamed = await realpath(resolved.absolute);
+    for (const listed of listing.files) {
+      const relative = toPosix(path.relative(resolved.absolute, listed));
+      const blocked = await blockedLeadingPath(physicalNamed, relative, leading);
       if (blocked !== null) {
         entries.push(`path\t${resolved.spec}\t${blocked}\t${relative}`);
         continue;
       }
+      // Read from the directory's physical path (see WORKING_READ_FLAGS).
+      const file = path.join(physicalNamed, relative);
       const fileKind = await pathKind(file);
-      const gitlink = listing.gitlinks.get(file);
+      const stages = listing.gitlinks.get(listed);
+      const gitlink = stages === undefined ? undefined : [...stages].sort().join(' ');
       // A tracked file deleted in the working tree is still listed: it counts
       // as missing. A submodule counts with its index entry's commit and,
       // checked out, its own fingerprint (D-423 item 2).
       if (gitlink !== undefined) {
         if (fileKind === 'directory' && (await holdsCheckout(file))) {
-          const inner = await fingerprintCheckout(file, `submodule ${relative} under ${resolved.spec}`, env, 1);
+          const inner = await fingerprintCheckout(listed, `submodule ${relative} under ${resolved.spec}`, env, 1);
           for (const repository of inner.repositories) repositories.add(repository);
           entries.push(`path\t${resolved.spec}\tsubmodule\t${relative}\t${gitlink}\t${inner.fingerprint}`);
         } else if (fileKind === 'file') {
@@ -482,7 +523,7 @@ export async function fingerprintWork({ rootDir, laneDir, worktrees = {}, paths 
         // A folder git lists as untracked without looking inside: a
         // repository that isn't a submodule.
         if (await holdsCheckout(file)) {
-          const inner = await fingerprintCheckout(file, `repository ${relative} under ${resolved.spec}`, env, 1);
+          const inner = await fingerprintCheckout(listed, `repository ${relative} under ${resolved.spec}`, env, 1);
           for (const repository of inner.repositories) repositories.add(repository);
           entries.push(`path\t${resolved.spec}\trepository\t${relative}\t${inner.fingerprint}`);
         } else {
@@ -527,10 +568,12 @@ async function listDirectoryFiles(dir, { rootDir, laneDir, env }) {
     const listedFiles = new Set();
     for (const record of splitNul(staged.stdout)) {
       const tab = record.indexOf('\t');
-      const [mode, oid] = record.slice(0, tab).split(' ');
+      const [mode, oid, stage] = record.slice(0, tab).split(' ');
       const file = underNamed(record.slice(tab + 1));
       listedFiles.add(file);
-      if (mode === '160000') gitlinks.set(file, oid);
+      // Every stage of a submodule entry counts: in a merge conflict each
+      // stage names its own commit.
+      if (mode === '160000') gitlinks.set(file, [...(gitlinks.get(file) ?? []), `${stage}:${oid}`]);
     }
     const others = await gitText(['ls-files', '--others', '--exclude-standard', '-z', '--', relative], top, env);
     if (!others.ok) {
